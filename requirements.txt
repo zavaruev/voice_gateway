@@ -1,0 +1,10 @@
+websockets
+fastapi
+uvicorn
+opuslib
+pydub
+aiohttp
+loguru
+onnxruntime
+numpy
+python-multipart

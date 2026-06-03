@@ -1,0 +1,896 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="color-scheme" content="light dark">
+<title>Voice Gateway</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M16 2a4 4 0 00-4 4v8a4 4 0 008 0V6a4 4 0 00-4-4z' fill='%230066cc'/%3E%3Cpath d='M10 14a6 6 0 0012 0h2a8 8 0 01-16 0z' fill='%230066cc'/%3E%3Crect x='15' y='20' width='2' height='8' rx='1' fill='%230066cc'/%3E%3C/svg%3E">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --primary: #0066cc;
+    --primary-focus: #0071e3;
+    --primary-on-dark: #2997ff;
+    --ink: #1d1d1f;
+    --canvas: #ffffff;
+    --parchment: #f5f5f7;
+    --hairline: #e0e0e0;
+    --black: #000000;
+    --muted-48: #7a7a7a;
+    --muted: #cccccc;
+    --divider-soft: #f0f0f0;
+    --input-border: rgba(0,0,0,0.12);
+    --toggle-off: #ddd;
+    --badge-online-bg: #e8f5e9;
+    --badge-online-fg: #2e7d32;
+    --badge-listening-bg: #e3f2fd;
+    --badge-listening-fg: #1565c0;
+    --badge-processing-bg: #fff3e0;
+    --badge-processing-fg: #e65100;
+    --badge-speaking-bg: #fce4ec;
+    --badge-speaking-fg: #c62828;
+    --radius-pill: 9999px;
+    --radius-lg: 18px;
+    --radius-sm: 8px;
+  }
+
+  [data-theme="dark"] {
+    --ink: #f5f5f7;
+    --canvas: #1c1c1e;
+    --parchment: #000000;
+    --hairline: #38383a;
+    --divider-soft: #2c2c2e;
+    --muted-48: #98989d;
+    --muted: #636366;
+    --input-border: rgba(255,255,255,0.15);
+    --toggle-off: #636366;
+    --badge-online-bg: #1b5e20;
+    --badge-online-fg: #a5d6a7;
+    --badge-listening-bg: #0d47a1;
+    --badge-listening-fg: #90caf9;
+    --badge-processing-bg: #e65100;
+    --badge-processing-fg: #ffcc80;
+    --badge-speaking-bg: #b71c1c;
+    --badge-speaking-fg: #ef9a9a;
+  }
+
+  html { font-size: 17px; color-scheme: light; }
+  [data-theme="dark"] html { color-scheme: dark; }
+  body {
+    font-family: system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+    font-size: 1rem;
+    font-weight: 400;
+    line-height: 1.47;
+    letter-spacing: -0.374px;
+    color: var(--ink);
+    background: var(--parchment);
+    -webkit-font-smoothing: antialiased;
+    transition: color 0.2s, background 0.2s;
+  }
+
+  .nav {
+    background: var(--black);
+    height: 44px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 22px;
+    position: sticky;
+    top: 0;
+    z-index: 100;
+  }
+  .nav-title {
+    color: #ffffff;
+    font-size: 12px;
+    font-weight: 400;
+    line-height: 1;
+    letter-spacing: -0.12px;
+    text-decoration: none;
+  }
+  .nav-actions { display: flex; align-items: center; gap: 12px; }
+
+  .theme-btn {
+    background: transparent; border: none; cursor: pointer;
+    width: 28px; height: 28px; padding: 0;
+    color: #cccccc; font-size: 16px; line-height: 1;
+    display: flex; align-items: center; justify-content: center;
+    border-radius: var(--radius-pill);
+    transition: color 0.15s, background 0.15s;
+  }
+  .theme-btn:hover { color: #ffffff; background: rgba(255,255,255,0.1); }
+
+  .page { max-width: 1068px; margin: 0 auto; padding: 32px 22px; transition: padding 0.2s; }
+  @media (max-width: 734px) { .page { padding: 24px 16px; } }
+
+  .tabs { display: flex; gap: 0; margin-bottom: 0; border-bottom: 1px solid var(--hairline); transition: border-color 0.2s; }
+  .tab {
+    padding: 11px 22px;
+    font-size: 14px;
+    font-weight: 400;
+    line-height: 1.29;
+    letter-spacing: -0.224px;
+    color: var(--muted-48);
+    cursor: pointer;
+    border: none;
+    background: transparent;
+    border-bottom: 2px solid transparent;
+    transition: color 0.15s, border-color 0.15s;
+  }
+  .tab:hover { color: var(--ink); }
+  .tab.active { color: var(--primary); border-bottom-color: var(--primary); font-weight: 600; }
+
+  .panel { display: none; padding-top: 24px; }
+  .panel.active { display: block; }
+
+  .card {
+    background: var(--canvas);
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius-lg);
+    padding: 24px;
+    margin-bottom: 24px;
+    transition: background 0.2s, border-color 0.2s;
+  }
+
+  .summary { display: flex; gap: 24px; margin-bottom: 24px; }
+  .summary-item { display: flex; flex-direction: column; align-items: center; min-width: 80px; }
+  .summary-value { font-size: 34px; font-weight: 600; line-height: 1.1; letter-spacing: 0; color: var(--ink); transition: color 0.2s; }
+  .summary-label { font-size: 14px; font-weight: 400; line-height: 1.43; letter-spacing: -0.224px; color: var(--muted-48); }
+  .summary-value.success { color: var(--badge-online-fg); }
+
+  .table-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; }
+  th {
+    text-align: left;
+    padding: 8px 12px;
+    font-size: 12px;
+    font-weight: 600;
+    line-height: 1;
+    letter-spacing: -0.12px;
+    color: var(--muted-48);
+    text-transform: uppercase;
+    border-bottom: 1px solid var(--hairline);
+    transition: color 0.2s, border-color 0.2s;
+  }
+  td {
+    padding: 11px 12px;
+    font-size: 14px;
+    font-weight: 400;
+    line-height: 1.43;
+    letter-spacing: -0.224px;
+    border-bottom: 1px solid var(--divider-soft);
+    vertical-align: middle;
+    transition: border-color 0.2s;
+  }
+  tr:last-child td { border-bottom: none; }
+  td.actions { white-space: nowrap; text-align: right; }
+
+  .badge {
+    display: inline-block;
+    padding: 3px 10px;
+    font-size: 12px;
+    font-weight: 600;
+    line-height: 1.3;
+    letter-spacing: -0.08px;
+    border-radius: var(--radius-pill);
+    transition: background 0.2s, color 0.2s;
+  }
+  .badge.online { background: var(--badge-online-bg); color: var(--badge-online-fg); }
+  .badge.offline { background: var(--divider-soft); color: var(--muted-48); }
+  .badge.listening { background: var(--badge-listening-bg); color: var(--badge-listening-fg); }
+  .badge.processing { background: var(--badge-processing-bg); color: var(--badge-processing-fg); }
+  .badge.speaking { background: var(--badge-speaking-bg); color: var(--badge-speaking-fg); }
+  .badge.idle { background: var(--divider-soft); color: var(--muted-48); }
+
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-family: inherit;
+    font-size: 14px;
+    font-weight: 400;
+    line-height: 1.29;
+    letter-spacing: -0.224px;
+    cursor: pointer;
+    border: 1px solid transparent;
+    border-radius: var(--radius-pill);
+    padding: 8px 15px;
+    transition: transform 0.1s, opacity 0.1s, background 0.15s, color 0.15s, border-color 0.15s;
+    white-space: nowrap;
+  }
+  .btn:active { transform: scale(0.95); }
+  .btn:focus-visible { outline: 2px solid var(--primary-focus); outline-offset: 2px; }
+  .btn-primary { background: var(--primary); color: #ffffff; border-color: var(--primary); }
+  .btn-primary:hover { opacity: 0.9; }
+  .btn-secondary { background: transparent; color: var(--primary); border-color: var(--primary); }
+  .btn-secondary:hover { background: rgba(0,102,204,0.08); }
+  .btn-danger { background: transparent; color: var(--badge-speaking-fg); border-color: var(--badge-speaking-fg); }
+  .btn-danger:hover { background: rgba(198,40,40,0.08); }
+  .btn-ghost { background: transparent; color: var(--muted-48); border-color: transparent; }
+  .btn-ghost:hover { color: var(--ink); }
+  .btn-sm { padding: 4px 11px; font-size: 12px; }
+  .btn + .btn { margin-left: 6px; }
+
+  input, textarea, select {
+    font-family: inherit;
+    font-size: 14px;
+    font-weight: 400;
+    line-height: 1.43;
+    letter-spacing: -0.224px;
+    color: var(--ink);
+    background: var(--canvas);
+    border: 1px solid var(--input-border);
+    border-radius: var(--radius-pill);
+    padding: 10px 16px;
+    width: 100%;
+    outline: none;
+    transition: border-color 0.15s, background 0.2s, color 0.2s;
+  }
+  input:focus, textarea:focus, select:focus {
+    border-color: var(--primary);
+    box-shadow: 0 0 0 2px rgba(0,102,204,0.15);
+  }
+  @media (prefers-color-scheme: dark) {
+    input:focus, textarea:focus, select:focus {
+      box-shadow: 0 0 0 2px rgba(41,151,255,0.25);
+    }
+  }
+  textarea { border-radius: var(--radius-sm); resize: vertical; min-height: 80px; font-family: Menlo, monospace; font-size: 13px; }
+  select { appearance: none; background-image: url("data:image/svg+xml,%3Csvg width='10' height='6' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%237a7a7a' stroke-width='1.5' stroke-linecap='round'/%3E%3C/svg%3E"); background-repeat: no-repeat; background-position: right 12px center; padding-right: 32px; }
+  [data-theme="dark"] select { background-image: url("data:image/svg+xml,%3Csvg width='10' height='6' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%2398989d' stroke-width='1.5' stroke-linecap='round'/%3E%3C/svg%3E"); }
+
+  .toggle { position: relative; display: inline-block; width: 36px; height: 22px; flex-shrink: 0; }
+  .toggle input { opacity: 0; width: 0; height: 0; padding: 0; border: none; }
+  .toggle-slider {
+    position: absolute; cursor: pointer; inset: 0;
+    background: var(--toggle-off); border-radius: var(--radius-pill);
+    transition: background 0.2s;
+  }
+  .toggle-slider::before {
+    content: ''; position: absolute; height: 18px; width: 18px;
+    left: 2px; bottom: 2px; background: #ffffff; border-radius: 50%;
+    transition: transform 0.2s;
+  }
+  .toggle input:checked + .toggle-slider { background: var(--primary); }
+  .toggle input:checked + .toggle-slider::before { transform: translateX(14px); }
+
+  .form-group { margin-bottom: 16px; }
+  .form-group label { display: block; font-size: 14px; font-weight: 600; line-height: 1.29; letter-spacing: -0.224px; margin-bottom: 4px; color: var(--ink); transition: color 0.2s; }
+  .form-row { display: flex; gap: 16px; align-items: center; }
+  .form-row .form-group { flex: 1; margin-bottom: 0; }
+
+  .modal-overlay {
+    display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.4);
+    z-index: 200; align-items: center; justify-content: center;
+    backdrop-filter: blur(2px);
+  }
+  [data-theme="dark"] .modal-overlay { background: rgba(0,0,0,0.65); }
+  .modal-overlay.open { display: flex; }
+  .modal {
+    background: var(--canvas); border-radius: var(--radius-lg); padding: 32px;
+    width: 90%; max-width: 520px; max-height: 90vh; overflow-y: auto;
+    transition: background 0.2s;
+  }
+  .modal h2 { font-size: 21px; font-weight: 600; line-height: 1.19; letter-spacing: 0.231px; margin-bottom: 20px; color: var(--ink); transition: color 0.2s; }
+  .modal-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 24px; padding-top: 16px; border-top: 1px solid var(--divider-soft); transition: border-color 0.2s; }
+
+  .toast {
+    position: fixed; bottom: 24px; right: 24px; z-index: 300;
+    background: var(--ink); color: var(--canvas);
+    font-size: 14px; font-weight: 400; line-height: 1.43;
+    padding: 12px 20px; border-radius: var(--radius-pill);
+    opacity: 0; transform: translateY(10px); transition: opacity 0.25s, transform 0.25s, background 0.2s, color 0.2s;
+    pointer-events: none;
+  }
+  .toast.show { opacity: 1; transform: translateY(0); }
+  .toast.error { background: #c62828; color: #ffffff; }
+  .toast.success { background: #2e7d32; color: #ffffff; }
+
+  .empty { text-align: center; padding: 48px 24px; color: var(--muted-48); font-size: 14px; }
+
+  .loading { text-align: center; padding: 24px; color: var(--muted-48); }
+  .spinner { display: inline-block; width: 20px; height: 20px; border: 2px solid var(--hairline); border-top-color: var(--primary); border-radius: 50%; animation: spin 0.6s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .mcp-result { background: var(--parchment); border-radius: var(--radius-sm); padding: 12px; font-family: Menlo, monospace; font-size: 13px; white-space: pre-wrap; word-break: break-all; max-height: 200px; overflow-y: auto; margin-top: 8px; transition: background 0.2s; }
+
+  /* Control tab styles */
+  .ctrl-section-title { font-size: 14px; font-weight: 600; line-height: 1.29; letter-spacing: -0.224px; color: var(--muted-48); margin-bottom: 14px; text-transform: uppercase; letter-spacing: 0.5px; }
+  .ctrl-row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+  .ctrl-row + .ctrl-row { margin-top: 12px; }
+  .ctrl-label { font-size: 14px; font-weight: 500; color: var(--ink); min-width: 80px; transition: color 0.2s; }
+  .ctrl-input { width: auto; min-width: 200px; flex: 1; }
+  .ctrl-slider { width: 160px; height: 4px; -webkit-appearance: none; appearance: none; background: var(--hairline); border-radius: 2px; outline: none; cursor: pointer; }
+  .ctrl-slider::-webkit-slider-thumb { -webkit-appearance: none; width: 18px; height: 18px; border-radius: 50%; background: var(--primary); cursor: pointer; border: 2px solid var(--canvas); box-shadow: 0 1px 3px rgba(0,0,0,0.2); }
+  .ctrl-slider::-moz-range-thumb { width: 18px; height: 18px; border-radius: 50%; background: var(--primary); cursor: pointer; border: 2px solid var(--canvas); box-shadow: 0 1px 3px rgba(0,0,0,0.2); }
+  .ctrl-slider-val { font-size: 14px; font-weight: 600; min-width: 32px; text-align: right; color: var(--ink); transition: color 0.2s; font-family: Menlo, monospace; }
+  .ctrl-btn-group { display: flex; gap: 6px; }
+  .ctrl-btn-group .btn.active { background: var(--primary); color: #fff; border-color: var(--primary); }
+  .ctrl-result { margin-top: 8px; }
+  .ctrl-file-area { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  .ctrl-file-area input[type="file"] { width: auto; flex: 1; padding: 8px 12px; }
+  .ctrl-progress { height: 4px; background: var(--hairline); border-radius: 2px; margin-top: 8px; overflow: hidden; }
+  .ctrl-progress-bar { height: 100%; background: var(--primary); width: 0%; transition: width 0.3s; border-radius: 2px; }
+  .ctrl-status { font-size: 13px; color: var(--muted-48); margin-top: 4px; }
+  .ctrl-fw-meta { font-size: 13px; font-family: Menlo, monospace; color: var(--muted-48); margin-top: 4px; }
+</style>
+</head>
+<body>
+<nav class="nav">
+  <span class="nav-title">Voice Gateway</span>
+  <div class="nav-actions">
+    <button class="theme-btn" id="theme-btn" onclick="toggleTheme()" aria-label="Toggle theme"></button>
+  </div>
+</nav>
+
+<div class="page">
+  <div class="tabs">
+    <button class="tab active" data-tab="devices">Devices</button>
+    <button class="tab" data-tab="sessions">Sessions</button>
+    <button class="tab" data-tab="control">Control</button>
+  </div>
+
+  <!-- DEVICES PANEL -->
+  <div class="panel active" id="panel-devices">
+    <div class="summary" id="device-summary"></div>
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+        <span style="font-size:14px;font-weight:600;line-height:1.29;letter-spacing:-0.224px;color:var(--muted-48)">Registered devices</span>
+        <button class="btn btn-primary" onclick="openAddDevice()">+ New Device</button>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr>
+            <th>MAC</th><th>Name</th><th>Status</th><th>WebSocket URL</th><th>Allowed</th><th></th>
+          </tr></thead>
+          <tbody id="device-table"></tbody>
+        </table>
+      </div>
+      <div class="empty" id="device-empty">No devices registered yet.</div>
+    </div>
+  </div>
+
+  <!-- SESSIONS PANEL -->
+  <div class="panel" id="panel-sessions">
+    <div class="summary" id="session-summary"></div>
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+        <span style="font-size:14px;font-weight:600;line-height:1.29;letter-spacing:-0.224px;color:var(--muted-48)">Active WebSocket sessions</span>
+        <button class="btn btn-secondary btn-sm" onclick="refreshSessions()">Refresh</button>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr>
+            <th>Session ID</th><th>MAC</th><th>Status</th><th>Last Text</th><th></th>
+          </tr></thead>
+          <tbody id="session-table"></tbody>
+        </table>
+      </div>
+      <div class="empty" id="session-empty">No active sessions.</div>
+    </div>
+  </div>
+
+  <!-- CONTROL PANEL -->
+  <div class="panel" id="panel-control">
+    <div style="margin-bottom:20px">
+      <div class="ctrl-section-title">Target Session</div>
+      <div class="ctrl-row">
+        <span class="ctrl-label">Session</span>
+        <select id="ctrl-session" class="ctrl-input" onchange="ctrlRefresh()">
+          <option value="latest">latest (most recent)</option>
+        </select>
+      </div>
+    </div>
+
+    <!-- Status & Info -->
+    <div class="card">
+      <div class="ctrl-section-title">Status &amp; Info</div>
+      <div class="ctrl-row">
+        <button class="btn btn-secondary" onclick="ctrlCall('self.get_device_status')">Device Status</button>
+        <button class="btn btn-secondary" onclick="ctrlCall('self.get_system_info')">System Info</button>
+        <button class="btn btn-secondary" onclick="ctrlCall('self.screen.get_info')">Screen Info</button>
+      </div>
+      <div id="ctrl-result-info" class="ctrl-result"></div>
+    </div>
+
+    <!-- Display -->
+    <div class="card">
+      <div class="ctrl-section-title">Display</div>
+      <div class="ctrl-row">
+        <span class="ctrl-label">Brightness</span>
+        <input type="range" class="ctrl-slider" id="ctrl-brightness" min="0" max="100" value="100" oninput="document.getElementById('ctrl-brightness-val').textContent=this.value">
+        <span class="ctrl-slider-val" id="ctrl-brightness-val">100</span>
+        <button class="btn btn-primary btn-sm" onclick="ctrlCall('self.screen.set_brightness', {brightness: parseInt(document.getElementById('ctrl-brightness').value)})">Set</button>
+      </div>
+      <div class="ctrl-row">
+        <span class="ctrl-label">Theme</span>
+        <div class="ctrl-btn-group">
+          <button class="btn btn-secondary btn-sm theme-opt" data-theme-val="light" onclick="ctrlCall('self.screen.set_theme', {theme:'light'}); document.querySelectorAll('.theme-opt').forEach(b=>b.classList.remove('active')); this.classList.add('active')">&#127774; Light</button>
+          <button class="btn btn-secondary btn-sm theme-opt" data-theme-val="dark" onclick="ctrlCall('self.screen.set_theme', {theme:'dark'}); document.querySelectorAll('.theme-opt').forEach(b=>b.classList.remove('active')); this.classList.add('active')">&#127769; Dark</button>
+        </div>
+      </div>
+      <div class="ctrl-row">
+        <span class="ctrl-label">Preview Image</span>
+        <input class="ctrl-input" id="ctrl-preview-url" placeholder="http://..." onkeydown="if(event.key==='Enter')ctrlCall('self.screen.preview_image', {url: this.value})">
+        <button class="btn btn-primary btn-sm" onclick="ctrlCall('self.screen.preview_image', {url: document.getElementById('ctrl-preview-url').value})">Send</button>
+      </div>
+      <div class="ctrl-row">
+        <span class="ctrl-label">Screenshot</span>
+        <input class="ctrl-input" id="ctrl-snap-url" placeholder="Upload URL">
+        <span style="font-size:14px;color:var(--muted-48)">Quality</span>
+        <input type="range" class="ctrl-slider" id="ctrl-snap-quality" min="1" max="100" value="80" style="width:100px" oninput="document.getElementById('ctrl-snap-quality-val').textContent=this.value">
+        <span class="ctrl-slider-val" id="ctrl-snap-quality-val">80</span>
+        <button class="btn btn-primary btn-sm" onclick="ctrlCall('self.screen.snapshot', {url: document.getElementById('ctrl-snap-url').value, quality: parseInt(document.getElementById('ctrl-snap-quality').value)})">Capture</button>
+      </div>
+      <div id="ctrl-result-display" class="ctrl-result"></div>
+    </div>
+
+    <!-- Audio -->
+    <div class="card">
+      <div class="ctrl-section-title">Audio</div>
+      <div class="ctrl-row">
+        <span class="ctrl-label">Volume</span>
+        <input type="range" class="ctrl-slider" id="ctrl-volume" min="0" max="100" value="100" oninput="document.getElementById('ctrl-volume-val').textContent=this.value">
+        <span class="ctrl-slider-val" id="ctrl-volume-val">100</span>
+        <button class="btn btn-primary btn-sm" onclick="ctrlCall('self.audio_speaker.set_volume', {volume: parseInt(document.getElementById('ctrl-volume').value)})">Set</button>
+      </div>
+      <div id="ctrl-result-audio" class="ctrl-result"></div>
+    </div>
+
+    <!-- System -->
+    <div class="card">
+      <div class="ctrl-section-title">System</div>
+      <div class="ctrl-row">
+        <span class="ctrl-label">Device</span>
+        <button class="btn btn-danger btn-sm" onclick="ctrlConfirmReboot()">&#128308; Reboot</button>
+      </div>
+      <div class="ctrl-row">
+        <span class="ctrl-label">Download URL</span>
+        <input class="ctrl-input" id="ctrl-assets-url" placeholder="http://..." onkeydown="if(event.key==='Enter')ctrlCall('self.assets.set_download_url', {url: this.value})">
+        <button class="btn btn-primary btn-sm" onclick="ctrlCall('self.assets.set_download_url', {url: document.getElementById('ctrl-assets-url').value})">Set URL</button>
+      </div>
+      <div class="ctrl-row">
+        <span class="ctrl-label">Upgrade FW</span>
+        <input class="ctrl-input" id="ctrl-fw-url" placeholder="http://.../firmware.bin" onkeydown="if(event.key==='Enter')ctrlConfirmUpgrade()">
+        <button class="btn btn-danger btn-sm" onclick="ctrlConfirmUpgrade()">Upgrade</button>
+      </div>
+      <div id="ctrl-result-system" class="ctrl-result"></div>
+    </div>
+
+    <!-- OTA Firmware Upload -->
+    <div class="card">
+      <div class="ctrl-section-title">OTA Firmware Upload</div>
+      <div id="ctrl-fw-meta" class="ctrl-fw-meta">No firmware uploaded yet.</div>
+      <div class="ctrl-row" style="margin-top:12px">
+        <span class="ctrl-label">Firmware (.bin)</span>
+        <div class="ctrl-file-area" style="flex:1">
+          <input type="file" id="ctrl-fw-file" accept=".bin">
+          <input style="width:100px" id="ctrl-fw-version" placeholder="Version" onkeydown="if(event.key==='Enter')ctrlUploadFirmware()">
+          <button class="btn btn-primary" id="ctrl-fw-upload-btn" onclick="ctrlUploadFirmware()">Upload</button>
+        </div>
+      </div>
+      <div class="ctrl-progress"><div class="ctrl-progress-bar" id="ctrl-fw-progress"></div></div>
+      <div id="ctrl-fw-status" class="ctrl-status"></div>
+      <div id="ctrl-result-fw" class="ctrl-result"></div>
+    </div>
+  </div>
+</div>
+
+<!-- Modal overlay -->
+<div class="modal-overlay" id="modal-overlay">
+  <div class="modal" id="modal-content"></div>
+</div>
+
+<!-- Toast -->
+<div class="toast" id="toast"></div>
+
+<script>
+const API = {
+  devices: () => fetch('/api/devices/config').then(r => r.json()),
+  createDevice: (d) => fetch('/api/devices/config', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(d)}).then(r => { if(!r.ok) throw r; return r.json(); }),
+  updateDevice: (mac, d) => fetch(`/api/devices/config/${encodeURIComponent(mac)}`, {method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(d)}).then(r => { if(!r.ok) throw r; return r.json(); }),
+  deleteDevice: (mac) => fetch(`/api/devices/config/${encodeURIComponent(mac)}`, {method:'DELETE'}).then(r => { if(!r.ok) throw r; return r.json(); }),
+  sessions: () => fetch('/api/devices').then(r => r.json()),
+  mcp: (sid, data) => fetch(`/mcp/${encodeURIComponent(sid)}`, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(data)}).then(r => r.json()),
+  firmwareInfo: () => fetch('/api/firmware').then(r => r.json()),
+  firmwareUpload: (file, version) => { const fd = new FormData(); fd.append('file', file); if (version) fd.append('version', version); return fetch('/api/firmware/upload', {method:'POST', body: fd}); },
+};
+
+let devices = [];
+let sessions = [];
+let sessionTimer = null;
+
+// Theme
+function getTheme() { return localStorage.getItem('theme') || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'); }
+function setTheme(t) {
+  document.documentElement.setAttribute('data-theme', t);
+  localStorage.setItem('theme', t);
+  document.getElementById('theme-btn').textContent = t === 'dark' ? '\u2600\uFE0F' : '\uD83C\uDF19';
+}
+function toggleTheme() { setTheme(getTheme() === 'dark' ? 'light' : 'dark'); }
+setTheme(getTheme());
+
+// Tabs
+document.querySelectorAll('.tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+    tab.classList.add('active');
+    document.getElementById('panel-' + tab.dataset.tab).classList.add('active');
+    if (tab.dataset.tab === 'sessions') loadSessions();
+    if (tab.dataset.tab === 'control') { ctrlRefresh(); loadFirmwareInfo(); }
+  });
+});
+
+// Toast
+function toast(msg, type='') {
+  const el = document.getElementById('toast');
+  el.textContent = msg; el.className = 'toast ' + type;
+  requestAnimationFrame(() => requestAnimationFrame(() => el.classList.add('show')));
+  setTimeout(() => el.classList.remove('show'), 3000);
+}
+
+// Modal
+function openModal(html) {
+  document.getElementById('modal-content').innerHTML = html;
+  document.getElementById('modal-overlay').classList.add('open');
+}
+function closeModal() {
+  document.getElementById('modal-overlay').classList.remove('open');
+}
+document.getElementById('modal-overlay').addEventListener('click', (e) => {
+  if (e.target === e.currentTarget) closeModal();
+});
+
+// Load devices
+async function loadDevices() {
+  try {
+    devices = await API.devices();
+    renderDevices();
+  } catch(e) {
+    toast('Failed to load devices', 'error');
+  }
+}
+
+function renderDevices() {
+  const tbody = document.getElementById('device-table');
+  const empty = document.getElementById('device-empty');
+  tbody.innerHTML = '';
+
+  if (devices.length === 0) {
+    empty.style.display = 'block';
+    document.querySelector('#panel-devices .table-wrap').style.display = 'none';
+  } else {
+    empty.style.display = 'none';
+    document.querySelector('#panel-devices .table-wrap').style.display = 'block';
+    devices.forEach(d => {
+      const tr = document.createElement('tr');
+      const online = d.status !== 'offline';
+      tr.innerHTML = `
+        <td style="font-family:Menlo,monospace;font-size:13px">${esc(d.mac)}</td>
+        <td>${esc(d.friendly_name || '\u2014')}</td>
+        <td><span class="badge ${online ? 'online' : 'offline'}">${online ? d.status.toLowerCase() : 'offline'}</span></td>
+        <td style="font-family:Menlo,monospace;font-size:13px;max-width:200px;overflow:hidden;text-overflow:ellipsis">${esc(d.ws_url || '\u2014')}</td>
+        <td><label class="toggle"><input type="checkbox" ${d.allowed ? 'checked' : ''} onchange="toggleAllowed('${esc(d.mac)}', this.checked)"><span class="toggle-slider"></span></label></td>
+        <td class="actions">
+          <button class="btn btn-secondary btn-sm" onclick="openEditDevice('${esc(d.mac)}')">Edit</button>
+          <button class="btn btn-danger btn-sm" onclick="confirmDelete('${esc(d.mac)}')">Delete</button>
+        </td>`;
+      tbody.appendChild(tr);
+    });
+  }
+
+  const total = devices.length;
+  const online = devices.filter(d => d.status !== 'offline').length;
+  document.getElementById('device-summary').innerHTML = `
+    <div class="summary-item"><span class="summary-value">${total}</span><span class="summary-label">Total</span></div>
+    <div class="summary-item"><span class="summary-value success">${online}</span><span class="summary-label">Online</span></div>
+    <div class="summary-item"><span class="summary-value" style="color:var(--muted-48)">${total - online}</span><span class="summary-label">Offline</span></div>`;
+}
+
+// Add device
+function openAddDevice() {
+  openModal(`
+    <h2>New Device</h2>
+    <div class="form-group"><label>MAC Address</label><input id="f-mac" placeholder="e.g. AA:BB:CC:DD:EE:FF" oninput="this.value=this.value.toUpperCase()"></div>
+    <div class="form-group"><label>Friendly Name</label><input id="f-name" placeholder="Living Room"></div>
+    <div class="form-group"><label>WebSocket URL</label><input id="f-url" placeholder="ws://192.168.22.102:18792/"></div>
+    <div class="form-group"><label class="form-row" style="gap:12px"><input type="checkbox" id="f-allowed" checked style="width:auto;flex:none"><span>Allowed to connect</span></label></div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="createDevice()">Add Device</button>
+    </div>`);
+  setTimeout(() => document.getElementById('f-mac')?.focus(), 100);
+}
+
+async function createDevice() {
+  const mac = document.getElementById('f-mac').value.trim();
+  if (!mac) { toast('MAC address is required', 'error'); return; }
+  try {
+    await API.createDevice({ mac, friendly_name: document.getElementById('f-name').value.trim(), ws_url: document.getElementById('f-url').value.trim(), allowed: document.getElementById('f-allowed').checked });
+    closeModal(); toast('Device created', 'success'); loadDevices();
+  } catch(e) {
+    const msg = e.status === 409 ? 'Device already exists' : 'Failed to create device';
+    toast(msg, 'error');
+  }
+}
+
+// Edit device
+function openEditDevice(mac) {
+  const d = devices.find(x => x.mac === mac);
+  if (!d) return;
+  openModal(`
+    <h2>Edit Device</h2>
+    <div class="form-group"><label>MAC Address</label><input id="e-mac" value="${esc(d.mac)}" disabled style="opacity:0.5;font-family:Menlo,monospace;font-size:13px"></div>
+    <div class="form-group"><label>Friendly Name</label><input id="e-name" value="${esc(d.friendly_name || '')}"></div>
+    <div class="form-group"><label>WebSocket URL</label><input id="e-url" value="${esc(d.ws_url || '')}"></div>
+    <div class="form-group"><label class="form-row" style="gap:12px"><input type="checkbox" id="e-allowed" ${d.allowed ? 'checked' : ''} style="width:auto;flex:none"><span>Allowed to connect</span></label></div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="updateDevice('${esc(mac)}')">Save</button>
+    </div>`);
+}
+
+async function updateDevice(mac) {
+  try {
+    await API.updateDevice(mac, {
+      friendly_name: document.getElementById('e-name').value.trim(),
+      ws_url: document.getElementById('e-url').value.trim(),
+      allowed: document.getElementById('e-allowed').checked
+    });
+    closeModal(); toast('Device updated', 'success'); loadDevices();
+  } catch(e) {
+    toast('Failed to update device', 'error');
+  }
+}
+
+// Toggle allowed
+async function toggleAllowed(mac, allowed) {
+  try {
+    await API.updateDevice(mac, { allowed });
+    toast(allowed ? 'Access granted' : 'Access revoked', 'success');
+  } catch(e) {
+    toast('Failed to update', 'error');
+    loadDevices();
+  }
+}
+
+// Delete device
+function confirmDelete(mac) {
+  const d = devices.find(x => x.mac === mac);
+  openModal(`
+    <h2>Delete Device</h2>
+    <p style="margin-bottom:16px;color:var(--muted-48)">Are you sure you want to remove <strong>${esc(d ? d.friendly_name || d.mac : mac)}</strong>?</p>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-danger" onclick="deleteDevice('${esc(mac)}')">Delete</button>
+    </div>`);
+}
+
+async function deleteDevice(mac) {
+  try {
+    await API.deleteDevice(mac);
+    closeModal(); toast('Device deleted', 'success'); loadDevices();
+  } catch(e) {
+    toast('Failed to delete device', 'error');
+  }
+}
+
+// Sessions
+async function loadSessions() {
+  try {
+    sessions = await API.sessions();
+    renderSessions();
+  } catch(e) {
+    toast('Failed to load sessions', 'error');
+  }
+}
+
+function renderSessions() {
+  const tbody = document.getElementById('session-table');
+  const empty = document.getElementById('session-empty');
+  tbody.innerHTML = '';
+
+  if (sessions.length === 0) {
+    empty.style.display = 'block';
+    document.querySelector('#panel-sessions .table-wrap').style.display = 'none';
+  } else {
+    empty.style.display = 'none';
+    document.querySelector('#panel-sessions .table-wrap').style.display = 'block';
+    sessions.forEach(s => {
+      const tr = document.createElement('tr');
+      const statusClass = (s.status || '').toLowerCase();
+      tr.innerHTML = `
+        <td style="font-family:Menlo,monospace;font-size:12px;max-width:140px;overflow:hidden;text-overflow:ellipsis" title="${esc(s.session_id)}">${esc(s.session_id.slice(0,8))}\u2026</td>
+        <td style="font-family:Menlo,monospace;font-size:13px">${esc(s.mac)}</td>
+        <td><span class="badge ${statusClass}">${esc(s.status || 'unknown')}</span></td>
+        <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis">${esc(s.last_text || '\u2014')}</td>
+        <td class="actions"><button class="btn btn-secondary btn-sm" onclick="openMcp('${esc(s.session_id)}')">Send MCP</button></td>`;
+      tbody.appendChild(tr);
+    });
+  }
+
+  document.getElementById('session-summary').innerHTML = `
+    <div class="summary-item"><span class="summary-value">${sessions.length}</span><span class="summary-label">Active</span></div>
+    <div class="summary-item"><span class="summary-value listening">${sessions.filter(s => s.status === 'LISTENING').length}</span><span class="summary-label">Listening</span></div>
+    <div class="summary-item"><span class="summary-value speaking">${sessions.filter(s => s.status === 'SPEAKING').length}</span><span class="summary-label">Speaking</span></div>`;
+}
+
+function refreshSessions() { loadSessions(); }
+
+// MCP (legacy from Sessions tab)
+function openMcp(sid) {
+  openModal(`
+    <h2>Send MCP Command</h2>
+    <p style="font-size:14px;color:var(--muted-48);margin-bottom:16px">Session: <strong style="font-family:Menlo,monospace;font-size:13px;color:var(--ink)">${esc(sid)}</strong></p>
+    <div class="form-group"><label>Command (JSON-RPC)</label>
+      <textarea id="mcp-payload" rows="6">{\n  "jsonrpc": "2.0",\n  "method": "tools/call",\n  "params": {\n    "name": "self.screen.set_brightness",\n    "arguments": {\n      "brightness": 50\n    }\n  },\n  "id": 1\n}</textarea></div>
+    <div class="form-group"><label>Request ID (leave blank for auto)</label><input id="mcp-id" placeholder="e.g. 1"></div>
+    <div id="mcp-result"></div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="closeModal()">Close</button>
+      <button class="btn btn-primary" onclick="sendMcp('${esc(sid)}')">Send</button>
+    </div>`);
+}
+
+async function sendMcp(sid) {
+  const resultEl = document.getElementById('mcp-result');
+  const btn = resultEl.closest('.modal').querySelector('.btn-primary');
+  btn.disabled = true; btn.textContent = 'Sending...';
+  try {
+    let payload;
+    try { payload = JSON.parse(document.getElementById('mcp-payload').value); } catch(e) { toast('Invalid JSON', 'error'); btn.disabled = false; btn.textContent = 'Send'; return; }
+    const idInput = document.getElementById('mcp-id').value.trim();
+    if (idInput) payload.id = parseInt(idInput);
+    const result = await API.mcp(sid, payload);
+    resultEl.innerHTML = '<div class="mcp-result">' + esc(JSON.stringify(result, null, 2)) + '</div>';
+    toast('MCP command sent', 'success');
+  } catch(e) {
+    toast('Failed to send MCP', 'error');
+  }
+  btn.disabled = false; btn.textContent = 'Send';
+}
+
+// =============================================
+// CONTROL TAB
+// =============================================
+
+// Session selector
+function ctrlRefresh() {
+  loadSessions().then(() => {
+    const sel = document.getElementById('ctrl-session');
+    const current = sel.value;
+    sel.innerHTML = '<option value="latest">latest (most recent)</option>';
+    sessions.forEach(s => {
+      const opt = document.createElement('option');
+      opt.value = s.session_id;
+      opt.textContent = s.mac + ' (' + s.session_id.slice(0,8) + '\u2026) [' + (s.status || '?') + ']';
+      sel.appendChild(opt);
+    });
+    // try to keep selection
+    if (Array.from(sel.options).some(o => o.value === current)) sel.value = current;
+  });
+}
+
+function ctrlGetSid() {
+  return document.getElementById('ctrl-session').value;
+}
+
+function ctrlResult(target, data) {
+  const el = document.getElementById('ctrl-result-' + target);
+  if (!el) return;
+  el.innerHTML = '<div class="mcp-result">' + esc(JSON.stringify(data, null, 2)) + '</div>';
+  setTimeout(() => { if (el.querySelector('.mcp-result')) el.innerHTML = ''; }, 15000);
+}
+
+async function ctrlCall(tool, args) {
+  const sid = ctrlGetSid();
+  const payload = {
+    jsonrpc: '2.0',
+    method: 'tools/call',
+    params: { name: tool, arguments: args || {} },
+    id: Date.now()
+  };
+  try {
+    const result = await API.mcp(sid, payload);
+    // route result to right section
+    let target = 'system';
+    if (tool.includes('get_device_status') || tool.includes('get_system_info') || tool.includes('screen.get_info')) target = 'info';
+    else if (tool.includes('screen.')) target = 'display';
+    else if (tool.includes('audio')) target = 'audio';
+    ctrlResult(target, result);
+  } catch(e) {
+    toast('MCP call failed: ' + e.message, 'error');
+  }
+}
+
+function ctrlConfirmReboot() {
+  openModal(`
+    <h2>Reboot Device</h2>
+    <p style="margin-bottom:16px;color:var(--muted-48)">Are you sure you want to reboot the device?</p>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-danger" onclick="closeModal();ctrlCall('self.reboot')">Reboot</button>
+    </div>`);
+}
+
+function ctrlConfirmUpgrade() {
+  const url = document.getElementById('ctrl-fw-url').value.trim();
+  if (!url) { toast('Enter firmware URL first', 'error'); return; }
+  openModal(`
+    <h2>Upgrade Firmware</h2>
+    <p style="margin-bottom:16px;color:var(--muted-48)">Upload firmware from:<br><strong style="word-break:break-all;font-family:Menlo,monospace;font-size:13px">${esc(url)}</strong></p>
+    <p style="margin-bottom:16px;color:var(--badge-speaking-fg);font-size:14px">Device will reboot after upgrade.</p>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-danger" onclick="closeModal();ctrlCall('self.upgrade_firmware', {url: '${esc(url)}'})">Upgrade</button>
+    </div>`);
+}
+
+// OTA Firmware Upload
+async function loadFirmwareInfo() {
+  try {
+    const meta = await API.firmwareInfo();
+    const el = document.getElementById('ctrl-fw-meta');
+    if (meta.version) {
+      el.textContent = 'Version: ' + meta.version + ' | Uploaded: ' + new Date(meta.timestamp).toLocaleString();
+    } else {
+      el.textContent = 'No firmware uploaded yet.';
+    }
+  } catch(e) { /* ignore */ }
+}
+
+async function ctrlUploadFirmware() {
+  const fileInput = document.getElementById('ctrl-fw-file');
+  const file = fileInput.files[0];
+  if (!file) { toast('Select a .bin file first', 'error'); return; }
+  if (!file.name.endsWith('.bin')) { toast('Only .bin files accepted', 'error'); return; }
+
+  const version = document.getElementById('ctrl-fw-version').value.trim();
+  const btn = document.getElementById('ctrl-fw-upload-btn');
+  const progress = document.getElementById('ctrl-fw-progress');
+  const status = document.getElementById('ctrl-fw-status');
+
+  btn.disabled = true; btn.textContent = 'Uploading...';
+  progress.style.width = '60%';
+  status.textContent = 'Uploading ' + file.name + ' (' + (file.size / 1024).toFixed(1) + ' KB)...';
+
+  try {
+    const resp = await API.firmwareUpload(file, version);
+    progress.style.width = '100%';
+    if (resp.ok) {
+      const data = await resp.json();
+      status.textContent = '\u2705 Uploaded: v' + (data.meta?.version || '?');
+      toast('Firmware uploaded', 'success');
+      loadFirmwareInfo();
+    } else {
+      const err = await resp.text();
+      status.textContent = '\u274c Upload failed: ' + err;
+      toast('Upload failed', 'error');
+    }
+  } catch(e) {
+    progress.style.width = '0%';
+    status.textContent = '\u274c Upload error: ' + e.message;
+    toast('Upload error', 'error');
+  }
+  setTimeout(() => { progress.style.width = '0%'; }, 3000);
+  btn.disabled = false; btn.textContent = 'Upload';
+}
+
+// Auto-refresh sessions
+document.querySelector('[data-tab="sessions"]').addEventListener('click', () => {
+  if (sessionTimer) clearInterval(sessionTimer);
+  sessionTimer = setInterval(loadSessions, 5000);
+});
+document.querySelector('[data-tab="devices"]').addEventListener('click', () => {
+  if (sessionTimer) { clearInterval(sessionTimer); sessionTimer = null; }
+});
+
+// Utilities
+function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
+// Init
+loadDevices();
+</script>
+</body>
+</html>

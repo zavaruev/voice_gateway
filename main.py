@@ -12,9 +12,10 @@ import onnxruntime as ort
 import opuslib
 from pydub import AudioSegment
 from loguru import logger
-from fastapi import FastAPI, Request, Form, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, Form, WebSocket, WebSocketDisconnect, HTTPException, UploadFile, File
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 
 # ==========================================
 # CONFIGURATION & ENVIRONMENT VARIABLES
@@ -38,10 +39,16 @@ WHISPER_HALLUCINATIONS = [
     "dimatorzok", "субтитры сделал", "dima torzok", "продолжение следует"
 ]
 
+SINGLE_WORD_HALLUCINATIONS = {"как", "вот", "ну", "да", "вы", "о", "а", "и", "кх-кх", "ха-ха", "жизнь", "пьютер"}
+
 app = FastAPI()
 
-if os.path.exists("/app/config/firmware"):
-    app.mount("/firmware", StaticFiles(directory="/app/config/firmware"), name="firmware")
+FIRMWARE_DIR = "/app/config/firmware"
+os.makedirs(FIRMWARE_DIR, exist_ok=True)
+FIRMWARE_META = "/app/config/firmware.json"
+app.mount("/firmware", StaticFiles(directory=FIRMWARE_DIR), name="firmware")
+
+templates = Jinja2Templates(directory="templates")
 
 # ==========================================
 # VAD ENGINE (Voice Activity Detection)
@@ -167,7 +174,6 @@ async def request_mcp_tools(device_ws: WebSocket, session_id: str):
         logger.error(f"❌ [MCP] Failed to request tools: {e}")
 
 async def activity_monitor_task(device_ws: WebSocket, state: dict):
-    is_dimmed = False
     await send_mcp_cmd(device_ws, state["sid"], "self.audio_speaker.set_volume", {"volume": 100})
     await send_mcp_cmd(device_ws, state["sid"], "self.screen.set_brightness", {"brightness": 100})
     
@@ -180,23 +186,12 @@ async def activity_monitor_task(device_ws: WebSocket, state: dict):
                 state["last_activity"] = now
                 
             time_idle = now - state["last_activity"]
-            
-            # Защита от зависания сессии, если пользователь ушел во время вопроса
-            if state["status"] == "LISTENING" and time_idle > 45:
-                logger.info("💤 [Timeout] Пользователь не отвечает. Закрываем брошенную сессию.")
+
+            # 5с бездействия → standby (экран выкл, сокет закрыт)
+            if state["status"] == "LISTENING" and time_idle > 5:
+                logger.info(f"💤 [Timeout] {int(time_idle)}с бездействия. Standby.")
                 asyncio.create_task(reset_to_standby(device_ws, state))
                 break
-
-            if time_idle > 30:
-                if not is_dimmed:
-                    logger.debug("🌙 [Screen] Dimming to 25% due to inactivity.")
-                    await send_mcp_cmd(device_ws, state["sid"], "self.screen.set_brightness", {"brightness": 25})
-                    is_dimmed = True
-            else:
-                if is_dimmed:
-                    logger.debug("☀ [Screen] Activity detected. Resetting brightness to 100%.")
-                    await send_mcp_cmd(device_ws, state["sid"], "self.screen.set_brightness", {"brightness": 100})
-                    is_dimmed = False
                     
             await asyncio.sleep(1.0)
     except asyncio.CancelledError:
@@ -208,7 +203,7 @@ async def reset_to_standby(device_ws: WebSocket, state: dict):
     logger.info("💤 Переводим колонку в Standby. Понижаем яркость и закрываем сокет...")
     state["status"] = "IDLE"
     
-    await send_mcp_cmd(device_ws, state["sid"], "self.screen.set_brightness", {"brightness": 25})
+    await send_mcp_cmd(device_ws, state["sid"], "self.screen.set_brightness", {"brightness": 0})
     await asyncio.sleep(0.5)
     
     if state.get("watchdog"):
@@ -241,9 +236,11 @@ async def fetch_speaker_id(audio: bytes, sess: aiohttp.ClientSession) -> str:
             if r.status == 200:
                 json_resp = await r.json()
                 uid, conf = json_resp.get("user_id", "unknown"), json_resp.get("confidence", 0.0)
-                if uid != "unknown" and conf > 0.2:
+                if uid != "unknown" and conf > 0.1:
                     logger.info(f"✅ [SpeakerID] Recognized: {uid} ({conf:.2f})")
                     return uid
+                else:
+                    logger.debug(f"👤 [SpeakerID] Rejected: {uid} ({conf:.2f})")
     except Exception: pass
     return "unknown"
 
@@ -271,11 +268,31 @@ async def fetch_transcription(audio: bytes, sess: aiohttp.ClientSession) -> str:
 def is_valid_text(txt: str) -> bool:
     clean = txt.strip(" .,?!-").lower()
     if not clean: return False
+
+    if len(clean) >= 10:
+        max_run, cur = 1, 1
+        for i in range(1, len(clean)):
+            cur = cur + 1 if clean[i] == clean[i-1] else 1
+            max_run = max(max_run, cur)
+        if max_run / len(clean) > 0.5:
+            return False
+
+    words = clean.split()
+    if len(words) == 1:
+        if words[0] in SINGLE_WORD_HALLUCINATIONS:
+            return False
+        if len(words[0]) <= 2:
+            return False
+
     for bad in WHISPER_HALLUCINATIONS:
         if bad in clean: return False
     return True
 
-async def process_audio_and_send(frames: list, state: dict, device_ws: WebSocket, nano_ws: aiohttp.ClientWebSocketResponse):
+async def process_audio_and_send(frames: list, state: dict, device_ws: WebSocket):
+    if len(frames) < 5:
+        logger.info(f"🔇 [Pipeline] Too few frames ({len(frames)}), likely noise — skipping STT")
+        state["status"] = "LISTENING"
+        return
     try:
         audio = pack_ogg(frames)
         logger.debug(f"🎙 [Pipeline] Processing {len(audio)} bytes...")
@@ -293,9 +310,11 @@ async def process_audio_and_send(frames: list, state: dict, device_ws: WebSocket
                     await device_ws.send_json({"type": "stt", "text": txt, "session_id": state["sid"]})
                 except Exception: return
                 
+                nano_ws = state.get("nano_ws")
                 if nano_ws and not nano_ws.closed:
                     chat_id = state.get("nanobot_chat_id")
                     if not chat_id:
+                        logger.warning("⚠️ [Pipeline] Nanobot connected but no chat_id yet, waiting...")
                         state["status"] = "SPEAKING"
                         await generate_and_stream_tts("Система не готова, повторите.", device_ws, state["sid"])
                         await reset_to_standby(device_ws, state)  
@@ -306,7 +325,13 @@ async def process_audio_and_send(frames: list, state: dict, device_ws: WebSocket
                     
                     if state.get("watchdog"): state["watchdog"].cancel()
                     state["watchdog"] = asyncio.get_event_loop().call_later(WATCHDOG_TIMEOUT, lambda: asyncio.create_task(watchdog_timeout(device_ws, state)))
+                else:
+                    logger.warning(f"⚠️ [Pipeline] Nanobot not connected, falling back to direct TTS")
+                    state["status"] = "SPEAKING"
+                    await generate_and_stream_tts(txt, device_ws, state["sid"])
+                    await reset_to_standby(device_ws, state)
             else:
+                logger.warning(f"⚠ [Pipeline] Rejected transcription (text='{txt}') from user '{uid}', falling back to error TTS")
                 state["status"] = "SPEAKING"
                 await generate_and_stream_tts("Связь с сервером потеряна.", device_ws, state["sid"])
                 await reset_to_standby(device_ws, state)
@@ -385,7 +410,8 @@ class NanobotResponseHandler:
             self.state["watchdog"] = None
         self.buffer += chunk
         if self.timer: self.timer.cancel()
-        self.timer = asyncio.get_event_loop().call_later(0.8, lambda: asyncio.create_task(self.flush()))
+        delay = 1.5 if self.buffer.count("[") > self.buffer.count("]") else 0.8
+        self.timer = asyncio.get_event_loop().call_later(delay, lambda: asyncio.create_task(self.flush()))
 
     async def flush(self):
         if self.is_flushing or not self.buffer.strip(): return
@@ -394,6 +420,13 @@ class NanobotResponseHandler:
         
         text = self.buffer
         self.buffer = ""  
+        
+        # If emotion tag is still incomplete, wait for next chunk
+        if text.count("[") > text.count("]"):
+            self.buffer = text
+            self.timer = asyncio.get_event_loop().call_later(0.5, lambda: asyncio.create_task(self.flush()))
+            self.is_flushing = False
+            return
         
         emotions = self.emotion_regex.findall(text)
         for emotion in emotions:
@@ -407,18 +440,18 @@ class NanobotResponseHandler:
             
             await generate_and_stream_tts(clean_text, self.device_ws, self.state["sid"])
             
-            clean_for_check = self.full_response_text.strip().lower()
-            has_question = (re.search(r'[?？]\s*$', clean_for_check) is not None) or ("повторите пожалуйста" in clean_for_check)
-            
-            if not has_question:
-                await reset_to_standby(self.device_ws, self.state)
-            else:
-                logger.info("🎤 [Dialogue] Question detected. Keeping mic open.")
-                self.state.update({"status": "LISTENING", "frames": [], "silence": 0, "has_speech": False})
-                self.state["last_activity"] = time.time()
-                vad.reset()
+            self.state.update({"status": "LISTENING", "frames": [], "silence": 0, "has_speech": False})
+            self.state["last_activity"] = time.time()
+            vad.reset()
             self.full_response_text = ""
         self.is_flushing = False
+
+# ==========================================
+# WEB UI
+# ==========================================
+@app.get("/", response_class=HTMLResponse)
+async def web_index(req: Request):
+    return templates.TemplateResponse(req, "index.html")
 
 # ==========================================
 # MAIN FASTAPI WEBSOCKET GATEWAY
@@ -506,16 +539,21 @@ async def voice_ws(device_ws: WebSocket):
                 
                 elif d.get("type") == "hello":
                     state["version"] = d.get("version", 1)
+                    logger.info(f"🤝 [Device] Hello received (v{state['version']})")
                     async def connect_upstream():
                         nonlocal nano_ws, nano_listener_task
                         auth_url = f"{NANOBOT_WS_URL}?token=token" if "?" not in NANOBOT_WS_URL else f"{NANOBOT_WS_URL}&token=token"
                         for attempt in range(8):
                             try:
                                 nano_ws = await nano_session.ws_connect(auth_url)
-                                logger.info(f"✅ AI Brain connected.")
+                                state["nano_ws"] = nano_ws
+                                logger.info(f"✅ AI Brain connected (chat_id will follow).")
                                 nano_listener_task = asyncio.create_task(listen_to_nanobot())
                                 return
-                            except Exception: await asyncio.sleep(3)
+                            except Exception as e:
+                                logger.warning(f"⚠️ [Nanobot] Connection attempt {attempt+1}/8 failed: {e}")
+                                await asyncio.sleep(3)
+                        logger.error(f"❌ [Nanobot] All 8 connection attempts failed!")
                     asyncio.create_task(connect_upstream())
                 
                 elif d.get("type") == "listen" and d.get("state") == "start":
@@ -529,7 +567,7 @@ async def voice_ws(device_ws: WebSocket):
                     if state["status"] == "LISTENING" and state["has_speech"]:
                         state["status"] = "PROCESSING"
                         frames_to_process, state["frames"] = list(state["frames"]), []
-                        asyncio.create_task(process_audio_and_send(frames_to_process, state, device_ws, nano_ws))
+                        asyncio.create_task(process_audio_and_send(frames_to_process, state, device_ws))
 
             # --- AUDIO BYTES ---
             byte_data = m.get("bytes")
@@ -556,7 +594,7 @@ async def voice_ws(device_ws: WebSocket):
                         frames_to_process, state["frames"] = list(state["frames"]), []
                         state["silence"] = 0
                         state["has_speech"] = False
-                        asyncio.create_task(process_audio_and_send(frames_to_process, state, device_ws, nano_ws))
+                        asyncio.create_task(process_audio_and_send(frames_to_process, state, device_ws))
                     else:
                         state["frames"], state["silence"] = [], 0
                         vad.reset()
@@ -597,15 +635,120 @@ async def execute_mcp(session_id: str, req: Request):
             return {"status": "sent"}
     return {"error": "Offline"}
 
+def load_firmware_meta() -> dict:
+    try:
+        with open(FIRMWARE_META) as f: return json.load(f)
+    except Exception: return {"version": "", "filename": "", "timestamp": 0}
+
+def save_firmware_meta(version: str, filename: str):
+    meta = {"version": version, "filename": filename, "timestamp": int(time.time() * 1000)}
+    with open(FIRMWARE_META, "w") as f: json.dump(meta, f)
+    return meta
+
+@app.post("/api/firmware/upload")
+async def firmware_upload(file: UploadFile = File(...), version: str = Form("")):
+    if not file.filename or not file.filename.endswith(".bin"):
+        raise HTTPException(400, "Only .bin files accepted")
+    fname = f"firmware_v{version}.bin" if version else file.filename
+    fpath = os.path.join(FIRMWARE_DIR, fname)
+    content = await file.read()
+    with open(fpath, "wb") as f: f.write(content)
+    meta = save_firmware_meta(version, fname)
+    return {"status": "ok", "meta": meta}
+
+@app.get("/api/firmware")
+async def firmware_info():
+    meta = load_firmware_meta()
+    return meta
+
 @app.api_route("/ota", methods=["GET", "POST"])
 async def ota_handler(req: Request):
     db = load_db()
+    meta = load_firmware_meta()
+    has_update = bool(meta.get("version"))
+    url = f"http://{req.url.hostname}:18792/firmware/{meta['filename']}" if has_update else ""
     return {
         "server_time": {"timestamp": int(time.time() * 1000), "timeZone": "Europe/Moscow", "timezone_offset": 180},
         "protocol": "websocket",
         "websocket": {"url": f"ws://{req.url.hostname}:18792/", "access_token": "token"},
-        "firmware": {"has_update": False, "version": "2.2.6", "url": ""}
+        "firmware": {"has_update": has_update, "version": meta.get("version", ""), "url": url}
     }
+
+# ==========================================
+# DEVICE CONFIG CRUD (Web UI)
+# ==========================================
+from pydantic import BaseModel
+
+class DeviceCreate(BaseModel):
+    mac: str
+    friendly_name: str = ""
+    ws_url: str = ""
+    allowed: bool = True
+
+class DeviceUpdate(BaseModel):
+    friendly_name: str | None = None
+    ws_url: str | None = None
+    allowed: bool | None = None
+
+def normalize_mac(mac: str) -> str:
+    return mac.strip().upper()
+
+def device_online_status(mac: str) -> str:
+    for st in session_states.values():
+        if st.get("mac", "").lower() == mac.lower():
+            return st["status"]
+    return "offline"
+
+def device_list_with_status() -> list[dict]:
+    db = load_db()
+    result = []
+    for mac, cfg in db.items():
+        entry = {"mac": mac, **cfg, "status": device_online_status(mac)}
+        result.append(entry)
+    result.sort(key=lambda x: (x["status"] == "offline", x["mac"]))
+    return result
+
+@app.get("/api/devices/config")
+async def api_get_device_config():
+    return device_list_with_status()
+
+@app.post("/api/devices/config")
+async def api_create_device(body: DeviceCreate):
+    mac = normalize_mac(body.mac)
+    if not mac:
+        raise HTTPException(400, "MAC address required")
+    db = load_db()
+    if mac in db:
+        raise HTTPException(409, "Device already exists")
+    db[mac] = {"friendly_name": body.friendly_name, "ws_url": body.ws_url, "allowed": body.allowed}
+    save_db(db)
+    return {"mac": mac, **db[mac], "status": "offline"}
+
+@app.put("/api/devices/config/{mac}")
+async def api_update_device(mac: str, body: DeviceUpdate):
+    normalized = normalize_mac(mac)
+    db = load_db()
+    if normalized not in db:
+        raise HTTPException(404, "Device not found")
+    entry = db[normalized]
+    if body.friendly_name is not None:
+        entry["friendly_name"] = body.friendly_name
+    if body.ws_url is not None:
+        entry["ws_url"] = body.ws_url
+    if body.allowed is not None:
+        entry["allowed"] = body.allowed
+    save_db(db)
+    return {"mac": normalized, **entry, "status": device_online_status(normalized)}
+
+@app.delete("/api/devices/config/{mac}")
+async def api_delete_device(mac: str):
+    normalized = normalize_mac(mac)
+    db = load_db()
+    if normalized not in db:
+        raise HTTPException(404, "Device not found")
+    del db[normalized]
+    save_db(db)
+    return {"status": "deleted", "mac": normalized}
 
 if __name__ == "__main__":
     import uvicorn

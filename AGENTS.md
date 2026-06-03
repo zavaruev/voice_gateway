@@ -40,7 +40,12 @@ No test/lint/CI infrastructure.
 
 | Path | Method | Purpose |
 |---|---|---|
-| `/api/devices` | GET | List active sessions |
+| `/` | GET | Web UI (Apple-style dashboard: devices + sessions) |
+| `/api/devices` | GET | List active WebSocket sessions |
+| `/api/devices/config` | GET | List all registered devices from `devices.json` |
+| `/api/devices/config` | POST | Create a new device entry |
+| `/api/devices/config/{mac}` | PUT | Update device fields |
+| `/api/devices/config/{mac}` | DELETE | Remove device entry |
 | `/mcp/{session_id}` | POST | Send MCP command to device (`"latest"` for most recent session) |
 | `/ota` | GET/POST | ESP32 OTA handshake; returns WS URL + firmware info |
 

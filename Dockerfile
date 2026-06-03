@@ -11,6 +11,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN curl -L -o silero_vad.onnx https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx
 
 COPY main.py .
+COPY templates/ ./templates/
 EXPOSE 18792 8080
 
 CMD ["python", "-u", "main.py"]

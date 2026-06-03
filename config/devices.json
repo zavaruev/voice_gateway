@@ -8,10 +8,5 @@
         "friendly_name": "Device 78:B8",
         "ws_url": "ws://192.168.22.102:18792/",
         "allowed": false
-    },
-    "3C:0F:02:DD:C1:A4": {
-        "friendly_name": "Device 1:A4",
-        "ws_url": "ws://192.168.22.102:18792/",
-        "allowed": false
     }
 }

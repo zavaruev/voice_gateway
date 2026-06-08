@@ -334,7 +334,10 @@ async def process_audio_and_send(frames: list, state: dict, device_ws: WebSocket
                 logger.warning(f"⚠ [Pipeline] Rejected transcription (text='{txt}') from user '{uid}', falling back to error TTS")
                 state["status"] = "SPEAKING"
                 await generate_and_stream_tts("Прости, не расслышала.", device_ws, state["sid"])
-                await reset_to_standby(device_ws, state)
+                logger.info("🎤 [Pipeline] Возвращаем микрофон для повтора после rejected.")
+                state.update({"status": "LISTENING", "frames": [], "silence": 0, "has_speech": False})
+                state["last_activity"] = time.time()
+                vad.reset()
     except Exception as e:
         logger.error(f"❌ Pipeline Error: {e}")
         await reset_to_standby(device_ws, state)

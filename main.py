@@ -30,7 +30,7 @@ TTS_MODEL = os.getenv("TTS_MODEL", "tts-1")
 TTS_VOICE = os.getenv("TTS_VOICE", "ru-RU-SvetlanaNeural")
 
 DB_FILE = "/app/config/devices.json"
-VAD_SILENCE_FRAMES = int(os.getenv("VAD_SILENCE_FRAMES", 8))  
+VAD_SILENCE_FRAMES = int(os.getenv("VAD_SILENCE_FRAMES", 6))  
 WATCHDOG_TIMEOUT = 30.0  
 STANDBY_TIMEOUT_QUESTION = int(os.getenv("STANDBY_TIMEOUT_QUESTION", 30))
 STANDBY_TIMEOUT_STATEMENT = int(os.getenv("STANDBY_TIMEOUT_STATEMENT", 10))
@@ -460,6 +460,33 @@ async def process_audio_and_send(frames: list, state: dict, device_ws: WebSocket
                     state["status"] = "SPEAKING"
                     await generate_and_stream_tts(txt, device_ws, state["sid"])
                     await reset_to_standby(device_ws, state)
+                    return
+                
+                speaker_name = SPEAKER_NAME_MAP.get(uid, uid)
+                state["status"] = "SPEAKING"
+                
+                success = await stream_nanobot_sse(
+                    chat_id=chat_id,
+                    user_id=uid,
+                    user_name=speaker_name,
+                    content=txt,
+                    device_ws=device_ws,
+                    state=state,
+                    session_id=state["sid"]
+                )
+                
+                if not success:
+                    logger.warning("⚠️ [Pipeline] SSE streaming failed, falling back to direct TTS")
+                    await generate_and_stream_tts("Извини, не удалось получить ответ.", device_ws, state["sid"])
+                    await reset_to_standby(device_ws, state)
+                    return
+                
+                if state.get("watchdog"): state["watchdog"].cancel()
+                state["watchdog"] = asyncio.get_event_loop().call_later(WATCHDOG_TIMEOUT, lambda: asyncio.create_task(watchdog_timeout(device_ws, state)))
+                
+                state.update({"status": "LISTENING", "frames": [], "silence": 0, "has_speech": False})
+                state["last_activity"] = time.time()
+                vad.reset()
             else:
                 logger.warning(f"⚠ [Pipeline] Rejected transcription (text='{txt}') from user '{uid}', asking for repeat")
                 state["status"] = "SPEAKING"
@@ -518,10 +545,10 @@ async def generate_and_stream_tts(text: str, device_ws: WebSocket, session_id: s
         try: await device_ws.send_json({"type": "tts", "state": "stop", "session_id": session_id})
         except Exception: pass
 
-async def trigger_emotion(emotion: str, device_ws: WebSocket, session_id: str):
-    logger.info(f"💡 [Emotion] Setting display face to: '{emotion}'")
-    try: await device_ws.send_json({"session_id": session_id, "type": "llm", "emotion": emotion, "text": " "})
-    except Exception: pass
+    async def trigger_emotion(emotion: str, device_ws: WebSocket, session_id: str):
+        logger.info(f"💡 [Emotion] Setting display face to: '{emotion}'")
+        try: await device_ws.send_json({"session_id": session_id, "type": "llm", "emotion": emotion, "text": " "})
+        except Exception: pass
 
 # ==========================================
 # NANOBOT WEBSOCKET RESPONSE HANDLER

@@ -8,6 +8,7 @@ import re
 import io
 import aiohttp
 import numpy as np
+import noisereduce as nr
 import onnxruntime as ort
 import opuslib
 from pydub import AudioSegment
@@ -357,6 +358,29 @@ def calculate_rms(pcm_data: bytes) -> float:
     except Exception:
         return 0.0
 
+def denoise_audio(pcm_data: bytes, sample_rate: int = 16000) -> bytes:
+    """Apply noise reduction to PCM16 audio data using noisereduce."""
+    try:
+        audio_int16 = np.frombuffer(pcm_data, dtype=np.int16)
+        audio_float32 = audio_int16.astype(np.float32) / 32768.0
+        
+        # Apply noise reduction
+        # stationary=False for non-stationary noise (speech-like noise)
+        # prop_decrease=0.8 to reduce noise by 80%
+        reduced = nr.reduce_noise(
+            y=audio_float32,
+            sr=sample_rate,
+            stationary=False,
+            prop_decrease=0.8
+        )
+        
+        # Convert back to int16
+        reduced_int16 = (reduced * 32767).astype(np.int16)
+        return reduced_int16.tobytes()
+    except Exception as e:
+        logger.warning(f"⚠️ [Denoise] Failed: {e}, returning original audio")
+        return pcm_data
+
 def decode_opus_frames(frames: list, decoder: opuslib.Decoder) -> tuple[bytes, list[float], list[bool]]:
     """Decode Opus frames to PCM and return (combined_pcm, rms_list, vad_results)."""
     all_pcm = bytearray()
@@ -394,6 +418,9 @@ async def process_audio_and_send(frames: list, state: dict, device_ws: WebSocket
         # Decode frames for metrics and gates
         dec = opuslib.Decoder(16000, 1)
         pcm_data, rms_list, vad_results = decode_opus_frames(frames, dec)
+        
+        # Apply noise reduction to combined PCM
+        pcm_data = denoise_audio(pcm_data, sample_rate=16000)
         
         # Debug metrics logging
         avg_rms = sum(rms_list) / len(rms_list) if rms_list else 0.0

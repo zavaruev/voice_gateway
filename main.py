@@ -6,6 +6,7 @@ import struct
 import uuid
 import re
 import io
+import hashlib
 import aiohttp
 import numpy as np
 import noisereduce as nr
@@ -35,7 +36,7 @@ VAD_SILENCE_FRAMES = int(os.getenv("VAD_SILENCE_FRAMES", 8))
 WATCHDOG_TIMEOUT = 30.0  
 STANDBY_TIMEOUT_QUESTION = int(os.getenv("STANDBY_TIMEOUT_QUESTION", 30))
 STANDBY_TIMEOUT_STATEMENT = int(os.getenv("STANDBY_TIMEOUT_STATEMENT", 10))
-CHAT_ID_TTL = int(os.getenv("CHAT_ID_TTL", 604800))  # 7 дней скользящее окно — контекст Nanobot живёт неделю
+CHAT_ID_TTL = int(os.getenv("CHAT_ID_TTL", 604800))  # 7-day sliding window — Nanobot context lives a week
 THINKING_SOUND_PATH = os.getenv("THINKING_SOUND_PATH", "")
 
 ENERGY_THRESHOLD = float(os.getenv("ENERGY_THRESHOLD", "0.008"))
@@ -67,14 +68,14 @@ CHAT_ID_CACHE = {}
 CHAT_ID_CACHE_FILE = "/app/config/chat_id_cache.json"
 
 def load_chat_id_cache():
-    """Загружает кеш chat_id из файла (переживает рестарт контейнера)."""
+    """Loads chat_id cache from disk (survives container rebuild)."""
     global CHAT_ID_CACHE
     if os.path.exists(CHAT_ID_CACHE_FILE):
         try:
             with open(CHAT_ID_CACHE_FILE, "r") as f:
                 data = json.load(f)
             now = time.time()
-            # Фильтруем протухшие записи при загрузке
+            # Filter expired entries on load
             CHAT_ID_CACHE = {
                 mac: entry for mac, entry in data.items()
                 if now - entry.get("ts", 0) < CHAT_ID_TTL
@@ -83,7 +84,7 @@ def load_chat_id_cache():
             CHAT_ID_CACHE = {}
 
 def save_chat_id_cache():
-    """Сохраняет кеш chat_id на диск."""
+    """Persists chat_id cache to disk."""
     try:
         with open(CHAT_ID_CACHE_FILE, "w") as f:
             json.dump(CHAT_ID_CACHE, f, indent=2)
@@ -98,7 +99,13 @@ def get_cached_chat_id(mac: str) -> str | None:
 
 def set_cached_chat_id(mac: str, chat_id: str):
     CHAT_ID_CACHE[mac.lower()] = {"chat_id": chat_id, "ts": time.time()}
-    save_chat_id_cache()  # Сохраняем на диск — переживёт ребуилд контейнера
+    save_chat_id_cache()  # Persist to disk — survives container rebuild
+
+def make_chat_id(mac: str) -> str:
+    """Deterministic chat_id from MAC address in UUID format (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx).
+       Nanobot reuses the session across reconnects."""
+    h = hashlib.sha256(mac.lower().encode()).hexdigest()
+    return f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
 
 def clear_expired_chat_ids():
     now = time.time()
@@ -107,7 +114,7 @@ def clear_expired_chat_ids():
         del CHAT_ID_CACHE[mac]
     save_chat_id_cache()
 
-load_chat_id_cache()  # Загружаем при старте
+load_chat_id_cache()  # Load on startup
 
 app = FastAPI()
 
@@ -259,8 +266,8 @@ async def request_mcp_tools(device_ws: WebSocket, session_id: str):
         logger.error(f"❌ [MCP] Failed to request tools: {e}")
 
 async def activity_monitor_task(device_ws: WebSocket, state: dict):
-    """Мониторит бездействие: гасит экран, НО не закрывает соединение.
-       Persistent mode — WS/контекст живут, пока ESP32 включён."""
+    """Monitors idle: dims screen but does NOT close the connection.
+       Persistent mode — WS/context lives while ESP32 is on."""
     await send_mcp_cmd(device_ws, state["sid"], "self.audio_speaker.set_volume", {"volume": 100})
     await send_mcp_cmd(device_ws, state["sid"], "self.screen.set_brightness", {"brightness": 100})
     
@@ -268,17 +275,17 @@ async def activity_monitor_task(device_ws: WebSocket, state: dict):
         while state["sid"] in session_states:
             now = time.time()
             
-            # Замораживаем таймер, пока колонка активна (думает/говорит)
+            # Freeze timer while the speaker is active (thinking/speaking)
             if state["status"] in ["PROCESSING", "SPEAKING"]:
                 state["last_activity"] = now
                 
             time_idle = now - state["last_activity"]
             
-            # Адаптивный standby: 30с после вопроса, 10с после утверждения
+            # Adaptive standby: 30s after question, 10s after statement
             if state["status"] == "LISTENING":
                 timeout = STANDBY_TIMEOUT_QUESTION if state.get("last_ai_had_question") else STANDBY_TIMEOUT_STATEMENT
                 if time_idle > timeout:
-                    logger.info(f"💤 [Timeout] {int(time_idle)}с бездействия (лимит {timeout}с). Standby.")
+                    logger.info(f"💤 [Timeout] {int(time_idle)}s idle (limit {timeout}s). Standby.")
                     asyncio.create_task(reset_to_standby(device_ws, state))
                     break
                     
@@ -289,9 +296,9 @@ async def activity_monitor_task(device_ws: WebSocket, state: dict):
         logger.error(f"Error in monitor task: {e}")
 
 async def reset_to_standby(device_ws: WebSocket, state: dict):
-    """Переводим колонку в режим ожидания: гасим экран, закрываем WS.
-       chat_id сохраняется в кеше на диске — при переподключении Nanobot восстановит контекст."""
-    logger.info("💤 Бездействие — dim экрана, закрываем WS. chat_id сохранён для след. подключения")
+    """Switches the speaker to standby: dims screen, closes WS.
+       chat_id is cached on disk — Nanobot restores context on reconnect."""
+    logger.info("💤 Idle — dim screen, close WS. chat_id saved for next connection")
     state["status"] = "IDLE"
     
     await send_mcp_cmd(device_ws, state["sid"], "self.screen.set_brightness", {"brightness": 0})
@@ -313,9 +320,9 @@ async def watchdog_timeout(device_ws: WebSocket, state: dict):
         await generate_and_stream_tts("Простите, я задумалась. Повторите пожалуйста.", device_ws, state["sid"], state)
     except Exception: pass
     
-    logger.info("🎤 [Watchdog] Оставляем микрофон открытым для повтора.")
+    logger.info("🎤 [Watchdog] Keeping mic open for repeat.")
     state.update({"status": "LISTENING", "frames": [], "silence": 0, "has_speech": False})
-    state["last_activity"] = time.time() # Сброс таймера
+    state["last_activity"] = time.time() # Reset timer
     vad.reset()
 
 # ==========================================
@@ -342,8 +349,8 @@ async def fetch_transcription(audio: bytes, sess: aiohttp.ClientSession) -> str:
         form = aiohttp.FormData()
         form.add_field('file', audio, filename='a.ogg')
         
-        # ОБЯЗАТЕЛЬНОЕ ПОЛЕ для speaches (OpenAI API), иначе ошибка 422
-        # Точное имя скачанной модели
+        # REQUIRED field for speaches (OpenAI API), otherwise 422 error
+        # Exact downloaded model name
         form.add_field('model', 'koekaverna/faster-whisper-podlodka-turbo')
         form.add_field('language', 'ru')
         form.add_field('temperature', '0.0')
@@ -479,7 +486,7 @@ async def process_audio_and_send(frames: list, state: dict, device_ws: WebSocket
         
         audio = pack_ogg(frames)
         logger.info(f"🎙 [Pipeline] Processing {len(audio)} bytes (rms={avg_rms:.4f}, speech_ratio={speech_ratio:.2f})...")
-        # Зажигаем экран перед отправкой в Nanobot — на случай если listen:start ещё не успел
+        # Light up screen before sending to Nanobot — in case listen:start hasn't arrived yet
         asyncio.create_task(send_mcp_cmd(device_ws, state["sid"],
             "self.screen.set_brightness", {"brightness": 100}))
         asyncio.create_task(trigger_emotion("thinking", device_ws, state["sid"]))
@@ -493,7 +500,7 @@ async def process_audio_and_send(frames: list, state: dict, device_ws: WebSocket
                 state["last_activity"] = time.time()
                 state["last_text"] = txt  
                 
-                # Продлеваем TTL кеша chat_id при каждом успешном STT — скользящее окно 7 дней
+                # Extend chat_id cache TTL on each successful STT — 7-day sliding window
                 if state.get("nanobot_chat_id"):
                     set_cached_chat_id(state["mac"].lower(), state["nanobot_chat_id"])
                 
@@ -531,7 +538,7 @@ async def process_audio_and_send(frames: list, state: dict, device_ws: WebSocket
                 logger.warning(f"⚠ [Pipeline] Rejected transcription (text='{txt}') from user '{uid}', asking for repeat")
                 state["status"] = "SPEAKING"
                 await generate_and_stream_tts("Скажи ещё раз?", device_ws, state["sid"], state)
-                logger.info("🎤 [Pipeline] Возвращаем микрофон для повтора после rejected.")
+                logger.info("🎤 [Pipeline] Returning mic for repeat after rejected.")
                 state.update({"status": "LISTENING", "frames": [], "silence": 0, "has_speech": False})
                 state["last_activity"] = time.time()
                 vad.reset()
@@ -638,7 +645,7 @@ class NanobotResponseHandler:
         
         clean_text = self.emotion_regex.sub('', text).strip()
         
-        # Команда [disconnect] — пользователь сказал "отключайся", Nanobot подтвердил
+        # [disconnect] command — user said "disconnect", Nanobot confirmed
         if "[disconnect]" in clean_text:
             clean_text = clean_text.replace("[disconnect]", "").strip()
             if clean_text:
@@ -646,8 +653,8 @@ class NanobotResponseHandler:
                 try: await self.device_ws.send_json({"type": "tts", "state": "sentence_start", "text": clean_text, "session_id": self.state["sid"]})
                 except Exception: pass
                 await generate_and_stream_tts(clean_text, self.device_ws, self.state["sid"], self.state)
-            # Закрываем сессию — пользователь явно попросил
-            logger.info("🔌 [Disconnect] Пользователь запросил отключение — закрываем сессию")
+            # Close session — user explicitly requested disconnect
+            logger.info("🔌 [Disconnect] User requested disconnect — closing session")
             try: await self.device_ws.close()
             except Exception: pass
             self.is_flushing = False
@@ -726,12 +733,13 @@ async def voice_ws(device_ws: WebSocket):
                 try:
                     d = json.loads(msg.data)
                     if d.get("event") == "ready":
-                        state["nanobot_chat_id"] = d.get("chat_id")
+                        nano_chat_id = d.get("chat_id")
+                        state["nanobot_chat_id"] = make_chat_id(state["mac"])
                         mac_key = state["mac"].lower()
                         set_cached_chat_id(mac_key, state["nanobot_chat_id"])
-                        logger.info(f"💾 [Nanobot] Cached chat_id for {mac_key}: {state['nanobot_chat_id']}")
+                        logger.info(f"💾 [Nanobot] Cached deterministic chat_id for {mac_key}: {state['nanobot_chat_id']} (Nanobot assigned: {nano_chat_id})")
                         if state["available_tools"]:
-                            logger.info(f"📤 [Nanobot] Снабжаем AI списком инструментов: {len(state['available_tools'])} шт.")
+                            logger.info(f"📤 [Nanobot] Feeding AI tool list: {len(state['available_tools'])} tools")
                             await nano_ws.send_json({
                                 "type": "tools_update",
                                 "chat_id": state["nanobot_chat_id"],
@@ -760,7 +768,7 @@ async def voice_ws(device_ws: WebSocket):
                     if req_id == 999 and "result" in payload and "tools" in payload["result"]:
                         state["available_tools"] = payload["result"]["tools"]
                         tool_names = [t.get("name") for t in state["available_tools"]]
-                        logger.info(f"🛠 [MCP] ESP32 вернул инструменты: {tool_names}")
+                        logger.info(f"🛠 [MCP] ESP32 returned tools: {tool_names}")
                         continue
                     
                     if req_id in mcp_futures and not mcp_futures[req_id].done():
@@ -772,12 +780,9 @@ async def voice_ws(device_ws: WebSocket):
                     async def connect_upstream():
                         nonlocal nano_ws, nano_listener_task
                         mac_key = state["mac"].lower()
-                        cached_chat_id = get_cached_chat_id(mac_key)
-                        if cached_chat_id:
-                            auth_url = f"{NANOBOT_WS_URL}?token=token&chat_id={cached_chat_id}"
-                            logger.info(f"🔁 [Nanobot] Reconnecting with cached chat_id: {cached_chat_id}")
-                        else:
-                            auth_url = f"{NANOBOT_WS_URL}?token=token" if "?" not in NANOBOT_WS_URL else f"{NANOBOT_WS_URL}&token=token"
+                        det_chat_id = make_chat_id(mac_key)
+                        auth_url = f"{NANOBOT_WS_URL}?token=token&chat_id={det_chat_id}"
+                        logger.info(f"🔁 [Nanobot] Connecting with deterministic chat_id: {det_chat_id}")
                         for attempt in range(8):
                             try:
                                 nano_ws = await nano_session.ws_connect(auth_url)
@@ -797,7 +802,7 @@ async def voice_ws(device_ws: WebSocket):
                     state["silence"] = 0
                     state["has_speech"] = False
                     vad.reset()
-                    # Пробуждение — зажигаем экран после wake word до начала обработки аудио
+                    # Wake — light up screen after wake word before audio processing starts
                     try: await device_ws.send_json({"session_id": state["sid"],
                         "type": "mcp", "payload": {
                             "jsonrpc": "2.0", "method": "tools/call",
@@ -815,7 +820,7 @@ async def voice_ws(device_ws: WebSocket):
             # --- AUDIO BYTES ---
             byte_data = m.get("bytes")
             if byte_data:
-                # В IDLE не слушаем — ждём listen:start от устройства (wake word)
+                # In IDLE we don't listen — wait for listen:start from device (wake word)
                 if state["status"] == "IDLE": continue
                 if state["status"] in ["PROCESSING", "SPEAKING"]: continue
                 # Skip audio during TTS cooldown to prevent self-triggering

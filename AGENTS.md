@@ -70,5 +70,5 @@ No test/lint/CI infrastructure.
 - Dockerfile exposes 8080 alongside 18792 but code never listens on 8080
 - `setup_gateway.sh` is an outdated snapshot; not authoritative
 - `config/` has its own `.git` (no commits); parent dir not version-controlled
-- Code and comments are in Russian
+- Code and comments are in English (Russian string literals kept for TTS/STT data)
 - Whisper hallucination filter rejects transcriptions containing known garbage strings

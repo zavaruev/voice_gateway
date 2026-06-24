@@ -43,7 +43,7 @@ ESP32 connects to `ws://gateway:18792/` with header `device-id: <MAC>`.
 | `WHISPER_URL` | `http://192.168.22.111:8000/v1/audio/transcriptions` | OpenAI-compatible STT endpoint |
 | `TTS_URL` | `http://edge_tts:5050/v1/audio/speech` | OpenAI-compatible TTS endpoint |
 | `TTS_VOICE` | `ru-RU-SvetlanaNeural` | TTS voice identifier |
-| `SPEAKER_ID_URL` | `http://192.168.22.102:8001/identify` | Speaker recognition endpoint |
+| `SPEAKER_ID_URL` | `http://192.168.22.102:8001/identify` | Speaker recognition endpoint ([speaker-id](https://github.com/zavaruev/speaker-id)) |
 | `VAD_SILENCE_FRAMES` | `8` | Silence frames before processing (~60ms each) |
 | `STANDBY_TIMEOUT_QUESTION` | `30` | Seconds before standby after a question |
 | `STANDBY_TIMEOUT_STATEMENT` | `10` | Seconds before standby after a statement |

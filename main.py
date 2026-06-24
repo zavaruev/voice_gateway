@@ -271,23 +271,17 @@ async def activity_monitor_task(device_ws: WebSocket, state: dict):
             # Замораживаем таймер, пока колонка активна (думает/говорит)
             if state["status"] in ["PROCESSING", "SPEAKING"]:
                 state["last_activity"] = now
-            
-            # В IDLE ничего не делаем — экран уже погашен, ждём wake word
-            if state["status"] == "IDLE":
-                await asyncio.sleep(5.0)
-                continue
-            
+                
             time_idle = now - state["last_activity"]
             
             # Адаптивный standby: 30с после вопроса, 10с после утверждения
             if state["status"] == "LISTENING":
                 timeout = STANDBY_TIMEOUT_QUESTION if state.get("last_ai_had_question") else STANDBY_TIMEOUT_STATEMENT
                 if time_idle > timeout:
-                    logger.info(f"💤 [Timeout] {int(time_idle)}с бездействия (лимит {timeout}с). — dim экрана, но WS жив")
+                    logger.info(f"💤 [Timeout] {int(time_idle)}с бездействия (лимит {timeout}с). Standby.")
                     asyncio.create_task(reset_to_standby(device_ws, state))
-                    # Не break — не закрываем WS, persistent mode
-                    state["last_activity"] = now
-            
+                    break
+                    
             await asyncio.sleep(1.0)
     except asyncio.CancelledError:
         pass
@@ -295,19 +289,22 @@ async def activity_monitor_task(device_ws: WebSocket, state: dict):
         logger.error(f"Error in monitor task: {e}")
 
 async def reset_to_standby(device_ws: WebSocket, state: dict):
-    """Переводим колонку в режим ожидания: гасим экран, НО не закрываем WS.
-       Persistent mode — сессия и контекст Nanobot сохраняются."""
-    logger.info("💤 Бездействие — dim экрана, WS и контекст Nanobot сохранены")
+    """Переводим колонку в режим ожидания: гасим экран, закрываем WS.
+       chat_id сохраняется в кеше на диске — при переподключении Nanobot восстановит контекст."""
+    logger.info("💤 Бездействие — dim экрана, закрываем WS. chat_id сохранён для след. подключения")
     state["status"] = "IDLE"
     
     await send_mcp_cmd(device_ws, state["sid"], "self.screen.set_brightness", {"brightness": 0})
+    await asyncio.sleep(0.5)
     
     state["last_ai_had_question"] = False
     
     if state.get("watchdog"):
         state["watchdog"].cancel()
         state["watchdog"] = None
-    # WS не закрываем — контекст Nanobot живёт, device может ответить по wake word
+    try:
+        await device_ws.close()
+    except Exception: pass
 
 async def watchdog_timeout(device_ws: WebSocket, state: dict):
     logger.warning("⏱ [Watchdog] Upstream AI timed out.")
@@ -699,7 +696,6 @@ async def voice_ws(device_ws: WebSocket):
         "nanobot_chat_id": None, "last_text": "", "last_activity": time.time(),
         "available_tools": [],
         "tts_cooldown_until": 0.0,
-        "persistent": True,  # Сессия живёт пока ESP32 подключён — не закрываем WS при бездействии
     }
     session_states[session_id] = state
     logger.info(f"🔌 [WS] Device connected. Session: {session_id}")

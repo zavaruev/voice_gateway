@@ -64,6 +64,31 @@ def load_speaker_names() -> dict:
 SPEAKER_NAME_MAP = load_speaker_names()
 
 CHAT_ID_CACHE = {}
+CHAT_ID_CACHE_FILE = "/app/config/chat_id_cache.json"
+
+def load_chat_id_cache():
+    """Загружает кеш chat_id из файла (переживает рестарт контейнера)."""
+    global CHAT_ID_CACHE
+    if os.path.exists(CHAT_ID_CACHE_FILE):
+        try:
+            with open(CHAT_ID_CACHE_FILE, "r") as f:
+                data = json.load(f)
+            now = time.time()
+            # Фильтруем протухшие записи при загрузке
+            CHAT_ID_CACHE = {
+                mac: entry for mac, entry in data.items()
+                if now - entry.get("ts", 0) < CHAT_ID_TTL
+            }
+        except Exception:
+            CHAT_ID_CACHE = {}
+
+def save_chat_id_cache():
+    """Сохраняет кеш chat_id на диск."""
+    try:
+        with open(CHAT_ID_CACHE_FILE, "w") as f:
+            json.dump(CHAT_ID_CACHE, f, indent=2)
+    except Exception as e:
+        logger.error(f"Failed to save chat_id cache: {e}")
 
 def get_cached_chat_id(mac: str) -> str | None:
     entry = CHAT_ID_CACHE.get(mac.lower())
@@ -73,12 +98,16 @@ def get_cached_chat_id(mac: str) -> str | None:
 
 def set_cached_chat_id(mac: str, chat_id: str):
     CHAT_ID_CACHE[mac.lower()] = {"chat_id": chat_id, "ts": time.time()}
+    save_chat_id_cache()  # Сохраняем на диск — переживёт ребуилд контейнера
 
 def clear_expired_chat_ids():
     now = time.time()
     expired = [mac for mac, entry in CHAT_ID_CACHE.items() if now - entry["ts"] >= CHAT_ID_TTL]
     for mac in expired:
         del CHAT_ID_CACHE[mac]
+    save_chat_id_cache()
+
+load_chat_id_cache()  # Загружаем при старте
 
 app = FastAPI()
 
@@ -790,6 +819,8 @@ async def voice_ws(device_ws: WebSocket):
             # --- AUDIO BYTES ---
             byte_data = m.get("bytes")
             if byte_data:
+                # В IDLE не слушаем — ждём listen:start от устройства (wake word)
+                if state["status"] == "IDLE": continue
                 if state["status"] in ["PROCESSING", "SPEAKING"]: continue
                 # Skip audio during TTS cooldown to prevent self-triggering
                 if time.time() < state.get("tts_cooldown_until", 0):

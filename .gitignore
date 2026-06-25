@@ -4,4 +4,4 @@ __pycache__/
 silero_vad.onnx
 config/chat_id_cache.json
 config/speaker_names.json
-data/
+.coverage

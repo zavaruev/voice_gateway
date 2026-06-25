@@ -188,14 +188,24 @@ vad = VadEngine()
 # ==========================================
 # UTILS & AUDIO PACKING
 # ==========================================
+_DB_CACHE = None
+
 def load_db() -> dict:
+    global _DB_CACHE
+    if _DB_CACHE is not None:
+        return _DB_CACHE
     if os.path.exists(DB_FILE):
         try:
-            with open(DB_FILE, "r") as f: return json.load(f)
+            with open(DB_FILE, "r") as f:
+                _DB_CACHE = json.load(f)
+                return _DB_CACHE
         except Exception: pass
-    return {}
+    _DB_CACHE = {}
+    return _DB_CACHE
 
 def save_db(db: dict):
+    global _DB_CACHE
+    _DB_CACHE = db
     os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
     with open(DB_FILE, "w") as f: json.dump(db, f, indent=4)
 

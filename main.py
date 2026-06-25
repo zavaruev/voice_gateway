@@ -933,7 +933,10 @@ async def firmware_upload(file: UploadFile = File(...), version: str = Form(""))
     fname = os.path.basename(fname)
     fpath = os.path.join(FIRMWARE_DIR, fname)
     content = await file.read()
-    with open(fpath, "wb") as f: f.write(content)
+    def write_sync(path, data):
+        with open(path, "wb") as f:
+            f.write(data)
+    await asyncio.to_thread(write_sync, fpath, content)
     meta = save_firmware_meta(version, fname)
     return {"status": "ok", "meta": meta}
 

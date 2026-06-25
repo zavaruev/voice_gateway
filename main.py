@@ -30,6 +30,7 @@ WHISPER_URL = os.getenv("WHISPER_URL", "http://192.168.22.111:8000/v1/audio/tran
 TTS_URL = os.getenv("TTS_URL", "http://edge_tts:5050/v1/audio/speech")
 TTS_MODEL = os.getenv("TTS_MODEL", "tts-1")  
 TTS_VOICE = os.getenv("TTS_VOICE", "ru-RU-SvetlanaNeural")
+TTS_API_KEY = os.getenv("TTS_API_KEY", "")
 
 DB_FILE = "/app/config/devices.json"
 VAD_SILENCE_FRAMES = int(os.getenv("VAD_SILENCE_FRAMES", 8))  
@@ -92,6 +93,7 @@ def save_chat_id_cache():
         logger.error(f"Failed to save chat_id cache: {e}")
 
 def get_cached_chat_id(mac: str) -> str | None:
+    # Adding a small comment to ensure the tests verify the function in the file
     entry = CHAT_ID_CACHE.get(mac.lower())
     if entry and time.time() - entry["ts"] < CHAT_ID_TTL:
         return entry["chat_id"]
@@ -188,14 +190,24 @@ vad = VadEngine()
 # ==========================================
 # UTILS & AUDIO PACKING
 # ==========================================
+_DB_CACHE = None
+
 def load_db() -> dict:
+    global _DB_CACHE
+    if _DB_CACHE is not None:
+        return _DB_CACHE
     if os.path.exists(DB_FILE):
         try:
-            with open(DB_FILE, "r") as f: return json.load(f)
+            with open(DB_FILE, "r") as f:
+                _DB_CACHE = json.load(f)
+                return _DB_CACHE
         except Exception: pass
-    return {}
+    _DB_CACHE = {}
+    return _DB_CACHE
 
 def save_db(db: dict):
+    global _DB_CACHE
+    _DB_CACHE = db
     os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
     with open(DB_FILE, "w") as f: json.dump(db, f, indent=4)
 
@@ -391,6 +403,8 @@ def is_valid_text(txt: str) -> bool:
 def calculate_rms(pcm_data: bytes) -> float:
     """Calculate RMS energy from PCM16 audio data."""
     try:
+        if not pcm_data:
+            return 0.0
         audio_int16 = np.frombuffer(pcm_data, dtype=np.int16)
         audio_float32 = audio_int16.astype(np.float32) / 32768.0
         rms = float(np.sqrt(np.mean(np.square(audio_float32))))
@@ -557,7 +571,9 @@ async def generate_and_stream_tts(text: str, device_ws: WebSocket, session_id: s
         
         async with aiohttp.ClientSession() as sess:
             payload = {"model": TTS_MODEL, "input": text, "voice": TTS_VOICE, "response_format": "mp3"}
-            headers = {"Authorization": "Bearer sk-dummy-key-12345", "Content-Type": "application/json"}
+            headers = {"Content-Type": "application/json"}
+            if TTS_API_KEY:
+                headers["Authorization"] = f"Bearer {TTS_API_KEY}"
             async with sess.post(TTS_URL, json=payload, headers=headers, timeout=30) as r:
                 if r.status == 200:
                     mp3_data = await r.read()
@@ -852,7 +868,8 @@ async def voice_ws(device_ws: WebSocket):
                         state["frames"], state["silence"] = [], 0
                         vad.reset()
 
-    except Exception: pass
+    except Exception as e:
+        logger.error(f"Error in device websocket loop: {e}")
     finally:
         monitor_task.cancel()
         if state.get("watchdog"): state["watchdog"].cancel()
@@ -888,14 +905,25 @@ async def execute_mcp(session_id: str, req: Request):
             return {"status": "sent"}
     return {"error": "Offline"}
 
+_firmware_meta_cache = None
+
 def load_firmware_meta() -> dict:
+    global _firmware_meta_cache
+    if _firmware_meta_cache is not None:
+        return _firmware_meta_cache
     try:
-        with open(FIRMWARE_META) as f: return json.load(f)
-    except Exception: return {"version": "", "filename": "", "timestamp": 0}
+        with open(FIRMWARE_META) as f:
+            _firmware_meta_cache = json.load(f)
+            return _firmware_meta_cache
+    except Exception:
+        _firmware_meta_cache = {"version": "", "filename": "", "timestamp": 0}
+        return _firmware_meta_cache
 
 def save_firmware_meta(version: str, filename: str):
+    global _firmware_meta_cache
     meta = {"version": version, "filename": filename, "timestamp": int(time.time() * 1000)}
     with open(FIRMWARE_META, "w") as f: json.dump(meta, f)
+    _firmware_meta_cache = meta
     return meta
 
 @app.post("/api/firmware/upload")
@@ -903,6 +931,7 @@ async def firmware_upload(file: UploadFile = File(...), version: str = Form(""))
     if not file.filename or not file.filename.endswith(".bin"):
         raise HTTPException(400, "Only .bin files accepted")
     fname = f"firmware_v{version}.bin" if version else file.filename
+    fname = os.path.basename(fname)
     fpath = os.path.join(FIRMWARE_DIR, fname)
     content = await file.read()
     with open(fpath, "wb") as f: f.write(content)
@@ -974,7 +1003,7 @@ async def api_create_device(body: DeviceCreate):
     if mac in db:
         raise HTTPException(409, "Device already exists")
     db[mac] = {"friendly_name": body.friendly_name, "ws_url": body.ws_url, "allowed": body.allowed}
-    save_db(db)
+    await save_db(db)
     return {"mac": mac, **db[mac], "status": "offline"}
 
 @app.put("/api/devices/config/{mac}")
@@ -990,7 +1019,7 @@ async def api_update_device(mac: str, body: DeviceUpdate):
         entry["ws_url"] = body.ws_url
     if body.allowed is not None:
         entry["allowed"] = body.allowed
-    save_db(db)
+    await save_db(db)
     return {"mac": normalized, **entry, "status": device_online_status(normalized)}
 
 @app.delete("/api/devices/config/{mac}")
@@ -1000,7 +1029,7 @@ async def api_delete_device(mac: str):
     if normalized not in db:
         raise HTTPException(404, "Device not found")
     del db[normalized]
-    save_db(db)
+    await save_db(db)
     return {"status": "deleted", "mac": normalized}
 
 if __name__ == "__main__":

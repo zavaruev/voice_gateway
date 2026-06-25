@@ -391,6 +391,9 @@ def is_valid_text(txt: str) -> bool:
 def calculate_rms(pcm_data: bytes) -> float:
     """Calculate RMS energy from PCM16 audio data."""
     try:
+        count = len(pcm_data) // 2
+        if count == 0:
+            return 0.0
         audio_int16 = np.frombuffer(pcm_data, dtype=np.int16)
         audio_float32 = audio_int16.astype(np.float32) / 32768.0
         rms = float(np.sqrt(np.mean(np.square(audio_float32))))

@@ -1,53 +1,29 @@
-import sys
-from unittest.mock import MagicMock
-import time
-
-# Mock onnxruntime before importing main
-sys.modules['onnxruntime'] = MagicMock()
-
-import main
 import pytest
+from main import is_valid_text, WHISPER_HALLUCINATIONS, SINGLE_WORD_HALLUCINATIONS
 
-@pytest.fixture(autouse=True)
-def reset_cache():
-    """Reset the chat id cache before each test."""
-    main.CHAT_ID_CACHE.clear()
+def test_is_valid_text_empty_or_punctuation():
+    assert is_valid_text("") is False
+    assert is_valid_text("   ") is False
+    assert is_valid_text(".,?!-") is False
 
-def test_get_cached_chat_id_valid():
-    mac = "00:11:22:33:44:55"
-    chat_id = "test-chat-id-123"
+def test_is_valid_text_short_valid():
+    assert is_valid_text("hello") is True
+    assert is_valid_text("hi there") is True
 
-    # Set the cache
-    main.CHAT_ID_CACHE[mac.lower()] = {"chat_id": chat_id, "ts": time.time()}
+def test_is_valid_text_repeating_characters():
+    assert is_valid_text("haaaaaaaaaaa") is False
+    assert is_valid_text("aaabbbcccdd") is True
 
-    assert main.get_cached_chat_id(mac) == chat_id
+def test_is_valid_text_single_word_hallucinations():
+    for word in SINGLE_WORD_HALLUCINATIONS:
+        assert is_valid_text(word) is False
+    assert is_valid_text("word") is True
+    assert is_valid_text("ok") is False
 
-def test_get_cached_chat_id_expired():
-    mac = "AA:BB:CC:DD:EE:FF"
-    chat_id = "test-chat-id-expired"
+def test_is_valid_text_whisper_hallucinations():
+    for hall in WHISPER_HALLUCINATIONS:
+        assert is_valid_text(hall) is False
+        assert is_valid_text(f"prefix {hall} suffix") is False
 
-    # Set the timestamp in the past to exceed CHAT_ID_TTL
-    main.CHAT_ID_CACHE[mac.lower()] = {"chat_id": chat_id, "ts": time.time() - main.CHAT_ID_TTL - 100}
-
-    assert main.get_cached_chat_id(mac) is None
-
-def test_get_cached_chat_id_uncached():
-    mac = "12:34:56:78:90:AB"
-
-    # Ensure the MAC is not in cache
-    main.CHAT_ID_CACHE.pop(mac.lower(), None)
-
-    assert main.get_cached_chat_id(mac) is None
-
-def test_get_cached_chat_id_case_insensitive():
-    mac_upper = "FF:EE:DD:CC:BB:AA"
-    mac_lower = mac_upper.lower()
-    chat_id = "test-chat-id-case"
-
-    # Cache it with lower case key as the original implementation expects
-    main.CHAT_ID_CACHE[mac_lower] = {"chat_id": chat_id, "ts": time.time()}
-
-    # Should work for uppercase input
-    assert main.get_cached_chat_id(mac_upper) == chat_id
-    # Should work for lowercase input
-    assert main.get_cached_chat_id(mac_lower) == chat_id
+def test_is_valid_text_normal():
+    assert is_valid_text("This is a completely valid text.") is True

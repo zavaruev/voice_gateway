@@ -1002,7 +1002,7 @@ async def api_create_device(body: DeviceCreate):
     if mac in db:
         raise HTTPException(409, "Device already exists")
     db[mac] = {"friendly_name": body.friendly_name, "ws_url": body.ws_url, "allowed": body.allowed}
-    save_db(db)
+    await save_db(db)
     return {"mac": mac, **db[mac], "status": "offline"}
 
 @app.put("/api/devices/config/{mac}")
@@ -1018,7 +1018,7 @@ async def api_update_device(mac: str, body: DeviceUpdate):
         entry["ws_url"] = body.ws_url
     if body.allowed is not None:
         entry["allowed"] = body.allowed
-    save_db(db)
+    await save_db(db)
     return {"mac": normalized, **entry, "status": device_online_status(normalized)}
 
 @app.delete("/api/devices/config/{mac}")
@@ -1028,7 +1028,7 @@ async def api_delete_device(mac: str):
     if normalized not in db:
         raise HTTPException(404, "Device not found")
     del db[normalized]
-    save_db(db)
+    await save_db(db)
     return {"status": "deleted", "mac": normalized}
 
 if __name__ == "__main__":

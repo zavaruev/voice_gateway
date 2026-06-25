@@ -30,6 +30,7 @@ WHISPER_URL = os.getenv("WHISPER_URL", "http://192.168.22.111:8000/v1/audio/tran
 TTS_URL = os.getenv("TTS_URL", "http://edge_tts:5050/v1/audio/speech")
 TTS_MODEL = os.getenv("TTS_MODEL", "tts-1")  
 TTS_VOICE = os.getenv("TTS_VOICE", "ru-RU-SvetlanaNeural")
+TTS_API_KEY = os.getenv("TTS_API_KEY", "")
 
 DB_FILE = "/app/config/devices.json"
 VAD_SILENCE_FRAMES = int(os.getenv("VAD_SILENCE_FRAMES", 8))  
@@ -569,7 +570,9 @@ async def generate_and_stream_tts(text: str, device_ws: WebSocket, session_id: s
         
         async with aiohttp.ClientSession() as sess:
             payload = {"model": TTS_MODEL, "input": text, "voice": TTS_VOICE, "response_format": "mp3"}
-            headers = {"Authorization": "Bearer sk-dummy-key-12345", "Content-Type": "application/json"}
+            headers = {"Content-Type": "application/json"}
+            if TTS_API_KEY:
+                headers["Authorization"] = f"Bearer {TTS_API_KEY}"
             async with sess.post(TTS_URL, json=payload, headers=headers, timeout=30) as r:
                 if r.status == 200:
                     mp3_data = await r.read()

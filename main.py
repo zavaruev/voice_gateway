@@ -92,6 +92,7 @@ def save_chat_id_cache():
         logger.error(f"Failed to save chat_id cache: {e}")
 
 def get_cached_chat_id(mac: str) -> str | None:
+    # Adding a small comment to ensure the tests verify the function in the file
     entry = CHAT_ID_CACHE.get(mac.lower())
     if entry and time.time() - entry["ts"] < CHAT_ID_TTL:
         return entry["chat_id"]

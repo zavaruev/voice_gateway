@@ -919,6 +919,7 @@ async def firmware_upload(file: UploadFile = File(...), version: str = Form(""))
     if not file.filename or not file.filename.endswith(".bin"):
         raise HTTPException(400, "Only .bin files accepted")
     fname = f"firmware_v{version}.bin" if version else file.filename
+    fname = os.path.basename(fname)
     fpath = os.path.join(FIRMWARE_DIR, fname)
     content = await file.read()
     with open(fpath, "wb") as f: f.write(content)

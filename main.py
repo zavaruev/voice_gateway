@@ -188,6 +188,12 @@ vad = VadEngine()
 # ==========================================
 # UTILS & AUDIO PACKING
 # ==========================================
+_OGG_CRC_TABLE = []
+for i in range(256):
+    c = i << 24
+    for _ in range(8): c = (c << 1) ^ 0x04C11DB7 if c & 0x80000000 else c << 1
+    _OGG_CRC_TABLE.append(c & 0xFFFFFFFF)
+
 def load_db() -> dict:
     if os.path.exists(DB_FILE):
         try:
@@ -201,12 +207,8 @@ def save_db(db: dict):
 
 def pack_ogg(frames: list, sample_rate=16000) -> bytes:
     def ogg_crc(data: bytes) -> int:
-        crc, table = 0, []
-        for i in range(256):
-            c = i << 24
-            for _ in range(8): c = (c << 1) ^ 0x04C11DB7 if c & 0x80000000 else c << 1
-            table.append(c & 0xFFFFFFFF)
-        for b in data: crc = ((crc << 8) & 0xFFFFFFFF) ^ table[((crc >> 24) ^ b) & 0xFF]
+        crc = 0
+        for b in data: crc = ((crc << 8) & 0xFFFFFFFF) ^ _OGG_CRC_TABLE[((crc >> 24) ^ b) & 0xFF]
         return crc
 
     def page(idx: int, gran: int, ser: int, bos: bool, eos: bool, pkts: list) -> bytes:

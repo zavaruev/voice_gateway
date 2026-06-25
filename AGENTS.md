@@ -66,7 +66,7 @@ No test/lint/CI infrastructure.
 - `silero_vad.onnx` downloaded at Docker build time (must exist at runtime)
 - `config/devices.json` auto-created with `{}` if missing
 - Whisper form must include `model` field (`koekaverna/faster-whisper-podlodka-turbo`)
-- TTS sends dummy auth header (`Bearer sk-dummy-key-12345`)
+- TTS sends auth header if `TTS_API_KEY` is provided (`Bearer $TTS_API_KEY`)
 - Dockerfile exposes 8080 alongside 18792 but code never listens on 8080
 - `setup_gateway.sh` is an outdated snapshot; not authoritative
 - `config/` has its own `.git` (no commits); parent dir not version-controlled

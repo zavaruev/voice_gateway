@@ -852,7 +852,8 @@ async def voice_ws(device_ws: WebSocket):
                         state["frames"], state["silence"] = [], 0
                         vad.reset()
 
-    except Exception: pass
+    except Exception as e:
+        logger.error(f"Error in device websocket loop: {e}")
     finally:
         monitor_task.cancel()
         if state.get("watchdog"): state["watchdog"].cancel()

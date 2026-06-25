@@ -888,14 +888,25 @@ async def execute_mcp(session_id: str, req: Request):
             return {"status": "sent"}
     return {"error": "Offline"}
 
+_firmware_meta_cache = None
+
 def load_firmware_meta() -> dict:
+    global _firmware_meta_cache
+    if _firmware_meta_cache is not None:
+        return _firmware_meta_cache
     try:
-        with open(FIRMWARE_META) as f: return json.load(f)
-    except Exception: return {"version": "", "filename": "", "timestamp": 0}
+        with open(FIRMWARE_META) as f:
+            _firmware_meta_cache = json.load(f)
+            return _firmware_meta_cache
+    except Exception:
+        _firmware_meta_cache = {"version": "", "filename": "", "timestamp": 0}
+        return _firmware_meta_cache
 
 def save_firmware_meta(version: str, filename: str):
+    global _firmware_meta_cache
     meta = {"version": version, "filename": filename, "timestamp": int(time.time() * 1000)}
     with open(FIRMWARE_META, "w") as f: json.dump(meta, f)
+    _firmware_meta_cache = meta
     return meta
 
 @app.post("/api/firmware/upload")

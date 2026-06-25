@@ -290,7 +290,8 @@ async def activity_monitor_task(device_ws: WebSocket, state: dict):
             time_idle = now - state["last_activity"]
             
             # Adaptive standby: 30s after question, 10s after statement
-            if state["status"] == "LISTENING":
+            # Skip if frames are buffered (user is actively speaking)
+            if state["status"] == "LISTENING" and not state["frames"]:
                 timeout = STANDBY_TIMEOUT_QUESTION if state.get("last_ai_had_question") else STANDBY_TIMEOUT_STATEMENT
                 if time_idle > timeout:
                     logger.info(f"💤 [Timeout] {int(time_idle)}s idle (limit {timeout}s). Standby.")
@@ -813,6 +814,7 @@ async def voice_ws(device_ws: WebSocket):
                     state["frames"] = []
                     state["silence"] = 0
                     state["has_speech"] = False
+                    state["last_activity"] = time.time()
                     vad.reset()
                     # Wake — light up screen after wake word before audio processing starts
                     try: await device_ws.send_json({"session_id": state["sid"],
@@ -839,6 +841,7 @@ async def voice_ws(device_ws: WebSocket):
                 if time.time() < state.get("tts_cooldown_until", 0):
                     continue
                 state["status"] = "LISTENING"
+                state["last_activity"] = time.time()
                 
                 f = byte_data if state["version"] == 1 else (byte_data[16:] if state["version"] == 2 else byte_data[4:])
                 state["frames"].append(f)

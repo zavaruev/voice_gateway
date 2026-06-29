@@ -423,6 +423,9 @@ def calculate_rms(pcm_data: bytes) -> float:
 def denoise_audio(pcm_data: bytes, sample_rate: int = 16000) -> bytes:
     """Apply noise reduction to PCM16 audio data using noisereduce."""
     try:
+        # Check if imported at top
+        if 'df' not in globals() or df is None:
+            return pcm_data
         audio_int16 = np.frombuffer(pcm_data, dtype=np.int16)
         audio_float32 = audio_int16.astype(np.float32) / 32768.0
         

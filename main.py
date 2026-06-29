@@ -8,14 +8,16 @@ import re
 import io
 import hashlib
 import aiohttp
+import secrets
 import numpy as np
 import noisereduce as nr
 import onnxruntime as ort
 import opuslib
 from pydub import AudioSegment
 from loguru import logger
-from fastapi import FastAPI, Request, Form, WebSocket, WebSocketDisconnect, HTTPException, UploadFile, File
+from fastapi import FastAPI, Request, Form, WebSocket, WebSocketDisconnect, HTTPException, UploadFile, File, Depends
 from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -31,6 +33,9 @@ TTS_URL = os.getenv("TTS_URL", "http://edge_tts:5050/v1/audio/speech")
 TTS_MODEL = os.getenv("TTS_MODEL", "tts-1")  
 TTS_VOICE = os.getenv("TTS_VOICE", "ru-RU-SvetlanaNeural")
 TTS_API_KEY = os.getenv("TTS_API_KEY", "")
+
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin")
 
 DB_FILE = "/app/config/devices.json"
 VAD_SILENCE_FRAMES = int(os.getenv("VAD_SILENCE_FRAMES", 8))  
@@ -119,6 +124,19 @@ def clear_expired_chat_ids():
 load_chat_id_cache()  # Load on startup
 
 app = FastAPI()
+
+security = HTTPBasic()
+
+def verify_auth(credentials: HTTPBasicCredentials = Depends(security)):
+    is_user_ok = secrets.compare_digest(credentials.username, ADMIN_USERNAME)
+    is_pass_ok = secrets.compare_digest(credentials.password, ADMIN_PASSWORD)
+    if not (is_user_ok and is_pass_ok):
+        raise HTTPException(
+            status_code=401,
+            detail="Incorrect email or password",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    return credentials.username
 
 FIRMWARE_DIR = "/app/config/firmware"
 os.makedirs(FIRMWARE_DIR, exist_ok=True)
@@ -706,7 +724,7 @@ class NanobotResponseHandler:
 # WEB UI
 # ==========================================
 @app.get("/", response_class=HTMLResponse)
-async def web_index(req: Request):
+async def web_index(req: Request, username: str = Depends(verify_auth)):
     return templates.TemplateResponse(req, "index.html")
 
 # ==========================================
@@ -893,11 +911,11 @@ async def voice_ws(device_ws: WebSocket):
 # REST API & OTA
 # ==========================================
 @app.get("/api/devices")
-async def api_get_devices():
+async def api_get_devices(username: str = Depends(verify_auth)):
     return [{"session_id": sid, "mac": st["mac"], "status": st["status"], "last_text": st["last_text"]} for sid, st in session_states.items()]
 
 @app.post("/mcp/{session_id}")
-async def execute_mcp(session_id: str, req: Request):
+async def execute_mcp(session_id: str, req: Request, username: str = Depends(verify_auth)):
     data = await req.json()
     req_id = data.get("id")
     if session_id == "latest" and active_sessions: session_id = list(active_sessions.keys())[-1]
@@ -937,7 +955,7 @@ def save_firmware_meta(version: str, filename: str):
     return meta
 
 @app.post("/api/firmware/upload")
-async def firmware_upload(file: UploadFile = File(...), version: str = Form("")):
+async def firmware_upload(file: UploadFile = File(...), version: str = Form(""), username: str = Depends(verify_auth)):
     if not file.filename or not file.filename.endswith(".bin"):
         raise HTTPException(400, "Only .bin files accepted")
     fname = f"firmware_v{version}.bin" if version else file.filename
@@ -952,7 +970,7 @@ async def firmware_upload(file: UploadFile = File(...), version: str = Form(""))
     return {"status": "ok", "meta": meta}
 
 @app.get("/api/firmware")
-async def firmware_info():
+async def firmware_info(username: str = Depends(verify_auth)):
     meta = load_firmware_meta()
     return meta
 
@@ -1004,11 +1022,11 @@ def device_list_with_status() -> list[dict]:
     return result
 
 @app.get("/api/devices/config")
-async def api_get_device_config():
+async def api_get_device_config(username: str = Depends(verify_auth)):
     return device_list_with_status()
 
 @app.post("/api/devices/config")
-async def api_create_device(body: DeviceCreate):
+async def api_create_device(body: DeviceCreate, username: str = Depends(verify_auth)):
     mac = normalize_mac(body.mac)
     if not mac:
         raise HTTPException(400, "MAC address required")
@@ -1020,7 +1038,7 @@ async def api_create_device(body: DeviceCreate):
     return {"mac": mac, **db[mac], "status": "offline"}
 
 @app.put("/api/devices/config/{mac}")
-async def api_update_device(mac: str, body: DeviceUpdate):
+async def api_update_device(mac: str, body: DeviceUpdate, username: str = Depends(verify_auth)):
     normalized = normalize_mac(mac)
     db = load_db()
     if normalized not in db:
@@ -1036,7 +1054,7 @@ async def api_update_device(mac: str, body: DeviceUpdate):
     return {"mac": normalized, **entry, "status": device_online_status(normalized)}
 
 @app.delete("/api/devices/config/{mac}")
-async def api_delete_device(mac: str):
+async def api_delete_device(mac: str, username: str = Depends(verify_auth)):
     normalized = normalize_mac(mac)
     db = load_db()
     if normalized not in db:

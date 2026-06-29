@@ -1,3 +1,4 @@
+import asyncio
 import pytest
 import os
 import json
@@ -16,7 +17,6 @@ from main import (
     is_valid_text,
     make_chat_id,
     calculate_rms,
-    denoise_audio,
     pack_ogg,
     set_cached_chat_id,
     get_cached_chat_id,
@@ -83,19 +83,6 @@ def test_calculate_rms():
     # RMS of a sine wave with amplitude 1 is ~0.707.
     # Our float values are scaled down by 32768, so the expected RMS is ~0.707
     assert 0.70 < rms < 0.71
-
-def test_denoise_audio():
-    # Provide a simple 1-sec PCM16 buffer
-    audio_data = (np.random.randn(16000) * 1000).astype(np.int16).tobytes()
-    denoised_data = denoise_audio(audio_data, sample_rate=16000)
-
-    # Check that output has the same length as input
-    assert len(denoised_data) == len(audio_data)
-
-    # If noisereduce fails, it should return original audio. Let's mock to raise an exception
-    with patch("main.nr.reduce_noise", side_effect=Exception("mocked error")):
-        denoised_fail = denoise_audio(audio_data, sample_rate=16000)
-        assert denoised_fail == audio_data
 
 def test_pack_ogg():
     # Test packing 1 Opus frame into Ogg container
@@ -230,7 +217,7 @@ def test_vad_engine(mock_inference_session):
 
     # Provide 512+ samples of audio
     audio_data = (np.ones(600) * 1000).astype(np.int16).tobytes()
-    is_speech, rms = vad.is_speech(audio_data)
+    is_speech, rms = asyncio.run(vad.is_speech(audio_data))
 
     assert is_speech == True
     # The session should have been called since we provided enough buffer
@@ -244,6 +231,6 @@ def test_vad_engine(mock_inference_session):
     # With np.ones(10)*10, RMS is ~0.0003, no speech
     mock_session_instance.run.reset_mock()
     small_audio_data = (np.ones(10) * 10).astype(np.int16).tobytes()
-    is_speech, rms = vad.is_speech(small_audio_data)
+    is_speech, rms = asyncio.run(vad.is_speech(small_audio_data))
     assert not mock_session_instance.run.called
     assert is_speech == False

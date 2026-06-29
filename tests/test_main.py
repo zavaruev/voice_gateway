@@ -115,6 +115,55 @@ def test_pack_ogg():
     assert b'OpusHead' in ogg_data
     assert b'OpusTags' in ogg_data
 
+def test_pack_ogg_empty_frames():
+    sample_rate = 16000
+    ogg_data = pack_ogg([], sample_rate)
+
+    assert isinstance(ogg_data, bytes)
+    assert len(ogg_data) > 0
+    assert ogg_data.startswith(b'OggS')
+
+    # Should contain headers but no data pages (since no frames)
+    assert b'OpusHead' in ogg_data
+    assert b'OpusTags' in ogg_data
+
+def test_pack_ogg_pagination():
+    sample_rate = 16000
+    dummy_frame = b"dummy"
+
+    # Test with exactly 50 frames
+    frames_50 = [dummy_frame] * 50
+    ogg_data_50 = pack_ogg(frames_50, sample_rate)
+
+    # Find all OggS headers to count pages
+    # First page: OpusHead (bos), Second: OpusTags, Third: Audio data (eos)
+    assert ogg_data_50.count(b'OggS') == 3
+
+    # Test with 101 frames to verify it splits into 50, 50, 1
+    frames_101 = [dummy_frame] * 101
+    ogg_data_101 = pack_ogg(frames_101, sample_rate)
+
+    # OpusHead, OpusTags, Data(50), Data(50), Data(1) -> 5 pages total
+    assert ogg_data_101.count(b'OggS') == 5
+
+    # To check that correct flags are applied:
+    # First byte after OggS, Version=0, Flags byte (5th byte from 'OggS')
+    # OggS(4), Version(1), HeaderType(1) -> offset is 5 from OggS index
+
+    idx = ogg_data_101.find(b'OggS')
+    page_count = 0
+    while idx != -1:
+        flag = ogg_data_101[idx + 5]
+        if page_count == 0:
+            assert flag == 0x02 # BOS
+        elif page_count == 4:
+            assert flag == 0x04 # EOS
+        else:
+            assert flag == 0x00 # Normal page
+
+        page_count += 1
+        idx = ogg_data_101.find(b'OggS', idx + 1)
+
 @patch("main.time.time")
 def test_chat_id_cache(mock_time):
     # Setup

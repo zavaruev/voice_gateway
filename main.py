@@ -52,10 +52,11 @@ VAD_ADAPTIVE = os.getenv("VAD_ADAPTIVE", "true").lower() == "true"
 WHISPER_HALLUCINATIONS = [
     "субтитры подогнал симон", "спасибо за просмотр", "подписывайтесь на канал",  
     "аминь", "субтитры создавал", "редактор субтитров", "thank you", "thanks for watching", "so",
-    "dimatorzok", "субтитры сделал", "dima torzok", "продолжение следует"
+    "dimatorzok", "субтитры сделал", "dima torzok", "продолжение следует",
+    "синкинг"
 ]
 
-SINGLE_WORD_HALLUCINATIONS = {"о", "а", "и", "кх-кх", "ха-ха", "жизнь", "пьютер"}
+SINGLE_WORD_HALLUCINATIONS = {"о", "а", "и", "кх-кх", "ха-ха", "жизнь", "пьютер", "как"}
 
 HOLD_PHRASES = {"подожди", "мomento", "секундочку", "подожди-ка", "один момент", "мomento"}
 
@@ -203,8 +204,6 @@ class VadEngine:
             logger.error(f"❌ VAD Error: {e}")
             return False, 0.0
 
-vad = VadEngine()
-
 # ==========================================
 # UTILS & AUDIO PACKING
 # ==========================================
@@ -302,6 +301,39 @@ async def request_mcp_tools(device_ws: WebSocket, session_id: str):
     except Exception as e:
         logger.error(f"❌ [MCP] Failed to request tools: {e}")
 
+async def handle_device_tool_call(nano_ws: aiohttp.ClientWebSocketResponse, device_ws: WebSocket, state: dict, d: dict):
+    tc = d.get("tool_call", {})
+    tool_name = tc.get("name", "")
+    arguments = tc.get("arguments", {})
+    tool_call_id = tc.get("id", "")
+    logger.info(f"🔧 [DeviceTool] AI calling ESP32 tool: {tool_name}({arguments})")
+    req_id = int(time.time() * 1000)
+    loop = asyncio.get_running_loop()
+    future = loop.create_future()
+    mcp_futures[req_id] = future
+    try:
+        await send_mcp_cmd(device_ws, state["sid"], tool_name, arguments, req_id)
+        result = await asyncio.wait_for(future, timeout=10.0)
+        await nano_ws.send_json({
+            "type": "device_tool_result",
+            "chat_id": d.get("chat_id"),
+            "tool_call_id": tool_call_id,
+            "result": result,
+        })
+        logger.info(f"✅ [DeviceTool] ESP32 tool {tool_name} completed")
+    except asyncio.TimeoutError:
+        logger.warning(f"⏱ [DeviceTool] ESP32 tool {tool_name} timed out")
+        await nano_ws.send_json({
+            "type": "device_tool_result",
+            "chat_id": d.get("chat_id"),
+            "tool_call_id": tool_call_id,
+            "result": {"error": "ESP32 tool call timed out"},
+        })
+    except Exception as e:
+        logger.error(f"❌ [DeviceTool] Error calling ESP32 tool {tool_name}: {e}")
+    finally:
+        mcp_futures.pop(req_id, None)
+
 async def activity_monitor_task(device_ws: WebSocket, state: dict):
     """Monitors idle: dims screen but does NOT close the connection.
        Persistent mode — WS/context lives while ESP32 is on."""
@@ -334,22 +366,24 @@ async def activity_monitor_task(device_ws: WebSocket, state: dict):
         logger.error(f"Error in monitor task: {e}")
 
 async def reset_to_standby(device_ws: WebSocket, state: dict):
-    """Switches the speaker to standby: dims screen, closes WS.
-       chat_id is cached on disk — Nanobot restores context on reconnect."""
-    logger.info("💤 Idle — dim screen, close WS. chat_id saved for next connection")
+    """Switches the speaker to standby: dims screen, stops listening.
+       Keeps WS open — MCP tools (temperature monitoring) continue working."""
+    if state["frames"] or state["has_speech"]:
+        return  # Race: new audio arrived between timeout check and now
+    logger.info("💤 Standby — dim screen, stop listening")
     state["status"] = "IDLE"
+    state["frames"] = []
+    state["silence"] = 0
+    state["has_speech"] = False
     
     await send_mcp_cmd(device_ws, state["sid"], "self.screen.set_brightness", {"brightness": 0})
-    await asyncio.sleep(0.5)
     
     state["last_ai_had_question"] = False
+    state["last_activity"] = time.time()
     
     if state.get("watchdog"):
         state["watchdog"].cancel()
         state["watchdog"] = None
-    try:
-        await device_ws.close()
-    except Exception: pass
 
 async def watchdog_timeout(device_ws: WebSocket, state: dict):
     logger.warning("⏱ [Watchdog] Upstream AI timed out.")
@@ -361,7 +395,7 @@ async def watchdog_timeout(device_ws: WebSocket, state: dict):
     logger.info("🎤 [Watchdog] Keeping mic open for repeat.")
     state.update({"status": "LISTENING", "frames": [], "silence": 0, "has_speech": False})
     state["last_activity"] = time.time() # Reset timer
-    vad.reset()
+    state["vad"].reset()
 
 # ==========================================
 # ASYNC PIPELINE (STT & SPEAKER ID)
@@ -454,7 +488,7 @@ def denoise_audio(pcm_data: bytes, sample_rate: int = 16000) -> bytes:
             y=audio_float32,
             sr=sample_rate,
             stationary=False,
-            prop_decrease=0.8
+            prop_decrease=0.5
         )
         
         # Convert back to int16
@@ -464,7 +498,7 @@ def denoise_audio(pcm_data: bytes, sample_rate: int = 16000) -> bytes:
         logger.warning(f"⚠️ [Denoise] Failed: {e}, returning original audio")
         return pcm_data
 
-def decode_opus_frames(frames: list, decoder: opuslib.Decoder) -> tuple[bytes, list[float], list[bool]]:
+def decode_opus_frames(frames: list, decoder: opuslib.Decoder, vad: VadEngine) -> tuple[bytes, list[float], list[bool]]:
     """Decode Opus frames to PCM and return (combined_pcm, rms_list, vad_results)."""
     all_pcm = bytearray()
     rms_list = []
@@ -472,7 +506,6 @@ def decode_opus_frames(frames: list, decoder: opuslib.Decoder) -> tuple[bytes, l
     
     # Create a temporary decoder for this batch
     temp_dec = opuslib.Decoder(16000, 1)
-    temp_vad = VadEngine()
     
     for frame in frames:
         try:
@@ -500,10 +533,11 @@ async def process_audio_and_send(frames: list, state: dict, device_ws: WebSocket
     try:
         # Decode frames for metrics and gates
         dec = opuslib.Decoder(16000, 1)
-        pcm_data, rms_list, vad_results = decode_opus_frames(frames, dec)
+        pcm_data, rms_list, vad_results = decode_opus_frames(frames, dec, state["vad"])
         
-        # Apply noise reduction to combined PCM
-        pcm_data = denoise_audio(pcm_data, sample_rate=16000)
+        # Apply noise reduction is disabled — Podlodka model is trained on noisy data
+        # and noisereduce artifacts degrade VAD gate accuracy
+        # pcm_data = denoise_audio(pcm_data, sample_rate=16000)
         
         # Debug metrics logging
         avg_rms = sum(rms_list) / len(rms_list) if rms_list else 0.0
@@ -578,13 +612,8 @@ async def process_audio_and_send(frames: list, state: dict, device_ws: WebSocket
                     await generate_and_stream_tts(txt, device_ws, state["sid"], state)
                     await reset_to_standby(device_ws, state)
             else:
-                logger.warning(f"⚠ [Pipeline] Rejected transcription (text='{txt}') from user '{uid}', asking for repeat")
-                state["status"] = "SPEAKING"
-                await generate_and_stream_tts("Скажи ещё раз?", device_ws, state["sid"], state)
-                logger.info("🎤 [Pipeline] Returning mic for repeat after rejected.")
-                state.update({"status": "LISTENING", "frames": [], "silence": 0, "has_speech": False})
-                state["last_activity"] = time.time()
-                vad.reset()
+                logger.warning(f"⚠ [Pipeline] Rejected transcription (text='{txt}') from user '{uid}'")
+                await reset_to_standby(device_ws, state)
     except Exception as e:
         logger.error(f"❌ Pipeline Error: {e}")
         await reset_to_standby(device_ws, state)
@@ -712,15 +741,33 @@ class NanobotResponseHandler:
             except Exception: pass
             
             await generate_and_stream_tts(clean_text, self.device_ws, self.state["sid"], self.state)
-            
+
             clean_for_check = self.full_response_text.strip().lower()
             has_question = (re.search(r'[?？]\s*$', clean_for_check) is not None) or ("повторите пожалуйста" in clean_for_check)
             self.state["last_ai_had_question"] = has_question
             
-            self.state.update({"status": "LISTENING", "frames": [], "silence": 0, "has_speech": False})
+            if has_question:
+                self.state.update({"status": "LISTENING", "frames": [], "silence": 0, "has_speech": False})
+            else:
+                self.state.update({"status": "IDLE", "frames": [], "silence": 0, "has_speech": False})
             self.state["last_activity"] = time.time()
-            vad.reset()
+            self.state["vad"].reset()
             self.full_response_text = ""
+            
+            _dim_activity = self.state["last_activity"]
+            async def _dim():
+                await asyncio.sleep(5)
+                if self.state.get("status") in ["SPEAKING", "PROCESSING"]:
+                    return
+                if self.state["last_activity"] != _dim_activity:
+                    return
+                logger.info(f"💡 [Display] Turning off display after TTS")
+                try:
+                    await send_mcp_cmd(self.device_ws, self.state["sid"],
+                        "self.screen.set_brightness", {"brightness": 0})
+                except Exception:
+                    logger.error(f"💡 [Display] Failed to turn off display after TTS")
+            asyncio.create_task(_dim())
         self.is_flushing = False
 
 # ==========================================
@@ -743,11 +790,12 @@ async def voice_ws(device_ws: WebSocket):
     active_sessions[session_id] = device_ws
     
     state = {
-        "status": "LISTENING", "frames": [], "silence": 0, "has_speech": False,  
+        "status": "IDLE", "frames": [], "silence": 0, "has_speech": False,  
         "sid": session_id, "mac": mac_addr, "version": 1, "watchdog": None,
         "nanobot_chat_id": None, "last_text": "", "last_activity": time.time(),
         "available_tools": [],
         "tts_cooldown_until": 0.0,
+        "vad": VadEngine(),
     }
     session_states[session_id] = state
     logger.info(f"🔌 [WS] Device connected. Session: {session_id}")
@@ -762,7 +810,7 @@ async def voice_ws(device_ws: WebSocket):
     await request_mcp_tools(device_ws, session_id)
     
     dec = opuslib.Decoder(16000, 1)
-    vad.reset()
+    state["vad"].reset()
     nano_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None))
     nano_ws = None
     nano_listener_task = None
@@ -792,6 +840,8 @@ async def voice_ws(device_ws: WebSocket):
                             })
                     elif d.get("event") == "error":
                         logger.error(f"❌ Nanobot Error: {d.get('detail')}")
+                    elif d.get("event") == "device_tool_call":
+                        asyncio.create_task(handle_device_tool_call(nano_ws, device_ws, state, d))
                     elif "text" in d and d.get("type") not in ["stt", "listen"] and d.get("event") != "reasoning_delta":
                         await handler.handle_chunk(d["text"])
                 except Exception: pass
@@ -842,12 +892,14 @@ async def voice_ws(device_ws: WebSocket):
                     asyncio.create_task(connect_upstream())
                 
                 elif d.get("type") == "listen" and d.get("state") == "start":
+                    logger.info(f"👂 [Wake] listen:start — wake word detected, entering LISTENING")
+                    state["_display_gen"] = state.get("_display_gen", 0) + 1
                     state["status"] = "LISTENING"
                     state["frames"] = []
                     state["silence"] = 0
                     state["has_speech"] = False
                     state["last_activity"] = time.time()
-                    vad.reset()
+                    state["vad"].reset()
                     # Wake — light up screen after wake word before audio processing starts
                     try: await device_ws.send_json({"session_id": state["sid"],
                         "type": "mcp", "payload": {
@@ -880,7 +932,14 @@ async def voice_ws(device_ws: WebSocket):
                 
                 try:
                     pcm = dec.decode(f, 960)
-                    is_sp, _ = vad.is_speech(pcm)
+                    # Pre-VAD RMS gate: skip VAD for near-silent frames
+                    audio_int16 = np.frombuffer(pcm, dtype=np.int16)
+                    audio_float32 = audio_int16.astype(np.float32) / 32768.0
+                    frame_rms = float(np.sqrt(np.mean(np.square(audio_float32))))
+                    if frame_rms < 0.003:
+                        is_sp = False
+                    else:
+                        is_sp, _ = state["vad"].is_speech(pcm)
                     if is_sp:  
                         state["silence"] = 0
                         state["has_speech"] = True
@@ -897,7 +956,7 @@ async def voice_ws(device_ws: WebSocket):
                         asyncio.create_task(process_audio_and_send(frames_to_process, state, device_ws))
                     else:
                         state["frames"], state["silence"] = [], 0
-                        vad.reset()
+                        state["vad"].reset()
 
     except Exception as e:
         logger.error(f"Error in device websocket loop: {e}")

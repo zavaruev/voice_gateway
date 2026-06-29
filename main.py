@@ -211,6 +211,17 @@ def save_db(db: dict):
     os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
     with open(DB_FILE, "w") as f: json.dump(db, f, indent=4)
 
+def _build_crc_table():
+    table = []
+    for i in range(256):
+        c = i << 24
+        for _ in range(8):
+            c = (c << 1) ^ 0x04C11DB7 if c & 0x80000000 else c << 1
+        table.append(c & 0xFFFFFFFF)
+    return table
+
+_OGG_CRC_TABLE = _build_crc_table()
+
 def pack_ogg(frames: list, sample_rate=16000) -> bytes:
     def ogg_crc(data: bytes) -> int:
         crc = 0

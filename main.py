@@ -849,10 +849,33 @@ async def voice_ws(device_ws: WebSocket):
                         state["available_tools"] = payload["result"]["tools"]
                         tool_names = [t.get("name") for t in state["available_tools"]]
                         logger.info(f"🛠 [MCP] ESP32 returned tools: {tool_names}")
+                        nano_ws = state.get("nano_ws")
+                        if nano_ws and not nano_ws.closed and state.get("nanobot_chat_id"):
+                            logger.info(f"📤 [MCP] Forwarding {len(state['available_tools'])} tools to Nanobot")
+                            try:
+                                await nano_ws.send_json({
+                                    "type": "tools_update",
+                                    "chat_id": state["nanobot_chat_id"],
+                                    "tools": state["available_tools"]
+                                })
+                            except Exception:
+                                pass
                         continue
                     
                     if req_id in mcp_futures and not mcp_futures[req_id].done():
                         mcp_futures[req_id].set_result(payload)
+                    elif req_id is None and payload.get("method"):
+                        nano_ws = state.get("nano_ws")
+                        if nano_ws and not nano_ws.closed and state.get("nanobot_chat_id"):
+                            try:
+                                await nano_ws.send_json({
+                                    "type": "device_event",
+                                    "chat_id": state["nanobot_chat_id"],
+                                    "event": payload["method"],
+                                    "data": payload.get("params", {}),
+                                })
+                            except Exception:
+                                pass
                 
                 elif d.get("type") == "hello":
                     state["version"] = d.get("version", 1)

@@ -374,13 +374,12 @@ async def activity_monitor_task(device_ws: WebSocket, state: dict):
             time_idle = now - state["last_activity"]
             
             # Adaptive standby: 30s after question, 10s after statement
-            # Skip if frames are buffered (user is actively speaking)
-            if state["status"] == "LISTENING" and not state["frames"]:
+            if state["status"] == "LISTENING":
                 timeout = STANDBY_TIMEOUT_QUESTION if state.get("last_ai_had_question") else STANDBY_TIMEOUT_STATEMENT
                 if time_idle > timeout:
                     logger.info(f"💤 [Timeout] {int(time_idle)}s idle (limit {timeout}s). Standby.")
                     asyncio.create_task(reset_to_standby(device_ws, state))
-                    break
+                    continue
                     
             await asyncio.sleep(1.0)
     except asyncio.CancelledError:
@@ -910,7 +909,6 @@ async def voice_ws(device_ws: WebSocket):
                 if time.time() < state.get("tts_cooldown_until", 0):
                     continue
                 state["status"] = "LISTENING"
-                state["last_activity"] = time.time()
                 
                 f = byte_data if state["version"] == 1 else (byte_data[16:] if state["version"] == 2 else byte_data[4:])
                 state["frames"].append(f)
@@ -928,6 +926,7 @@ async def voice_ws(device_ws: WebSocket):
                     if is_sp:  
                         state["silence"] = 0
                         state["has_speech"] = True
+                        state["last_activity"] = time.time()
                     else: state["silence"] += 1
                 except Exception: state["silence"] += 1
                 

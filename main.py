@@ -754,16 +754,16 @@ class NanobotResponseHandler:
             _dim_activity = self.state["last_activity"]
             async def _dim():
                 await asyncio.sleep(5)
-                if self.state.get("status") in ["SPEAKING", "PROCESSING"]:
+                if self.state.get("status") in ["SPEAKING", "PROCESSING", "LISTENING"]:
                     return
                 if self.state["last_activity"] != _dim_activity:
                     return
-                logger.info(f"💡 [Display] Turning off display after TTS")
+                logger.info(f"💡 [Display] Dimming display after TTS")
                 try:
                     await send_mcp_cmd(self.device_ws, self.state["sid"],
-                        "self.screen.set_brightness", {"brightness": 0})
+                        "self.screen.set_brightness", {"brightness": 25})
                 except Exception:
-                    logger.error(f"💡 [Display] Failed to turn off display after TTS")
+                    logger.error(f"💡 [Display] Failed to dim display after TTS")
             asyncio.create_task(_dim())
         self.is_flushing = False
 

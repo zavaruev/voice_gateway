@@ -34,7 +34,7 @@ TTS_VOICE = os.getenv("TTS_VOICE", "ru-RU-SvetlanaNeural")
 TTS_API_KEY = os.getenv("TTS_API_KEY", "")
 
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin")
 
 DB_FILE = "/app/config/devices.json"
 VAD_SILENCE_FRAMES = int(os.getenv("VAD_SILENCE_FRAMES", 8))  
@@ -392,7 +392,7 @@ async def activity_monitor_task(device_ws: WebSocket, state: dict):
                     logger.info(f"💤 [Idle] {int(time_idle)}s idle — dim screen")
                     await send_mcp_cmd(device_ws, state["sid"], "self.screen.set_brightness", {"brightness": 0})
                     dim_sent = True
-            else:
+            elif state["status"] not in ("IDLE", "LISTENING"):
                 dim_sent = False  # Reset when activity resumes
                     
             await asyncio.sleep(1.0)

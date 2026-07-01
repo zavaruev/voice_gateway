@@ -368,6 +368,7 @@ async def activity_monitor_task(device_ws: WebSocket, state: dict):
        Persistent mode — WS/context lives while ESP32 is on."""
     await send_mcp_cmd(device_ws, state["sid"], "self.audio_speaker.set_volume", {"volume": 100})
     await send_mcp_cmd(device_ws, state["sid"], "self.screen.set_brightness", {"brightness": 100})
+    dim_sent = False
     
     try:
         while state["sid"] in session_states:
@@ -385,6 +386,14 @@ async def activity_monitor_task(device_ws: WebSocket, state: dict):
                 if time_idle > timeout:
                     logger.info(f"💤 [Timeout] {int(time_idle)}s idle (limit {timeout}s). Standby.")
                     asyncio.create_task(reset_to_standby(device_ws, state))
+            # Dim screen when idle (device powered on but no interaction)
+            elif state["status"] == "IDLE" and time_idle > 10:
+                if not dim_sent:
+                    logger.info(f"💤 [Idle] {int(time_idle)}s idle — dim screen")
+                    await send_mcp_cmd(device_ws, state["sid"], "self.screen.set_brightness", {"brightness": 0})
+                    dim_sent = True
+            else:
+                dim_sent = False  # Reset when activity resumes
                     
             await asyncio.sleep(1.0)
     except asyncio.CancelledError:

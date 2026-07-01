@@ -34,7 +34,7 @@ TTS_VOICE = os.getenv("TTS_VOICE", "ru-RU-SvetlanaNeural")
 TTS_API_KEY = os.getenv("TTS_API_KEY", "")
 
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
 
 DB_FILE = "/app/config/devices.json"
 VAD_SILENCE_FRAMES = int(os.getenv("VAD_SILENCE_FRAMES", 8))  
@@ -136,6 +136,12 @@ app = FastAPI()
 security = HTTPBasic()
 
 def verify_auth(credentials: HTTPBasicCredentials = Depends(security)):
+    if not ADMIN_USERNAME or not ADMIN_PASSWORD:
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication not configured",
+            headers={"WWW-Authenticate": "Basic"},
+        )
     is_user_ok = secrets.compare_digest(credentials.username, ADMIN_USERNAME)
     is_pass_ok = secrets.compare_digest(credentials.password, ADMIN_PASSWORD)
     if not (is_user_ok and is_pass_ok):
@@ -379,7 +385,6 @@ async def activity_monitor_task(device_ws: WebSocket, state: dict):
                 if time_idle > timeout:
                     logger.info(f"💤 [Timeout] {int(time_idle)}s idle (limit {timeout}s). Standby.")
                     asyncio.create_task(reset_to_standby(device_ws, state))
-                    continue
                     
             await asyncio.sleep(1.0)
     except asyncio.CancelledError:
@@ -390,8 +395,9 @@ async def activity_monitor_task(device_ws: WebSocket, state: dict):
 async def reset_to_standby(device_ws: WebSocket, state: dict):
     """Switches the speaker to standby: dims screen, stops listening.
        Keeps WS open — MCP tools (temperature monitoring) continue working."""
-    if state["frames"] or state["has_speech"]:
-        return  # Race: new audio arrived between timeout check and now
+    # Note: no has_speech guard here — last_activity timer already protects
+    # against interrupting active speech. has_speech can be stuck True by
+    # VAD false positives on background noise, permanently blocking standby.
     logger.info("💤 Standby — dim screen, stop listening")
     state["status"] = "IDLE"
     state["frames"] = []
@@ -824,10 +830,28 @@ async def voice_ws(device_ws: WebSocket):
                             })
                     elif d.get("event") == "error":
                         logger.error(f"❌ Nanobot Error: {d.get('detail')}")
+                        if state.get("watchdog"):
+                            state["watchdog"].cancel()
+                            state["watchdog"] = None
+                        state["status"] = "SPEAKING"
+                        await generate_and_stream_tts("Простите, я задумалась. Повторите пожалуйста.", device_ws, state["sid"], state)
+                        state["vad"].reset()
+                        await reset_to_standby(device_ws, state)
                     elif d.get("event") == "device_tool_call":
                         asyncio.create_task(handle_device_tool_call(nano_ws, device_ws, state, d))
                     elif "text" in d and d.get("type") not in ["stt", "listen"] and d.get("event") != "reasoning_delta":
-                        await handler.handle_chunk(d["text"])
+                        text_content = d["text"]
+                        if "Error from provider" in text_content or text_content.startswith("Error:"):
+                            logger.error(f"❌ Nanobot Error in text: {text_content}")
+                            if state.get("watchdog"):
+                                state["watchdog"].cancel()
+                                state["watchdog"] = None
+                            state["status"] = "SPEAKING"
+                            await generate_and_stream_tts("Простите, я задумалась. Повторите пожалуйста.", device_ws, state["sid"], state)
+                            state["vad"].reset()
+                            await reset_to_standby(device_ws, state)
+                        else:
+                            await handler.handle_chunk(text_content)
                 except Exception: pass
 
     try:

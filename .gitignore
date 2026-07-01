@@ -1,7 +1,29 @@
+# Python
 __pycache__/
 *.pyc
+*.pyo
 .env
+.coverage
+.pytest_cache/
+
+# Project-specific
 silero_vad.onnx
 config/chat_id_cache.json
 config/speaker_names.json
-.coverage
+test_main.py
+DESIGN.md
+AGENTS.md
+setup_gateway.sh
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Editor junk
+*.swp
+*.swo
+*.bak
+*.tmp
+*.log
+.idea/
+.vscode/

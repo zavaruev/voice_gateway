@@ -9,4 +9,3 @@ onnxruntime
 numpy
 python-multipart
 jinja2
-noisereduce

@@ -209,6 +209,8 @@ class VadEngine:
                 out, self._state = await asyncio.to_thread(self._run_onnx, chunk, self._state)
                 if out[0][0] > current_threshold:
                     speech_detected = True
+            if rms > 0.02 and not speech_detected:
+                speech_detected = True
             if self.vad_adaptive and not speech_detected:
                 self.noise_floor = (1 - self.alpha) * self.noise_floor + self.alpha * rms
                 self.threshold = max(0.15, self.noise_floor * 4)
@@ -425,6 +427,7 @@ async def reset_to_standby(device_ws: WebSocket, state: dict):
     state["has_speech"] = False
     
     await send_mcp_cmd(device_ws, state["sid"], "self.screen.set_brightness", {"brightness": 25})
+    state["vad"].reset()
     
     state["last_ai_had_question"] = False
     state["last_activity"] = time.time()
@@ -580,8 +583,8 @@ async def process_audio_and_send(frames: list, state: dict, device_ws: WebSocket
             "self.screen.set_brightness", {"brightness": 100}), state)
         create_tracked_task(trigger_emotion("thinking", device_ws, state["sid"]), state)
         sess = state["http_session"]
-        uid_task = asyncio.create_task(fetch_speaker_id(audio, sess))
-        stt_task = asyncio.create_task(fetch_transcription(audio, sess))
+        uid_task = create_tracked_task(fetch_speaker_id(audio, sess), state)
+        stt_task = create_tracked_task(fetch_transcription(audio, sess), state)
         uid, txt = await asyncio.gather(uid_task, stt_task)
 
         if is_valid_text(txt):
@@ -804,7 +807,6 @@ async def voice_ws(device_ws: WebSocket):
         "available_tools": [],
         "tts_cooldown_until": 0.0,
         "vad": VadEngine(),
-        "lock": asyncio.Lock(),
         "tasks": set(),
         "last_receive": time.time(),
     }
@@ -905,7 +907,7 @@ async def voice_ws(device_ws: WebSocket):
     try:
         while True:
             try:
-                m = await asyncio.wait_for(device_ws.receive(), timeout=120)
+                m = await asyncio.wait_for(device_ws.receive(), timeout=600)
                 state["last_receive"] = time.time()
             except asyncio.TimeoutError:
                 try:
@@ -918,7 +920,7 @@ async def voice_ws(device_ws: WebSocket):
                             continue
                 except Exception:
                     pass
-                logger.warning(f"🔌 [WS] No data from device for 120s, closing session {session_id}")
+                logger.warning(f"🔌 [WS] No data from device for 600s, closing session {session_id}")
                 break
             
             # --- TEXT EVENTS ---

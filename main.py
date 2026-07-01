@@ -389,8 +389,8 @@ async def activity_monitor_task(device_ws: WebSocket, state: dict):
             # Dim screen when idle (device powered on but no interaction)
             elif state["status"] == "IDLE" and time_idle > 10:
                 if not dim_sent:
-                    logger.info(f"💤 [Idle] {int(time_idle)}s idle — dim screen")
-                    await send_mcp_cmd(device_ws, state["sid"], "self.screen.set_brightness", {"brightness": 0})
+                    logger.info(f"💤 [Idle] {int(time_idle)}s idle — dim screen to 25%")
+                    await send_mcp_cmd(device_ws, state["sid"], "self.screen.set_brightness", {"brightness": 25})
                     dim_sent = True
             elif state["status"] not in ("IDLE", "LISTENING"):
                 dim_sent = False  # Reset when activity resumes

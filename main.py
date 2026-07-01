@@ -815,53 +815,72 @@ async def voice_ws(device_ws: WebSocket):
     nano_listener_task = None
     
     async def listen_to_nanobot():
+        nonlocal nano_ws, nano_listener_task
         handler = NanobotResponseHandler(device_ws, state)
-        async for msg in nano_ws:
-            if msg.type == aiohttp.WSMsgType.TEXT:
-                if state.get("watchdog"):
-                    state["watchdog"].cancel()
-                    state["watchdog"] = asyncio.get_event_loop().call_later(WATCHDOG_TIMEOUT, lambda: asyncio.create_task(watchdog_timeout(device_ws, state)))
-                
-                try:
-                    d = json.loads(msg.data)
-                    if d.get("event") == "ready":
-                        nano_chat_id = d.get("chat_id")
-                        state["nanobot_chat_id"] = make_chat_id(state["mac"])
-                        mac_key = state["mac"].lower()
-                        set_cached_chat_id(mac_key, state["nanobot_chat_id"])
-                        logger.info(f"💾 [Nanobot] Cached deterministic chat_id for {mac_key}: {state['nanobot_chat_id']} (Nanobot assigned: {nano_chat_id})")
-                        if state["available_tools"]:
-                            logger.info(f"📤 [Nanobot] Feeding AI tool list: {len(state['available_tools'])} tools")
-                            await nano_ws.send_json({
-                                "type": "tools_update",
-                                "chat_id": state["nanobot_chat_id"],
-                                "tools": state["available_tools"]
-                            })
-                    elif d.get("event") == "error":
-                        logger.error(f"❌ Nanobot Error: {d.get('detail')}")
+        while state["sid"] in session_states:
+            try:
+                async for msg in nano_ws:
+                    if msg.type == aiohttp.WSMsgType.TEXT:
                         if state.get("watchdog"):
                             state["watchdog"].cancel()
-                            state["watchdog"] = None
-                        state["status"] = "SPEAKING"
-                        await generate_and_stream_tts("Простите, я задумалась. Повторите пожалуйста.", device_ws, state["sid"], state)
-                        state["vad"].reset()
-                        await reset_to_standby(device_ws, state)
-                    elif d.get("event") == "device_tool_call":
-                        asyncio.create_task(handle_device_tool_call(nano_ws, device_ws, state, d))
-                    elif "text" in d and d.get("type") not in ["stt", "listen"] and d.get("event") != "reasoning_delta":
-                        text_content = d["text"]
-                        if "Error from provider" in text_content or text_content.startswith("Error:"):
-                            logger.error(f"❌ Nanobot Error in text: {text_content}")
-                            if state.get("watchdog"):
-                                state["watchdog"].cancel()
-                                state["watchdog"] = None
-                            state["status"] = "SPEAKING"
-                            await generate_and_stream_tts("Простите, я задумалась. Повторите пожалуйста.", device_ws, state["sid"], state)
-                            state["vad"].reset()
-                            await reset_to_standby(device_ws, state)
-                        else:
-                            await handler.handle_chunk(text_content)
-                except Exception: pass
+                            state["watchdog"] = asyncio.get_event_loop().call_later(WATCHDOG_TIMEOUT, lambda: asyncio.create_task(watchdog_timeout(device_ws, state)))
+                        
+                        try:
+                            d = json.loads(msg.data)
+                            if d.get("event") == "ready":
+                                nano_chat_id = d.get("chat_id")
+                                state["nanobot_chat_id"] = make_chat_id(state["mac"])
+                                mac_key = state["mac"].lower()
+                                set_cached_chat_id(mac_key, state["nanobot_chat_id"])
+                                logger.info(f"💾 [Nanobot] Cached deterministic chat_id for {mac_key}: {state['nanobot_chat_id']} (Nanobot assigned: {nano_chat_id})")
+                                if state["available_tools"]:
+                                    logger.info(f"📤 [Nanobot] Feeding AI tool list: {len(state['available_tools'])} tools")
+                                    await nano_ws.send_json({
+                                        "type": "tools_update",
+                                        "chat_id": state["nanobot_chat_id"],
+                                        "tools": state["available_tools"]
+                                    })
+                            elif d.get("event") == "error":
+                                logger.error(f"❌ Nanobot Error: {d.get('detail')}")
+                                if state.get("watchdog"):
+                                    state["watchdog"].cancel()
+                                    state["watchdog"] = None
+                                state["status"] = "SPEAKING"
+                                await generate_and_stream_tts("Простите, я задумалась. Повторите пожалуйста.", device_ws, state["sid"], state)
+                                state["vad"].reset()
+                                await reset_to_standby(device_ws, state)
+                            elif d.get("event") == "device_tool_call":
+                                asyncio.create_task(handle_device_tool_call(nano_ws, device_ws, state, d))
+                            elif "text" in d and d.get("type") not in ["stt", "listen"] and d.get("event") != "reasoning_delta":
+                                text_content = d["text"]
+                                if "Error from provider" in text_content or text_content.startswith("Error:"):
+                                    logger.error(f"❌ Nanobot Error in text: {text_content}")
+                                    if state.get("watchdog"):
+                                        state["watchdog"].cancel()
+                                        state["watchdog"] = None
+                                    state["status"] = "SPEAKING"
+                                    await generate_and_stream_tts("Простите, я задумалась. Повторите пожалуйста.", device_ws, state["sid"], state)
+                                    state["vad"].reset()
+                                    await reset_to_standby(device_ws, state)
+                                else:
+                                    await handler.handle_chunk(text_content)
+                        except Exception: pass
+            except Exception as e:
+                logger.warning(f"🔁 [Nanobot] Connection lost ({e}), reconnecting in 5s...")
+            if state["sid"] not in session_states:
+                break
+            await asyncio.sleep(5)
+            try:
+                mac_key = state["mac"].lower()
+                det_chat_id = make_chat_id(mac_key)
+                auth_url = f"{NANOBOT_WS_URL}?token=token&chat_id={det_chat_id}"
+                nano_ws = await nano_session.ws_connect(auth_url)
+                state["nano_ws"] = nano_ws
+                handler = NanobotResponseHandler(device_ws, state)
+                logger.info(f"✅ [Nanobot] Reconnected successfully")
+            except Exception as e:
+                logger.error(f"❌ [Nanobot] Reconnect failed: {e}")
+                state["nano_ws"] = None
 
     try:
         while True:

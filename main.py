@@ -440,7 +440,7 @@ async def watchdog_timeout(device_ws: WebSocket, state: dict):
     logger.warning("⏱ [Watchdog] Upstream AI timed out.")
     state["status"] = "SPEAKING"
     try:
-        await generate_and_stream_tts("Простите, я задумалась. Повторите пожалуйста.", device_ws, state["sid"], state)
+        await generate_and_stream_tts("Прости, я затупила. Повтори пожалуйста.", device_ws, state["sid"], state)
     except Exception as e:
         logger.error(f"❌ [Watchdog] TTS failed: {e}")
     
@@ -448,6 +448,7 @@ async def watchdog_timeout(device_ws: WebSocket, state: dict):
     state.update({"status": "LISTENING", "frames": [], "silence": 0, "has_speech": False})
     state["last_activity"] = time.time() # Reset timer
     state["vad"].reset()
+    await send_mcp_cmd(device_ws, state["sid"], "self.screen.set_brightness", {"brightness": 100})
 
 # ==========================================
 # ASYNC PIPELINE (STT & SPEAKER ID)
@@ -578,9 +579,7 @@ async def process_audio_and_send(frames: list, state: dict, device_ws: WebSocket
         
         audio = pack_ogg(frames)
         logger.info(f"🎙 [Pipeline] Processing {len(audio)} bytes (rms={avg_rms:.4f}, speech_ratio={speech_ratio:.2f})...")
-        # Light up screen before sending to Nanobot — in case listen:start hasn't arrived yet
-        create_tracked_task(send_mcp_cmd(device_ws, state["sid"],
-            "self.screen.set_brightness", {"brightness": 100}), state)
+        # Screen already lit by listen:start handler; no need to set brightness here
         create_tracked_task(trigger_emotion("thinking", device_ws, state["sid"]), state)
         sess = state["http_session"]
         uid_task = create_tracked_task(fetch_speaker_id(audio, sess), state)
@@ -772,14 +771,21 @@ class NanobotResponseHandler:
             
             if has_question:
                 self.state.update({"status": "LISTENING", "frames": [], "silence": 0, "has_speech": False})
+                logger.info(f"💡 [Brightness] Dialogue mode — screen 100%")
+                await send_mcp_cmd(self.device_ws, self.state["sid"], "self.screen.set_brightness", {"brightness": 100})
             else:
-                self.state.update({"status": "IDLE", "frames": [], "silence": 0, "has_speech": False})
+                self.state.update({"status": "LISTENING", "frames": [], "silence": 0, "has_speech": False})
+                logger.info(f"💡 [Brightness] Statement — listening for 3s then idle")
+                await send_mcp_cmd(self.device_ws, self.state["sid"], "self.screen.set_brightness", {"brightness": 25})
+                asyncio.get_event_loop().call_later(3.0, lambda: create_tracked_task(self._delayed_idle(), self.state))
             self.state["last_activity"] = time.time()
             self.state["vad"].reset()
             self.full_response_text = ""
-            
-            # activity_monitor_task handles dimming — no need for redundant _dim() here
         self.is_flushing = False
+
+    async def _delayed_idle(self):
+        if self.state.get("status") == "LISTENING":
+            await reset_to_standby(self.device_ws, self.state)
 
 # ==========================================
 # WEB UI
@@ -883,7 +889,7 @@ async def voice_ws(device_ws: WebSocket):
                                 state["watchdog"].cancel()
                                 state["watchdog"] = None
                             state["status"] = "SPEAKING"
-                            await generate_and_stream_tts("Простите, я задумалась. Повторите пожалуйста.", device_ws, state["sid"], state)
+                            await generate_and_stream_tts("Прости, я затупила. Повтори пожалуйста.", device_ws, state["sid"], state)
                             state["vad"].reset()
                             await reset_to_standby(device_ws, state)
                         elif d.get("event") == "device_tool_call":
@@ -896,7 +902,7 @@ async def voice_ws(device_ws: WebSocket):
                                     state["watchdog"].cancel()
                                     state["watchdog"] = None
                                 state["status"] = "SPEAKING"
-                                await generate_and_stream_tts("Простите, я задумалась. Повторите пожалуйста.", device_ws, state["sid"], state)
+                                await generate_and_stream_tts("Прости, я затупила. Повтори пожалуйста.", device_ws, state["sid"], state)
                                 state["vad"].reset()
                                 await reset_to_standby(device_ws, state)
                             else:
@@ -973,6 +979,10 @@ async def voice_ws(device_ws: WebSocket):
                         nano_listener_task = create_tracked_task(listen_to_nanobot(), state)
                 
                 elif d.get("type") == "listen" and d.get("state") == "start":
+                    # Skip false wake word immediately after TTS (audio tail)
+                    if time.time() < state.get("tts_cooldown_until", 0):
+                        logger.info(f"👂 [Wake] Ignoring listen:start during TTS cooldown (false wake)")
+                        continue
                     logger.info(f"👂 [Wake] listen:start — wake word detected, entering LISTENING")
                     state["status"] = "LISTENING"
                     state["frames"] = []
@@ -980,6 +990,7 @@ async def voice_ws(device_ws: WebSocket):
                     state["has_speech"] = False
                     state["last_activity"] = time.time()
                     state["vad"].reset()
+                    state["post_wake_cooldown_until"] = time.time() + 0.3
                     try:
                         await device_ws.send_json({"session_id": state["sid"],
                             "type": "mcp", "payload": {
@@ -1004,6 +1015,9 @@ async def voice_ws(device_ws: WebSocket):
                 if state["status"] in ["PROCESSING", "SPEAKING"]: continue
                 # Skip audio during TTS cooldown to prevent self-triggering
                 if time.time() < state.get("tts_cooldown_until", 0):
+                    continue
+                # Skip audio during post-wake cooldown (pip noise after beep)
+                if time.time() < state.get("post_wake_cooldown_until", 0):
                     continue
                 state["status"] = "LISTENING"
                 

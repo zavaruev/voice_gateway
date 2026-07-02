@@ -38,7 +38,7 @@ ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin")
 
 DB_FILE = "/app/config/devices.json"
 VAD_SILENCE_FRAMES = int(os.getenv("VAD_SILENCE_FRAMES", 8))  
-WATCHDOG_TIMEOUT = 30.0  
+WATCHDOG_TIMEOUT = 15  
 STANDBY_TIMEOUT_QUESTION = int(os.getenv("STANDBY_TIMEOUT_QUESTION", 30))
 STANDBY_TIMEOUT_STATEMENT = int(os.getenv("STANDBY_TIMEOUT_STATEMENT", 10))
 CHAT_ID_TTL = int(os.getenv("CHAT_ID_TTL", 604800))  # 7-day sliding window — Nanobot context lives a week
@@ -380,8 +380,8 @@ async def activity_monitor_task(device_ws: WebSocket, state: dict):
     """Monitors idle: dims screen but does NOT close the connection.
        Persistent mode — WS/context lives while ESP32 is on."""
     await send_mcp_cmd(device_ws, state["sid"], "self.audio_speaker.set_volume", {"volume": 100})
-    await send_mcp_cmd(device_ws, state["sid"], "self.screen.set_brightness", {"brightness": 100})
-    dim_sent = False
+    await send_mcp_cmd(device_ws, state["sid"], "self.screen.set_brightness", {"brightness": 25})
+    dim_sent = True
     
     try:
         while state["sid"] in session_states:
@@ -438,6 +438,7 @@ async def reset_to_standby(device_ws: WebSocket, state: dict):
 
 async def watchdog_timeout(device_ws: WebSocket, state: dict):
     logger.warning("⏱ [Watchdog] Upstream AI timed out.")
+    state["watchdog_fired"] = True
     state["status"] = "SPEAKING"
     try:
         await generate_and_stream_tts("Прости, я затупила. Повтори пожалуйста.", device_ws, state["sid"], state)
@@ -616,6 +617,14 @@ async def process_audio_and_send(frames: list, state: dict, device_ws: WebSocket
                 payload = {"type": "message", "chat_id": chat_id, "content": txt, "user_id": uid, "user_name": speaker_name, "voice_reply": True}
                 await nano_ws.send_json(payload)
 
+                # Send tts:start early to prevent device auto-timeout during Nanobot wait
+                try:
+                    await device_ws.send_json({"type": "tts", "state": "start", "session_id": state["sid"]})
+                except Exception:
+                    return
+                state["status"] = "SPEAKING"
+                state["tts_started"] = True
+
                 if state.get("watchdog"): state["watchdog"].cancel()
                 state["watchdog"] = asyncio.get_event_loop().call_later(WATCHDOG_TIMEOUT, lambda: create_tracked_task(watchdog_timeout(device_ws, state), state))
             else:
@@ -636,8 +645,10 @@ async def process_audio_and_send(frames: list, state: dict, device_ws: WebSocket
 async def generate_and_stream_tts(text: str, device_ws: WebSocket, session_id: str, state: dict = None):
     logger.info(f"🔊 [TTS] Synthesizing: '{text}'")
     try:
-        try: await device_ws.send_json({"type": "tts", "state": "start", "session_id": session_id})
-        except Exception: return
+        if not state or not state.get("tts_started"):
+            try: await device_ws.send_json({"type": "tts", "state": "start", "session_id": session_id})
+            except Exception: return
+            if state: state["tts_started"] = True
         
         sess = state["http_session"]
         payload = {"model": TTS_MODEL, "input": text, "voice": TTS_VOICE, "response_format": "mp3"}
@@ -679,6 +690,7 @@ async def generate_and_stream_tts(text: str, device_ws: WebSocket, session_id: s
     except Exception as e:  
         if "Cannot call" not in str(e): logger.error(f"❌ [TTS] Error: {e}")
     finally:
+        if state: state["tts_started"] = False
         try:
             await device_ws.send_json({"type": "tts", "state": "stop", "session_id": session_id})
         except Exception:
@@ -815,6 +827,8 @@ async def voice_ws(device_ws: WebSocket):
         "vad": VadEngine(),
         "tasks": set(),
         "last_receive": time.time(),
+        "tts_started": False,
+        "watchdog_fired": False,
     }
     session_states[session_id] = state
     logger.info(f"🔌 [WS] Device connected. Session: {session_id}")
@@ -906,6 +920,9 @@ async def voice_ws(device_ws: WebSocket):
                                 state["vad"].reset()
                                 await reset_to_standby(device_ws, state)
                             else:
+                                if state.get("watchdog_fired"):
+                                    logger.info(f"⏱️ [Watchdog] Ignoring late Nanobot response")
+                                    continue
                                 await handler.handle_chunk(text_content)
             except Exception as e:
                 logger.warning(f"🔁 [Nanobot] Connection lost ({e}), reconnecting in 5s...")
@@ -991,6 +1008,8 @@ async def voice_ws(device_ws: WebSocket):
                     state["last_activity"] = time.time()
                     state["vad"].reset()
                     state["post_wake_cooldown_until"] = time.time() + 0.3
+                    state["watchdog_fired"] = False
+                    state["tts_started"] = False
                     try:
                         await device_ws.send_json({"session_id": state["sid"],
                             "type": "mcp", "payload": {

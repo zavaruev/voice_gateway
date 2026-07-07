@@ -1,5 +1,4 @@
 import asyncio
-import pytest
 import os
 import json
 import time
@@ -236,29 +235,52 @@ def test_vad_engine(mock_inference_session):
     assert not mock_session_instance.run.called
     assert is_speech == False
 
-def test_load_firmware_meta():
-    # Clear cache before testing
-    main._firmware_meta_cache = None
+def test_load_db_cache_hit():
+    original_cache = main._DB_CACHE
+    try:
+        dummy_cache = {"device1": "config"}
+        main._DB_CACHE = dummy_cache
 
-    valid_data = {"version": "1.0", "filename": "firmware.bin", "timestamp": 12345}
+        result = main.load_db()
 
-    # 1. Happy Path: File exists and contains valid JSON
-    with patch("main.open", mock_open(read_data=json.dumps(valid_data))):
-        result = load_firmware_meta()
-        assert result == valid_data
-        assert main._firmware_meta_cache == valid_data
+        assert result == dummy_cache
+        assert result is dummy_cache
+    finally:
+        main._DB_CACHE = original_cache
 
-    # 2. Cache Hit: Data is already cached, no file read
-    main._firmware_meta_cache = {"cached": "data"}
-    with patch("main.open") as mock_file:
-        result = load_firmware_meta()
-        assert result == {"cached": "data"}
-        mock_file.assert_not_called()
+@patch("os.path.exists", return_value=True)
+def test_load_db_from_file(mock_exists):
+    original_cache = main._DB_CACHE
+    try:
+        main._DB_CACHE = None
+        db_data = {"test_device": {"config": "val"}}
+        with patch("builtins.open", mock_open(read_data=json.dumps(db_data))):
+            result = main.load_db()
+            assert result == db_data
+            assert main._DB_CACHE == db_data
+    finally:
+        main._DB_CACHE = original_cache
 
-    # 3. Error Handling: File reading fails
-    main._firmware_meta_cache = None
-    with patch("main.open", side_effect=Exception("File read error")):
-        result = load_firmware_meta()
-        expected_fallback = {"version": "", "filename": "", "timestamp": 0}
-        assert result == expected_fallback
-        assert main._firmware_meta_cache == expected_fallback
+@patch("os.path.exists", return_value=False)
+def test_load_db_file_not_found(mock_exists):
+    original_cache = main._DB_CACHE
+    try:
+        main._DB_CACHE = None
+        result = main.load_db()
+        assert result == {}
+        assert main._DB_CACHE == {}
+    finally:
+        main._DB_CACHE = original_cache
+
+@patch("os.path.exists", return_value=True)
+def test_load_db_file_error(mock_exists):
+    original_cache = main._DB_CACHE
+    try:
+        main._DB_CACHE = None
+        # Simulate a JSON decoding error (e.g., malformed JSON)
+        with patch("builtins.open", mock_open(read_data="{invalid_json}")):
+            result = main.load_db()
+            assert result == {}
+            assert main._DB_CACHE == {}
+    finally:
+        main._DB_CACHE = original_cache

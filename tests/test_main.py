@@ -28,6 +28,8 @@ from main import (
     SINGLE_WORD_HALLUCINATIONS,
     load_firmware_meta,
 )
+from fastapi import HTTPException
+from fastapi.security import HTTPBasicCredentials
 import main
 
 def test_is_valid_text():

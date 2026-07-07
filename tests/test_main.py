@@ -27,7 +27,10 @@ from main import (
     VadEngine,
     WHISPER_HALLUCINATIONS,
     SINGLE_WORD_HALLUCINATIONS,
+    verify_auth,
 )
+from fastapi import HTTPException
+from fastapi.security import HTTPBasicCredentials
 import main
 
 def test_is_valid_text():
@@ -234,3 +237,27 @@ def test_vad_engine(mock_inference_session):
     is_speech, rms = asyncio.run(vad.is_speech(small_audio_data))
     assert not mock_session_instance.run.called
     assert is_speech == False
+
+def test_verify_auth_missing_credentials():
+    credentials = HTTPBasicCredentials(username="admin", password="password")
+
+    # Test when both ADMIN_USERNAME and ADMIN_PASSWORD are not set
+    with patch("main.ADMIN_USERNAME", ""), patch("main.ADMIN_PASSWORD", ""):
+        with pytest.raises(HTTPException) as exc_info:
+            verify_auth(credentials)
+        assert exc_info.value.status_code == 401
+        assert exc_info.value.detail == "Authentication not configured"
+
+    # Test when ADMIN_USERNAME is set but ADMIN_PASSWORD is not set
+    with patch("main.ADMIN_USERNAME", "admin"), patch("main.ADMIN_PASSWORD", ""):
+        with pytest.raises(HTTPException) as exc_info:
+            verify_auth(credentials)
+        assert exc_info.value.status_code == 401
+        assert exc_info.value.detail == "Authentication not configured"
+
+    # Test when ADMIN_USERNAME is not set but ADMIN_PASSWORD is set
+    with patch("main.ADMIN_USERNAME", ""), patch("main.ADMIN_PASSWORD", "password"):
+        with pytest.raises(HTTPException) as exc_info:
+            verify_auth(credentials)
+        assert exc_info.value.status_code == 401
+        assert exc_info.value.detail == "Authentication not configured"

@@ -808,6 +808,200 @@ async def web_index(req: Request, username: str = Depends(verify_auth)):
 # ==========================================
 # MAIN FASTAPI WEBSOCKET GATEWAY
 # ==========================================
+async def listen_to_nanobot_task(device_ws: WebSocket, state: dict, nano_session: aiohttp.ClientSession):
+    nano_ws = state.get("nano_ws")
+    handler = NanobotResponseHandler(device_ws, state)
+    while state["sid"] in session_states:
+        if nano_ws is None or nano_ws.closed:
+            try:
+                mac_key = state["mac"].lower()
+                det_chat_id = make_chat_id(mac_key)
+                auth_url = f"{NANOBOT_WS_URL}?token=token&chat_id={det_chat_id}"
+                nano_ws = await nano_session.ws_connect(auth_url)
+                state["nano_ws"] = nano_ws
+                handler = NanobotResponseHandler(device_ws, state)
+                logger.info(f"✅ [Nanobot] Connected (chat_id={det_chat_id})")
+            except Exception as e:
+                logger.warning(f"🔁 [Nanobot] Connection failed ({e}), retrying in 10s...")
+                if state["sid"] not in session_states:
+                    break
+                await asyncio.sleep(10)
+                continue
+        try:
+            async for msg in nano_ws:
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    if state.get("watchdog"):
+                        state["watchdog"].cancel()
+                        state["watchdog"] = asyncio.get_event_loop().call_later(WATCHDOG_TIMEOUT, lambda: create_tracked_task(watchdog_timeout(device_ws, state), state))
+
+                    try:
+                        d = json.loads(msg.data)
+                    except json.JSONDecodeError as e:
+                        logger.error(f"❌ [Nanobot] Invalid JSON from Nanobot: {e}, data={msg.data[:200]}")
+                        continue
+
+                    if d.get("event") == "ready":
+                        nano_chat_id = d.get("chat_id")
+                        state["nanobot_chat_id"] = make_chat_id(state["mac"])
+                        mac_key = state["mac"].lower()
+                        set_cached_chat_id(mac_key, state["nanobot_chat_id"])
+                        logger.info(f"💾 [Nanobot] Cached deterministic chat_id for {mac_key}: {state['nanobot_chat_id']} (Nanobot assigned: {nano_chat_id})")
+                        if state["available_tools"]:
+                            logger.info(f"📤 [Nanobot] Feeding AI tool list: {len(state['available_tools'])} tools")
+                            await nano_ws.send_json({
+                                "type": "tools_update",
+                                "chat_id": state["nanobot_chat_id"],
+                                "tools": state["available_tools"]
+                            })
+                    elif d.get("event") == "error":
+                        logger.error(f"❌ Nanobot Error: {d.get('detail')}")
+                        if state.get("watchdog"):
+                            state["watchdog"].cancel()
+                            state["watchdog"] = None
+                        state["status"] = "SPEAKING"
+                        await generate_and_stream_tts("Прости, я затупила. Повтори пожалуйста.", device_ws, state["sid"], state)
+                        state["vad"].reset()
+                        await reset_to_standby(device_ws, state)
+                    elif d.get("event") == "device_tool_call":
+                        create_tracked_task(handle_device_tool_call(nano_ws, device_ws, state, d), state)
+                    elif "text" in d and d.get("type") not in ["stt", "listen"] and d.get("event") != "reasoning_delta":
+                        text_content = d["text"]
+                        if "Error from provider" in text_content or text_content.startswith("Error:"):
+                            logger.error(f"❌ Nanobot Error in text: {text_content}")
+                            if state.get("watchdog"):
+                                state["watchdog"].cancel()
+                                state["watchdog"] = None
+                            state["status"] = "SPEAKING"
+                            await generate_and_stream_tts("Прости, я затупила. Повтори пожалуйста.", device_ws, state["sid"], state)
+                            state["vad"].reset()
+                            await reset_to_standby(device_ws, state)
+                        else:
+                            if state.get("watchdog_fired"):
+                                logger.info(f"⏱️ [Watchdog] Ignoring late Nanobot response")
+                                continue
+                            await handler.handle_chunk(text_content)
+        except Exception as e:
+            logger.warning(f"🔁 [Nanobot] Connection lost ({e}), reconnecting in 5s...")
+
+
+async def handle_ws_text_message(d: dict, state: dict, device_ws: WebSocket, session_id: str, dec: opuslib.Decoder, nano_session: aiohttp.ClientSession, nano_listener_task):
+    if d.get("type") == "mcp":
+        _clean_stale_futures()
+        payload = d.get("payload", {})
+        req_id = payload.get("id")
+
+        if req_id == 999 and "result" in payload and "tools" in payload["result"]:
+            state["available_tools"] = payload["result"]["tools"]
+            tool_names = [t.get("name") for t in state["available_tools"]]
+            logger.info(f"🛠 [MCP] ESP32 returned tools: {tool_names}")
+            nano_ws = state.get("nano_ws")
+            if nano_ws and not nano_ws.closed and state.get("nanobot_chat_id"):
+                logger.info(f"📤 [MCP] Forwarding {len(state['available_tools'])} tools to Nanobot")
+                try:
+                    await nano_ws.send_json({
+                        "type": "tools_update",
+                        "chat_id": state["nanobot_chat_id"],
+                        "tools": state["available_tools"]
+                    })
+                except Exception as e:
+                    logger.error(f"❌ [MCP] Failed to forward tools to Nanobot: {e}")
+            return nano_listener_task, True
+
+        if req_id in mcp_futures and not mcp_futures[req_id].done():
+            mcp_futures[req_id].set_result(payload)
+        elif req_id is None and payload.get("method"):
+            nano_ws = state.get("nano_ws")
+            if nano_ws and not nano_ws.closed and state.get("nanobot_chat_id"):
+                try:
+                    await nano_ws.send_json({
+                        "type": "device_event",
+                        "chat_id": state["nanobot_chat_id"],
+                        "event": payload["method"],
+                        "data": payload.get("params", {}),
+                    })
+                except Exception as e:
+                    logger.error(f"❌ [MCP] Failed to forward device_event to Nanobot: {e}")
+
+    elif d.get("type") == "hello":
+        state["version"] = d.get("version", 1)
+        logger.info(f"🤝 [Device] Hello received (v{state['version']})")
+        if nano_listener_task is None:
+            nano_listener_task = create_tracked_task(listen_to_nanobot_task(device_ws, state, nano_session), state)
+
+    elif d.get("type") == "listen" and d.get("state") == "start":
+        # Skip false wake word immediately after TTS (audio tail)
+        if time.time() < state.get("tts_cooldown_until", 0):
+            logger.info(f"👂 [Wake] Ignoring listen:start during TTS cooldown (false wake)")
+            return nano_listener_task, False
+        logger.info(f"👂 [Wake] listen:start — wake word detected, entering LISTENING")
+        state["status"] = "LISTENING"
+        state["frames"] = []
+        state["silence"] = 0
+        state["has_speech"] = False
+        state["last_activity"] = time.time()
+        state["vad"].reset()
+        state["post_wake_cooldown_until"] = time.time() + 0.3
+        state["watchdog_fired"] = False
+        state["tts_started"] = False
+        try:
+            await device_ws.send_json({"session_id": state["sid"],
+                "type": "mcp", "payload": {
+                    "jsonrpc": "2.0", "method": "tools/call",
+                    "params": {"name": "self.screen.set_brightness", "arguments": {"brightness": 100}},
+                    "id": int(time.time() * 1000)
+                }})
+        except Exception as e:
+            logger.warning(f"⚠️ [Wake] Failed to light screen: {e}")
+
+    elif d.get("type") == "listen" and d.get("state") == "stop":
+        if state["status"] == "LISTENING" and len(state["frames"]) >= 10:
+            state["status"] = "PROCESSING"
+            frames_to_process, state["frames"] = list(state["frames"]), []
+            create_tracked_task(process_audio_and_send(frames_to_process, state, device_ws, dec), state)
+
+    return nano_listener_task, False
+
+
+async def handle_ws_audio_message(byte_data: bytes, state: dict, device_ws: WebSocket, dec: opuslib.Decoder):
+    if state["status"] == "IDLE": return
+    if state["status"] in ["PROCESSING", "SPEAKING"]: return
+    if time.time() < state.get("tts_cooldown_until", 0):
+        return
+    if time.time() < state.get("post_wake_cooldown_until", 0):
+        return
+    state["status"] = "LISTENING"
+
+    f = byte_data if state["version"] == 1 else (byte_data[16:] if state["version"] == 2 else byte_data[4:])
+    state["frames"].append(f)
+
+    try:
+        pcm = dec.decode(f, 960)
+        audio_int16 = np.frombuffer(pcm, dtype=np.int16)
+        audio_float32 = audio_int16.astype(np.float32) / 32768.0
+        frame_rms = float(np.sqrt(np.mean(np.square(audio_float32))))
+        if frame_rms < 0.003:
+            is_sp = False
+        else:
+            is_sp, _ = await state["vad"].is_speech(pcm, frame_rms)
+        if is_sp:
+            state["silence"] = 0
+            state["has_speech"] = True
+            state["last_activity"] = time.time()
+        else: state["silence"] += 1
+    except Exception: state["silence"] += 1
+
+    if state["silence"] > VAD_SILENCE_FRAMES:
+        if state["has_speech"]:
+            logger.info(f"🔪 Server VAD triggered.")
+            state["status"] = "PROCESSING"
+            frames_to_process, state["frames"] = list(state["frames"]), []
+            state["silence"] = 0
+            state["has_speech"] = False
+            create_tracked_task(process_audio_and_send(frames_to_process, state, device_ws, dec), state)
+        else:
+            state["frames"], state["silence"] = [], 0
+            state["vad"].reset()
+
 @app.websocket("/")
 async def voice_ws(device_ws: WebSocket):
     await device_ws.accept()
@@ -851,80 +1045,6 @@ async def voice_ws(device_ws: WebSocket):
     nano_ws = None
     nano_listener_task = None
     
-    async def listen_to_nanobot():
-        nonlocal nano_ws, nano_listener_task
-        handler = NanobotResponseHandler(device_ws, state)
-        while state["sid"] in session_states:
-            if nano_ws is None or nano_ws.closed:
-                try:
-                    mac_key = state["mac"].lower()
-                    det_chat_id = make_chat_id(mac_key)
-                    auth_url = f"{NANOBOT_WS_URL}?token=token&chat_id={det_chat_id}"
-                    nano_ws = await nano_session.ws_connect(auth_url)
-                    state["nano_ws"] = nano_ws
-                    handler = NanobotResponseHandler(device_ws, state)
-                    logger.info(f"✅ [Nanobot] Connected (chat_id={det_chat_id})")
-                except Exception as e:
-                    logger.warning(f"🔁 [Nanobot] Connection failed ({e}), retrying in 10s...")
-                    if state["sid"] not in session_states:
-                        break
-                    await asyncio.sleep(10)
-                    continue
-            try:
-                async for msg in nano_ws:
-                    if msg.type == aiohttp.WSMsgType.TEXT:
-                        if state.get("watchdog"):
-                            state["watchdog"].cancel()
-                            state["watchdog"] = asyncio.get_event_loop().call_later(WATCHDOG_TIMEOUT, lambda: create_tracked_task(watchdog_timeout(device_ws, state), state))
-                        
-                        try:
-                            d = json.loads(msg.data)
-                        except json.JSONDecodeError as e:
-                            logger.error(f"❌ [Nanobot] Invalid JSON from Nanobot: {e}, data={msg.data[:200]}")
-                            continue
-                        
-                        if d.get("event") == "ready":
-                            nano_chat_id = d.get("chat_id")
-                            state["nanobot_chat_id"] = make_chat_id(state["mac"])
-                            mac_key = state["mac"].lower()
-                            set_cached_chat_id(mac_key, state["nanobot_chat_id"])
-                            logger.info(f"💾 [Nanobot] Cached deterministic chat_id for {mac_key}: {state['nanobot_chat_id']} (Nanobot assigned: {nano_chat_id})")
-                            if state["available_tools"]:
-                                logger.info(f"📤 [Nanobot] Feeding AI tool list: {len(state['available_tools'])} tools")
-                                await nano_ws.send_json({
-                                    "type": "tools_update",
-                                    "chat_id": state["nanobot_chat_id"],
-                                    "tools": state["available_tools"]
-                                })
-                        elif d.get("event") == "error":
-                            logger.error(f"❌ Nanobot Error: {d.get('detail')}")
-                            if state.get("watchdog"):
-                                state["watchdog"].cancel()
-                                state["watchdog"] = None
-                            state["status"] = "SPEAKING"
-                            await generate_and_stream_tts("Прости, я затупила. Повтори пожалуйста.", device_ws, state["sid"], state)
-                            state["vad"].reset()
-                            await reset_to_standby(device_ws, state)
-                        elif d.get("event") == "device_tool_call":
-                            create_tracked_task(handle_device_tool_call(nano_ws, device_ws, state, d), state)
-                        elif "text" in d and d.get("type") not in ["stt", "listen"] and d.get("event") != "reasoning_delta":
-                            text_content = d["text"]
-                            if "Error from provider" in text_content or text_content.startswith("Error:"):
-                                logger.error(f"❌ Nanobot Error in text: {text_content}")
-                                if state.get("watchdog"):
-                                    state["watchdog"].cancel()
-                                    state["watchdog"] = None
-                                state["status"] = "SPEAKING"
-                                await generate_and_stream_tts("Прости, я затупила. Повтори пожалуйста.", device_ws, state["sid"], state)
-                                state["vad"].reset()
-                                await reset_to_standby(device_ws, state)
-                            else:
-                                if state.get("watchdog_fired"):
-                                    logger.info(f"⏱️ [Watchdog] Ignoring late Nanobot response")
-                                    continue
-                                await handler.handle_chunk(text_content)
-            except Exception as e:
-                logger.warning(f"🔁 [Nanobot] Connection lost ({e}), reconnecting in 5s...")
 
     try:
         while True:
@@ -951,125 +1071,14 @@ async def voice_ws(device_ws: WebSocket):
                 state["last_activity"] = time.time()
                 d = json.loads(text_data)
                 
-                if d.get("type") == "mcp":
-                    _clean_stale_futures()
-                    payload = d.get("payload", {})
-                    req_id = payload.get("id")
-                    
-                    if req_id == 999 and "result" in payload and "tools" in payload["result"]:
-                        state["available_tools"] = payload["result"]["tools"]
-                        tool_names = [t.get("name") for t in state["available_tools"]]
-                        logger.info(f"🛠 [MCP] ESP32 returned tools: {tool_names}")
-                        nano_ws = state.get("nano_ws")
-                        if nano_ws and not nano_ws.closed and state.get("nanobot_chat_id"):
-                            logger.info(f"📤 [MCP] Forwarding {len(state['available_tools'])} tools to Nanobot")
-                            try:
-                                await nano_ws.send_json({
-                                    "type": "tools_update",
-                                    "chat_id": state["nanobot_chat_id"],
-                                    "tools": state["available_tools"]
-                                })
-                            except Exception as e:
-                                logger.error(f"❌ [MCP] Failed to forward tools to Nanobot: {e}")
-                        continue
-                    
-                    if req_id in mcp_futures and not mcp_futures[req_id].done():
-                        mcp_futures[req_id].set_result(payload)
-                    elif req_id is None and payload.get("method"):
-                        nano_ws = state.get("nano_ws")
-                        if nano_ws and not nano_ws.closed and state.get("nanobot_chat_id"):
-                            try:
-                                await nano_ws.send_json({
-                                    "type": "device_event",
-                                    "chat_id": state["nanobot_chat_id"],
-                                    "event": payload["method"],
-                                    "data": payload.get("params", {}),
-                                })
-                            except Exception as e:
-                                logger.error(f"❌ [MCP] Failed to forward device_event to Nanobot: {e}")
-                
-                elif d.get("type") == "hello":
-                    state["version"] = d.get("version", 1)
-                    logger.info(f"🤝 [Device] Hello received (v{state['version']})")
-                    if nano_listener_task is None:
-                        nano_listener_task = create_tracked_task(listen_to_nanobot(), state)
-                
-                elif d.get("type") == "listen" and d.get("state") == "start":
-                    # Skip false wake word immediately after TTS (audio tail)
-                    if time.time() < state.get("tts_cooldown_until", 0):
-                        logger.info(f"👂 [Wake] Ignoring listen:start during TTS cooldown (false wake)")
-                        continue
-                    logger.info(f"👂 [Wake] listen:start — wake word detected, entering LISTENING")
-                    state["status"] = "LISTENING"
-                    state["frames"] = []
-                    state["silence"] = 0
-                    state["has_speech"] = False
-                    state["last_activity"] = time.time()
-                    state["vad"].reset()
-                    state["post_wake_cooldown_until"] = time.time() + 0.3
-                    state["watchdog_fired"] = False
-                    state["tts_started"] = False
-                    try:
-                        await device_ws.send_json({"session_id": state["sid"],
-                            "type": "mcp", "payload": {
-                                "jsonrpc": "2.0", "method": "tools/call",
-                                "params": {"name": "self.screen.set_brightness", "arguments": {"brightness": 100}},
-                                "id": int(time.time() * 1000)
-                            }})
-                    except Exception as e:
-                        logger.warning(f"⚠️ [Wake] Failed to light screen: {e}")
-                
-                elif d.get("type") == "listen" and d.get("state") == "stop":
-                    if state["status"] == "LISTENING" and len(state["frames"]) >= 10:
-                        state["status"] = "PROCESSING"
-                        frames_to_process, state["frames"] = list(state["frames"]), []
-                        create_tracked_task(process_audio_and_send(frames_to_process, state, device_ws, dec), state)
+                nano_listener_task, should_continue = await handle_ws_text_message(d, state, device_ws, session_id, dec, nano_session, nano_listener_task)
+                if should_continue:
+                    continue
 
             # --- AUDIO BYTES ---
             byte_data = m.get("bytes")
             if byte_data:
-                # In IDLE we don't listen — wait for listen:start from device (wake word)
-                if state["status"] == "IDLE": continue
-                if state["status"] in ["PROCESSING", "SPEAKING"]: continue
-                # Skip audio during TTS cooldown to prevent self-triggering
-                if time.time() < state.get("tts_cooldown_until", 0):
-                    continue
-                # Skip audio during post-wake cooldown (pip noise after beep)
-                if time.time() < state.get("post_wake_cooldown_until", 0):
-                    continue
-                state["status"] = "LISTENING"
-                
-                f = byte_data if state["version"] == 1 else (byte_data[16:] if state["version"] == 2 else byte_data[4:])
-                state["frames"].append(f)
-                
-                try:
-                    pcm = dec.decode(f, 960)
-                    # Pre-VAD RMS gate: skip VAD for near-silent frames
-                    audio_int16 = np.frombuffer(pcm, dtype=np.int16)
-                    audio_float32 = audio_int16.astype(np.float32) / 32768.0
-                    frame_rms = float(np.sqrt(np.mean(np.square(audio_float32))))
-                    if frame_rms < 0.003:
-                        is_sp = False
-                    else:
-                        is_sp, _ = await state["vad"].is_speech(pcm, frame_rms)
-                    if is_sp:  
-                        state["silence"] = 0
-                        state["has_speech"] = True
-                        state["last_activity"] = time.time()
-                    else: state["silence"] += 1
-                except Exception: state["silence"] += 1
-                
-                if state["silence"] > VAD_SILENCE_FRAMES:
-                    if state["has_speech"]:
-                        logger.info(f"🔪 Server VAD triggered.")
-                        state["status"] = "PROCESSING"
-                        frames_to_process, state["frames"] = list(state["frames"]), []
-                        state["silence"] = 0
-                        state["has_speech"] = False
-                        create_tracked_task(process_audio_and_send(frames_to_process, state, device_ws, dec), state)
-                    else:
-                        state["frames"], state["silence"] = [], 0
-                        state["vad"].reset()
+                await handle_ws_audio_message(byte_data, state, device_ws, dec)
 
     except Exception as e:
         logger.error(f"Error in device websocket loop: {e}")
@@ -1081,7 +1090,7 @@ async def voice_ws(device_ws: WebSocket):
         if session_id in active_sessions: del active_sessions[session_id]
         if session_id in session_states: del session_states[session_id]
         if nano_listener_task: nano_listener_task.cancel()
-        if nano_ws: await nano_ws.close()
+        if state.get("nano_ws"): await state["nano_ws"].close()
         await nano_session.close()
         await http_session.close()
 

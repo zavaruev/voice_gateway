@@ -26,6 +26,7 @@ from main import (
     VadEngine,
     WHISPER_HALLUCINATIONS,
     SINGLE_WORD_HALLUCINATIONS,
+    load_firmware_meta,
 )
 import main
 

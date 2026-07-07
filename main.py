@@ -24,6 +24,7 @@ from fastapi.templating import Jinja2Templates
 # CONFIGURATION & ENVIRONMENT VARIABLES
 # ==========================================
 NANOBOT_WS_URL = os.getenv("NANOBOT_WS_URL", "ws://nanobot:8765/").rstrip("/")
+NANOBOT_TOKEN = os.getenv("NANOBOT_TOKEN", "token")
 SPEAKER_ID_URL = os.getenv("SPEAKER_ID_URL", "http://192.168.22.102:8001/identify")
 
 WHISPER_URL = os.getenv("WHISPER_URL", "http://192.168.22.111:8000/v1/audio/transcriptions")
@@ -859,7 +860,7 @@ async def voice_ws(device_ws: WebSocket):
                 try:
                     mac_key = state["mac"].lower()
                     det_chat_id = make_chat_id(mac_key)
-                    auth_url = f"{NANOBOT_WS_URL}?token=token&chat_id={det_chat_id}"
+                    auth_url = f"{NANOBOT_WS_URL}?token={NANOBOT_TOKEN}&chat_id={det_chat_id}"
                     nano_ws = await nano_session.ws_connect(auth_url)
                     state["nano_ws"] = nano_ws
                     handler = NanobotResponseHandler(device_ws, state)

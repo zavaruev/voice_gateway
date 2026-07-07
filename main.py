@@ -330,6 +330,8 @@ _OGG_CRC_TABLE = _build_crc_table()
 
 
 def pack_ogg(frames: list, sample_rate=16000) -> bytes:
+    ser = int(time.time()) & 0xFFFFFFFF
+
     def ogg_crc(data: bytes) -> int:
         crc = 0
         for b in data:

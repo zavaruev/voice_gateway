@@ -14,18 +14,8 @@ import onnxruntime as ort
 import opuslib
 from pydub import AudioSegment
 from loguru import logger
-from fastapi import (
-    FastAPI,
-    Request,
-    Form,
-    WebSocket,
-    WebSocketDisconnect,
-    HTTPException,
-    UploadFile,
-    File,
-    Depends,
-)
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi import FastAPI, Request, Form, WebSocket, HTTPException, UploadFile, File, Depends
+from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -78,6 +68,8 @@ WHISPER_HALLUCINATIONS = [
     "продолжение следует",
     "синкинг",
 ]
+
+WHISPER_HALLUCINATIONS_PATTERN = re.compile("|".join(re.escape(bad) for bad in WHISPER_HALLUCINATIONS))
 
 SINGLE_WORD_HALLUCINATIONS = {"о", "а", "и", "кх-кх", "ха-ха", "жизнь", "пьютер", "как"}
 
@@ -666,9 +658,8 @@ def is_valid_text(txt: str) -> bool:
         if len(words[0]) <= 2:
             return False
 
-    for bad in WHISPER_HALLUCINATIONS:
-        if bad in clean:
-            return False
+    if WHISPER_HALLUCINATIONS_PATTERN.search(clean):
+        return False
     return True
 
 

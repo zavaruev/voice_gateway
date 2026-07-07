@@ -1,5 +1,4 @@
 import asyncio
-import pytest
 import os
 import json
 import time

@@ -234,3 +234,36 @@ def test_vad_engine(mock_inference_session):
     is_speech, rms = asyncio.run(vad.is_speech(small_audio_data))
     assert not mock_session_instance.run.called
     assert is_speech == False
+
+def test_device_online_status():
+    # Setup test state
+    original_session_states = main.session_states.copy()
+
+    try:
+        main.session_states.clear()
+
+        # Populate with test data
+        main.session_states["ws-123"] = {"mac": "AA:BB:CC:DD:EE:FF", "status": "online"}
+        main.session_states["ws-456"] = {"mac": "11:22:33:44:55:66", "status": "active"}
+        main.session_states["ws-789"] = {"status": "unknown"} # Missing MAC key
+        main.session_states["ws-999"] = {"mac": "", "status": "empty"}
+
+        # Exact match
+        assert main.device_online_status("AA:BB:CC:DD:EE:FF") == "online"
+
+        # Case insensitive match
+        assert main.device_online_status("aa:bb:cc:dd:ee:ff") == "online"
+
+        # Another match
+        assert main.device_online_status("11:22:33:44:55:66") == "active"
+
+        # Non-existent MAC
+        assert main.device_online_status("00:00:00:00:00:00") == "offline"
+
+        # Empty string
+        assert main.device_online_status("") == "unknown"
+
+    finally:
+        # Restore original state
+        main.session_states.clear()
+        main.session_states.update(original_session_states)

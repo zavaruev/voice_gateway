@@ -27,6 +27,7 @@ from main import (
     VadEngine,
     WHISPER_HALLUCINATIONS,
     SINGLE_WORD_HALLUCINATIONS,
+    load_firmware_meta,
 )
 import main
 
@@ -234,3 +235,30 @@ def test_vad_engine(mock_inference_session):
     is_speech, rms = asyncio.run(vad.is_speech(small_audio_data))
     assert not mock_session_instance.run.called
     assert is_speech == False
+
+def test_load_firmware_meta():
+    # Clear cache before testing
+    main._firmware_meta_cache = None
+
+    valid_data = {"version": "1.0", "filename": "firmware.bin", "timestamp": 12345}
+
+    # 1. Happy Path: File exists and contains valid JSON
+    with patch("main.open", mock_open(read_data=json.dumps(valid_data))):
+        result = load_firmware_meta()
+        assert result == valid_data
+        assert main._firmware_meta_cache == valid_data
+
+    # 2. Cache Hit: Data is already cached, no file read
+    main._firmware_meta_cache = {"cached": "data"}
+    with patch("main.open") as mock_file:
+        result = load_firmware_meta()
+        assert result == {"cached": "data"}
+        mock_file.assert_not_called()
+
+    # 3. Error Handling: File reading fails
+    main._firmware_meta_cache = None
+    with patch("main.open", side_effect=Exception("File read error")):
+        result = load_firmware_meta()
+        expected_fallback = {"version": "", "filename": "", "timestamp": 0}
+        assert result == expected_fallback
+        assert main._firmware_meta_cache == expected_fallback

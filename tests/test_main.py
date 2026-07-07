@@ -27,6 +27,7 @@ from main import (
     VadEngine,
     WHISPER_HALLUCINATIONS,
     SINGLE_WORD_HALLUCINATIONS,
+    normalize_mac,
 )
 import main
 
@@ -53,6 +54,26 @@ def test_is_valid_text():
 
     # Test repeated characters
     assert is_valid_text("ааааааааааааааааааа") == False
+
+def test_normalize_mac():
+    # Standard uppercase MAC
+    assert normalize_mac("AA:BB:CC:DD:EE:FF") == "AA:BB:CC:DD:EE:FF"
+
+    # Lowercase MAC
+    assert normalize_mac("aa:bb:cc:dd:ee:ff") == "AA:BB:CC:DD:EE:FF"
+
+    # MAC with leading/trailing whitespaces
+    assert normalize_mac("  aa:bb:cc:dd:ee:ff \n\t") == "AA:BB:CC:DD:EE:FF"
+
+    # Mixed case MAC
+    assert normalize_mac("aA:bB:Cc:DD:ee:Ff") == "AA:BB:CC:DD:EE:FF"
+
+    # Empty string
+    assert normalize_mac("") == ""
+
+    # Whitespace-only string
+    assert normalize_mac("   \n\t  ") == ""
+
 
 def test_make_chat_id():
     mac1 = "AA:BB:CC:DD:EE:FF"

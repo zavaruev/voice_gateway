@@ -1051,7 +1051,7 @@ class NanobotResponseHandler:
                         "has_speech": False,
                     }
                 )
-                self.state["tts_cooldown_until"] = 0
+                self.state["tts_cooldown_until"] = time.time() + 0.2
                 logger.info(f"💡 [Brightness] Dialogue mode — screen 100%")
                 await send_mcp_cmd(
                     self.device_ws,

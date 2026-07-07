@@ -24,6 +24,7 @@ from main import (
     CHAT_ID_TTL,
     clear_expired_chat_ids,
     VadEngine,
+    load_speaker_names,
     WHISPER_HALLUCINATIONS,
     SINGLE_WORD_HALLUCINATIONS,
     load_firmware_meta,
@@ -186,6 +187,17 @@ def test_chat_id_cache(mock_time):
         clear_expired_chat_ids()
         # Should be removed because time is 1000 + TTL + 100
         assert mac not in main.CHAT_ID_CACHE
+
+def test_load_speaker_names_success():
+    valid_data = {"speaker_1": "Alice", "speaker_2": "Bob"}
+    with patch("main.open", mock_open(read_data=json.dumps(valid_data))):
+        result = load_speaker_names()
+        assert result == valid_data
+
+def test_load_speaker_names_error():
+    with patch("main.open", side_effect=Exception("File read error")):
+        result = load_speaker_names()
+        assert result == {}
 
 def test_load_chat_id_cache():
     main.CHAT_ID_CACHE.clear()

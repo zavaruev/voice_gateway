@@ -260,23 +260,24 @@ def _build_crc_table():
 _OGG_CRC_TABLE = _build_crc_table()
 
 def pack_ogg(frames: list, sample_rate=16000) -> bytes:
+    ser = int(time.time()) & 0xFFFFFFFF
+
     def ogg_crc(data: bytes) -> int:
         crc = 0
         for b in data: crc = ((crc << 8) & 0xFFFFFFFF) ^ _OGG_CRC_TABLE[((crc >> 24) ^ b) & 0xFF]
         return crc
 
-    def page(idx: int, gran: int, ser: int, bos: bool, eos: bool, pkts: list) -> bytes:
+    def page(idx: int, gran: int, bos: bool, eos: bool, pkts: list) -> bytes:
         h = struct.pack('<4sBBqIIIB', b'OggS', 0, (2 if bos else 0)|(4 if eos else 0), gran, ser, idx, 0, len(pkts))
         p = h + bytearray([len(x) for x in pkts]) + b"".join(pkts)
         crc = ogg_crc(p)
         return p[:22] + struct.pack('<I', crc) + p[26:]
 
-    ser = int(time.time()) & 0xFFFFFFFF
-    res = page(0, 0, ser, True, False, [struct.pack('<8sBBHIHB', b'OpusHead', 1, 1, 312, sample_rate, 0, 0)])
-    res += page(1, 0, ser, False, False, [struct.pack('<8sI8sI', b'OpusTags', 8, b'VoiceGW ', 0)])
+    res = page(0, 0, True, False, [struct.pack('<8sBBHIHB', b'OpusHead', 1, 1, 312, sample_rate, 0, 0)])
+    res += page(1, 0, False, False, [struct.pack('<8sI8sI', b'OpusTags', 8, b'VoiceGW ', 0)])
     for i in range(0, len(frames), 50):
         c = frames[i:i+50]
-        res += page(2 + i//50, (i + len(c)) * int(48000 * 0.06), ser, False, (i + 50 >= len(frames)), c)
+        res += page(2 + i//50, (i + len(c)) * int(48000 * 0.06), False, (i + 50 >= len(frames)), c)
     return res
 
 # ==========================================

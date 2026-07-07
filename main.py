@@ -36,6 +36,8 @@ TTS_API_KEY = os.getenv("TTS_API_KEY", "")
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin")
 
+LOG_TRANSCRIPTIONS = os.getenv("LOG_TRANSCRIPTIONS", "false").lower() == "true"
+
 DB_FILE = "/app/config/devices.json"
 VAD_SILENCE_FRAMES = int(os.getenv("VAD_SILENCE_FRAMES", 8))  
 WATCHDOG_TIMEOUT = 15  
@@ -588,7 +590,10 @@ async def process_audio_and_send(frames: list, state: dict, device_ws: WebSocket
         uid, txt = await asyncio.gather(uid_task, stt_task)
 
         if is_valid_text(txt):
-            logger.info(f"🗣 [User: {uid}] Transcribed: '{txt}'")
+            if LOG_TRANSCRIPTIONS:
+                logger.info(f"🗣 [User: {uid}] Transcribed: '{txt}'")
+            else:
+                logger.info(f"🗣 [User: {uid}] Transcribed: [REDACTED] ({len(txt)} chars)")
             state["last_activity"] = time.time()
             state["last_text"] = txt  
 

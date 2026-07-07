@@ -1771,7 +1771,7 @@ async def firmware_upload(
             f.write(data)
 
     await asyncio.to_thread(write_sync, fpath, content)
-    meta = save_firmware_meta(version, fname)
+    meta = await save_firmware_meta(version, fname)
     return {"status": "ok", "meta": meta}
 
 

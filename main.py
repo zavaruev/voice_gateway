@@ -55,6 +55,8 @@ WHISPER_HALLUCINATIONS = [
     "синкинг"
 ]
 
+WHISPER_HALLUCINATIONS_PATTERN = re.compile("|".join(re.escape(bad) for bad in WHISPER_HALLUCINATIONS))
+
 SINGLE_WORD_HALLUCINATIONS = {"о", "а", "и", "кх-кх", "ха-ха", "жизнь", "пьютер", "как"}
 
 HOLD_PHRASES = {"подожди", "мomento", "секундочку", "подожди-ка", "один момент", "мomento"}
@@ -511,8 +513,8 @@ def is_valid_text(txt: str) -> bool:
         if len(words[0]) <= 2:
             return False
 
-    for bad in WHISPER_HALLUCINATIONS:
-        if bad in clean: return False
+    if WHISPER_HALLUCINATIONS_PATTERN.search(clean):
+        return False
     return True
 
 def calculate_rms(pcm_data: bytes) -> float:

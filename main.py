@@ -87,7 +87,7 @@ HOLD_PHRASES = {
 
 HAS_QUESTION_RE = re.compile(r"[?？]\s*$")
 HAS_QUESTION_WORDS_RE = re.compile(
-    r"\b(что|как|где|когда|почему|зачем|сколько|кто|какой|какая|какое|какие|чей|чья|чьё|чьи|куда|откуда|зачем|уточни|расскажи|напомни|объясни|не знаю|не понимаю|можешь)\b",
+    r"\b(что|как|где|когда|почему|зачем|сколько|кто|какой|какая|какое|какие|чей|чья|чьё|чьи|куда|откуда|уточни|расскажи|напомни|объясни|повтори|скажи|покажи|подожди|помоги|ответь|напиши|сделай|включи|выключи|открой|закрой|дай|можешь|не знаю|не понимаю)\b",
     re.IGNORECASE,
 )
 
@@ -1044,7 +1044,6 @@ class NanobotResponseHandler:
             has_question = (
                 HAS_QUESTION_RE.search(clean_for_check) is not None
                 or "повторите пожалуйста" in clean_for_check
-                or "пожалуйста" in clean_for_check
                 or HAS_QUESTION_WORDS_RE.search(clean_for_check) is not None
             )
             self.state["last_ai_had_question"] = has_question

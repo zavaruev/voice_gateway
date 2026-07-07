@@ -1193,8 +1193,14 @@ def device_online_status(mac: str) -> str:
 def device_list_with_status() -> list[dict]:
     db = load_db()
     result = []
+    mac_to_status = {}
+    for st in session_states.values():
+        if "mac" in st:
+            mac_to_status[st["mac"].lower()] = st["status"]
+
     for mac, cfg in db.items():
-        entry = {"mac": mac, **cfg, "status": device_online_status(mac)}
+        status = mac_to_status.get(mac.lower(), "offline")
+        entry = {"mac": mac, **cfg, "status": status}
         result.append(entry)
     result.sort(key=lambda x: (x["status"] == "offline", x["mac"]))
     return result

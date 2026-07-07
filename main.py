@@ -783,21 +783,20 @@ class NanobotResponseHandler:
             
             if has_question:
                 self.state.update({"status": "LISTENING", "frames": [], "silence": 0, "has_speech": False})
+                self.state["tts_cooldown_until"] = 0
                 logger.info(f"💡 [Brightness] Dialogue mode — screen 100%")
                 await send_mcp_cmd(self.device_ws, self.state["sid"], "self.screen.set_brightness", {"brightness": 100})
             else:
-                self.state.update({"status": "LISTENING", "frames": [], "silence": 0, "has_speech": False})
-                logger.info(f"💡 [Brightness] Statement — listening for 3s then idle")
-                await send_mcp_cmd(self.device_ws, self.state["sid"], "self.screen.set_brightness", {"brightness": 25})
-                asyncio.get_event_loop().call_later(3.0, lambda: create_tracked_task(self._delayed_idle(), self.state))
+                self.state.update({"status": "IDLE", "frames": [], "silence": 0, "has_speech": False})
+                if self.state.get("watchdog"):
+                    self.state["watchdog"].cancel()
+                    self.state["watchdog"] = None
+                logger.info(f"💤 [Info] Statement — idle, screen stays lit for 10s then dims")
             self.state["last_activity"] = time.time()
             self.state["vad"].reset()
             self.full_response_text = ""
         self.is_flushing = False
 
-    async def _delayed_idle(self):
-        if self.state.get("status") == "LISTENING":
-            await reset_to_standby(self.device_ws, self.state)
 
 # ==========================================
 # WEB UI

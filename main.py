@@ -1580,7 +1580,7 @@ async def firmware_info(username: str = Depends(verify_auth)):
 
 
 @app.api_route("/ota", methods=["GET", "POST"])
-async def ota_handler(req: Request):
+async def ota_handler(req: Request, username: str = Depends(verify_auth)):
     db = load_db()
     meta = load_firmware_meta()
     has_update = bool(meta.get("version"))

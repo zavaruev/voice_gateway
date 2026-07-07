@@ -86,6 +86,10 @@ HOLD_PHRASES = {
 }
 
 HAS_QUESTION_RE = re.compile(r"[?？]\s*$")
+HAS_QUESTION_WORDS_RE = re.compile(
+    r"\b(что|как|где|когда|почему|зачем|сколько|кто|какой|какая|какое|какие|чей|чья|чьё|чьи|куда|откуда|зачем|уточни|расскажи|напомни|объясни|не знаю|не понимаю|можешь)\b",
+    re.IGNORECASE,
+)
 
 SPEAKER_NAME_FILE = "/app/config/speaker_names.json"
 
@@ -1037,8 +1041,11 @@ class NanobotResponseHandler:
             )
 
             clean_for_check = self.full_response_text.strip().lower()
-            has_question = (HAS_QUESTION_RE.search(clean_for_check) is not None) or (
-                "повторите пожалуйста" in clean_for_check
+            has_question = (
+                HAS_QUESTION_RE.search(clean_for_check) is not None
+                or "повторите пожалуйста" in clean_for_check
+                or "пожалуйста" in clean_for_check
+                or HAS_QUESTION_WORDS_RE.search(clean_for_check) is not None
             )
             self.state["last_ai_had_question"] = has_question
 

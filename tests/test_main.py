@@ -234,3 +234,88 @@ def test_vad_engine(mock_inference_session):
     is_speech, rms = asyncio.run(vad.is_speech(small_audio_data))
     assert not mock_session_instance.run.called
     assert is_speech == False
+
+from fastapi import HTTPException
+from fastapi.security import HTTPBasicCredentials
+
+def test_verify_auth_success():
+    # Store original values
+    orig_user = main.ADMIN_USERNAME
+    orig_pass = main.ADMIN_PASSWORD
+
+    try:
+        main.ADMIN_USERNAME = "testadmin"
+        main.ADMIN_PASSWORD = "testpassword"
+
+        creds = HTTPBasicCredentials(username="testadmin", password="testpassword")
+        result = main.verify_auth(creds)
+        assert result == "testadmin"
+    finally:
+        # Restore
+        main.ADMIN_USERNAME = orig_user
+        main.ADMIN_PASSWORD = orig_pass
+
+def test_verify_auth_invalid_credentials():
+    orig_user = main.ADMIN_USERNAME
+    orig_pass = main.ADMIN_PASSWORD
+
+    try:
+        main.ADMIN_USERNAME = "testadmin"
+        main.ADMIN_PASSWORD = "testpassword"
+
+        # Wrong password
+        creds_wrong_pass = HTTPBasicCredentials(username="testadmin", password="wrongpassword")
+        with pytest.raises(HTTPException) as exc_info:
+            main.verify_auth(creds_wrong_pass)
+        assert exc_info.value.status_code == 401
+        assert exc_info.value.detail == "Incorrect email or password"
+        assert exc_info.value.headers == {"WWW-Authenticate": "Basic"}
+
+        # Wrong username
+        creds_wrong_user = HTTPBasicCredentials(username="wrongadmin", password="testpassword")
+        with pytest.raises(HTTPException) as exc_info:
+            main.verify_auth(creds_wrong_user)
+        assert exc_info.value.status_code == 401
+        assert exc_info.value.detail == "Incorrect email or password"
+        assert exc_info.value.headers == {"WWW-Authenticate": "Basic"}
+    finally:
+        main.ADMIN_USERNAME = orig_user
+        main.ADMIN_PASSWORD = orig_pass
+
+def test_verify_auth_missing_config():
+    orig_user = main.ADMIN_USERNAME
+    orig_pass = main.ADMIN_PASSWORD
+
+    try:
+        # Missing username
+        main.ADMIN_USERNAME = ""
+        main.ADMIN_PASSWORD = "testpassword"
+        creds = HTTPBasicCredentials(username="testadmin", password="testpassword")
+        with pytest.raises(HTTPException) as exc_info:
+            main.verify_auth(creds)
+        assert exc_info.value.status_code == 401
+        assert exc_info.value.detail == "Authentication not configured"
+        assert exc_info.value.headers == {"WWW-Authenticate": "Basic"}
+
+        # Missing password
+        main.ADMIN_USERNAME = "testadmin"
+        main.ADMIN_PASSWORD = ""
+        creds = HTTPBasicCredentials(username="testadmin", password="testpassword")
+        with pytest.raises(HTTPException) as exc_info:
+            main.verify_auth(creds)
+        assert exc_info.value.status_code == 401
+        assert exc_info.value.detail == "Authentication not configured"
+        assert exc_info.value.headers == {"WWW-Authenticate": "Basic"}
+
+        # Both missing
+        main.ADMIN_USERNAME = ""
+        main.ADMIN_PASSWORD = ""
+        creds = HTTPBasicCredentials(username="testadmin", password="testpassword")
+        with pytest.raises(HTTPException) as exc_info:
+            main.verify_auth(creds)
+        assert exc_info.value.status_code == 401
+        assert exc_info.value.detail == "Authentication not configured"
+        assert exc_info.value.headers == {"WWW-Authenticate": "Basic"}
+    finally:
+        main.ADMIN_USERNAME = orig_user
+        main.ADMIN_PASSWORD = orig_pass

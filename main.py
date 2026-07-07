@@ -1125,11 +1125,20 @@ def load_firmware_meta() -> dict:
         _firmware_meta_cache = {"version": "", "filename": "", "timestamp": 0}
         return _firmware_meta_cache
 
-def save_firmware_meta(version: str, filename: str):
+_firmware_meta_lock = asyncio.Lock()
+
+async def save_firmware_meta(version: str, filename: str):
     global _firmware_meta_cache
     meta = {"version": version, "filename": filename, "timestamp": int(time.time() * 1000)}
-    with open(FIRMWARE_META, "w") as f: json.dump(meta, f)
-    _firmware_meta_cache = meta
+
+    def write_meta_sync(m):
+        with open(FIRMWARE_META, "w") as f:
+            json.dump(m, f)
+
+    async with _firmware_meta_lock:
+        await asyncio.to_thread(write_meta_sync, meta)
+        _firmware_meta_cache = meta
+
     return meta
 
 @app.post("/api/firmware/upload")
@@ -1144,7 +1153,7 @@ async def firmware_upload(file: UploadFile = File(...), version: str = Form(""),
         with open(path, "wb") as f:
             f.write(data)
     await asyncio.to_thread(write_sync, fpath, content)
-    meta = save_firmware_meta(version, fname)
+    meta = await save_firmware_meta(version, fname)
     return {"status": "ok", "meta": meta}
 
 @app.get("/api/firmware")

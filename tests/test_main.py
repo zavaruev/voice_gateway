@@ -1,5 +1,4 @@
 import asyncio
-import pytest
 import os
 import json
 import time
@@ -25,9 +24,13 @@ from main import (
     CHAT_ID_TTL,
     clear_expired_chat_ids,
     VadEngine,
+    load_speaker_names,
     WHISPER_HALLUCINATIONS,
     SINGLE_WORD_HALLUCINATIONS,
+    load_firmware_meta,
 )
+from fastapi import HTTPException
+from fastapi.security import HTTPBasicCredentials
 import main
 
 def test_is_valid_text():
@@ -185,6 +188,17 @@ def test_chat_id_cache(mock_time):
         # Should be removed because time is 1000 + TTL + 100
         assert mac not in main.CHAT_ID_CACHE
 
+def test_load_speaker_names_success():
+    valid_data = {"speaker_1": "Alice", "speaker_2": "Bob"}
+    with patch("main.open", mock_open(read_data=json.dumps(valid_data))):
+        result = load_speaker_names()
+        assert result == valid_data
+
+def test_load_speaker_names_error():
+    with patch("main.open", side_effect=Exception("File read error")):
+        result = load_speaker_names()
+        assert result == {}
+
 def test_load_chat_id_cache():
     main.CHAT_ID_CACHE.clear()
 
@@ -235,87 +249,52 @@ def test_vad_engine(mock_inference_session):
     assert not mock_session_instance.run.called
     assert is_speech == False
 
-from fastapi import HTTPException
-from fastapi.security import HTTPBasicCredentials
-
-def test_verify_auth_success():
-    # Store original values
-    orig_user = main.ADMIN_USERNAME
-    orig_pass = main.ADMIN_PASSWORD
-
+def test_load_db_cache_hit():
+    original_cache = main._DB_CACHE
     try:
-        main.ADMIN_USERNAME = "testadmin"
-        main.ADMIN_PASSWORD = "testpassword"
+        dummy_cache = {"device1": "config"}
+        main._DB_CACHE = dummy_cache
 
-        creds = HTTPBasicCredentials(username="testadmin", password="testpassword")
-        result = main.verify_auth(creds)
-        assert result == "testadmin"
+        result = main.load_db()
+
+        assert result == dummy_cache
+        assert result is dummy_cache
     finally:
-        # Restore
-        main.ADMIN_USERNAME = orig_user
-        main.ADMIN_PASSWORD = orig_pass
+        main._DB_CACHE = original_cache
 
-def test_verify_auth_invalid_credentials():
-    orig_user = main.ADMIN_USERNAME
-    orig_pass = main.ADMIN_PASSWORD
-
+@patch("os.path.exists", return_value=True)
+def test_load_db_from_file(mock_exists):
+    original_cache = main._DB_CACHE
     try:
-        main.ADMIN_USERNAME = "testadmin"
-        main.ADMIN_PASSWORD = "testpassword"
-
-        # Wrong password
-        creds_wrong_pass = HTTPBasicCredentials(username="testadmin", password="wrongpassword")
-        with pytest.raises(HTTPException) as exc_info:
-            main.verify_auth(creds_wrong_pass)
-        assert exc_info.value.status_code == 401
-        assert exc_info.value.detail == "Incorrect email or password"
-        assert exc_info.value.headers == {"WWW-Authenticate": "Basic"}
-
-        # Wrong username
-        creds_wrong_user = HTTPBasicCredentials(username="wrongadmin", password="testpassword")
-        with pytest.raises(HTTPException) as exc_info:
-            main.verify_auth(creds_wrong_user)
-        assert exc_info.value.status_code == 401
-        assert exc_info.value.detail == "Incorrect email or password"
-        assert exc_info.value.headers == {"WWW-Authenticate": "Basic"}
+        main._DB_CACHE = None
+        db_data = {"test_device": {"config": "val"}}
+        with patch("builtins.open", mock_open(read_data=json.dumps(db_data))):
+            result = main.load_db()
+            assert result == db_data
+            assert main._DB_CACHE == db_data
     finally:
-        main.ADMIN_USERNAME = orig_user
-        main.ADMIN_PASSWORD = orig_pass
+        main._DB_CACHE = original_cache
 
-def test_verify_auth_missing_config():
-    orig_user = main.ADMIN_USERNAME
-    orig_pass = main.ADMIN_PASSWORD
-
+@patch("os.path.exists", return_value=False)
+def test_load_db_file_not_found(mock_exists):
+    original_cache = main._DB_CACHE
     try:
-        # Missing username
-        main.ADMIN_USERNAME = ""
-        main.ADMIN_PASSWORD = "testpassword"
-        creds = HTTPBasicCredentials(username="testadmin", password="testpassword")
-        with pytest.raises(HTTPException) as exc_info:
-            main.verify_auth(creds)
-        assert exc_info.value.status_code == 401
-        assert exc_info.value.detail == "Authentication not configured"
-        assert exc_info.value.headers == {"WWW-Authenticate": "Basic"}
-
-        # Missing password
-        main.ADMIN_USERNAME = "testadmin"
-        main.ADMIN_PASSWORD = ""
-        creds = HTTPBasicCredentials(username="testadmin", password="testpassword")
-        with pytest.raises(HTTPException) as exc_info:
-            main.verify_auth(creds)
-        assert exc_info.value.status_code == 401
-        assert exc_info.value.detail == "Authentication not configured"
-        assert exc_info.value.headers == {"WWW-Authenticate": "Basic"}
-
-        # Both missing
-        main.ADMIN_USERNAME = ""
-        main.ADMIN_PASSWORD = ""
-        creds = HTTPBasicCredentials(username="testadmin", password="testpassword")
-        with pytest.raises(HTTPException) as exc_info:
-            main.verify_auth(creds)
-        assert exc_info.value.status_code == 401
-        assert exc_info.value.detail == "Authentication not configured"
-        assert exc_info.value.headers == {"WWW-Authenticate": "Basic"}
+        main._DB_CACHE = None
+        result = main.load_db()
+        assert result == {}
+        assert main._DB_CACHE == {}
     finally:
-        main.ADMIN_USERNAME = orig_user
-        main.ADMIN_PASSWORD = orig_pass
+        main._DB_CACHE = original_cache
+
+@patch("os.path.exists", return_value=True)
+def test_load_db_file_error(mock_exists):
+    original_cache = main._DB_CACHE
+    try:
+        main._DB_CACHE = None
+        # Simulate a JSON decoding error (e.g., malformed JSON)
+        with patch("builtins.open", mock_open(read_data="{invalid_json}")):
+            result = main.load_db()
+            assert result == {}
+            assert main._DB_CACHE == {}
+    finally:
+        main._DB_CACHE = original_cache

@@ -27,3 +27,4 @@ Thumbs.db
 *.log
 .idea/
 .vscode/
+config/firmware/*

@@ -1072,8 +1072,12 @@ class NanobotResponseHandler:
                 if self.state.get("watchdog"):
                     self.state["watchdog"].cancel()
                     self.state["watchdog"] = None
-                logger.info(
-                    f"💤 [Info] Statement — idle, screen stays lit for 10s then dims"
+                logger.info(f"💤 [Brightness] Statement — dim screen to 25%")
+                await send_mcp_cmd(
+                    self.device_ws,
+                    self.state["sid"],
+                    "self.screen.set_brightness",
+                    {"brightness": 25},
                 )
             self.state["last_activity"] = time.time()
             self.state["vad"].reset()

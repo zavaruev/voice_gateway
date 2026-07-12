@@ -1067,18 +1067,12 @@ class NanobotResponseHandler:
                 )
             else:
                 self.state.update(
-                    {"status": "IDLE", "frames": [], "silence": 0, "has_speech": False}
+                    {"status": "LISTENING", "frames": [], "silence": 0, "has_speech": False}
                 )
+                self.state["tts_cooldown_until"] = time.time() + 0.2
                 if self.state.get("watchdog"):
                     self.state["watchdog"].cancel()
                     self.state["watchdog"] = None
-                logger.info(f"💤 [Brightness] Statement — dim screen to 25%")
-                await send_mcp_cmd(
-                    self.device_ws,
-                    self.state["sid"],
-                    "self.screen.set_brightness",
-                    {"brightness": 25},
-                )
             self.state["last_activity"] = time.time()
             self.state["vad"].reset()
             self.full_response_text = ""
@@ -1609,6 +1603,10 @@ async def voice_ws(device_ws: WebSocket):
                                 frames_to_process, state, device_ws, dec
                             ),
                             state,
+                        )
+                    elif state["status"] == "LISTENING":
+                        logger.info(
+                            f"💤 [Listen] Device 3s silence, {len(state['frames'])} frames — let activity monitor handle timeout"
                         )
 
             # --- AUDIO BYTES ---

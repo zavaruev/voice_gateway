@@ -398,9 +398,8 @@ active_sessions = {}
 session_states = {}
 mcp_futures = {}
 
-# Only one device can be in active conversation (LISTENING/PROCESSING/SPEAKING)
-# Prevents chaos when multiple devices detect the same wake word
-_listening_session_id: str | None = None
+# Speaker ID lock: prevents duplicate processing when two devices hear the same speaker
+_active_speaker_lock: dict | None = None  # {"uid": str, "sid": str, "expires": float}
 
 
 def _clean_stale_futures():
@@ -567,9 +566,9 @@ async def reset_to_standby(device_ws: WebSocket, state: dict):
     # Note: no has_speech guard here — last_activity timer already protects
     # against interrupting active speech. has_speech can be stuck True by
     # VAD false positives on background noise, permanently blocking standby.
-    global _listening_session_id
-    if _listening_session_id == state.get("sid"):
-        _listening_session_id = None
+    global _active_speaker_lock
+    if _active_speaker_lock and _active_speaker_lock["sid"] == state.get("sid"):
+        _active_speaker_lock = None
     logger.info("💤 Standby — dim screen, stop listening")
     state["status"] = "IDLE"
     state["frames"] = []
@@ -723,13 +722,6 @@ async def decode_opus_frames(
 async def process_audio_and_send(
     frames: list, state: dict, device_ws: WebSocket, decoder: opuslib.Decoder = None
 ):
-    global _listening_session_id
-    if _listening_session_id is not None and _listening_session_id != state.get("sid"):
-        logger.info(
-            f"🔇 [Multi] Session {state.get('sid')} — session {_listening_session_id} already processing, dropping"
-        )
-        state["status"] = "LISTENING"
-        return
     if len(frames) < 15:
         logger.info(
             f"🔇 [Pipeline] Too few frames ({len(frames)}), likely noise — skipping STT"
@@ -776,6 +768,19 @@ async def process_audio_and_send(
         uid_task = create_tracked_task(fetch_speaker_id(audio, sess), state)
         stt_task = create_tracked_task(fetch_transcription(audio, sess), state)
         uid, txt = await asyncio.gather(uid_task, stt_task)
+
+        # Multi-device speaker lock: block duplicate processing for same speaker
+        global _active_speaker_lock
+        now = time.time()
+        if _active_speaker_lock and _active_speaker_lock["expires"] < now:
+            _active_speaker_lock = None  # Expired, release
+        if _active_speaker_lock and _active_speaker_lock["uid"] == uid and _active_speaker_lock["sid"] != state["sid"]:
+            logger.info(
+                f"🔇 [Multi] Speaker '{uid}' already active on {_active_speaker_lock['sid']}, skipping duplicate"
+            )
+            state["status"] = "LISTENING"
+            return
+        _active_speaker_lock = {"uid": uid, "sid": state["sid"], "expires": now + 30}
 
         if is_valid_text(txt):
             if LOG_TRANSCRIPTIONS:
@@ -1303,7 +1308,7 @@ async def handle_ws_audio_message(byte_data: bytes, state: dict, device_ws: WebS
 
 @app.websocket("/")
 async def voice_ws(device_ws: WebSocket):
-    global _listening_session_id
+    global _active_speaker_lock
     await device_ws.accept()
 
     fwd_headers = {k.lower(): v for k, v in device_ws.headers.items()}
@@ -1595,16 +1600,6 @@ async def voice_ws(device_ws: WebSocket):
                             f"👂 [Wake] Ignoring listen:start during TTS cooldown (false wake)"
                         )
                         continue
-                    # Multi-device guard: only one device can be active at a time
-                    if (
-                        _listening_session_id is not None
-                        and _listening_session_id != state["sid"]
-                    ):
-                        logger.info(
-                            f"👂 [Multi] Device {state['mac']} ignored — session {_listening_session_id} already active"
-                        )
-                        continue
-                    _listening_session_id = state["sid"]
                     logger.info(
                         f"👂 [Wake] listen:start — wake word detected, entering LISTENING"
                     )
@@ -1713,8 +1708,8 @@ async def voice_ws(device_ws: WebSocket):
     except Exception as e:
         logger.error(f"Error in device websocket loop: {e}")
     finally:
-        if _listening_session_id == session_id:
-            _listening_session_id = None
+        if _active_speaker_lock and _active_speaker_lock["sid"] == session_id:
+            _active_speaker_lock = None
         monitor_task.cancel()
         for t in list(state.get("tasks", set())):
             t.cancel()

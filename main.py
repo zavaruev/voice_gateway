@@ -184,14 +184,16 @@ load_chat_id_cache()  # Load on startup
 
 app = FastAPI()
 
-security = HTTPBasic()
+security = HTTPBasic(auto_error=False)
 
 
-def verify_auth(credentials: HTTPBasicCredentials = Depends(security)):
+def verify_auth(credentials: HTTPBasicCredentials | None = Depends(security)):
     if not ADMIN_USERNAME or not ADMIN_PASSWORD:
+        return "admin"
+    if credentials is None:
         raise HTTPException(
             status_code=401,
-            detail="Authentication not configured",
+            detail="Authentication required",
             headers={"WWW-Authenticate": "Basic"},
         )
     is_user_ok = secrets.compare_digest(credentials.username, ADMIN_USERNAME)
@@ -396,6 +398,10 @@ active_sessions = {}
 session_states = {}
 mcp_futures = {}
 
+# Only one device can be in active conversation (LISTENING/PROCESSING/SPEAKING)
+# Prevents chaos when multiple devices detect the same wake word
+_listening_session_id: str | None = None
+
 
 def _clean_stale_futures():
     now = time.time()
@@ -561,6 +567,9 @@ async def reset_to_standby(device_ws: WebSocket, state: dict):
     # Note: no has_speech guard here — last_activity timer already protects
     # against interrupting active speech. has_speech can be stuck True by
     # VAD false positives on background noise, permanently blocking standby.
+    global _listening_session_id
+    if _listening_session_id == state.get("sid"):
+        _listening_session_id = None
     logger.info("💤 Standby — dim screen, stop listening")
     state["status"] = "IDLE"
     state["frames"] = []
@@ -597,6 +606,7 @@ async def watchdog_timeout(device_ws: WebSocket, state: dict):
     )
     state["last_activity"] = time.time()  # Reset timer
     state["vad"].reset()
+    state["tts_cooldown_until"] = time.time() + 0.3  # Short cooldown after apology
     await send_mcp_cmd(
         device_ws, state["sid"], "self.screen.set_brightness", {"brightness": 100}
     )
@@ -713,7 +723,14 @@ async def decode_opus_frames(
 async def process_audio_and_send(
     frames: list, state: dict, device_ws: WebSocket, decoder: opuslib.Decoder = None
 ):
-    if len(frames) < 25:
+    global _listening_session_id
+    if _listening_session_id is not None and _listening_session_id != state.get("sid"):
+        logger.info(
+            f"🔇 [Multi] Session {state.get('sid')} — session {_listening_session_id} already processing, dropping"
+        )
+        state["status"] = "LISTENING"
+        return
+    if len(frames) < 15:
         logger.info(
             f"🔇 [Pipeline] Too few frames ({len(frames)}), likely noise — skipping STT"
         )
@@ -1286,6 +1303,7 @@ async def handle_ws_audio_message(byte_data: bytes, state: dict, device_ws: WebS
 
 @app.websocket("/")
 async def voice_ws(device_ws: WebSocket):
+    global _listening_session_id
     await device_ws.accept()
 
     fwd_headers = {k.lower(): v for k, v in device_ws.headers.items()}
@@ -1416,8 +1434,15 @@ async def voice_ws(device_ws: WebSocket):
                                 state["sid"],
                                 state,
                             )
+                            state.update({
+                                "status": "LISTENING", "frames": [], "silence": 0,
+                                "has_speech": False, "last_activity": time.time(),
+                            })
                             state["vad"].reset()
-                            await reset_to_standby(device_ws, state)
+                            await send_mcp_cmd(
+                                device_ws, state["sid"],
+                                "self.screen.set_brightness", {"brightness": 100},
+                            )
                         elif d.get("event") == "device_tool_call":
                             create_tracked_task(
                                 handle_device_tool_call(nano_ws, device_ws, state, d),
@@ -1446,8 +1471,15 @@ async def voice_ws(device_ws: WebSocket):
                                     state["sid"],
                                     state,
                                 )
+                                state.update({
+                                    "status": "LISTENING", "frames": [], "silence": 0,
+                                    "has_speech": False, "last_activity": time.time(),
+                                })
                                 state["vad"].reset()
-                                await reset_to_standby(device_ws, state)
+                                await send_mcp_cmd(
+                                    device_ws, state["sid"],
+                                    "self.screen.set_brightness", {"brightness": 100},
+                                )
                             else:
                                 if state.get("watchdog_fired"):
                                     logger.info(
@@ -1563,6 +1595,16 @@ async def voice_ws(device_ws: WebSocket):
                             f"👂 [Wake] Ignoring listen:start during TTS cooldown (false wake)"
                         )
                         continue
+                    # Multi-device guard: only one device can be active at a time
+                    if (
+                        _listening_session_id is not None
+                        and _listening_session_id != state["sid"]
+                    ):
+                        logger.info(
+                            f"👂 [Multi] Device {state['mac']} ignored — session {_listening_session_id} already active"
+                        )
+                        continue
+                    _listening_session_id = state["sid"]
                     logger.info(
                         f"👂 [Wake] listen:start — wake word detected, entering LISTENING"
                     )
@@ -1671,6 +1713,8 @@ async def voice_ws(device_ws: WebSocket):
     except Exception as e:
         logger.error(f"Error in device websocket loop: {e}")
     finally:
+        if _listening_session_id == session_id:
+            _listening_session_id = None
         monitor_task.cancel()
         for t in list(state.get("tasks", set())):
             t.cancel()
@@ -1732,6 +1776,46 @@ async def execute_mcp(
     return {"error": "Offline"}
 
 
+@app.post("/api/tts")
+async def api_tts(
+    req: Request, username: str = Depends(verify_auth)
+):
+    data = await req.json()
+    session_id = data.get("session_id", "latest")
+    text = data.get("text", "").strip()
+    if not text:
+        return {"error": "Missing text"}
+    if session_id == "latest" and active_sessions:
+        session_id = list(active_sessions.keys())[-1]
+    if session_id not in active_sessions:
+        return {"error": "Offline"}
+    state = session_states.get(session_id)
+    state = session_states.get(session_id)
+    if not state:
+        return {"error": "No state"}
+    device_ws = active_sessions[session_id]
+
+    if state.get("status") == "PLAYING":
+        return {"error": "Busy"}
+
+    state["last_activity"] = time.time()
+
+    try:
+        await send_mcp_cmd(
+            device_ws, session_id,
+            "self.screen.set_brightness", {"brightness": 100},
+        )
+    except Exception:
+        pass
+
+    async def _tts_with_cleanup():
+        await generate_and_stream_tts(text, device_ws, session_id, state)
+        state["last_activity"] = time.time()
+
+    create_tracked_task(_tts_with_cleanup(), state)
+    return {"status": "sent"}
+
+
 _firmware_meta_cache = None
 
 
@@ -1741,7 +1825,12 @@ def load_firmware_meta() -> dict:
         return _firmware_meta_cache
     try:
         with open(FIRMWARE_META) as f:
-            _firmware_meta_cache = json.load(f)
+            meta = json.load(f)
+            fpath = os.path.join(FIRMWARE_DIR, meta.get("filename", ""))
+            if not os.path.isfile(fpath):
+                _firmware_meta_cache = {"version": "", "filename": "", "timestamp": 0}
+            else:
+                _firmware_meta_cache = meta
             return _firmware_meta_cache
     except Exception:
         _firmware_meta_cache = {"version": "", "filename": "", "timestamp": 0}
@@ -1779,8 +1868,8 @@ async def firmware_upload(
             f.write(data)
 
     await asyncio.to_thread(write_sync, fpath, content)
-    meta = await save_firmware_meta(version, fname)
-    return {"status": "ok", "meta": meta}
+    meta = save_firmware_meta(version, fname)
+    return {"status": "ok", "version": meta["version"]}
 
 
 @app.get("/api/firmware")
@@ -1919,4 +2008,10 @@ async def api_delete_device(mac: str, username: str = Depends(verify_auth)):
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=18792)
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=18792,
+        ws_ping_interval=None,
+        ws_ping_timeout=None,
+    )

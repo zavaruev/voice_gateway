@@ -59,6 +59,7 @@ No test/lint/CI infrastructure.
 |---|---|---|
 | `NANOBOT_WS_URL` | `ws://nanobot:8765/` | Trailing `/` stripped, `?token=token` appended |
 | `VAD_SILENCE_FRAMES` | `15` | ~60ms per frame |
+| `WATCHDOG_TIMEOUT` | `30` | Seconds before fallback TTS (Nanobot unresponsive) |
 | `TTS_VOICE` | `ru-RU-SvetlanaNeural` | |
 
 ## Gotchas

@@ -9,3 +9,8 @@ onnxruntime
 numpy
 python-multipart
 jinja2
+aiortc
+av
+vosk
+scipy
+openwakeword

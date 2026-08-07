@@ -2,7 +2,6 @@ import asyncio
 import json
 import os
 import time
-import struct
 import uuid
 import re
 import io
@@ -19,6 +18,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from camera_client import CameraSession
 
 # ==========================================
 # CONFIGURATION & ENVIRONMENT VARIABLES
@@ -51,30 +51,11 @@ CHAT_ID_TTL = int(
 )  # 7-day sliding window — Nanobot context lives a week
 THINKING_SOUND_PATH = os.getenv("THINKING_SOUND_PATH", "")
 
-ENERGY_THRESHOLD = float(os.getenv("ENERGY_THRESHOLD", "0.005"))
+ENERGY_THRESHOLD = float(os.getenv("ENERGY_THRESHOLD", "0.002"))
 MIN_SPEECH_RATIO = float(os.getenv("MIN_SPEECH_RATIO", "0.12"))
 VAD_ADAPTIVE = os.getenv("VAD_ADAPTIVE", "true").lower() == "true"
 
-WHISPER_HALLUCINATIONS = [
-    "субтитры подогнал симон",
-    "спасибо за просмотр",
-    "подписывайтесь на канал",
-    "аминь",
-    "субтитры создавал",
-    "редактор субтитров",
-    "thank you",
-    "thanks for watching",
-    "so",
-    "dimatorzok",
-    "субтитры сделал",
-    "dima torzok",
-    "продолжение следует",
-    "синкинг",
-]
-
-WHISPER_HALLUCINATIONS_PATTERN = re.compile("|".join(re.escape(bad) for bad in WHISPER_HALLUCINATIONS))
-
-SINGLE_WORD_HALLUCINATIONS = {"о", "а", "и", "как", "кх-кх", "ха-ха", "жизнь", "пьютер"}
+from audio_utils import pack_ogg, is_valid_text
 
 HOLD_PHRASES = {
     "подожди",
@@ -86,6 +67,7 @@ HOLD_PHRASES = {
 }
 
 HAS_QUESTION_RE = re.compile(r"[?？]\s*$")
+SENTENCE_END_RE = re.compile(r"[.!?…](?:\s|$)|[\n]")
 HAS_QUESTION_WORDS_RE = re.compile(
     r"\b(что|как|где|когда|почему|зачем|сколько|кто|какой|какая|какое|какие|чей|чья|чьё|чьи|куда|откуда|уточни|расскажи|напомни|объясни|повтори|скажи|покажи|подожди|помоги|ответь|напиши|сделай|включи|выключи|открой|закрой|дай|можешь|не знаю|не понимаю)\b",
     re.IGNORECASE,
@@ -219,7 +201,10 @@ templates = Jinja2Templates(directory="templates")
 # VAD ENGINE (Voice Activity Detection)
 # ==========================================
 class VadEngine:
-    def __init__(self):
+    def __init__(self, energy_fallback: bool = True, energy_threshold: float = 0.01,
+                 onnx_threshold: float = 0.02, vad_adaptive: bool | None = None,
+                 rms_noise_floor: float = 0.10, rms_alpha: float = 0.05,
+                 onnx_gain: float = 20.0):
         logger.info("Loading Silero VAD (ONNX) model...")
         opts = ort.SessionOptions()
         opts.inter_op_num_threads = 1
@@ -228,27 +213,29 @@ class VadEngine:
             "silero_vad.onnx", sess_options=opts, providers=["CPUExecutionProvider"]
         )
         self.buffer = np.array([], dtype=np.float32)
+        self.energy_fallback = energy_fallback
+        self.energy_threshold = energy_threshold
+        self._last_debug_log = 0.0
+        self.onnx_gain = onnx_gain
 
-        # Adaptive VAD threshold
-        self.noise_floor = 0.02
-        self.threshold = 0.15
-        self.alpha = 0.01  # Adaptation speed
-        self.vad_adaptive = VAD_ADAPTIVE
+        self.onnx_threshold = onnx_threshold
+        self.rms_noise_floor = rms_noise_floor
+        self.rms_alpha = rms_alpha
+        self._context_size = 64  # official Silero VAD context prefix
 
         self.reset()
 
     def reset(self):
         self._state = np.zeros((2, 1, 128), dtype=np.float32)
+        self._context = np.zeros((1, self._context_size), dtype=np.float32)
         self.buffer = np.array([], dtype=np.float32)
-        if self.vad_adaptive:
-            self.noise_floor = 0.02
-            self.threshold = 0.15
 
-    def _run_onnx(self, chunk: np.ndarray, state: np.ndarray) -> tuple:
+    def _run_onnx(self, chunk: np.ndarray, state: np.ndarray, context: np.ndarray) -> tuple:
+        full_input = np.concatenate([context, chunk[np.newaxis, :]], axis=1)  # (1, 576)
         return self.session.run(
             None,
             {
-                "input": chunk[np.newaxis, :],
+                "input": full_input,
                 "state": state,
                 "sr": np.array([16000], dtype=np.int64),
             },
@@ -265,24 +252,34 @@ class VadEngine:
                 rms = precomputed_rms
             else:
                 rms = float(np.sqrt(np.mean(np.square(audio_float32))))
-            self.buffer = np.concatenate((self.buffer, audio_float32))
-            speech_detected = False
-            current_threshold = self.threshold
+
+            # ONNX-based detection (apply gain to compensate for quiet camera audio)
+            speech_onnx = False
+            onnx_max = 0.0
+            onnx_input = audio_float32 * self.onnx_gain
+            self.buffer = np.concatenate((self.buffer, onnx_input))
             while len(self.buffer) >= 512:
                 chunk = self.buffer[:512]
                 self.buffer = self.buffer[512:]
                 out, self._state = await asyncio.to_thread(
-                    self._run_onnx, chunk, self._state
+                    self._run_onnx, chunk, self._state, self._context
                 )
-                if out[0][0] > current_threshold:
-                    speech_detected = True
-            if rms > 0.02 and not speech_detected:
-                speech_detected = True
-            if self.vad_adaptive and not speech_detected:
-                self.noise_floor = (
-                    1 - self.alpha
-                ) * self.noise_floor + self.alpha * rms
-                self.threshold = max(0.15, self.noise_floor * 4)
+                # Update context: last 64 samples of (context + chunk)
+                self._context = np.concatenate([self._context, chunk[np.newaxis, :]], axis=1)[:, -self._context_size:]
+                onnx_max = max(onnx_max, out[0][0])
+                if out[0][0] > self.onnx_threshold:
+                    speech_onnx = True
+
+            # Energy-based detection with adaptive threshold
+            speech_energy = False
+            if self.energy_fallback:
+                energy_thresh = max(self.energy_threshold, self.rms_noise_floor * 1.2)
+                if rms > energy_thresh:
+                    speech_energy = True
+
+            speech_detected = speech_onnx or speech_energy
+
+            self.rms_noise_floor = (1 - self.rms_alpha) * self.rms_noise_floor + self.rms_alpha * rms
 
             return speech_detected, rms
         except Exception as e:
@@ -321,74 +318,6 @@ def _save_db_sync(db: dict):
     os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
     with open(DB_FILE, "w") as f:
         json.dump(db, f, indent=4)
-
-
-def _build_crc_table():
-    table = []
-    for i in range(256):
-        c = i << 24
-        for _ in range(8):
-            c = (c << 1) ^ 0x04C11DB7 if c & 0x80000000 else c << 1
-        table.append(c & 0xFFFFFFFF)
-    return table
-
-
-_OGG_CRC_TABLE = _build_crc_table()
-
-
-def pack_ogg(frames: list, sample_rate=16000) -> bytes:
-    ser = int(time.time()) & 0xFFFFFFFF
-
-    def ogg_crc(data: bytes) -> int:
-        crc = 0
-        for b in data:
-            crc = ((crc << 8) & 0xFFFFFFFF) ^ _OGG_CRC_TABLE[((crc >> 24) ^ b) & 0xFF]
-        return crc
-
-    def page(idx: int, gran: int, ser: int, bos: bool, eos: bool, pkts: list) -> bytes:
-        h = struct.pack(
-            "<4sBBqIIIB",
-            b"OggS",
-            0,
-            (2 if bos else 0) | (4 if eos else 0),
-            gran,
-            ser,
-            idx,
-            0,
-            len(pkts),
-        )
-        p = h + bytearray([len(x) for x in pkts]) + b"".join(pkts)
-        crc = ogg_crc(p)
-        return p[:22] + struct.pack("<I", crc) + p[26:]
-
-    ser = int(time.time()) & 0xFFFFFFFF
-    res = page(
-        0,
-        0,
-        ser,
-        True,
-        False,
-        [struct.pack("<8sBBHIHB", b"OpusHead", 1, 1, 312, sample_rate, 0, 0)],
-    )
-    res += page(
-        1,
-        0,
-        ser,
-        False,
-        False,
-        [struct.pack("<8sI8sI", b"OpusTags", 8, b"VoiceGW ", 0)],
-    )
-    for i in range(0, len(frames), 50):
-        c = frames[i : i + 50]
-        res += page(
-            2 + i // 50,
-            (i + len(c)) * int(48000 * 0.06),
-            ser,
-            False,
-            (i + 50 >= len(frames)),
-            c,
-        )
-    return res
 
 
 # ==========================================
@@ -660,31 +589,6 @@ async def fetch_transcription(audio: bytes, sess: aiohttp.ClientSession) -> str:
     return ""
 
 
-def is_valid_text(txt: str) -> bool:
-    clean = txt.strip(" .,?!-").lower()
-    if not clean:
-        return False
-
-    if len(clean) >= 10:
-        max_run, cur = 1, 1
-        for i in range(1, len(clean)):
-            cur = cur + 1 if clean[i] == clean[i - 1] else 1
-            max_run = max(max_run, cur)
-        if max_run / len(clean) > 0.5:
-            return False
-
-    words = clean.split()
-    if len(words) == 1:
-        if words[0] in SINGLE_WORD_HALLUCINATIONS:
-            return False
-        if len(words[0]) <= 2:
-            return False
-
-    if WHISPER_HALLUCINATIONS_PATTERN.search(clean):
-        return False
-    return True
-
-
 def calculate_rms(pcm_data: bytes) -> float:
     """Calculate RMS energy from PCM16 audio data."""
     try:
@@ -897,21 +801,10 @@ async def process_audio_and_send(
 # ==========================================
 # TTS & EMOTION
 # ==========================================
-async def generate_and_stream_tts(
-    text: str, device_ws: WebSocket, session_id: str, state: dict = None
-):
+async def synthesize_tts_mp3(text: str, state: dict) -> bytes | None:
+    """Synthesize text to MP3 via the TTS API (network-bound, no streaming)."""
     logger.info(f"🔊 [TTS] Synthesizing: '{text}'")
     try:
-        if not state or not state.get("tts_started"):
-            try:
-                await device_ws.send_json(
-                    {"type": "tts", "state": "start", "session_id": session_id}
-                )
-            except Exception:
-                return
-            if state:
-                state["tts_started"] = True
-
         sess = state["http_session"]
         payload = {
             "model": TTS_MODEL,
@@ -924,59 +817,95 @@ async def generate_and_stream_tts(
             headers["Authorization"] = f"Bearer {TTS_API_KEY}"
         async with sess.post(TTS_URL, json=payload, headers=headers, timeout=30) as r:
             if r.status == 200:
-                mp3_data = await r.read()
-                audio_seg = AudioSegment.from_file(io.BytesIO(mp3_data), format="mp3")
-                audio_seg = (
-                    audio_seg.set_frame_rate(24000).set_channels(1).set_sample_width(2)
-                )
-                pcm_data = audio_seg.raw_data
-
-                enc = state.setdefault("tts_encoder", opuslib.Encoder(24000, 1, "voip"))
-                frame_size = 1440
-                chunk_size = frame_size * 2
-                _tts_start = time.time()
-
-                start_stream = time.perf_counter()
-                next_chunk_time = start_stream
-
-                for i in range(0, len(pcm_data), chunk_size):
-                    chunk = pcm_data[i : i + chunk_size]
-                    if len(chunk) < chunk_size:
-                        chunk += b"\x00" * (chunk_size - len(chunk))
-                    opus_frame = enc.encode(chunk, frame_size)
-
-                    try:
-                        await device_ws.send_bytes(opus_frame)
-                    except Exception:
-                        return
-
-                    next_chunk_time += 0.06
-                    sleep_duration = next_chunk_time - time.perf_counter()
-                    if sleep_duration > 0:
-                        await asyncio.sleep(sleep_duration)
-
-                _tts_end = time.time()
-                logger.info(f"⏱ [Timing] TTS done: {_tts_end - _tts_start:.1f}s playback")
-                logger.info("✅ [TTS] Audio stream completed smoothly.")
-                # Set TTS cooldown to prevent VAD triggering on our own output
-                if state:
-                    state["tts_cooldown_until"] = (
-                        time.time() + 1.5
-                    )  # 1.5s cooldown after TTS
-            else:
-                logger.error(f"❌ [TTS] API Error: {await r.text()}")
+                return await r.read()
+            logger.error(f"❌ [TTS] API Error: {await r.text()}")
     except Exception as e:
         if "Cannot call" not in str(e):
             logger.error(f"❌ [TTS] Error: {e}")
-    finally:
+    return None
+
+
+async def stream_tts_pcm(
+    mp3_data: bytes,
+    device_ws: WebSocket,
+    session_id: str,
+    state: dict,
+    send_stop: bool = True,
+) -> bool:
+    """Stream pre-synthesized MP3 to the device. Returns True on success."""
+    try:
+        if not state or not state.get("tts_started"):
+            try:
+                await device_ws.send_json(
+                    {"type": "tts", "state": "start", "session_id": session_id}
+                )
+            except Exception:
+                return False
+            if state:
+                state["tts_started"] = True
+
+        audio_seg = AudioSegment.from_file(io.BytesIO(mp3_data), format="mp3")
+        audio_seg = audio_seg.set_frame_rate(16000).set_channels(1).set_sample_width(2)
+        pcm_data = audio_seg.raw_data
+
+        enc = state.setdefault("tts_encoder", opuslib.Encoder(16000, 1, "voip"))
+        frame_size = 960
+        chunk_size = frame_size * 2
+        _tts_start = time.time()
+
+        start_stream = time.perf_counter()
+        next_chunk_time = start_stream
+
+        for i in range(0, len(pcm_data), chunk_size):
+            chunk = pcm_data[i : i + chunk_size]
+            if len(chunk) < chunk_size:
+                chunk += b"\x00" * (chunk_size - len(chunk))
+            opus_frame = enc.encode(chunk, frame_size)
+
+            try:
+                await device_ws.send_bytes(opus_frame)
+            except Exception as e:
+                logger.error(f"❌ [TTS] Send failed mid-stream: {e}")
+                return False
+
+            next_chunk_time += 0.06
+            sleep_duration = next_chunk_time - time.perf_counter()
+            if sleep_duration > 0:
+                await asyncio.sleep(sleep_duration)
+
+        _tts_end = time.time()
+        logger.info(f"⏱ [Timing] TTS done: {_tts_end - _tts_start:.1f}s playback")
+        logger.info("✅ [TTS] Audio stream completed smoothly.")
+        # Set TTS cooldown to prevent VAD triggering on our own output
         if state:
-            state["tts_started"] = False
-        try:
-            await device_ws.send_json(
-                {"type": "tts", "state": "stop", "session_id": session_id}
-            )
-        except Exception:
-            pass
+            state["tts_cooldown_until"] = time.time() + 1.5
+        if send_stop:
+            # Each standalone utterance is a self-contained audio unit.
+            if state:
+                state["tts_started"] = False
+            try:
+                await device_ws.send_json(
+                    {"type": "tts", "state": "stop", "session_id": session_id}
+                )
+            except Exception:
+                pass
+        return True
+    except Exception as e:
+        if "Cannot call" not in str(e):
+            logger.error(f"❌ [TTS] Error: {e}")
+        return False
+
+
+async def generate_and_stream_tts(
+    text: str, device_ws: WebSocket, session_id: str, state: dict = None
+):
+    """Compatibility wrapper: synthesize then stream a single utterance."""
+    if not state:
+        logger.error("❌ [TTS] generate_and_stream_tts called without state")
+        return
+    mp3_data = await synthesize_tts_mp3(text, state)
+    if mp3_data is not None:
+        await stream_tts_pcm(mp3_data, device_ws, session_id, state)
 
 
 async def trigger_emotion(
@@ -1007,6 +936,62 @@ class NanobotResponseHandler:
         self._first_chunk_time = None
         self._last_chunk_time = None
         self._chunk_count = 0
+        self.tts_audio_queue: asyncio.Queue = asyncio.Queue()
+        self.tts_player_task = None
+        self._synth_tasks: set = set()
+
+    async def _tts_player(self):
+        """Play pre-synthesized segments back-to-back as one continuous
+        stream (no stop/start between segments, so audio is gapless)."""
+        while True:
+            mp3_data = await self.tts_audio_queue.get()
+            if mp3_data is None:
+                self.tts_audio_queue.task_done()
+                return
+            ok = await stream_tts_pcm(
+                mp3_data,
+                self.device_ws,
+                self.state["sid"],
+                self.state,
+                send_stop=False,
+            )
+            self.tts_audio_queue.task_done()
+            if not ok:
+                break
+            await asyncio.sleep(0.1)
+
+    async def _send_tts_stop(self):
+        if self.state.get("tts_started"):
+            self.state["tts_started"] = False
+            try:
+                await self.device_ws.send_json(
+                    {"type": "tts", "state": "stop", "session_id": self.state["sid"]}
+                )
+            except Exception:
+                pass
+
+    async def _enqueue_tts(self, text: str):
+        """Synthesize in background; player picks it up when ready."""
+        mp3_data = await synthesize_tts_mp3(text, self.state)
+        if mp3_data is not None:
+            await self.tts_audio_queue.put(mp3_data)
+
+    def _ensure_tts_player(self):
+        if self.tts_player_task is None or self.tts_player_task.done():
+            self.tts_player_task = create_tracked_task(
+                self._tts_player(), self.state
+            )
+
+    async def _await_tts_drained(self):
+        """Wait until all background synthesis and playback has finished,
+        then close the continuous TTS stream with a single stop message."""
+        while self._synth_tasks:
+            await asyncio.sleep(0.05)
+        try:
+            await asyncio.wait_for(self.tts_audio_queue.join(), timeout=30)
+        except asyncio.TimeoutError:
+            logger.error("❌ [TTS] Timed out waiting for playback to finish")
+        await self._send_tts_stop()
 
     def reset_timing(self):
         self._first_chunk_time = None
@@ -1031,11 +1016,19 @@ class NanobotResponseHandler:
         self.buffer += chunk
         if self.timer:
             self.timer.cancel()
-        # Increase delay for longer responses to avoid premature flush
-        delay = 2.0 if self.buffer.count("[") > self.buffer.count("]") else 1.5
+        # Sentence-level flush: start TTS as soon as a complete sentence has
+        # arrived instead of waiting for the whole LLM response to finish.
+        # Chunks arrive every ~60ms, so a pending timer would be cancelled by
+        # the next chunk before it fires; launch the flush immediately instead.
+        brackets_balanced = self.buffer.count("[") == self.buffer.count("]")
+        delay = 2.0 if not brackets_balanced else 1.5
         self.timer = asyncio.get_event_loop().call_later(
             delay, lambda: create_tracked_task(self.flush(), self.state)
         )
+        if brackets_balanced and SENTENCE_END_RE.search(self.buffer) and not self.is_flushing:
+            self.timer.cancel()
+            self.timer = None
+            create_tracked_task(self.flush(), self.state)
 
     async def flush(self):
         if self.is_flushing or not self.buffer.strip():
@@ -1054,6 +1047,18 @@ class NanobotResponseHandler:
             )
             self.is_flushing = False
             return
+
+        # Flush only up to the last complete sentence; any trailing partial
+        # text stays in the buffer so phrases are not cut mid-thought and
+        # continuation words ("Или", "Если"...) keep flowing into the next
+        # segment naturally.
+        sentence_matches = list(SENTENCE_END_RE.finditer(text))
+        if sentence_matches:
+            last_match = sentence_matches[-1]
+            trailing = text[last_match.end():]
+            if trailing.strip():
+                text = text[: last_match.end()]
+                self.buffer = trailing + self.buffer
 
         emotions = self.emotion_regex.findall(text)
         for emotion in emotions:
@@ -1081,9 +1086,11 @@ class NanobotResponseHandler:
                     )
                 except Exception:
                     pass
-                await generate_and_stream_tts(
-                    clean_text, self.device_ws, self.state["sid"], self.state
-                )
+                mp3_data = await synthesize_tts_mp3(clean_text, self.state)
+                if mp3_data is not None:
+                    await stream_tts_pcm(
+                        mp3_data, self.device_ws, self.state["sid"], self.state
+                    )
             # Close session — user explicitly requested disconnect
             logger.info("🔌 [Disconnect] User requested disconnect — closing session")
             try:
@@ -1118,47 +1125,61 @@ class NanobotResponseHandler:
             except Exception:
                 pass
 
-            await generate_and_stream_tts(
-                clean_text, self.device_ws, self.state["sid"], self.state
-            )
+            # Pipeline TTS: synthesize in background while the previous
+            # segment is still playing, so phrases flow without gaps.
+            self._ensure_tts_player()
+            task = create_tracked_task(self._enqueue_tts(clean_text), self.state)
+            self._synth_tasks.add(task)
+            task.add_done_callback(self._synth_tasks.discard)
 
-            clean_for_check = self.full_response_text.strip().lower()
-            has_question = (
-                HAS_QUESTION_RE.search(clean_for_check) is not None
-                or "повторите пожалуйста" in clean_for_check
-                or HAS_QUESTION_WORDS_RE.search(clean_for_check) is not None
-            )
-            self.state["last_ai_had_question"] = has_question
-
-            if has_question:
-                self.state.update(
-                    {
-                        "status": "LISTENING",
-                        "frames": [],
-                        "silence": 0,
-                        "has_speech": False,
-                    }
-                )
-                self.state["tts_cooldown_until"] = time.time() + 0.2
-                logger.info(f"💡 [Brightness] Dialogue mode — screen 100%")
-                await send_mcp_cmd(
-                    self.device_ws,
-                    self.state["sid"],
-                    "self.screen.set_brightness",
-                    {"brightness": 100},
-                )
-            else:
-                self.state.update(
-                    {"status": "LISTENING", "frames": [], "silence": 0, "has_speech": False}
-                )
-                self.state["tts_cooldown_until"] = time.time() + 0.2
-                if self.state.get("watchdog"):
-                    self.state["watchdog"].cancel()
-                    self.state["watchdog"] = None
-            self.state["last_activity"] = time.time()
-            self.state["vad"].reset()
-            self.full_response_text = ""
+        # End of flush: if the LLM is still streaming, flush the remaining
+        # content shortly after; only finalize (dialogue mode check, return
+        # to standby) once the whole response has been produced.
         self.is_flushing = False
+        if self.buffer.strip():
+            self.timer = asyncio.get_event_loop().call_later(
+                0.15, lambda: create_tracked_task(self.flush(), self.state)
+            )
+            return
+
+        await self._await_tts_drained()
+
+        clean_for_check = self.full_response_text.strip().lower()
+        has_question = (
+            HAS_QUESTION_RE.search(clean_for_check) is not None
+            or "повторите пожалуйста" in clean_for_check
+            or HAS_QUESTION_WORDS_RE.search(clean_for_check) is not None
+        )
+        self.state["last_ai_had_question"] = has_question
+
+        if has_question:
+            self.state.update(
+                {
+                    "status": "LISTENING",
+                    "frames": [],
+                    "silence": 0,
+                    "has_speech": False,
+                }
+            )
+            self.state["tts_cooldown_until"] = time.time() + 0.2
+            logger.info(f"💡 [Brightness] Dialogue mode — screen 100%")
+            await send_mcp_cmd(
+                self.device_ws,
+                self.state["sid"],
+                "self.screen.set_brightness",
+                {"brightness": 100},
+            )
+        else:
+            self.state.update(
+                {"status": "LISTENING", "frames": [], "silence": 0, "has_speech": False}
+            )
+            self.state["tts_cooldown_until"] = time.time() + 0.2
+            if self.state.get("watchdog"):
+                self.state["watchdog"].cancel()
+                self.state["watchdog"] = None
+        self.state["last_activity"] = time.time()
+        self.state["vad"].reset()
+        self.full_response_text = ""
 
 
 # ==========================================
@@ -1211,12 +1232,7 @@ async def listen_to_nanobot_task(device_ws: WebSocket, state: dict, nano_session
                         set_cached_chat_id(mac_key, state["nanobot_chat_id"])
                         logger.info(f"💾 [Nanobot] Cached deterministic chat_id for {mac_key}: {state['nanobot_chat_id']} (Nanobot assigned: {nano_chat_id})")
                         if state["available_tools"]:
-                            logger.info(f"📤 [Nanobot] Feeding AI tool list: {len(state['available_tools'])} tools")
-                            await nano_ws.send_json({
-                                "type": "tools_update",
-                                "chat_id": state["nanobot_chat_id"],
-                                "tools": state["available_tools"]
-                            })
+                            logger.info(f"🛠 [MCP] Tools available: {len(state['available_tools'])} (managed by nanobot in v0.3.0)")
                     elif d.get("event") == "error":
                         logger.error(f"❌ Nanobot Error: {d.get('detail')}")
                         if state.get("watchdog"):
@@ -1258,17 +1274,7 @@ async def handle_ws_text_message(d: dict, state: dict, device_ws: WebSocket, ses
             state["available_tools"] = payload["result"]["tools"]
             tool_names = [t.get("name") for t in state["available_tools"]]
             logger.info(f"🛠 [MCP] ESP32 returned tools: {tool_names}")
-            nano_ws = state.get("nano_ws")
-            if nano_ws and not nano_ws.closed and state.get("nanobot_chat_id"):
-                logger.info(f"📤 [MCP] Forwarding {len(state['available_tools'])} tools to Nanobot")
-                try:
-                    await nano_ws.send_json({
-                        "type": "tools_update",
-                        "chat_id": state["nanobot_chat_id"],
-                        "tools": state["available_tools"]
-                    })
-                except Exception as e:
-                    logger.error(f"❌ [MCP] Failed to forward tools to Nanobot: {e}")
+            logger.info(f"🛠 [MCP] Tools available: {len(state['available_tools'])} (managed by nanobot in v0.3.0)")
             return nano_listener_task, True
 
         if req_id in mcp_futures and not mcp_futures[req_id].done():
@@ -1390,7 +1396,7 @@ async def voice_ws(device_ws: WebSocket):
         "last_activity": time.time(),
         "available_tools": [],
         "tts_cooldown_until": 0.0,
-        "vad": VadEngine(),
+        "vad": VadEngine(rms_noise_floor=0.008, rms_alpha=0.005, energy_threshold=0.008),
         "tasks": set(),
         "last_receive": time.time(),
         "tts_started": False,
@@ -1410,7 +1416,7 @@ async def voice_ws(device_ws: WebSocket):
             "session_id": session_id,
             "audio_params": {
                 "format": "opus",
-                "sample_rate": 24000,
+                "sample_rate": 16000,
                 "channels": 1,
                 "frame_duration": 60,
             },
@@ -1480,36 +1486,33 @@ async def voice_ws(device_ws: WebSocket):
                             )
                             if state["available_tools"]:
                                 logger.info(
-                                    f"📤 [Nanobot] Feeding AI tool list: {len(state['available_tools'])} tools"
-                                )
-                                await nano_ws.send_json(
-                                    {
-                                        "type": "tools_update",
-                                        "chat_id": state["nanobot_chat_id"],
-                                        "tools": state["available_tools"],
-                                    }
+                                    f"🛠 [MCP] Tools available: {len(state['available_tools'])} (managed by nanobot in v0.3.0)"
                                 )
                         elif d.get("event") == "error":
-                            logger.error(f"❌ Nanobot Error: {d.get('detail')}")
-                            if state.get("watchdog"):
-                                state["watchdog"].cancel()
-                                state["watchdog"] = None
-                            state["status"] = "SPEAKING"
-                            await generate_and_stream_tts(
-                                "Прости, я затупила. Повтори пожалуйста.",
-                                device_ws,
-                                state["sid"],
-                                state,
-                            )
-                            state.update({
-                                "status": "LISTENING", "frames": [], "silence": 0,
-                                "has_speech": False, "last_activity": time.time(),
-                            })
-                            state["vad"].reset()
-                            await send_mcp_cmd(
-                                device_ws, state["sid"],
-                                "self.screen.set_brightness", {"brightness": 100},
-                            )
+                            detail = d.get("detail", "")
+                            if "unknown type" in detail:
+                                logger.warning(f"⚠️ Nanobot protocol: {detail}")
+                            else:
+                                logger.error(f"❌ Nanobot Error: {detail}")
+                                if state.get("watchdog"):
+                                    state["watchdog"].cancel()
+                                    state["watchdog"] = None
+                                state["status"] = "SPEAKING"
+                                await generate_and_stream_tts(
+                                    "Прости, я затупила. Повтори пожалуйста.",
+                                    device_ws,
+                                    state["sid"],
+                                    state,
+                                )
+                                state.update({
+                                    "status": "LISTENING", "frames": [], "silence": 0,
+                                    "has_speech": False, "last_activity": time.time(),
+                                })
+                                state["vad"].reset()
+                                await send_mcp_cmd(
+                                    device_ws, state["sid"],
+                                    "self.screen.set_brightness", {"brightness": 100},
+                                )
                         elif d.get("event") == "device_tool_call":
                             create_tracked_task(
                                 handle_device_tool_call(nano_ws, device_ws, state, d),
@@ -1602,27 +1605,9 @@ async def voice_ws(device_ws: WebSocket):
                         state["available_tools"] = payload["result"]["tools"]
                         tool_names = [t.get("name") for t in state["available_tools"]]
                         logger.info(f"🛠 [MCP] ESP32 returned tools: {tool_names}")
-                        nano_ws = state.get("nano_ws")
-                        if (
-                            nano_ws
-                            and not nano_ws.closed
-                            and state.get("nanobot_chat_id")
-                        ):
-                            logger.info(
-                                f"📤 [MCP] Forwarding {len(state['available_tools'])} tools to Nanobot"
-                            )
-                            try:
-                                await nano_ws.send_json(
-                                    {
-                                        "type": "tools_update",
-                                        "chat_id": state["nanobot_chat_id"],
-                                        "tools": state["available_tools"],
-                                    }
-                                )
-                            except Exception as e:
-                                logger.error(
-                                    f"❌ [MCP] Failed to forward tools to Nanobot: {e}"
-                                )
+                        logger.info(
+                            f"🛠 [MCP] Tools available: {len(state['available_tools'])} (managed by nanobot in v0.3.0)"
+                        )
                         continue
 
                     if req_id in mcp_futures and not mcp_futures[req_id].done():
@@ -1746,7 +1731,7 @@ async def voice_ws(device_ws: WebSocket):
                     audio_int16 = np.frombuffer(pcm, dtype=np.int16)
                     audio_float32 = audio_int16.astype(np.float32) / 32768.0
                     frame_rms = float(np.sqrt(np.mean(np.square(audio_float32))))
-                    if frame_rms < 0.003:
+                    if frame_rms < 0.001:
                         is_sp = False
                     else:
                         is_sp, _ = await state["vad"].is_speech(pcm, frame_rms)
@@ -2083,6 +2068,82 @@ async def api_delete_device(mac: str, username: str = Depends(verify_auth)):
     del db[normalized]
     await save_db(db)
     return {"status": "deleted", "mac": normalized}
+
+
+# ── Camera sessions (go2rtc WebRTC) ──────────────────────────────────────
+
+_camera_sessions: list[CameraSession] = []
+
+
+async def start_camera_sessions():
+    global _camera_sessions
+    raw = os.getenv("CAMERA_STREAMS", "")
+    streams = [s.strip() for s in raw.split(",") if s.strip()]
+    if not streams:
+        logger.info("📷 No CAMERA_STREAMS configured")
+        return
+
+    logger.info(f"📷 Starting camera sessions: {streams}")
+    http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
+    go2rtc_host = os.getenv("GO2RTC_HOST", "192.168.22.102")
+    go2rtc_port = int(os.getenv("GO2RTC_PORT", "1984"))
+
+    for name in streams:
+        try:
+            session = CameraSession(
+                stream_name=name,
+                go2rtc_host=go2rtc_host,
+                go2rtc_port=go2rtc_port,
+                http_session=http,
+                nanobot_url=NANOBOT_WS_URL,
+                tts_url=TTS_URL,
+                tts_api_key=TTS_API_KEY,
+                vad=VadEngine(energy_fallback=True, energy_threshold=0.005,
+                              onnx_threshold=0.02, rms_noise_floor=0.005,
+                              rms_alpha=0.0, onnx_gain=8.0),
+            )
+            _camera_sessions.append(session)
+            await session.start()
+            logger.info(f"📷 Camera session started: {name}")
+        except Exception as e:
+            logger.error(f"📷 Camera session {name} failed: {e}")
+
+
+@app.post("/api/camera/tts")
+async def api_camera_tts(req: Request, username: str = Depends(verify_auth)):
+    data = await req.json()
+    text = data.get("text", "").strip()
+    name = data.get("name", "")
+    if not text:
+        return {"error": "Missing text"}
+    target = [s for s in _camera_sessions if not name or s.stream_name == name]
+    if not target:
+        return {"error": "Camera not found"}
+    for s in target:
+        logger.info(f"Dispatching TTS to {s.stream_name}: text={text!r}")
+        try:
+            t = asyncio.create_task(s._speak(text, text))
+            t.add_done_callback(lambda fut: logger.info(f"TTS task done, exc={fut.exception()}"))
+        except Exception as e:
+            logger.error(f"TTS create_task failed: {e}", exc_info=True)
+    return {"status": "sent", "cameras": [s.stream_name for s in target]}
+
+
+async def stop_camera_sessions():
+    global _camera_sessions
+    for s in _camera_sessions:
+        await s.stop()
+    _camera_sessions.clear()
+
+
+@app.on_event("startup")
+async def on_startup():
+    await start_camera_sessions()
+
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    await stop_camera_sessions()
 
 
 if __name__ == "__main__":

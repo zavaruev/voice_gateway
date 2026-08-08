@@ -11,6 +11,7 @@ RUN curl -L -o silero_vad.onnx https://github.com/snakers4/silero-vad/raw/master
 
 COPY main.py audio_utils.py camera_client.py engine.py .
 COPY config/computer.onnx config/computer.onnx
+COPY config/embedding_model.onnx config/embedding_model.onnx
 COPY config/devices.json config/devices.json
 COPY config/speaker_names.json config/speaker_names.json
 COPY config/chat_id_cache.json config/chat_id_cache.json

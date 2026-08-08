@@ -631,6 +631,10 @@ async def process_audio_and_send(
     frames: list, state: dict, device_ws: WebSocket, decoder: opuslib.Decoder = None
 ):
     _t0 = time.time()
+    if time.time() < camera_client.GLOBAL_TTS_UNTIL:
+        logger.info("🔇 [Pipeline] Skipping — TTS playback active (echo guard)")
+        state["status"] = "LISTENING"
+        return
     if len(frames) < 15:
         logger.info(
             f"🔇 [Pipeline] Too few frames ({len(frames)}), likely noise — skipping STT"
@@ -847,6 +851,8 @@ async def stream_tts_pcm(
         audio_seg = AudioSegment.from_file(io.BytesIO(mp3_data), format="mp3")
         audio_seg = audio_seg.set_frame_rate(16000).set_channels(1).set_sample_width(2)
         pcm_data = audio_seg.raw_data
+
+        camera_client.GLOBAL_TTS_UNTIL = time.time() + len(pcm_data) / (16000 * 2) + 3.0
 
         enc = state.setdefault("tts_encoder", opuslib.Encoder(16000, 1, "voip"))
         frame_size = 960
@@ -2098,6 +2104,7 @@ async def start_camera_sessions():
                 nanobot_url=NANOBOT_WS_URL,
                 tts_url=TTS_URL,
                 tts_api_key=TTS_API_KEY,
+                speaker_id_url=SPEAKER_ID_URL,
                 vad=VadEngine(energy_fallback=True, energy_threshold=0.005,
                               onnx_threshold=0.02, rms_noise_floor=0.005,
                               rms_alpha=0.0, onnx_gain=8.0),

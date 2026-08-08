@@ -82,6 +82,7 @@ class LocalAudioEngine:
         if wakeword_path:
             self.oww_model = Model(
                 wakeword_model_paths=[wakeword_path],
+                embedding_onnx_model_path="config/embedding_model.onnx",
             )
             logger.info("Loading openWakeWord custom model...")
         else:
@@ -116,7 +117,7 @@ class LocalAudioEngine:
             logger.info(f"VAD calls={self._vad_calls} max_prob={max_prob:.4f} level={level:.6f} (threshold={self.vad_threshold})")
         return max_prob > self.vad_threshold
 
-    def check_wakeword(self, audio_int16: np.ndarray) -> bool:
+    def check_wakeword(self, audio_int16: np.ndarray, threshold: float = 0.4) -> bool:
         peak = int(np.max(np.abs(audio_int16)))
         if self._ww_calls % 500 == 0:
             rms = np.sqrt(np.mean(audio_int16.astype(np.float64)**2))
@@ -128,10 +129,10 @@ class LocalAudioEngine:
             normalized = audio_int16.astype(np.float32) / 32768.0 * 32.0
             np.clip(normalized, -1.0, 1.0, out=normalized)
         prediction = self.oww_model.predict(normalized)
-        score = prediction.get("alexa", 0.0)
+        score = float(max(prediction.values())) if prediction else 0.0
         if score > 0.05:
             logger.info(f"Wake word score: {score:.4f} (peak={peak})")
-        return score > 0.3
+        return score > threshold
 
 
 class CameraProcessor:

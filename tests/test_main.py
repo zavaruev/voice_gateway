@@ -25,9 +25,12 @@ from main import (
     clear_expired_chat_ids,
     VadEngine,
     load_speaker_names,
+    load_firmware_meta,
+    normalize_mac,
+)
+from audio_utils import (
     WHISPER_HALLUCINATIONS,
     SINGLE_WORD_HALLUCINATIONS,
-    load_firmware_meta,
 )
 from fastapi import HTTPException
 from fastapi.security import HTTPBasicCredentials
@@ -246,8 +249,8 @@ def test_vad_engine(mock_inference_session):
     mock_inference_session.return_value = mock_session_instance
 
     vad = VadEngine()
-    assert vad.noise_floor == 0.02
-    assert vad.threshold == 0.15
+    assert vad.rms_noise_floor == 0.10
+    assert vad.onnx_threshold == 0.02
 
     # Provide 512+ samples of audio
     audio_data = (np.ones(600) * 1000).astype(np.int16).tobytes()

@@ -23,8 +23,19 @@ Thumbs.db
 *.swp
 *.swo
 *.bak
+*.bak-*
 *.tmp
 *.log
 .idea/
 .vscode/
 config/firmware/*
+
+# Local-only / secrets
+opencode.json
+
+# Wake word training leftovers (empty), models dir
+models/
+
+# Large downloaded models (not wired in yet)
+config/vosk-model-ru-0.42/
+config/vosk-model-small-ru-0.22/

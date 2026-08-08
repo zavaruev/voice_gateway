@@ -65,6 +65,11 @@ class AIVoiceOutputTrack(MediaStreamTrack):
         self._silence_frame = self._pcm_to_frame(silence_pcm, sample_rate)
         self._frame_count = 0
         self._last_real_recv: float = 0.0
+        # Duration (seconds) of the last queued playback; the mic echo-guard
+        # holds closed only as long as the playback itself (beeps are short,
+        # TTS replies long), instead of a blanket 10s that swallowed the
+        # question spoken right after the wake beep.
+        self._last_play_duration: float = 0.0
 
     def _pcm_to_frame(self, pcm: bytes, sample_rate: int) -> av.AudioFrame:
         samples = len(pcm) // 2
@@ -113,15 +118,21 @@ class AIVoiceOutputTrack(MediaStreamTrack):
         if self._queue.qsize() > 0:
             return True
         # WebRTC/go2rtc buffers return the camera's own speaker echo back
-        # with 8-15s delay, in ~3s bursts. Hold the mic closed long enough
-        # for the delayed echo to finish arriving.
-        return time.time() - self._last_real_recv < 10.0
+        # with 8-15s delay, in ~3s bursts. Hold the mic closed only long
+        # enough for the echo of WHAT PLAYED (plus a small tail) to finish
+        # arriving: 0.3s beep -> ~0.6s, 20s TTS -> capped 15s.
+        hold = min(15.0, self._last_play_duration + 0.3)
+        return time.time() - self._last_real_recv < hold
 
     def stop(self):
         pass
 
 
-_HAS_QUESTION_RE = re.compile(r"[?？]\s*$")
+_HAS_QUESTION_RE = re.compile(r"[?？]")
+
+# Global: while any TTS playback is running (ESP32 or camera), neither path
+# may send to nanobot — kills echo cascade (camera hears ESP32 TTS, resends).
+GLOBAL_TTS_UNTIL = 0.0
 
 
 class CameraSession:
@@ -139,9 +150,10 @@ class CameraSession:
         tts_voice: str = "ru-RU-SvetlanaNeural",
         tts_api_key: str = "",
         nanobot_url: str = "ws://nanobot:8765/",
+        speaker_id_url: str = "http://192.168.22.102:8001/identify",
         aec_block_ms: int = 1500,
-        wake_keyword: str = "computer",
-        wake_timeout: float = 10.0,
+        wake_keyword: str = "компьютер",
+        wake_timeout: float = 60.0,
         vad: object = None,
         wakeword_model_path: str = "",
         activation_wav_path: str = "/app/activation.wav",
@@ -157,6 +169,7 @@ class CameraSession:
         self.tts_voice = tts_voice
         self.tts_api_key = tts_api_key
         self._nanobot_url = nanobot_url.rstrip("/")
+        self._speaker_id_url = speaker_id_url
         self.aec_block_ms = aec_block_ms
         self.wake_keyword = wake_keyword
         self._wake_timeout = wake_timeout
@@ -218,6 +231,9 @@ class CameraSession:
         task = asyncio.create_task(self._run())
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
+        rtsp_task = asyncio.create_task(self._rtsp_audio_loop())
+        self._tasks.add(rtsp_task)
+        rtsp_task.add_done_callback(self._tasks.discard)
         logger.info(f"[{self.stream_name}] CameraSession started")
 
     async def _init_engine(self):
@@ -300,7 +316,10 @@ class CameraSession:
                     out.append(line)
                     continue
                 low = line.lower()
-                if "pcmu" in low or "pcma" in low or "l16" in low or "pcml" in low:
+                if "pcmu" in low or "pcma" in low or "pcml" in low:
+                    # Keep L16 (raw PCM mic, corridor) — dropping it forces
+                    # go2rtc onto the PCMU backchannel line which adds
+                    # μ-law quantization noise on quiet distant speech.
                     logger.debug(f"filter_offer_sdp: dropping codec line: {line.strip()[:60]}")
                     if "a=rtpmap:" in line:
                         pt = line.split("a=rtpmap:")[1].split(" ")[0]
@@ -517,10 +536,57 @@ class CameraSession:
                     f"layout={frame.layout.name} planes={len(frame.planes)} "
                     f"samples={frame.samples}"
                 )
-            pcm = self._frame_to_16k_mono(frame)
-            await self._feed_audio(pcm, frame.sample_rate)
+            # Mic audio comes from the RTSP loop (ffmpeg, raw L16, see
+            # _rtsp_audio_loop) — the WebRTC audio track is not used for VAD.
 
-    async def _feed_audio(self, pcm: bytes, rate: int = 48000):
+    async def _rtsp_audio_loop(self):
+        rtsp_url = f"rtsp://{self.go2rtc_host}:8554/{self.stream_name}?audio=copy"
+        logger.info(f"[{self.stream_name}] RTSP audio loop starting (ffmpeg): {rtsp_url}")
+        while not self._stopped.is_set():
+            proc = None
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "ffmpeg",
+                    "-loglevel", "error",
+                    "-rtsp_transport", "tcp",
+                    "-i", rtsp_url,
+                    "-vn",
+                    "-acodec", "pcm_s16le",
+                    "-ar", "16000",
+                    "-ac", "1",
+                    "-f", "s16le",
+                    "pipe:1",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                frame_bytes = 1280 * 2
+                while not self._stopped.is_set():
+                    chunk = await asyncio.wait_for(
+                        proc.stdout.readexactly(frame_bytes), timeout=20.0
+                    )
+                    if not chunk:
+                        break
+                    await self._feed_audio(chunk)
+            except asyncio.IncompleteReadError:
+                logger.info(f"[{self.stream_name}] RTSP ffmpeg stream ended")
+            except asyncio.TimeoutError:
+                logger.warning(f"[{self.stream_name}] RTSP ffmpeg stalled, restarting")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.warning(f"[{self.stream_name}] RTSP audio error: {e}")
+            finally:
+                if proc:
+                    try:
+                        proc.kill()
+                        await proc.wait()
+                    except Exception:
+                        pass
+            if not self._stopped.is_set():
+                logger.info(f"[{self.stream_name}] RTSP audio reconnecting in 3s...")
+                await asyncio.sleep(3)
+
+    async def _feed_audio(self, pcm: bytes, rate: int = 16000):
         if time.time() < self._speaking_until:
             return
         # Hard echo guard: while TTS frames are still queued for playback,
@@ -573,9 +639,10 @@ class CameraSession:
             
             # Only trust VAD if original audio has meaningful energy.
             # Corridor noise floor (mic AGC-boosted) sits at 0.015-0.042
-            # normalized; ticks/artifacts from lost packets reach 0.05-0.16.
-            # Real nearby speech is 0.1+. Gate at 0.10 to kill both.
-            if orig_rms < 0.10:
+            # normalized (quiet hours 0.022-0.029); ticks/artifacts reach 0.05+.
+            # Distant speech (3m) sits ~0.03-0.12. Gate at 0.030 to reject
+            # the idle noise floor while keeping distant speech.
+            if orig_rms < 0.030:
                 speech = False
 
             if now - self._last_rms_log > 2.0:
@@ -629,6 +696,33 @@ class CameraSession:
                 self._vad_start_time = now
                 asyncio.create_task(self._process_utterance(buf))
 
+            # openWakeWord detection on the live 16k feed (echo-guarded)
+            if (
+                not self._wake_detected
+                and self._engine.oww_model is not None
+                and time.time() >= self._speaking_until
+            ):
+                wake = await asyncio.to_thread(self._engine.check_wakeword, s16, 0.25)
+                if wake:
+                    logger.info(f"[{self.stream_name}] 🎯 Wake word (openWakeWord)")
+                    self._wake_detected = True
+                    self._wake_expires = time.time() + self._wake_timeout
+                    if not self._vad_has_speech:
+                        asyncio.create_task(self._play_attention("oww"))
+
+    def _apply_ns(self, audio_f: np.ndarray):
+        """SpeexDSP noise suppression — strips stationary noise (distant speech)."""
+        try:
+            from speexdsp_ns import NoiseSuppression
+            ns = NoiseSuppression.create(frame_size=256, sample_rate=16000)
+            clean = bytearray()
+            for i in range(0, len(audio_f) - 255, 256):
+                clean += ns.process(audio_f[i:i+256].astype(np.int16).tobytes())
+            return np.frombuffer(bytes(clean), dtype=np.int16).astype(np.float32), True
+        except Exception as exc:
+            logger.warning(f"[{self.stream_name}] NS error: {exc}")
+            return audio_f, False
+
     async def _process_utterance(self, buf: bytes):
         if self._processing_utterance:
             return
@@ -644,57 +738,88 @@ class CameraSession:
             # Minimum duration gate — very short utterances produce garbage
             if duration_s < 0.5:
                 logger.info(f"[{self.stream_name}] ⏩ Too short ({duration_s:.2f}s rms={rms_raw:.0f} peak={peak_raw})")
-                self._back_to_wake()
                 return
 
             # Minimum energy gate vs adaptive background floor.
-            # AGC-boosted corridor noise sits at rms 500-1400; ticks from lost
-            # packets add peaks up to 20k. Real nearby speech is 2000+. Gate
-            # against the rolling median of idle windows so loud background
-            # (AC, rain) can't sneak through fixed thresholds.
+            # Corridor noise sits at rms 500-1400; distant speech (3m) ~950-2500.
             bg = float(np.median(self._bg_window)) if self._bg_window else 0.0
-            min_rms = max(700, 1.8 * bg)
+            min_rms = max(350, 1.15 * bg)
             if rms_raw < min_rms:
-                logger.info(f"[{self.stream_name}] ⏩ Too quiet (rms={rms_raw:.0f} peak={peak_raw} dB={rms_dB:.1f} bg={bg:.0f} min={min_rms:.0f})")
-                self._back_to_wake()
-                return
+                # NS rescue: distant speech sits inside the noise floor — try
+                # cleaning first. Clean noise is ~100-250 int16, speech survives
+                # at 400+.
+                cleaned, ns_ok = self._apply_ns(samples.astype(np.float32))
+                rms_clean = float(np.sqrt(np.mean(np.square(cleaned))))
+                if ns_ok and rms_clean >= 400:
+                    logger.info(f"[{self.stream_name}] 🛟 NS rescue: rms {rms_raw:.0f} -> clean {rms_clean:.0f} (bg={bg:.0f})")
+                    samples = cleaned.astype(np.int16)
+                    rms_raw = rms_clean
+                else:
+                    logger.info(f"[{self.stream_name}] ⏩ Too quiet (rms={rms_raw:.0f} peak={peak_raw} dB={rms_dB:.1f} bg={bg:.0f} min={min_rms:.0f})")
+                    return
 
             # Speech-energy ratio gate — count chunks with real energy.
-            # Background noise ~190-500 int16 (AGC), speech chunks ~800+
+            # Background noise ~190-500 int16 (AGC), speech chunks ~800+,
+            # distant speech (3m) chunks ~400-900.
             chunk_samples = 1280  # 80ms at 16kHz
             speech_chunks = 0
             total_chunks = 0
             for i in range(0, len(samples) - chunk_samples + 1, chunk_samples):
                 chunk_rms = float(np.sqrt(np.mean(np.square(samples[i:i+chunk_samples].astype(np.float32)))))
                 total_chunks += 1
-                if chunk_rms >= 700:
+                if chunk_rms >= 400:
                     speech_chunks += 1
             speech_ratio = speech_chunks / max(total_chunks, 1)
-            if speech_ratio < 0.45:
+            if speech_ratio < 0.35:
                 logger.info(f"[{self.stream_name}] ⏩ Low speech ratio ({speech_ratio:.0%}={speech_chunks}/{total_chunks} rms={rms_raw:.0f} dB={rms_dB:.1f})")
-                self._back_to_wake()
                 return
 
-            # Adaptive peak normalization (max 10x gain — 50x amplifies noise floor)
+            # Adaptive peak normalization (max 20x gain for distant speech)
             audio_f = samples.astype(np.float32)
+
+            # Noise suppression — only when speech is near the noise floor
+            # (distant 3m). Normal near-field speech (rms well above bg) must
+            # pass through untouched so Whisper sees the original spectrum.
+            ns_applied = False
+            if rms_raw < max(1500, 1.8 * bg) and len(audio_f) >= 256:
+                audio_f, ns_applied = self._apply_ns(audio_f)
+
             peak = np.max(np.abs(audio_f))
             gain_applied = 1.0
             if peak > 0:
-                gain = min(32767.0 / peak, 10.0)
+                gain = min(32767.0 / peak, 20.0)
                 if gain > 1.5:
                     audio_f = np.clip(audio_f * gain, -32768, 32767)
                     gain_applied = gain
             buf = audio_f.astype(np.int16).tobytes()
+            buf_raw = samples.astype(np.int16).tobytes()
 
             wav = await asyncio.to_thread(self._encode_wav, buf)
-            logger.info(f"[{self.stream_name}] 🎤 Whisper IN: {duration_s:.2f}s raw_rms={rms_raw:.0f} peak={peak_raw} dB={rms_dB:.1f} gain={gain_applied:.1f}x wav={len(wav)}B")
-            txt = await self._fetch_transcription(wav)
+            try:
+                import os
+                os.makedirs("/tmp/utterances", exist_ok=True)
+                with open(f"/tmp/utterances/u_{int(time.time())}.wav", "wb") as f:
+                    f.write(wav)
+            except Exception:
+                pass
+            logger.info(f"[{self.stream_name}] 🎤 Whisper IN: {duration_s:.2f}s raw_rms={rms_raw:.0f} peak={peak_raw} dB={rms_dB:.1f} gain={gain_applied:.1f}x ns={int(ns_applied)} wav={len(wav)}B")
+            txt, uid = await asyncio.gather(
+                self._fetch_transcription(wav),
+                self._fetch_speaker_id(wav),
+            )
+            if (not txt or not is_valid_text(txt)) and self._wake_detected:
+                # Post-wake rescue: NS may have eaten the consonants of a
+                # distant command — retry the unprocessed signal.
+                logger.info(f"[{self.stream_name}] 🔁 Post-wake retry raw signal (wake={self._wake_detected})")
+                txt = await self._fetch_transcription(
+                    await asyncio.to_thread(self._encode_wav, buf_raw),
+                    temperature="0.7",
+                )
             if not txt or not is_valid_text(txt):
                 if not txt:
                     logger.info(f"[{self.stream_name}] ❌ Whisper empty for {len(buf)}-byte ({duration_s:.2f}s)")
                 else:
                     logger.info(f"[{self.stream_name}] ❌ Rejected: '{txt[:60]}'")
-                self._back_to_wake()
                 return
                 
             logger.info(f"[{self.stream_name}] ✅ Whisper OK: '{txt[:60]}'")
@@ -708,13 +833,34 @@ class CameraSession:
             # if this transcript matches a recent one, it's the echo.
             if norm and norm == self._last_transcript:
                 logger.info(f"[{self.stream_name}] ❌ Echo repeat, ignoring: '{txt[:60]}'")
-                self._back_to_wake()
                 return
             self._last_transcript = norm
-            await self._call_nanobot(txt)
+            if uid != "unknown":
+                logger.info(f"[{self.stream_name}] 👤 Speaker: {uid} | '{txt[:60]}'")
+            await self._handle_wake_or_command(txt, uid)
             return
         finally:
             self._processing_utterance = False
+
+    async def _handle_wake_or_command(self, txt: str, uid: str = "camera"):
+        low = txt.lower()
+        m = re.search(r"\b(компьютер|компютер|computer)\b", low)
+        if m:
+            self._wake_detected = True
+            self._wake_expires = time.time() + self._wake_timeout
+            asyncio.create_task(self._play_attention("processor_kw"))
+            cmd = (txt[: m.start()] + " " + txt[m.end():]).strip()
+            if cmd:
+                logger.info(f"[{self.stream_name}] 🎯 Wake+cmd: '{txt[:60]}' -> '{cmd[:60]}'")
+                await self._call_nanobot(cmd, uid)
+            else:
+                logger.info(f"[{self.stream_name}] 🎯 Wake word (awaiting command)")
+            return
+        if not self._wake_detected:
+            logger.info(f"[{self.stream_name}] ⏳ No wake word, ignoring: '{txt[:60]}'")
+            return
+        logger.info(f"[{self.stream_name}] 🗣 Post-wake dialogue: '{txt[:60]}'")
+        await self._call_nanobot(txt, uid)
 
     async def _on_user_command(self, text: str):
         try:
@@ -735,8 +881,13 @@ class CameraSession:
             logger.error(f"[{self.stream_name}] Error handling command: {e}")
             self._processor.set_state(AgentState.LISTENING)
 
-    async def _call_nanobot(self, txt: str):
+    async def _call_nanobot(self, txt: str, uid: str = "camera"):
         if not txt:
+            return
+        if time.time() < GLOBAL_TTS_UNTIL:
+            logger.info(
+                f"[{self.stream_name}] Ignoring '{txt[:40]}' — TTS playback active (echo guard)"
+            )
             return
         try:
             async with aiohttp.ClientSession() as session:
@@ -747,7 +898,7 @@ class CameraSession:
                         "type": "message",
                         "chat_id": self.chat_id,
                         "content": txt,
-                        "user_id": "camera",
+                        "user_id": uid,
                         "user_name": self.stream_name,
                         "voice_reply": True,
                     })
@@ -761,20 +912,44 @@ class CameraSession:
     @staticmethod
     async def _wait_reply(ws) -> str | None:
         parts: list[str] = []
+        got_text = False
         try:
             async for msg in ws:
                 if msg.type != aiohttp.WSMsgType.TEXT:
                     continue
                 data = json.loads(msg.data)
-                if data.get("event") in ("done", "error", "final", "stream_end"):
+                ev = data.get("event")
+                if ev in ("done", "error"):
                     break
-                if "text" in data and data.get("type") not in ("stt", "listen") and data.get("event") not in ("reasoning_delta", "thinking", "ready"):
-                    parts.append(data["text"])
+                if ev == "stream_end":
+                    if data.get("resuming") and not got_text:
+                        # End of the PREVIOUS stream (session resume), sent
+                        # before the new response starts — must not terminate.
+                        continue
+                    break  # end of the current response
+                if ev == "final":
+                    break
+                if "text" in data and data.get("type") not in ("stt", "listen") and ev not in ("reasoning_delta", "thinking", "ready"):
+                    parts.append(str(data["text"]))
+                    got_text = True
                 elif "parts" in data:
-                    parts.append(data["parts"])
+                    parts.append(str(data["parts"]))
+                    got_text = True
         except Exception:
             pass
-        return "".join(parts) if parts else None
+        text = "".join(parts)
+        # Nanobot streams text in fragments — strip tags on the JOINED text.
+        # Drop explicitly closed [thinking]...[/thinking] blocks, else just
+        # remove the bare tags (the model's replies carry [emotion] prefixes).
+        while True:
+            m = re.search(r"\[thinking\](.*?)\[/thinking\]", text, flags=re.S)
+            if not m:
+                break
+            text = text[: m.start()] + text[m.end():]
+        text = re.sub(r"\[/?thinking\]", "", text)
+        text = re.sub(r"\[[a-z]{2,30}\]", "", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text if text else None
 
     def _encode_wav(self, pcm_16k: bytes) -> bytes:
         sample_rate = 16000
@@ -792,23 +967,56 @@ class CameraSession:
         )
         return header + pcm_16k
 
-    async def _fetch_transcription(self, wav: bytes) -> str:
-        form = aiohttp.FormData()
-        form.add_field("file", wav, filename="a.wav")
-        form.add_field("model", self.whisper_model)
-        form.add_field("language", "ru")
-        form.add_field("temperature", "0.0")
+    async def _fetch_transcription(self, wav: bytes, temperature: str | None = None) -> str:
+        for temp in (temperature, "0.0", "0.5"):
+            if not temp:
+                continue
+            form = aiohttp.FormData()
+            form.add_field("file", wav, filename="a.wav")
+            form.add_field("model", self.whisper_model)
+            form.add_field("language", "ru")
+            form.add_field("temperature", temp)
+            try:
+                async with self.http_session.post(
+                    self.whisper_url, data=form,
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as r:
+                    if r.status == 200:
+                        data = await r.json()
+                        text = (data.get("text") or "").strip()
+                        if text:
+                            return text
+            except Exception:
+                pass
+        return ""
+
+    async def _fetch_speaker_id(self, wav: bytes) -> str:
         try:
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-loglevel", "error", "-i", "pipe:0",
+                "-c:a", "libopus", "-f", "ogg", "pipe:1",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            ogg, _ = await asyncio.wait_for(proc.communicate(wav), timeout=10)
+            if not ogg:
+                return "unknown"
+            form = aiohttp.FormData()
+            form.add_field("file", ogg, filename="audio.ogg", content_type="audio/ogg")
             async with self.http_session.post(
-                self.whisper_url, data=form,
-                timeout=aiohttp.ClientTimeout(total=30),
+                self._speaker_id_url, data=form, timeout=10
             ) as r:
                 if r.status == 200:
-                    data = await r.json()
-                    return (data.get("text") or "").strip()
-        except Exception:
-            pass
-        return ""
+                    j = await r.json()
+                    uid, conf = j.get("user_id", "unknown"), j.get("confidence", 0.0)
+                    if uid != "unknown" and conf > 0.1:
+                        logger.info(f"[{self.stream_name}] 👤 [SpeakerID] Recognized: {uid} ({conf:.2f})")
+                        return uid
+                    logger.debug(f"[{self.stream_name}] 👤 [SpeakerID] Rejected: {uid} ({conf:.2f})")
+        except Exception as e:
+            logger.warning(f"[{self.stream_name}] ⚠️ [SpeakerID] Request failed: {e}")
+        return "unknown"
 
     def _back_to_wake(self):
         self._wake_detected = False
@@ -843,6 +1051,7 @@ class CameraSession:
             pcm = (mix * 32767).astype(np.int16).tobytes()
             if self._out_track:
                 await self._out_track.queue_frame(pcm, sr)
+                self._out_track._last_play_duration = duration
             # Only extend speaking_until if not already blocked longer by KWS
             delay = now + 0.35
             if delay > self._speaking_until:
@@ -857,6 +1066,7 @@ class CameraSession:
             pcm = seg.raw_data
             if self._out_track:
                 await self._out_track.queue_frame(pcm, 8000)
+                self._out_track._last_play_duration = len(pcm) / (2 * 8000)
         except Exception:
             pass
 
@@ -909,10 +1119,12 @@ class CameraSession:
             
             # Блокируем микрофон только сейчас, когда звук реально готов пойти в канал
             audio_dur = len(pcm) / (sr * 2)
+            if self._out_track:
+                self._out_track._last_play_duration = audio_dur
             is_question = bool(_HAS_QUESTION_RE.search(reply.strip()))
             echo_tail = 1.5 if is_question else 3.0
 
-            chunk_size = sr * 20 // 1000 * 2  
+            chunk_size = sr * 20 // 1000 * 2
             for i in range(0, len(pcm), chunk_size):
                 c = pcm[i: i + chunk_size]
                 if len(c) < chunk_size:
@@ -926,6 +1138,8 @@ class CameraSession:
             # before the loop would expire while the speaker is still playing.
             if self._out_track:
                 self._speaking_until = time.time() + self._out_track.queue_seconds() + echo_tail
+            global GLOBAL_TTS_UNTIL
+            GLOBAL_TTS_UNTIL = time.time() + audio_dur + 3.0
         except Exception as e:
             logger.warning(f"[{self.stream_name}] playback error: {e}")
 

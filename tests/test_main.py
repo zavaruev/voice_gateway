@@ -339,7 +339,6 @@ def test_load_db_file_error(mock_exists):
     finally:
         main._DB_CACHE = original_cache
 
-<<<<<<< HEAD
 @patch("builtins.open", side_effect=Exception("Test mock exception"))
 @patch("main.logger.error")
 def test_save_chat_id_cache_error(mock_logger_error, mock_open_err):

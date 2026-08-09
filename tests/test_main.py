@@ -345,7 +345,7 @@ def test_save_chat_id_cache_error(mock_logger_error, mock_open_err):
     # This should not raise an exception, but it should log one
     main.save_chat_id_cache({"some": "data"})
     mock_logger_error.assert_called_once()
-    assert "Failed to save chat id cache:" in mock_logger_error.call_args[0][0]
+    assert "Failed to save chat_id cache:" in mock_logger_error.call_args[0][0]
 
 @patch("main.time.time", return_value=1234567890.123)
 def test_save_firmware_meta(mock_time):

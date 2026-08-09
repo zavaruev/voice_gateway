@@ -2003,6 +2003,8 @@ def normalize_mac(mac: str) -> str:
 
 
 def device_online_status(mac: str) -> str:
+    if not mac:
+        return "offline"
     for st in session_states.values():
         if st.get("mac", "").lower() == mac.lower():
             return st["status"]

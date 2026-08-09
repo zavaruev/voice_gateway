@@ -321,3 +321,11 @@ def test_load_db_file_error(mock_exists):
             assert main._DB_CACHE == {}
     finally:
         main._DB_CACHE = original_cache
+
+@patch("builtins.open", side_effect=Exception("Test mock exception"))
+@patch("main.logger.error")
+def test_save_chat_id_cache_error(mock_logger_error, mock_open_err):
+    # This should not raise an exception, but it should log one
+    main.save_chat_id_cache({"some": "data"})
+    mock_logger_error.assert_called_once()
+    assert "Failed to save chat_id cache:" in mock_logger_error.call_args[0][0]

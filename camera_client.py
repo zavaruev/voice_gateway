@@ -150,6 +150,7 @@ class CameraSession:
         tts_voice: str = "ru-RU-SvetlanaNeural",
         tts_api_key: str = "",
         nanobot_url: str = "ws://nanobot:8765/",
+        nanobot_token: str = "token",
         speaker_id_url: str = "http://192.168.22.102:8001/identify",
         aec_block_ms: int = 1500,
         wake_keyword: str = "компьютер",
@@ -169,6 +170,7 @@ class CameraSession:
         self.tts_voice = tts_voice
         self.tts_api_key = tts_api_key
         self._nanobot_url = nanobot_url.rstrip("/")
+        self._nanobot_token = nanobot_token
         self._speaker_id_url = speaker_id_url
         self.aec_block_ms = aec_block_ms
         self.wake_keyword = wake_keyword
@@ -892,7 +894,7 @@ class CameraSession:
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.ws_connect(
-                    f"{self._nanobot_url}?token=token&chat_id={self.chat_id}"
+                    f"{self._nanobot_url}?token={self._nanobot_token}&chat_id={self.chat_id}"
                 ) as ws:
                     await ws.send_json({
                         "type": "message",

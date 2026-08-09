@@ -44,6 +44,7 @@ LOG_TRANSCRIPTIONS = os.getenv("LOG_TRANSCRIPTIONS", "false").lower() == "true"
 
 DB_FILE = "/app/config/devices.json"
 VAD_SILENCE_FRAMES = int(os.getenv("VAD_SILENCE_FRAMES", 8))
+MAX_FIRMWARE_SIZE = int(os.getenv("MAX_FIRMWARE_SIZE", 10 * 1024 * 1024))
 WATCHDOG_TIMEOUT = int(os.getenv("WATCHDOG_TIMEOUT", 30))
 STANDBY_TIMEOUT_QUESTION = int(os.getenv("STANDBY_TIMEOUT_QUESTION", 30))
 STANDBY_TIMEOUT_STATEMENT = int(os.getenv("STANDBY_TIMEOUT_STATEMENT", 10))
@@ -1208,7 +1209,7 @@ async def listen_to_nanobot_task(device_ws: WebSocket, state: dict, nano_session
             try:
                 mac_key = state["mac"].lower()
                 det_chat_id = make_chat_id(mac_key)
-                auth_url = f"{NANOBOT_WS_URL}?token=token&chat_id={det_chat_id}"
+                auth_url = f"{NANOBOT_WS_URL}?token={NANOBOT_TOKEN}&chat_id={det_chat_id}"
                 nano_ws = await nano_session.ws_connect(auth_url)
                 state["nano_ws"] = nano_ws
                 handler = NanobotResponseHandler(device_ws, state)
@@ -1933,13 +1934,27 @@ async def firmware_upload(
     fname = f"firmware_v{version}.bin" if version else file.filename
     fname = os.path.basename(fname)
     fpath = os.path.join(FIRMWARE_DIR, fname)
-    content = await file.read()
 
-    def write_sync(path, data):
+    def write_sync_chunked(path, file_obj, max_size):
+        size = 0
         with open(path, "wb") as f:
-            f.write(data)
+            while True:
+                chunk = file_obj.read(65536)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > max_size:
+                    break
+                f.write(chunk)
+        if size > max_size:
+            os.remove(path)
+            raise ValueError("Firmware file too large")
 
-    await asyncio.to_thread(write_sync, fpath, content)
+    try:
+        await asyncio.to_thread(write_sync_chunked, fpath, file.file, MAX_FIRMWARE_SIZE)
+    except ValueError as e:
+        raise HTTPException(413, str(e))
+
     meta = save_firmware_meta(version, fname)
     return {"status": "ok", "version": meta["version"]}
 
@@ -1969,7 +1984,7 @@ async def ota_handler(req: Request, username: str = Depends(verify_auth)):
         "protocol": "websocket",
         "websocket": {
             "url": f"ws://{req.url.hostname}:18792/",
-            "access_token": "token",
+            "access_token": NANOBOT_TOKEN,
         },
         "firmware": {
             "has_update": has_update,
@@ -2103,6 +2118,7 @@ async def start_camera_sessions():
                 go2rtc_port=go2rtc_port,
                 http_session=http,
                 nanobot_url=NANOBOT_WS_URL,
+                nanobot_token=NANOBOT_TOKEN,
                 tts_url=TTS_URL,
                 tts_api_key=TTS_API_KEY,
                 speaker_id_url=SPEAKER_ID_URL,

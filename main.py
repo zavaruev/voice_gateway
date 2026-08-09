@@ -172,7 +172,11 @@ security = HTTPBasic(auto_error=False)
 
 def verify_auth(credentials: HTTPBasicCredentials | None = Depends(security)):
     if not ADMIN_USERNAME or not ADMIN_PASSWORD:
-        return "admin"
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication disabled (credentials not configured)",
+            headers={"WWW-Authenticate": "Basic"},
+        )
     if credentials is None:
         raise HTTPException(
             status_code=401,

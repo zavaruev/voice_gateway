@@ -1339,46 +1339,6 @@ async def handle_ws_text_message(d: dict, state: dict, device_ws: WebSocket, ses
     return nano_listener_task, False
 
 
-async def handle_ws_audio_message(byte_data: bytes, state: dict, device_ws: WebSocket, dec: opuslib.Decoder):
-    if state["status"] == "IDLE": return
-    if state["status"] in ["PROCESSING", "SPEAKING"]: return
-    if time.time() < state.get("tts_cooldown_until", 0):
-        return
-    if time.time() < state.get("post_wake_cooldown_until", 0):
-        return
-    state["status"] = "LISTENING"
-
-    f = byte_data if state["version"] == 1 else (byte_data[16:] if state["version"] == 2 else byte_data[4:])
-    state["frames"].append(f)
-
-    try:
-        pcm = dec.decode(f, 960)
-        audio_int16 = np.frombuffer(pcm, dtype=np.int16)
-        audio_float32 = audio_int16.astype(np.float32) / 32768.0
-        frame_rms = float(np.sqrt(np.mean(np.square(audio_float32))))
-        if frame_rms < 0.003:
-            is_sp = False
-        else:
-            is_sp, _ = await state["vad"].is_speech(pcm, frame_rms)
-        if is_sp:
-            state["silence"] = 0
-            state["has_speech"] = True
-            state["last_activity"] = time.time()
-        else: state["silence"] += 1
-    except Exception: state["silence"] += 1
-
-    if state["silence"] > VAD_SILENCE_FRAMES:
-        if state["has_speech"]:
-            logger.info(f"🔪 Server VAD triggered.")
-            state["status"] = "PROCESSING"
-            frames_to_process, state["frames"] = list(state["frames"]), []
-            state["silence"] = 0
-            state["has_speech"] = False
-            create_tracked_task(process_audio_and_send(frames_to_process, state, device_ws, dec), state)
-        else:
-            state["frames"], state["silence"] = [], 0
-            state["vad"].reset()
-
 @app.websocket("/")
 async def voice_ws(device_ws: WebSocket):
     global _active_speaker_lock

@@ -26,6 +26,7 @@ from main import (
     load_speaker_names,
     load_firmware_meta,
     normalize_mac,
+    device_online_status,
 )
 from audio_utils import (
     WHISPER_HALLUCINATIONS,
@@ -58,6 +59,29 @@ def test_is_valid_text():
 
     # Test repeated characters
     assert is_valid_text("ааааааааааааааааааа") == False
+
+def test_device_online_status():
+    dummy_states = {
+        "client1": {"mac": "AA:BB:CC:11:22:33", "status": "online"},
+        "client2": {"mac": "aa:bb:cc:dd:ee:ff", "status": "playing"},
+        "client3": {"status": "recording"}, # No MAC
+    }
+
+    with patch.dict(main.session_states, dummy_states, clear=True):
+        # Test exact match
+        assert device_online_status("AA:BB:CC:11:22:33") == "online"
+
+        # Test case-insensitive match (search with lower, stored is upper)
+        assert device_online_status("aa:bb:cc:11:22:33") == "online"
+
+        # Test case-insensitive match (search with upper, stored is lower)
+        assert device_online_status("AA:BB:CC:DD:EE:FF") == "playing"
+
+        # Test non-existent MAC
+        assert device_online_status("00:11:22:33:44:55") == "offline"
+
+        # Test empty string MAC
+        assert device_online_status("") == "offline"
 
 def test_normalize_mac():
     # Standard uppercase MAC

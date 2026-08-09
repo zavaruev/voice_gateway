@@ -153,15 +153,6 @@ def make_chat_id(mac: str) -> str:
     return f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
 
 
-def clear_expired_chat_ids():
-    now = time.time()
-    expired = [
-        mac for mac, entry in CHAT_ID_CACHE.items() if now - entry["ts"] >= CHAT_ID_TTL
-    ]
-    for mac in expired:
-        del CHAT_ID_CACHE[mac]
-    save_chat_id_cache()
-
 
 load_chat_id_cache()  # Load on startup
 

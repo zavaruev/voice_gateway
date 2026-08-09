@@ -339,6 +339,7 @@ def test_load_db_file_error(mock_exists):
     finally:
         main._DB_CACHE = original_cache
 
+<<<<<<< HEAD
 @patch("builtins.open", side_effect=Exception("Test mock exception"))
 @patch("main.logger.error")
 def test_save_chat_id_cache_error(mock_logger_error, mock_open_err):
@@ -393,3 +394,44 @@ def test_save_firmware_meta_error():
             assert main._firmware_meta_cache == original_cache
     finally:
         main._firmware_meta_cache = original_cache
+
+def test_device_list_with_status():
+    original_cache = main._DB_CACHE
+    original_session = main.session_states.copy()
+    try:
+        # Set up a known db state
+        db_data = {
+            "AA:BB:CC:00:11:22": {"name": "Device 1"},
+            "aa:bb:cc:00:11:33": {"name": "Device 2"}, # lowercase in DB
+            "11:22:33:44:55:66": {"name": "Device 3"}
+        }
+        main._DB_CACHE = db_data
+
+        # Scenario 1: All offline (session_states is empty)
+        main.session_states.clear()
+        result = main.device_list_with_status()
+        assert len(result) == 3
+        assert all(entry["status"] == "offline" for entry in result)
+        # Check sorting: by MAC since all offline
+        assert [entry["mac"] for entry in result] == ["11:22:33:44:55:66", "AA:BB:CC:00:11:22", "aa:bb:cc:00:11:33"]
+
+        # Scenario 2: Partial online and MAC case insensitivity
+        main.session_states.clear()
+        main.session_states["ws1"] = {"mac": "aa:bb:cc:00:11:22", "status": "online"} # DB has uppercase, session has lowercase
+        main.session_states["ws2"] = {"mac": "AA:BB:CC:00:11:33", "status": "online"} # DB has lowercase, session has uppercase
+
+        result = main.device_list_with_status()
+        assert len(result) == 3
+        # Expected statuses
+        status_map = {entry["mac"]: entry["status"] for entry in result}
+        assert status_map["AA:BB:CC:00:11:22"] == "online"
+        assert status_map["aa:bb:cc:00:11:33"] == "online"
+        assert status_map["11:22:33:44:55:66"] == "offline"
+
+        # Check sorting: online first, then by MAC
+        assert result[0]["mac"] == "AA:BB:CC:00:11:22"
+        assert result[1]["mac"] == "aa:bb:cc:00:11:33"
+        assert result[2]["mac"] == "11:22:33:44:55:66"
+    finally:
+        main._DB_CACHE = original_cache
+        main.session_states = original_session

@@ -81,7 +81,8 @@ def load_speaker_names() -> dict:
     try:
         with open(SPEAKER_NAME_FILE) as f:
             return json.load(f)
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Error loading speaker names: {e}")
         return {}
 
 

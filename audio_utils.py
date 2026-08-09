@@ -15,27 +15,17 @@ import time
 # ═══════════════════════════════════════════════════════
 
 
-def _build_crc_table():
-    table = []
-    for i in range(256):
-        c = i << 24
-        for _ in range(8):
-            c = (c << 1) ^ 0x04C11DB7 if c & 0x80000000 else c << 1
-        table.append(c & 0xFFFFFFFF)
-    return table
+import zlib
 
-
-_OGG_CRC_TABLE = _build_crc_table()
+_BIT_REVERSE_TABLE = bytes(int('{:08b}'.format(i)[::-1], 2) for i in range(256))
 
 
 def pack_ogg(frames: list, sample_rate=16000) -> bytes:
     ser = int(time.time()) & 0xFFFFFFFF
 
     def ogg_crc(data: bytes) -> int:
-        crc = 0
-        for b in data:
-            crc = ((crc << 8) & 0xFFFFFFFF) ^ _OGG_CRC_TABLE[((crc >> 24) ^ b) & 0xFF]
-        return crc
+        crc = zlib.crc32(data.translate(_BIT_REVERSE_TABLE), 0xFFFFFFFF) ^ 0xFFFFFFFF
+        return int.from_bytes(crc.to_bytes(4, 'little').translate(_BIT_REVERSE_TABLE), 'big')
 
     def page(idx: int, gran: int, ser: int, bos: bool, eos: bool, pkts: list) -> bytes:
         h = struct.pack(

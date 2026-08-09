@@ -87,15 +87,13 @@ def save_db(db):
     with open(DB_FILE, "w") as f: json.dump(db, f, indent=4)
 
 # --- OGG упаковка ---
+import zlib
+_BIT_REVERSE_TABLE = bytes(int('{:08b}'.format(i)[::-1], 2) for i in range(256))
+
 def pack_ogg(frames):
     def ogg_crc(data):
-        crc, table = 0, []
-        for i in range(256):
-            c = i << 24
-            for _ in range(8): c = (c << 1) ^ 0x04C11DB7 if c & 0x80000000 else c << 1
-            table.append(c & 0xFFFFFFFF)
-        for b in data: crc = ((crc << 8) & 0xFFFFFFFF) ^ table[((crc >> 24) ^ b) & 0xFF]
-        return crc
+        crc = zlib.crc32(data.translate(_BIT_REVERSE_TABLE), 0xFFFFFFFF) ^ 0xFFFFFFFF
+        return int.from_bytes(crc.to_bytes(4, 'little').translate(_BIT_REVERSE_TABLE), 'big')
     def page(idx, gran, ser, bos, eos, pkts):
         h = struct.pack('<4sBBqIIIB', b'OggS', 0, (2 if bos else 0)|(4 if eos else 0), gran, ser, idx, 0, len(pkts))
         p = h + bytearray([len(x) for x in pkts]) + b"".join(pkts)

@@ -22,11 +22,12 @@ from main import (
     load_chat_id_cache,
     save_chat_id_cache,
     CHAT_ID_TTL,
-    clear_expired_chat_ids,
     VadEngine,
     load_speaker_names,
     load_firmware_meta,
+    save_firmware_meta,
     normalize_mac,
+    device_online_status,
 )
 from audio_utils import (
     WHISPER_HALLUCINATIONS,
@@ -59,6 +60,29 @@ def test_is_valid_text():
 
     # Test repeated characters
     assert is_valid_text("ааааааааааааааааааа") == False
+
+def test_device_online_status():
+    dummy_states = {
+        "client1": {"mac": "AA:BB:CC:11:22:33", "status": "online"},
+        "client2": {"mac": "aa:bb:cc:dd:ee:ff", "status": "playing"},
+        "client3": {"status": "recording"}, # No MAC
+    }
+
+    with patch.dict(main.session_states, dummy_states, clear=True):
+        # Test exact match
+        assert device_online_status("AA:BB:CC:11:22:33") == "online"
+
+        # Test case-insensitive match (search with lower, stored is upper)
+        assert device_online_status("aa:bb:cc:11:22:33") == "online"
+
+        # Test case-insensitive match (search with upper, stored is lower)
+        assert device_online_status("AA:BB:CC:DD:EE:FF") == "playing"
+
+        # Test non-existent MAC
+        assert device_online_status("00:11:22:33:44:55") == "offline"
+
+        # Test empty string MAC
+        assert device_online_status("") == "offline"
 
 def test_normalize_mac():
     # Standard uppercase MAC
@@ -204,13 +228,6 @@ def test_chat_id_cache(mock_time):
     mock_time.return_value = 1000.0 + (CHAT_ID_TTL + 100)
     assert get_cached_chat_id(mac) is None
 
-    # Clear expired
-    main.CHAT_ID_CACHE[mac] = {"chat_id": chat_id, "ts": 1000.0}
-    with patch("main.open", mock_open()):
-        clear_expired_chat_ids()
-        # Should be removed because time is 1000 + TTL + 100
-        assert mac not in main.CHAT_ID_CACHE
-
 def test_load_speaker_names_success():
     valid_data = {"speaker_1": "Alice", "speaker_2": "Bob"}
     with patch("main.open", mock_open(read_data=json.dumps(valid_data))):
@@ -321,3 +338,99 @@ def test_load_db_file_error(mock_exists):
             assert main._DB_CACHE == {}
     finally:
         main._DB_CACHE = original_cache
+
+@patch("builtins.open", side_effect=Exception("Test mock exception"))
+@patch("main.logger.error")
+def test_save_chat_id_cache_error(mock_logger_error, mock_open_err):
+    # This should not raise an exception, but it should log one
+    main.save_chat_id_cache({"some": "data"})
+    mock_logger_error.assert_called_once()
+    assert "Failed to save chat_id cache:" in mock_logger_error.call_args[0][0]
+
+@patch("main.time.time", return_value=1234567890.123)
+def test_save_firmware_meta(mock_time):
+    original_cache = main._firmware_meta_cache
+    try:
+        with patch("builtins.open", mock_open()) as m_open:
+            result = save_firmware_meta("1.2.3", "firmware_v1.2.3.bin")
+
+            expected_meta = {
+                "version": "1.2.3",
+                "filename": "firmware_v1.2.3.bin",
+                "timestamp": int(1234567890.123 * 1000),  # 1234567890.123 * 1000
+            }
+
+            # verify return value
+            assert result == expected_meta
+
+            # verify global cache is updated
+            assert main._firmware_meta_cache == expected_meta
+
+            # verify file write
+            m_open.assert_called_with(main.FIRMWARE_META, "w")
+
+            # Get the file object that was written to
+            handle = m_open()
+
+            # Reconstruct what was written
+            written_data = "".join(call.args[0] for call in handle.write.call_args_list)
+
+            # Load the JSON that was written and verify it matches expected
+            written_json = json.loads(written_data)
+            assert written_json == expected_meta
+    finally:
+        main._firmware_meta_cache = original_cache
+
+def test_save_firmware_meta_error():
+    original_cache = main._firmware_meta_cache
+    try:
+        with patch("builtins.open", side_effect=OSError("Disk full")):
+            import pytest
+            with pytest.raises(OSError, match="Disk full"):
+                save_firmware_meta("1.2.3", "firmware_v1.2.3.bin")
+
+            # The cache shouldn't be updated if the file write fails
+            assert main._firmware_meta_cache == original_cache
+    finally:
+        main._firmware_meta_cache = original_cache
+
+def test_device_list_with_status():
+    original_cache = main._DB_CACHE
+    original_session = main.session_states.copy()
+    try:
+        # Set up a known db state
+        db_data = {
+            "AA:BB:CC:00:11:22": {"name": "Device 1"},
+            "aa:bb:cc:00:11:33": {"name": "Device 2"}, # lowercase in DB
+            "11:22:33:44:55:66": {"name": "Device 3"}
+        }
+        main._DB_CACHE = db_data
+
+        # Scenario 1: All offline (session_states is empty)
+        main.session_states.clear()
+        result = main.device_list_with_status()
+        assert len(result) == 3
+        assert all(entry["status"] == "offline" for entry in result)
+        # Check sorting: by MAC since all offline
+        assert [entry["mac"] for entry in result] == ["11:22:33:44:55:66", "AA:BB:CC:00:11:22", "aa:bb:cc:00:11:33"]
+
+        # Scenario 2: Partial online and MAC case insensitivity
+        main.session_states.clear()
+        main.session_states["ws1"] = {"mac": "aa:bb:cc:00:11:22", "status": "online"} # DB has uppercase, session has lowercase
+        main.session_states["ws2"] = {"mac": "AA:BB:CC:00:11:33", "status": "online"} # DB has lowercase, session has uppercase
+
+        result = main.device_list_with_status()
+        assert len(result) == 3
+        # Expected statuses
+        status_map = {entry["mac"]: entry["status"] for entry in result}
+        assert status_map["AA:BB:CC:00:11:22"] == "online"
+        assert status_map["aa:bb:cc:00:11:33"] == "online"
+        assert status_map["11:22:33:44:55:66"] == "offline"
+
+        # Check sorting: online first, then by MAC
+        assert result[0]["mac"] == "AA:BB:CC:00:11:22"
+        assert result[1]["mac"] == "aa:bb:cc:00:11:33"
+        assert result[2]["mac"] == "11:22:33:44:55:66"
+    finally:
+        main._DB_CACHE = original_cache
+        main.session_states = original_session

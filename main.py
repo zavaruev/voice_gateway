@@ -1208,7 +1208,7 @@ async def listen_to_nanobot_task(device_ws: WebSocket, state: dict, nano_session
             try:
                 mac_key = state["mac"].lower()
                 det_chat_id = make_chat_id(mac_key)
-                auth_url = f"{NANOBOT_WS_URL}?token=token&chat_id={det_chat_id}"
+                auth_url = f"{NANOBOT_WS_URL}?token={NANOBOT_TOKEN}&chat_id={det_chat_id}"
                 nano_ws = await nano_session.ws_connect(auth_url)
                 state["nano_ws"] = nano_ws
                 handler = NanobotResponseHandler(device_ws, state)

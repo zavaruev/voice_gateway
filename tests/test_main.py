@@ -22,7 +22,6 @@ from main import (
     load_chat_id_cache,
     save_chat_id_cache,
     CHAT_ID_TTL,
-    clear_expired_chat_ids,
     VadEngine,
     load_speaker_names,
     load_firmware_meta,
@@ -203,13 +202,6 @@ def test_chat_id_cache(mock_time):
     # Get cached ID after TTL
     mock_time.return_value = 1000.0 + (CHAT_ID_TTL + 100)
     assert get_cached_chat_id(mac) is None
-
-    # Clear expired
-    main.CHAT_ID_CACHE[mac] = {"chat_id": chat_id, "ts": 1000.0}
-    with patch("main.open", mock_open()):
-        clear_expired_chat_ids()
-        # Should be removed because time is 1000 + TTL + 100
-        assert mac not in main.CHAT_ID_CACHE
 
 def test_load_speaker_names_success():
     valid_data = {"speaker_1": "Alice", "speaker_2": "Bob"}

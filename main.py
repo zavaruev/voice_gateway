@@ -18,6 +18,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+import camera_client
 from camera_client import CameraSession
 
 # ==========================================

@@ -25,7 +25,7 @@ from camera_client import CameraSession
 # CONFIGURATION & ENVIRONMENT VARIABLES
 # ==========================================
 NANOBOT_WS_URL = os.getenv("NANOBOT_WS_URL", "ws://nanobot:8765/").rstrip("/")
-NANOBOT_TOKEN = os.getenv("NANOBOT_TOKEN", "token")
+NANOBOT_TOKEN = os.getenv("NANOBOT_TOKEN", "")
 SPEAKER_ID_URL = os.getenv("SPEAKER_ID_URL", "http://192.168.22.102:8001/identify")
 
 WHISPER_URL = os.getenv(

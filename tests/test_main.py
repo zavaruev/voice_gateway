@@ -25,6 +25,7 @@ from main import (
     VadEngine,
     load_speaker_names,
     load_firmware_meta,
+    save_firmware_meta,
     normalize_mac,
     device_online_status,
 )
@@ -344,4 +345,51 @@ def test_save_chat_id_cache_error(mock_logger_error, mock_open_err):
     # This should not raise an exception, but it should log one
     main.save_chat_id_cache({"some": "data"})
     mock_logger_error.assert_called_once()
-    assert "Failed to save chat_id cache:" in mock_logger_error.call_args[0][0]
+    assert "Failed to save chat id cache:" in mock_logger_error.call_args[0][0]
+
+@patch("main.time.time", return_value=1234567890.123)
+def test_save_firmware_meta(mock_time):
+    original_cache = main._firmware_meta_cache
+    try:
+        with patch("builtins.open", mock_open()) as m_open:
+            result = save_firmware_meta("1.2.3", "firmware_v1.2.3.bin")
+
+            expected_meta = {
+                "version": "1.2.3",
+                "filename": "firmware_v1.2.3.bin",
+                "timestamp": int(1234567890.123 * 1000),  # 1234567890.123 * 1000
+            }
+
+            # verify return value
+            assert result == expected_meta
+
+            # verify global cache is updated
+            assert main._firmware_meta_cache == expected_meta
+
+            # verify file write
+            m_open.assert_called_with(main.FIRMWARE_META, "w")
+
+            # Get the file object that was written to
+            handle = m_open()
+
+            # Reconstruct what was written
+            written_data = "".join(call.args[0] for call in handle.write.call_args_list)
+
+            # Load the JSON that was written and verify it matches expected
+            written_json = json.loads(written_data)
+            assert written_json == expected_meta
+    finally:
+        main._firmware_meta_cache = original_cache
+
+def test_save_firmware_meta_error():
+    original_cache = main._firmware_meta_cache
+    try:
+        with patch("builtins.open", side_effect=OSError("Disk full")):
+            import pytest
+            with pytest.raises(OSError, match="Disk full"):
+                save_firmware_meta("1.2.3", "firmware_v1.2.3.bin")
+
+            # The cache shouldn't be updated if the file write fails
+            assert main._firmware_meta_cache == original_cache
+    finally:
+        main._firmware_meta_cache = original_cache

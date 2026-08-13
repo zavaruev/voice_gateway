@@ -13,6 +13,7 @@ os.environ["TTS_URL"] = "http://test_tts"
 os.environ["SPEAKER_ID_URL"] = "http://test_speaker"
 
 from main import (
+    fetch_transcription,
     is_valid_text,
     make_chat_id,
     calculate_rms,
@@ -434,3 +435,41 @@ def test_device_list_with_status():
     finally:
         main._DB_CACHE = original_cache
         main.session_states = original_session
+
+import pytest
+import aiohttp
+from unittest.mock import AsyncMock
+
+@pytest.mark.asyncio
+async def test_fetch_transcription_success():
+    mock_session = AsyncMock(spec=aiohttp.ClientSession)
+    mock_response = AsyncMock()
+    mock_response.status = 200
+    mock_response.json.return_value = {"text": "Hello world"}
+    mock_session.post.return_value.__aenter__.return_value = mock_response
+
+    result = await fetch_transcription(b"fakeaudio", mock_session)
+    assert result == "Hello world"
+    mock_session.post.assert_called_once()
+
+@pytest.mark.asyncio
+async def test_fetch_transcription_non_200():
+    mock_session = AsyncMock(spec=aiohttp.ClientSession)
+    mock_response = AsyncMock()
+    mock_response.status = 500
+    mock_response.text.return_value = "Internal Server Error"
+    mock_session.post.return_value.__aenter__.return_value = mock_response
+
+    result = await fetch_transcription(b"fakeaudio", mock_session)
+    assert result == ""
+    mock_session.post.assert_called_once()
+
+@pytest.mark.asyncio
+async def test_fetch_transcription_exception():
+    mock_session = AsyncMock(spec=aiohttp.ClientSession)
+    # Raising an exception when the context manager tries to enter
+    mock_session.post.return_value.__aenter__.side_effect = aiohttp.ClientError("Network Error")
+
+    result = await fetch_transcription(b"fakeaudio", mock_session)
+    assert result == ""
+    mock_session.post.assert_called_once()

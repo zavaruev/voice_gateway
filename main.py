@@ -1523,7 +1523,6 @@ async def api_tts(
     if session_id not in active_sessions:
         return {"error": "Offline"}
     state = session_states.get(session_id)
-    state = session_states.get(session_id)
     if not state:
         return {"error": "No state"}
     device_ws = active_sessions[session_id]

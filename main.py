@@ -1478,6 +1478,20 @@ async def execute_mcp(
             session_id = list(active_sessions.keys())[-1]
         if session_id in active_sessions:
             ws = active_sessions[session_id]
+
+            # Authorize MCP command
+            state = session_states.get(session_id)
+            if state and "mac" in state:
+                mac = normalize_mac(state["mac"])
+                db = load_db()
+                device_config = db.get(mac, {})
+                owner = device_config.get("owner")
+
+                # Check authorization
+                if username != ADMIN_USERNAME:
+                    if not owner or owner != username:
+                        return {"error": "Forbidden: Not device owner"}
+
             if ws.client_state.name == "DISCONNECTED":
                 active_sessions.pop(session_id, None)
                 return {"error": "Device disconnected"}
@@ -1665,12 +1679,14 @@ class DeviceCreate(BaseModel):
     friendly_name: str = ""
     ws_url: str = ""
     allowed: bool = True
+    owner: str | None = None
 
 
 class DeviceUpdate(BaseModel):
     friendly_name: str | None = None
     ws_url: str | None = None
     allowed: bool | None = None
+    owner: str | None = None
 
 
 def normalize_mac(mac: str) -> str:
@@ -1719,6 +1735,7 @@ async def api_create_device(body: DeviceCreate, username: str = Depends(verify_a
         "friendly_name": body.friendly_name,
         "ws_url": body.ws_url,
         "allowed": body.allowed,
+        "owner": body.owner,
     }
     await save_db(db)
     return {"mac": mac, **db[mac], "status": "offline"}
@@ -1739,6 +1756,8 @@ async def api_update_device(
         entry["ws_url"] = body.ws_url
     if body.allowed is not None:
         entry["allowed"] = body.allowed
+    if body.owner is not None:
+        entry["owner"] = body.owner
     await save_db(db)
     return {"mac": normalized, **entry, "status": device_online_status(normalized)}
 

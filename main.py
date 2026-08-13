@@ -40,6 +40,12 @@ TTS_API_KEY = os.getenv("TTS_API_KEY", "")
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
 
+if ADMIN_PASSWORD:
+    if len(ADMIN_PASSWORD) < 8:
+        raise ValueError("ADMIN_PASSWORD must be at least 8 characters long for security reasons.")
+    if ADMIN_PASSWORD == ADMIN_USERNAME:
+        raise ValueError("ADMIN_PASSWORD cannot be the same as ADMIN_USERNAME.")
+
 LOG_TRANSCRIPTIONS = os.getenv("LOG_TRANSCRIPTIONS", "false").lower() == "true"
 
 DB_FILE = "/app/config/devices.json"

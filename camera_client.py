@@ -32,18 +32,22 @@ _r = logging.getLogger()
 if not _r.handlers:
     _rh = logging.StreamHandler()
     _rh.setLevel(logging.DEBUG)
-    _rh.setFormatter(logging.Formatter(
-        "%(asctime)s.%(msecs)03d | %(levelname)-7s | %(name)s:%(lineno)d - %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    ))
+    _rh.setFormatter(
+        logging.Formatter(
+            "%(asctime)s.%(msecs)03d | %(levelname)-7s | %(name)s:%(lineno)d - %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
     _r.addHandler(_rh)
 if not logger.handlers:
     _h = logging.StreamHandler()
     _h.setLevel(logging.DEBUG)
-    _h.setFormatter(logging.Formatter(
-        "%(asctime)s.%(msecs)03d | %(levelname)-7s | %(name)s:%(lineno)d - %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    ))
+    _h.setFormatter(
+        logging.Formatter(
+            "%(asctime)s.%(msecs)03d | %(levelname)-7s | %(name)s:%(lineno)d - %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
     logger.addHandler(_h)
 logger.propagate = False
 
@@ -54,14 +58,14 @@ class AIVoiceOutputTrack(MediaStreamTrack):
     def __init__(self, sample_rate: int = 8000):
         super().__init__()
         self._sample_rate = sample_rate
-        # Буфер на ~10 секунд аудио. Если очередь заполнится, 
+        # Буфер на ~10 секунд аудио. Если очередь заполнится,
         # писатель будет ждать (backpressure), не теряя фреймы.
         self._queue: asyncio.Queue[av.AudioFrame] = asyncio.Queue(maxsize=500)
         self._timestamp = 0
         self._start: float = 0.0
-        
+
         self._frame_samples = max(sample_rate * 20 // 1000, 160)
-        silence_pcm = b'\x00\x00' * self._frame_samples
+        silence_pcm = b"\x00\x00" * self._frame_samples
         self._silence_frame = self._pcm_to_frame(silence_pcm, sample_rate)
         self._frame_count = 0
         self._last_real_recv: float = 0.0
@@ -88,7 +92,9 @@ class AIVoiceOutputTrack(MediaStreamTrack):
             self._frame_count += 1
             self._last_real_recv = time.time()
             if self._frame_count <= 3 or self._frame_count % 500 == 0:
-                logger.info(f"AIVoiceOutputTrack: real frame #{self._frame_count}, queue={self._queue.qsize()}")
+                logger.info(
+                    f"AIVoiceOutputTrack: real frame #{self._frame_count}, queue={self._queue.qsize()}"
+                )
         except asyncio.QueueEmpty:
             frame = self._silence_frame
 
@@ -106,7 +112,7 @@ class AIVoiceOutputTrack(MediaStreamTrack):
         return frame
 
     async def queue_frame(self, pcm: bytes, sample_rate: int = 8000):
-        # Используем await put, чтобы при больших TTS ответах трек не переполнялся 
+        # Используем await put, чтобы при больших TTS ответах трек не переполнялся
         # и не дропал слова в середине предложения.
         frame = self._pcm_to_frame(pcm, sample_rate)
         await self._queue.put(frame)
@@ -240,7 +246,10 @@ class CameraSession:
 
     async def _init_engine(self):
         try:
-            await asyncio.to_thread(self._engine.initialize_models, self._wakeword_model_path or "config/computer.onnx")
+            await asyncio.to_thread(
+                self._engine.initialize_models,
+                self._wakeword_model_path or "config/computer.onnx",
+            )
         except Exception as e:
             logger.warning(f"[{self.stream_name}] Failed to init audio engine: {e}")
 
@@ -295,7 +304,7 @@ class CameraSession:
     @staticmethod
     def _filter_offer_sdp(sdp: str) -> str:
         """Remove PCMU/PCMA codecs from audio media lines in offer SDP.
-        
+
         Camera exposes two audio media lines: opus/48000/2 (mic) and PCMU/8000
         (backchannel speaker). go2rtc can mismatch them, causing Python to receive
         μ-law data instead of opus. Remove PCMU/PCMA from the offer so go2rtc
@@ -322,7 +331,9 @@ class CameraSession:
                     # Keep L16 (raw PCM mic, corridor) — dropping it forces
                     # go2rtc onto the PCMU backchannel line which adds
                     # μ-law quantization noise on quiet distant speech.
-                    logger.debug(f"filter_offer_sdp: dropping codec line: {line.strip()[:60]}")
+                    logger.debug(
+                        f"filter_offer_sdp: dropping codec line: {line.strip()[:60]}"
+                    )
                     if "a=rtpmap:" in line:
                         pt = line.split("a=rtpmap:")[1].split(" ")[0]
                         removed_pts.add(pt)
@@ -398,7 +409,9 @@ class CameraSession:
         self._out_track = AIVoiceOutputTrack(sample_rate=8000)
         self._pc.addTransceiver(self._out_track, direction="sendonly")
         self._pc.addTransceiver("audio", direction="recvonly")
-        logger.info(f"[{self.stream_name}] created sendonly track + recvonly transceiver")
+        logger.info(
+            f"[{self.stream_name}] created sendonly track + recvonly transceiver"
+        )
 
         @self._pc.on("track")
         async def on_track(track):
@@ -411,10 +424,12 @@ class CameraSession:
 
         async with aiohttp.ClientSession() as sig:
             async with sig.ws_connect(sig_url) as ws:
-                await ws.send_json({
-                    "type": "webrtc/offer",
-                    "value": offer_sdp,
-                })
+                await ws.send_json(
+                    {
+                        "type": "webrtc/offer",
+                        "value": offer_sdp,
+                    }
+                )
                 answered = False
                 announced = False
                 ticks = 0
@@ -458,7 +473,9 @@ class CameraSession:
                             RTCSessionDescription(sdp=answer_sdp, type="answer")
                         )
                         answered = True
-                        logger.info(f"[{self.stream_name}] WebRTC ready (bidirectional)")
+                        logger.info(
+                            f"[{self.stream_name}] WebRTC ready (bidirectional)"
+                        )
 
                     if answered:
                         st = self._pc.connectionState
@@ -467,11 +484,13 @@ class CameraSession:
                             logger.info(f"[{self.stream_name}] WebRTC connected")
                             asyncio.create_task(self._delayed_attention())
                         elif st == "failed":
-                            logger.warning(f"[{self.stream_name}] WebRTC failed, retrying")
+                            logger.warning(
+                                f"[{self.stream_name}] WebRTC failed, retrying"
+                            )
                             return
 
     def _frame_to_16k_mono(self, frame: av.AudioFrame) -> bytes:
-        if frame.format.name in ('flt', 'fltp'):
+        if frame.format.name in ("flt", "fltp"):
             arr = frame.to_ndarray()
             if arr.ndim == 2:
                 mono = arr.mean(axis=0)
@@ -482,14 +501,24 @@ class CameraSession:
             raw = np.frombuffer(bytes(frame.planes[0]), dtype=np.int16)
             n_planes = len(frame.planes)
             if n_planes > 1:
-                channels = [np.frombuffer(bytes(p), dtype=np.int16) for p in frame.planes]
+                channels = [
+                    np.frombuffer(bytes(p), dtype=np.int16) for p in frame.planes
+                ]
                 mono = np.mean(channels, axis=0, dtype=np.int16)
             else:
-                layout_name = frame.layout.name if hasattr(frame.layout, 'name') else str(frame.layout)
-                if layout_name in ('mono', '1'):
+                layout_name = (
+                    frame.layout.name
+                    if hasattr(frame.layout, "name")
+                    else str(frame.layout)
+                )
+                if layout_name in ("mono", "1"):
                     mono = raw
                 else:
-                    n_ch = len(frame.layout.channels) if hasattr(frame.layout, 'channels') else 2
+                    n_ch = (
+                        len(frame.layout.channels)
+                        if hasattr(frame.layout, "channels")
+                        else 2
+                    )
                     mono = raw.reshape(-1, n_ch).mean(axis=1, dtype=np.int16)
 
         return bytes(mono.tobytes())
@@ -505,12 +534,14 @@ class CameraSession:
         ~8x cheaper and runs off the event loop.
         """
         from scipy.signal import resample_poly
+
         arr = np.frombuffer(mono_48k, dtype=np.int16).astype(np.float32)
         return resample_poly(arr, 1, 3).astype(np.int16).tobytes()
 
     @staticmethod
     def _resample_generic(pcm: bytes, rate: int) -> bytes:
         from scipy.signal import resample_poly
+
         arr = np.frombuffer(pcm, dtype=np.int16).astype(np.float32)
         g = np.gcd(16000, rate)
         up, down = 16000 // g, rate // g
@@ -526,10 +557,10 @@ class CameraSession:
             except Exception as e:
                 logger.info(f"[{self.stream_name}] _recv_audio ended: {e}")
                 break
-            
+
             if not isinstance(frame, av.AudioFrame):
                 continue
-            
+
             frame_count += 1
             if frame_count <= 2:
                 logger.info(
@@ -543,20 +574,29 @@ class CameraSession:
 
     async def _rtsp_audio_loop(self):
         rtsp_url = f"rtsp://{self.go2rtc_host}:8554/{self.stream_name}?audio=copy"
-        logger.info(f"[{self.stream_name}] RTSP audio loop starting (ffmpeg): {rtsp_url}")
+        logger.info(
+            f"[{self.stream_name}] RTSP audio loop starting (ffmpeg): {rtsp_url}"
+        )
         while not self._stopped.is_set():
             proc = None
             try:
                 proc = await asyncio.create_subprocess_exec(
                     "ffmpeg",
-                    "-loglevel", "error",
-                    "-rtsp_transport", "tcp",
-                    "-i", rtsp_url,
+                    "-loglevel",
+                    "error",
+                    "-rtsp_transport",
+                    "tcp",
+                    "-i",
+                    rtsp_url,
                     "-vn",
-                    "-acodec", "pcm_s16le",
-                    "-ar", "16000",
-                    "-ac", "1",
-                    "-f", "s16le",
+                    "-acodec",
+                    "pcm_s16le",
+                    "-ar",
+                    "16000",
+                    "-ac",
+                    "1",
+                    "-f",
+                    "s16le",
                     "pipe:1",
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
@@ -595,7 +635,7 @@ class CameraSession:
         # the camera speaker is (or will be) sounding — do not feed the mic.
         if self._out_track and self._out_track.echo_active():
             return
-        
+
         if self._wake_detected and time.time() >= self._wake_expires:
             self._back_to_wake()
 
@@ -635,10 +675,12 @@ class CameraSession:
     async def _vad_process(self, chunk: bytes):
         async with self._vad_lock:
             s16 = np.frombuffer(chunk, dtype=np.int16)
-            orig_rms = float(np.sqrt(np.mean(np.square(s16.astype(np.float64))))) / 32768.0
+            orig_rms = (
+                float(np.sqrt(np.mean(np.square(s16.astype(np.float64))))) / 32768.0
+            )
             speech, _ = await self._vad.is_speech(s16.tobytes())
             now = time.time()
-            
+
             # Only trust VAD if original audio has meaningful energy.
             # Corridor noise floor (mic AGC-boosted) sits at 0.015-0.042
             # normalized (quiet hours 0.022-0.029); ticks/artifacts reach 0.05+.
@@ -649,7 +691,9 @@ class CameraSession:
 
             if now - self._last_rms_log > 2.0:
                 self._last_rms_log = now
-                logger.info(f"[{self.stream_name}] VAD rms={orig_rms:.4f} speech={speech} consec={self._vad_speech_consecutive}")
+                logger.info(
+                    f"[{self.stream_name}] VAD rms={orig_rms:.4f} speech={speech} consec={self._vad_speech_consecutive}"
+                )
 
             # Sliding window (6 frames = 480ms): start utterance when >=3 speech frames,
             # tolerate short pauses between syllables instead of requiring 3 consecutive.
@@ -662,7 +706,9 @@ class CameraSession:
                 self._vad_speech_consecutive += 1
                 if not self._vad_has_speech:
                     if win_speech >= 3 and not self._processing_utterance:
-                        logger.info(f"[{self.stream_name}] VAD SPEECH START rms={orig_rms}")
+                        logger.info(
+                            f"[{self.stream_name}] VAD SPEECH START rms={orig_rms}"
+                        )
                         self._vad_has_speech = True
                         self._vad_silence_frames = 0
                         self._vad_start_time = now
@@ -675,7 +721,9 @@ class CameraSession:
                     self._vad_silence_frames += 1
                     if self._vad_silence_frames >= self._vad_silence_limit:
                         dur = len(self._vad_speech_buf) / 32
-                        logger.info(f"[{self.stream_name}] VAD UTTERANCE END dur={dur:.0f}ms")
+                        logger.info(
+                            f"[{self.stream_name}] VAD UTTERANCE END dur={dur:.0f}ms"
+                        )
                         buf = bytes(self._vad_speech_buf)
                         self._vad_speech_buf.clear()
                         self._vad_has_speech = False
@@ -688,7 +736,9 @@ class CameraSession:
 
             # Max duration by accumulated audio length (WebRTC delivers frames in
             # bursts, so wall-clock time is not a reliable cap)
-            if self._vad_has_speech and len(self._vad_speech_buf) >= int(self._vad_max_duration * 32000):
+            if self._vad_has_speech and len(self._vad_speech_buf) >= int(
+                self._vad_max_duration * 32000
+            ):
                 buf = bytes(self._vad_speech_buf)
                 self._vad_speech_buf.clear()
                 self._vad_has_speech = False
@@ -716,11 +766,17 @@ class CameraSession:
         """SpeexDSP noise suppression — strips stationary noise (distant speech)."""
         try:
             from speexdsp_ns import NoiseSuppression
+
             ns = NoiseSuppression.create(frame_size=256, sample_rate=16000)
-            clean = bytearray()
+            clean = []
             for i in range(0, len(audio_f) - 255, 256):
-                clean += ns.process(audio_f[i:i+256].astype(np.int16).tobytes())
-            return np.frombuffer(bytes(clean), dtype=np.int16).astype(np.float32), True
+                clean.append(
+                    ns.process(audio_f[i : i + 256].astype(np.int16).tobytes())
+                )
+            return (
+                np.frombuffer(b"".join(clean), dtype=np.int16).astype(np.float32),
+                True,
+            )
         except Exception as exc:
             logger.warning(f"[{self.stream_name}] NS error: {exc}")
             return audio_f, False
@@ -728,7 +784,7 @@ class CameraSession:
     async def _process_utterance(self, buf: bytes):
         if self._processing_utterance:
             return
-        
+
         self._processing_utterance = True
         try:
             samples = np.frombuffer(buf, dtype=np.int16)
@@ -739,7 +795,9 @@ class CameraSession:
 
             # Minimum duration gate — very short utterances produce garbage
             if duration_s < 0.5:
-                logger.info(f"[{self.stream_name}] ⏩ Too short ({duration_s:.2f}s rms={rms_raw:.0f} peak={peak_raw})")
+                logger.info(
+                    f"[{self.stream_name}] ⏩ Too short ({duration_s:.2f}s rms={rms_raw:.0f} peak={peak_raw})"
+                )
                 return
 
             # Minimum energy gate vs adaptive background floor.
@@ -753,11 +811,15 @@ class CameraSession:
                 cleaned, ns_ok = self._apply_ns(samples.astype(np.float32))
                 rms_clean = float(np.sqrt(np.mean(np.square(cleaned))))
                 if ns_ok and rms_clean >= 400:
-                    logger.info(f"[{self.stream_name}] 🛟 NS rescue: rms {rms_raw:.0f} -> clean {rms_clean:.0f} (bg={bg:.0f})")
+                    logger.info(
+                        f"[{self.stream_name}] 🛟 NS rescue: rms {rms_raw:.0f} -> clean {rms_clean:.0f} (bg={bg:.0f})"
+                    )
                     samples = cleaned.astype(np.int16)
                     rms_raw = rms_clean
                 else:
-                    logger.info(f"[{self.stream_name}] ⏩ Too quiet (rms={rms_raw:.0f} peak={peak_raw} dB={rms_dB:.1f} bg={bg:.0f} min={min_rms:.0f})")
+                    logger.info(
+                        f"[{self.stream_name}] ⏩ Too quiet (rms={rms_raw:.0f} peak={peak_raw} dB={rms_dB:.1f} bg={bg:.0f} min={min_rms:.0f})"
+                    )
                     return
 
             # Speech-energy ratio gate — count chunks with real energy.
@@ -767,13 +829,21 @@ class CameraSession:
             speech_chunks = 0
             total_chunks = 0
             for i in range(0, len(samples) - chunk_samples + 1, chunk_samples):
-                chunk_rms = float(np.sqrt(np.mean(np.square(samples[i:i+chunk_samples].astype(np.float32)))))
+                chunk_rms = float(
+                    np.sqrt(
+                        np.mean(
+                            np.square(samples[i : i + chunk_samples].astype(np.float32))
+                        )
+                    )
+                )
                 total_chunks += 1
                 if chunk_rms >= 400:
                     speech_chunks += 1
             speech_ratio = speech_chunks / max(total_chunks, 1)
             if speech_ratio < 0.35:
-                logger.info(f"[{self.stream_name}] ⏩ Low speech ratio ({speech_ratio:.0%}={speech_chunks}/{total_chunks} rms={rms_raw:.0f} dB={rms_dB:.1f})")
+                logger.info(
+                    f"[{self.stream_name}] ⏩ Low speech ratio ({speech_ratio:.0%}={speech_chunks}/{total_chunks} rms={rms_raw:.0f} dB={rms_dB:.1f})"
+                )
                 return
 
             # Adaptive peak normalization (max 20x gain for distant speech)
@@ -799,6 +869,7 @@ class CameraSession:
             wav = await asyncio.to_thread(self._encode_wav, buf)
             def _save_debug_wav(wav_data, ts):
                 import os
+
                 os.makedirs("/tmp/utterances", exist_ok=True)
                 with open(f"/tmp/utterances/u_{ts}.wav", "wb") as f:
                     f.write(wav_data)
@@ -809,7 +880,9 @@ class CameraSession:
                 )
             except Exception:
                 pass
-            logger.info(f"[{self.stream_name}] 🎤 Whisper IN: {duration_s:.2f}s raw_rms={rms_raw:.0f} peak={peak_raw} dB={rms_dB:.1f} gain={gain_applied:.1f}x ns={int(ns_applied)} wav={len(wav)}B")
+            logger.info(
+                f"[{self.stream_name}] 🎤 Whisper IN: {duration_s:.2f}s raw_rms={rms_raw:.0f} peak={peak_raw} dB={rms_dB:.1f} gain={gain_applied:.1f}x ns={int(ns_applied)} wav={len(wav)}B"
+            )
             txt, uid = await asyncio.gather(
                 self._fetch_transcription(wav),
                 self._fetch_speaker_id(wav),
@@ -817,21 +890,35 @@ class CameraSession:
             if (not txt or not is_valid_text(txt)) and self._wake_detected:
                 # Post-wake rescue: NS may have eaten the consonants of a
                 # distant command — retry the unprocessed signal.
-                logger.info(f"[{self.stream_name}] 🔁 Post-wake retry raw signal (wake={self._wake_detected})")
+                logger.info(
+                    f"[{self.stream_name}] 🔁 Post-wake retry raw signal (wake={self._wake_detected})"
+                )
                 txt = await self._fetch_transcription(
                     await asyncio.to_thread(self._encode_wav, buf_raw),
                     temperature="0.7",
                 )
             if not txt or not is_valid_text(txt):
                 if not txt:
-                    logger.info(f"[{self.stream_name}] ❌ Whisper empty for {len(buf)}-byte ({duration_s:.2f}s)")
+                    logger.info(
+                        f"[{self.stream_name}] ❌ Whisper empty for {len(buf)}-byte ({duration_s:.2f}s)"
+                    )
                 else:
                     logger.info(f"[{self.stream_name}] ❌ Rejected: '{txt[:60]}'")
                 return
-                
+
             logger.info(f"[{self.stream_name}] ✅ Whisper OK: '{txt[:60]}'")
             norm = txt.lower().strip().strip(".,!? -")
-            if norm in ("готов", "да", "го", "начинаем", "начали", "готово", "ок", "окей", "давай"):
+            if norm in (
+                "готов",
+                "да",
+                "го",
+                "начинаем",
+                "начали",
+                "готово",
+                "ок",
+                "окей",
+                "давай",
+            ):
                 logger.info(f"[{self.stream_name}] ✅ Acknowledge: '{txt[:60]}'")
                 await self._play_attention("ack")
                 self._back_to_wake()
@@ -839,7 +926,9 @@ class CameraSession:
             # Anti-loop: camera hears its own TTS echo with 15-25s delay;
             # if this transcript matches a recent one, it's the echo.
             if norm and norm == self._last_transcript:
-                logger.info(f"[{self.stream_name}] ❌ Echo repeat, ignoring: '{txt[:60]}'")
+                logger.info(
+                    f"[{self.stream_name}] ❌ Echo repeat, ignoring: '{txt[:60]}'"
+                )
                 return
             self._last_transcript = norm
             if uid != "unknown":
@@ -856,9 +945,11 @@ class CameraSession:
             self._wake_detected = True
             self._wake_expires = time.time() + self._wake_timeout
             asyncio.create_task(self._play_attention("processor_kw"))
-            cmd = (txt[: m.start()] + " " + txt[m.end():]).strip()
+            cmd = (txt[: m.start()] + " " + txt[m.end() :]).strip()
             if cmd:
-                logger.info(f"[{self.stream_name}] 🎯 Wake+cmd: '{txt[:60]}' -> '{cmd[:60]}'")
+                logger.info(
+                    f"[{self.stream_name}] 🎯 Wake+cmd: '{txt[:60]}' -> '{cmd[:60]}'"
+                )
                 await self._call_nanobot(cmd, uid)
             else:
                 logger.info(f"[{self.stream_name}] 🎯 Wake word (awaiting command)")
@@ -876,7 +967,7 @@ class CameraSession:
                 self._processor.set_state(AgentState.LISTENING)
                 return
             idx = text.lower().find(kw)
-            cmd = text[idx + len(kw):].strip().lstrip(".,!? -")
+            cmd = text[idx + len(kw) :].strip().lstrip(".,!? -")
             if not cmd:
                 self._wake_detected = True
                 self._wake_expires = time.time() + self._wake_timeout
@@ -901,14 +992,16 @@ class CameraSession:
                 async with session.ws_connect(
                     f"{self._nanobot_url}?token={self._nanobot_token}&chat_id={self.chat_id}"
                 ) as ws:
-                    await ws.send_json({
-                        "type": "message",
-                        "chat_id": self.chat_id,
-                        "content": txt,
-                        "user_id": uid,
-                        "user_name": self.stream_name,
-                        "voice_reply": True,
-                    })
+                    await ws.send_json(
+                        {
+                            "type": "message",
+                            "chat_id": self.chat_id,
+                            "content": txt,
+                            "user_id": uid,
+                            "user_name": self.stream_name,
+                            "voice_reply": True,
+                        }
+                    )
                     reply = await asyncio.wait_for(self._wait_reply(ws), timeout=30.0)
                     if reply:
                         self._wake_expires = time.time() + self._wake_timeout
@@ -936,7 +1029,11 @@ class CameraSession:
                     break  # end of the current response
                 if ev == "final":
                     break
-                if "text" in data and data.get("type") not in ("stt", "listen") and ev not in ("reasoning_delta", "thinking", "ready"):
+                if (
+                    "text" in data
+                    and data.get("type") not in ("stt", "listen")
+                    and ev not in ("reasoning_delta", "thinking", "ready")
+                ):
                     parts.append(str(data["text"]))
                     got_text = True
                 elif "parts" in data:
@@ -952,7 +1049,7 @@ class CameraSession:
             m = re.search(r"\[thinking\](.*?)\[/thinking\]", text, flags=re.S)
             if not m:
                 break
-            text = text[: m.start()] + text[m.end():]
+            text = text[: m.start()] + text[m.end() :]
         text = re.sub(r"\[/?thinking\]", "", text)
         text = re.sub(r"\[[a-z]{2,30}\]", "", text)
         text = re.sub(r"\s+", " ", text).strip()
@@ -965,16 +1062,25 @@ class CameraSession:
         data_size = len(pcm_16k)
         header = struct.pack(
             "<4sI4s4sIHHIIHH4sI",
-            b"RIFF", 36 + data_size, b"WAVE",
-            b"fmt ", 16, 1, channels, sample_rate,
+            b"RIFF",
+            36 + data_size,
+            b"WAVE",
+            b"fmt ",
+            16,
+            1,
+            channels,
+            sample_rate,
             sample_rate * channels * bits // 8,
             channels * bits // 8,
             bits,
-            b"data", data_size,
+            b"data",
+            data_size,
         )
         return header + pcm_16k
 
-    async def _fetch_transcription(self, wav: bytes, temperature: str | None = None) -> str:
+    async def _fetch_transcription(
+        self, wav: bytes, temperature: str | None = None
+    ) -> str:
         for temp in (temperature, "0.0", "0.5"):
             if not temp:
                 continue
@@ -985,7 +1091,8 @@ class CameraSession:
             form.add_field("temperature", temp)
             try:
                 async with self.http_session.post(
-                    self.whisper_url, data=form,
+                    self.whisper_url,
+                    data=form,
                     timeout=aiohttp.ClientTimeout(total=30),
                 ) as r:
                     if r.status == 200:
@@ -1000,8 +1107,16 @@ class CameraSession:
     async def _fetch_speaker_id(self, wav: bytes) -> str:
         try:
             proc = await asyncio.create_subprocess_exec(
-                "ffmpeg", "-loglevel", "error", "-i", "pipe:0",
-                "-c:a", "libopus", "-f", "ogg", "pipe:1",
+                "ffmpeg",
+                "-loglevel",
+                "error",
+                "-i",
+                "pipe:0",
+                "-c:a",
+                "libopus",
+                "-f",
+                "ogg",
+                "pipe:1",
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
@@ -1018,9 +1133,13 @@ class CameraSession:
                     j = await r.json()
                     uid, conf = j.get("user_id", "unknown"), j.get("confidence", 0.0)
                     if uid != "unknown" and conf > 0.1:
-                        logger.info(f"[{self.stream_name}] 👤 [SpeakerID] Recognized: {uid} ({conf:.2f})")
+                        logger.info(
+                            f"[{self.stream_name}] 👤 [SpeakerID] Recognized: {uid} ({conf:.2f})"
+                        )
                         return uid
-                    logger.debug(f"[{self.stream_name}] 👤 [SpeakerID] Rejected: {uid} ({conf:.2f})")
+                    logger.debug(
+                        f"[{self.stream_name}] 👤 [SpeakerID] Rejected: {uid} ({conf:.2f})"
+                    )
         except Exception as e:
             logger.warning(f"[{self.stream_name}] ⚠️ [SpeakerID] Request failed: {e}")
         return "unknown"
@@ -1123,7 +1242,7 @@ class CameraSession:
                 if gain > 1.2:
                     pcm_arr = np.clip(pcm_arr * gain, -32768, 32767).astype(np.int16)
                     pcm = pcm_arr.tobytes()
-            
+
             # Блокируем микрофон только сейчас, когда звук реально готов пойти в канал
             audio_dur = len(pcm) / (sr * 2)
             if self._out_track:
@@ -1133,7 +1252,7 @@ class CameraSession:
 
             chunk_size = sr * 20 // 1000 * 2
             for i in range(0, len(pcm), chunk_size):
-                c = pcm[i: i + chunk_size]
+                c = pcm[i : i + chunk_size]
                 if len(c) < chunk_size:
                     c += b"\x00" * (chunk_size - len(c))
                 if self._out_track:
@@ -1144,7 +1263,9 @@ class CameraSession:
             # takes ~audio_dur of real time (backpressure), so a lock set
             # before the loop would expire while the speaker is still playing.
             if self._out_track:
-                self._speaking_until = time.time() + self._out_track.queue_seconds() + echo_tail
+                self._speaking_until = (
+                    time.time() + self._out_track.queue_seconds() + echo_tail
+                )
             global GLOBAL_TTS_UNTIL
             GLOBAL_TTS_UNTIL = time.time() + audio_dur + 3.0
         except Exception as e:

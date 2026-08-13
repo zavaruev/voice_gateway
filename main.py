@@ -1331,6 +1331,17 @@ async def listen_to_nanobot_task(device_ws: WebSocket, state: dict, nano_session
 @app.websocket("/")
 async def voice_ws(device_ws: WebSocket):
     global _active_speaker_lock
+
+    token = device_ws.query_params.get("token")
+    if not token:
+        auth_header = device_ws.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:]
+
+    if token != NANOBOT_TOKEN:
+        await device_ws.close(code=1008, reason="Unauthorized")
+        return
+
     await device_ws.accept()
 
     fwd_headers = {k.lower(): v for k, v in device_ws.headers.items()}

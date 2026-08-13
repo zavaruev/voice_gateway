@@ -1593,6 +1593,8 @@ async def firmware_upload(
         raise HTTPException(400, "Only .bin files accepted")
     fname = f"firmware_v{version}.bin" if version else file.filename
     fname = os.path.basename(fname)
+    if not re.match(r"^[a-zA-Z0-9_.-]+$", fname):
+        raise HTTPException(400, "Invalid filename")
     fpath = os.path.join(FIRMWARE_DIR, fname)
 
     def write_sync_chunked(path, file_obj, max_size):

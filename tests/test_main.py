@@ -347,6 +347,34 @@ def test_save_chat_id_cache_error(mock_logger_error, mock_open_err):
     mock_logger_error.assert_called_once()
     assert "Failed to save chat_id cache:" in mock_logger_error.call_args[0][0]
 
+def test_load_firmware_meta_cache_hit():
+    with patch.dict(main.__dict__, {"_firmware_meta_cache": {"version": "cached", "filename": "test.bin", "timestamp": 123}}):
+        result = load_firmware_meta()
+        assert result == {"version": "cached", "filename": "test.bin", "timestamp": 123}
+
+def test_load_firmware_meta_success():
+    with patch.dict(main.__dict__, {"_firmware_meta_cache": None}):
+        with patch("builtins.open", mock_open(read_data='{"version": "1.0", "filename": "test.bin", "timestamp": 123}')):
+            with patch("os.path.isfile", return_value=True):
+                result = load_firmware_meta()
+                assert result == {"version": "1.0", "filename": "test.bin", "timestamp": 123}
+                assert main._firmware_meta_cache == {"version": "1.0", "filename": "test.bin", "timestamp": 123}
+
+def test_load_firmware_meta_missing_bin():
+    with patch.dict(main.__dict__, {"_firmware_meta_cache": None}):
+        with patch("builtins.open", mock_open(read_data='{"version": "1.0", "filename": "missing.bin", "timestamp": 123}')):
+            with patch("os.path.isfile", return_value=False):
+                result = load_firmware_meta()
+                assert result == {"version": "", "filename": "", "timestamp": 0}
+                assert main._firmware_meta_cache == {"version": "", "filename": "", "timestamp": 0}
+
+def test_load_firmware_meta_error():
+    with patch.dict(main.__dict__, {"_firmware_meta_cache": None}):
+        with patch("builtins.open", side_effect=Exception("JSON error")):
+            result = load_firmware_meta()
+            assert result == {"version": "", "filename": "", "timestamp": 0}
+            assert main._firmware_meta_cache == {"version": "", "filename": "", "timestamp": 0}
+
 @patch("main.time.time", return_value=1234567890.123)
 def test_save_firmware_meta(mock_time):
     original_cache = main._firmware_meta_cache

@@ -22,6 +22,7 @@ from main import (
     pack_ogg,
     set_cached_chat_id,
     get_cached_chat_id,
+    verify_auth,
     load_chat_id_cache,
     save_chat_id_cache,
     CHAT_ID_TTL,
@@ -416,7 +417,6 @@ def test_save_firmware_meta_error():
     original_cache = main._firmware_meta_cache
     try:
         with patch("builtins.open", side_effect=OSError("Disk full")):
-            import pytest
             with pytest.raises(OSError, match="Disk full"):
                 save_firmware_meta("1.2.3", "firmware_v1.2.3.bin")
 
@@ -554,3 +554,29 @@ async def test_fetch_transcription_exception():
     result = await fetch_transcription(b"fakeaudio", mock_session)
     assert result == ""
     mock_session.post.assert_called_once()
+
+def test_verify_auth_disabled():
+    with patch("main.ADMIN_USERNAME", ""), patch("main.ADMIN_PASSWORD", ""):
+        with pytest.raises(HTTPException) as exc:
+            verify_auth(HTTPBasicCredentials(username="admin", password="password"))
+        assert exc.value.status_code == 401
+        assert exc.value.detail == "Authentication disabled (credentials not configured)"
+
+def test_verify_auth_no_credentials():
+    with patch("main.ADMIN_USERNAME", "admin"), patch("main.ADMIN_PASSWORD", "password"):
+        with pytest.raises(HTTPException) as exc:
+            verify_auth(None)
+        assert exc.value.status_code == 401
+        assert exc.value.detail == "Authentication required"
+
+def test_verify_auth_incorrect_credentials():
+    with patch("main.ADMIN_USERNAME", "admin"), patch("main.ADMIN_PASSWORD", "password"):
+        with pytest.raises(HTTPException) as exc:
+            verify_auth(HTTPBasicCredentials(username="admin", password="wrongpassword"))
+        assert exc.value.status_code == 401
+        assert exc.value.detail == "Incorrect email or password"
+
+def test_verify_auth_success():
+    with patch("main.ADMIN_USERNAME", "admin"), patch("main.ADMIN_PASSWORD", "password"):
+        result = verify_auth(HTTPBasicCredentials(username="admin", password="password"))
+        assert result == "admin"

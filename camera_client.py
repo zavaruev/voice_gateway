@@ -165,6 +165,8 @@ class CameraSession:
         wakeword_model_path: str = "",
         activation_wav_path: str = "/app/activation.wav",
     ):
+        if not re.match(r"^[a-zA-Z0-9_-]+$", stream_name):
+            raise ValueError(f"Invalid stream_name: {stream_name}")
         self.stream_name = stream_name
         self.go2rtc_host = go2rtc_host
         self.go2rtc_port = go2rtc_port

@@ -42,7 +42,6 @@ def pack_ogg(frames: list, sample_rate=16000) -> bytes:
         crc = ogg_crc(p)
         return p[:22] + struct.pack("<I", crc) + p[26:]
 
-    ser = int(time.time()) & 0xFFFFFFFF
     res = page(
         0, 0, ser, True, False,
         [struct.pack("<8sBBHIHB", b"OpusHead", 1, 1, 312, sample_rate, 0, 0)],

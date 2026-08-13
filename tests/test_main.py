@@ -467,59 +467,55 @@ def test_device_list_with_status():
         main.session_states = original_session
 
 @pytest.mark.asyncio
-async def test_firmware_upload_path_traversal(mocker):
-
-    # We will just patch FIRMWARE_DIR to avoid writing any files to disk
-    mocker.patch("main.FIRMWARE_DIR", "/tmp/firmware_mock")
-
-    mocker.patch("main.save_firmware_meta")
-
-    # Actually we just use TestClient to test the API endpoint response
+async def test_firmware_upload_path_traversal():
     from fastapi.testclient import TestClient
     from main import app, verify_auth
 
-    app.dependency_overrides[verify_auth] = lambda: "admin"
-    client = TestClient(app)
+    # We will just patch FIRMWARE_DIR to avoid writing any files to disk
+    patch("main.FIRMWARE_DIR", "/tmp/firmware_mock").start()
+    patch("main.save_firmware_meta").start()
+    patch("main.asyncio.to_thread").start() # Prevent actual file writing
 
-    # 1. Test invalid filename traversal characters (using version)
-    # This shouldn't be reached because of the exception, but let's make sure
-    mocker.patch("main.asyncio.to_thread") # Prevent actual file writing
+    try:
+        app.dependency_overrides[verify_auth] = lambda: "admin"
+        client = TestClient(app)
 
-    response = client.post(
-        "/api/firmware/upload",
-        data={"version": "$%&invalid"},
-        files={"file": ("valid.bin", b"mock content")}
-    )
-    assert response.status_code == 400
-    assert response.json()["detail"] == "Invalid filename"
+        response = client.post(
+            "/api/firmware/upload",
+            data={"version": "$%&invalid"},
+            files={"file": ("valid.bin", b"mock content")}
+        )
+        assert response.status_code == 400
+        assert response.json()["detail"] == "Invalid version format"
 
-    # 2. Test valid filename with version
-    response = client.post(
-        "/api/firmware/upload",
-        data={"version": "1.0.0"},
-        files={"file": ("valid.bin", b"mock content")}
-    )
-    assert response.status_code == 200
-    assert response.json()["status"] == "ok"
+        # 2. Test valid filename with version
+        response = client.post(
+            "/api/firmware/upload",
+            data={"version": "1.0.0"},
+            files={"file": ("valid.bin", b"mock content")}
+        )
+        assert response.status_code == 200
+        assert response.json()["status"] == "ok"
 
-    # 3. Test invalid filename (using file.filename)
-    response = client.post(
-        "/api/firmware/upload",
-        files={"file": ("invalid$%&.bin", b"mock content")}
-    )
-    assert response.status_code == 400
-    assert response.json()["detail"] == "Invalid filename"
+        # 3. Test invalid filename (using file.filename)
+        response = client.post(
+            "/api/firmware/upload",
+            files={"file": ("invalid$%&.bin", b"mock content")}
+        )
+        assert response.status_code == 400
+        assert response.json()["detail"] == "Invalid filename"
 
-    # 4. Test valid filename without version
-    response = client.post(
-        "/api/firmware/upload",
-        files={"file": ("valid_name.bin", b"mock content")}
-    )
-    assert response.status_code == 200
-    assert response.json()["status"] == "ok"
-
-    # Clean up overrides
-    app.dependency_overrides = {}
+        # 4. Test valid filename without version
+        response = client.post(
+            "/api/firmware/upload",
+            files={"file": ("valid_name.bin", b"mock content")}
+        )
+        assert response.status_code == 200
+        assert response.json()["status"] == "ok"
+    finally:
+        # Clean up overrides and patches
+        app.dependency_overrides = {}
+        patch.stopall()
 
 @pytest.mark.asyncio
 async def test_fetch_transcription_success():
@@ -555,28 +551,33 @@ async def test_fetch_transcription_exception():
     assert result == ""
     mock_session.post.assert_called_once()
 
+from types import SimpleNamespace
+
+def _auth_request():
+    return SimpleNamespace(client=SimpleNamespace(host="127.0.0.1"))
+
 def test_verify_auth_disabled():
     with patch("main.ADMIN_USERNAME", ""), patch("main.ADMIN_PASSWORD", ""):
         with pytest.raises(HTTPException) as exc:
-            verify_auth(HTTPBasicCredentials(username="admin", password="password"))
+            verify_auth(_auth_request(), HTTPBasicCredentials(username="admin", password="password"))
         assert exc.value.status_code == 401
         assert exc.value.detail == "Authentication disabled (credentials not configured)"
 
 def test_verify_auth_no_credentials():
     with patch("main.ADMIN_USERNAME", "admin"), patch("main.ADMIN_PASSWORD", "password"):
         with pytest.raises(HTTPException) as exc:
-            verify_auth(None)
+            verify_auth(_auth_request(), None)
         assert exc.value.status_code == 401
         assert exc.value.detail == "Authentication required"
 
 def test_verify_auth_incorrect_credentials():
     with patch("main.ADMIN_USERNAME", "admin"), patch("main.ADMIN_PASSWORD", "password"):
         with pytest.raises(HTTPException) as exc:
-            verify_auth(HTTPBasicCredentials(username="admin", password="wrongpassword"))
+            verify_auth(_auth_request(), HTTPBasicCredentials(username="admin", password="wrongpassword"))
         assert exc.value.status_code == 401
         assert exc.value.detail == "Incorrect email or password"
 
 def test_verify_auth_success():
     with patch("main.ADMIN_USERNAME", "admin"), patch("main.ADMIN_PASSWORD", "password"):
-        result = verify_auth(HTTPBasicCredentials(username="admin", password="password"))
+        result = verify_auth(_auth_request(), HTTPBasicCredentials(username="admin", password="password"))
         assert result == "admin"

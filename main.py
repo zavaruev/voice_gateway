@@ -18,6 +18,10 @@ from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+import limits
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 import camera_client
 from camera_client import CameraSession
 
@@ -158,12 +162,19 @@ def make_chat_id(mac: str) -> str:
 
 load_chat_id_cache()  # Load on startup
 
+limiter = Limiter(key_func=get_remote_address)
 app = FastAPI()
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 security = HTTPBasic(auto_error=False)
 
 
-def verify_auth(credentials: HTTPBasicCredentials | None = Depends(security)):
+def verify_auth(request: Request, credentials: HTTPBasicCredentials | None = Depends(security)):
+    limit = limits.parse("5/minute")
+    if not limiter._limiter.hit(limit, get_remote_address(request), "verify_auth"):
+        raise HTTPException(status_code=429, detail="Too many requests")
+
     if not ADMIN_USERNAME or not ADMIN_PASSWORD:
         raise HTTPException(
             status_code=401,

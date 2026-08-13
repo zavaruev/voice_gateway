@@ -196,7 +196,7 @@ class CameraSession:
         self._last_feed_log = 0.0
         self._last_rms_log = 0.0
         self._bg_window: list[int] = []
-        self._resample_buf = b""
+        self._resample_buf = bytearray()
 
         self._engine = LocalAudioEngine(vad_threshold=0.03)
         self._processor = CameraProcessor(
@@ -600,11 +600,11 @@ class CameraSession:
             self._back_to_wake()
 
         if rate == 48000:
-            self._resample_buf += pcm
+            self._resample_buf.extend(pcm)
             # 160ms at 48kHz mono = 7680 samples = 15360 bytes
             while len(self._resample_buf) >= 15360:
-                block = self._resample_buf[:15360]
-                self._resample_buf = self._resample_buf[15360:]
+                block = bytes(self._resample_buf[:15360])
+                del self._resample_buf[:15360]
                 pcm_16k = await asyncio.to_thread(self._resample_16k, block)
                 self._vad_buf.extend(pcm_16k)
                 self._drain_vad_buf()
@@ -617,7 +617,7 @@ class CameraSession:
         chunk_bytes = 2560
         while len(self._vad_buf) >= chunk_bytes:
             chunk = bytes(self._vad_buf[:chunk_bytes])
-            self._vad_buf = self._vad_buf[chunk_bytes:]
+            del self._vad_buf[:chunk_bytes]
 
             now = time.time()
             if now - self._last_feed_log >= 3.0:

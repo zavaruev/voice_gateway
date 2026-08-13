@@ -5,7 +5,8 @@ import json
 import time
 import numpy as np
 import struct
-from unittest.mock import patch, MagicMock, mock_open
+import aiohttp
+from unittest.mock import patch, MagicMock, mock_open, AsyncMock
 
 # Environment variable mocks needed before importing main
 os.environ["NANOBOT_WS_URL"] = "ws://test_nanobot"
@@ -14,6 +15,7 @@ os.environ["TTS_URL"] = "http://test_tts"
 os.environ["SPEAKER_ID_URL"] = "http://test_speaker"
 
 from main import (
+    fetch_transcription,
     is_valid_text,
     make_chat_id,
     calculate_rms,
@@ -518,3 +520,37 @@ async def test_firmware_upload_path_traversal(mocker):
 
     # Clean up overrides
     app.dependency_overrides = {}
+
+@pytest.mark.asyncio
+async def test_fetch_transcription_success():
+    mock_session = AsyncMock(spec=aiohttp.ClientSession)
+    mock_response = AsyncMock()
+    mock_response.status = 200
+    mock_response.json.return_value = {"text": "Hello world"}
+    mock_session.post.return_value.__aenter__.return_value = mock_response
+
+    result = await fetch_transcription(b"fakeaudio", mock_session)
+    assert result == "Hello world"
+    mock_session.post.assert_called_once()
+
+@pytest.mark.asyncio
+async def test_fetch_transcription_non_200():
+    mock_session = AsyncMock(spec=aiohttp.ClientSession)
+    mock_response = AsyncMock()
+    mock_response.status = 500
+    mock_response.text.return_value = "Internal Server Error"
+    mock_session.post.return_value.__aenter__.return_value = mock_response
+
+    result = await fetch_transcription(b"fakeaudio", mock_session)
+    assert result == ""
+    mock_session.post.assert_called_once()
+
+@pytest.mark.asyncio
+async def test_fetch_transcription_exception():
+    mock_session = AsyncMock(spec=aiohttp.ClientSession)
+    # Raising an exception when the context manager tries to enter
+    mock_session.post.return_value.__aenter__.side_effect = aiohttp.ClientError("Network Error")
+
+    result = await fetch_transcription(b"fakeaudio", mock_session)
+    assert result == ""
+    mock_session.post.assert_called_once()

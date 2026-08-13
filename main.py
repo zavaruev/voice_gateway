@@ -1631,6 +1631,8 @@ async def firmware_upload(
     version: str = Form(""),
     username: str = Depends(verify_auth),
 ):
+    if version and not re.match(r"^[a-zA-Z0-9.\-_]+$", version):
+        raise HTTPException(400, "Invalid version format")
     if not file.filename or not file.filename.endswith(".bin"):
         raise HTTPException(400, "Only .bin files accepted")
     fname = f"firmware_v{version}.bin" if version else file.filename

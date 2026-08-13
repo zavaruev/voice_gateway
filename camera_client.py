@@ -797,13 +797,15 @@ class CameraSession:
             buf_raw = samples.astype(np.int16).tobytes()
 
             wav = await asyncio.to_thread(self._encode_wav, buf)
-            try:
-                import os
-                os.makedirs("/tmp/utterances", exist_ok=True)
-                with open(f"/tmp/utterances/u_{int(time.time())}.wav", "wb") as f:
-                    f.write(wav)
-            except Exception:
-                pass
+            def save_wav():
+                try:
+                    import os
+                    os.makedirs("/tmp/utterances", exist_ok=True)
+                    with open(f"/tmp/utterances/u_{int(time.time())}.wav", "wb") as f:
+                        f.write(wav)
+                except Exception:
+                    pass
+            await asyncio.to_thread(save_wav)
             logger.info(f"[{self.stream_name}] 🎤 Whisper IN: {duration_s:.2f}s raw_rms={rms_raw:.0f} peak={peak_raw} dB={rms_dB:.1f} gain={gain_applied:.1f}x ns={int(ns_applied)} wav={len(wav)}B")
             txt, uid = await asyncio.gather(
                 self._fetch_transcription(wav),

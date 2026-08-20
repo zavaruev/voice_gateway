@@ -162,14 +162,16 @@ class CameraProcessor:
             self.engine.reset_vad()
 
     async def _send_to_speeches_stt(self, audio_pcm16: np.ndarray) -> str:
-        wav_io = io.BytesIO()
-        with wave.open(wav_io, 'wb') as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(16000)
-            wf.writeframes(audio_pcm16.tobytes())
+        def _write_wav():
+            wav_io = io.BytesIO()
+            with wave.open(wav_io, 'wb') as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(16000)
+                wf.writeframes(audio_pcm16.tobytes())
+            return wav_io.getvalue()
 
-        wav_bytes = wav_io.getvalue()
+        wav_bytes = await asyncio.to_thread(_write_wav)
 
         form = aiohttp.FormData()
         form.add_field('file', wav_bytes, filename='speech.wav', content_type='audio/wav')
@@ -241,19 +243,3 @@ class CameraProcessor:
                 elif now - self.silence_start > self.SILENCE_TIMEOUT:
                     logger.info(f"VAD silence ({len(self.record_buffer)} frames). Processing STT...")
                     asyncio.create_task(self._handle_stt_and_llm())
-
-    async def handle_track(self, track):
-        logger.info("Track processing started.")
-        resampler = av.AudioResampler(format='s16', layout='mono', rate=16000)
-        while True:
-            try:
-                frame = await track.recv()
-                if frame is None:
-                    break
-                resampled = resampler.resample(frame)
-                for f in resampled:
-                    audio_data = f.to_ndarray(format='s16', layout='mono').flatten()
-                    await self.process_chunk(audio_data)
-            except Exception as e:
-                logger.error(f"Track processing error: {e}", exc_info=True)
-                break

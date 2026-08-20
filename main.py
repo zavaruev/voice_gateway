@@ -13,6 +13,7 @@ import onnxruntime as ort
 import opuslib
 from pydub import AudioSegment
 from loguru import logger
+from dataclasses import dataclass
 from fastapi import FastAPI, Request, Form, WebSocket, HTTPException, UploadFile, File, Depends
 from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
@@ -1345,7 +1346,25 @@ async def listen_to_nanobot_task(device_ws: WebSocket, state: dict, nano_session
             await asyncio.sleep(5)
 
 
-async def handle_ws_text_message(d: dict, state: dict, device_ws: WebSocket, session_id: str, dec: opuslib.Decoder, nano_session: aiohttp.ClientSession, nano_listener_task):
+@dataclass
+class WSContext:
+    d: dict
+    state: dict
+    device_ws: WebSocket
+    session_id: str
+    dec: opuslib.Decoder
+    nano_session: aiohttp.ClientSession
+    nano_listener_task: asyncio.Task | None
+
+
+async def handle_ws_text_message(ctx: WSContext):
+    d = ctx.d
+    state = ctx.state
+    device_ws = ctx.device_ws
+    session_id = ctx.session_id
+    dec = ctx.dec
+    nano_session = ctx.nano_session
+    nano_listener_task = ctx.nano_listener_task
     if d.get("type") == "mcp":
         _clean_stale_futures()
         payload = d.get("payload", {})
@@ -1555,9 +1574,16 @@ async def voice_ws(device_ws: WebSocket):
             if text_data:
                 state["last_activity"] = time.time()
                 d = json.loads(text_data)
-                nano_listener_task, should_continue = await handle_ws_text_message(
-                    d, state, device_ws, session_id, dec, nano_session, nano_listener_task
+                ctx = WSContext(
+                    d=d,
+                    state=state,
+                    device_ws=device_ws,
+                    session_id=session_id,
+                    dec=dec,
+                    nano_session=nano_session,
+                    nano_listener_task=nano_listener_task
                 )
+                nano_listener_task, should_continue = await handle_ws_text_message(ctx)
                 if should_continue:
                     continue
 

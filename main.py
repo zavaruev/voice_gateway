@@ -23,7 +23,7 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 import camera_client
-from camera_client import CameraSession
+from camera_client import CameraSession, CameraConfig
 
 # ==========================================
 # CONFIGURATION & ENVIRONMENT VARIABLES
@@ -1933,7 +1933,7 @@ async def start_camera_sessions():
 
     for name in streams:
         try:
-            session = CameraSession(
+            config = CameraConfig(
                 stream_name=name,
                 go2rtc_host=go2rtc_host,
                 go2rtc_port=go2rtc_port,
@@ -1947,6 +1947,7 @@ async def start_camera_sessions():
                               onnx_threshold=0.02, rms_noise_floor=0.005,
                               rms_alpha=0.0, onnx_gain=8.0),
             )
+            session = CameraSession(config=config)
             _camera_sessions.append(session)
             await session.start()
             logger.info(f"📷 Camera session started: {name}")

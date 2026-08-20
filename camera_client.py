@@ -12,6 +12,7 @@ import logging
 import re
 import struct
 import time
+from dataclasses import dataclass
 
 import aiohttp
 import aioice.ice
@@ -141,58 +142,60 @@ _HAS_QUESTION_RE = re.compile(r"[?？]")
 GLOBAL_TTS_UNTIL = 0.0
 
 
+@dataclass
+class CameraConfig:
+    stream_name: str
+    go2rtc_host: str = "192.168.22.102"
+    go2rtc_port: int = 1984
+    http_session: aiohttp.ClientSession | None = None
+    chat_id: str | None = None
+    whisper_url: str = "http://192.168.22.111:8000/v1/audio/transcriptions"
+    whisper_model: str = "koekaverna/faster-whisper-podlodka-turbo"
+    tts_url: str = "http://edge_tts:5050/v1/audio/speech"
+    tts_voice: str = "ru-RU-SvetlanaNeural"
+    tts_api_key: str = ""
+    nanobot_url: str = "ws://nanobot:8765/"
+    nanobot_token: str = "token"
+    speaker_id_url: str = "http://192.168.22.102:8001/identify"
+    aec_block_ms: int = 1500
+    wake_keyword: str = "компьютер"
+    wake_timeout: float = 60.0
+    vad: object = None
+    wakeword_model_path: str = ""
+    activation_wav_path: str = "/app/activation.wav"
+
+
 class CameraSession:
 
-    def __init__(
-        self,
-        stream_name: str,
-        go2rtc_host: str = "192.168.22.102",
-        go2rtc_port: int = 1984,
-        http_session: aiohttp.ClientSession | None = None,
-        chat_id: str | None = None,
-        whisper_url: str = "http://192.168.22.111:8000/v1/audio/transcriptions",
-        whisper_model: str = "koekaverna/faster-whisper-podlodka-turbo",
-        tts_url: str = "http://edge_tts:5050/v1/audio/speech",
-        tts_voice: str = "ru-RU-SvetlanaNeural",
-        tts_api_key: str = "",
-        nanobot_url: str = "ws://nanobot:8765/",
-        nanobot_token: str = "token",
-        speaker_id_url: str = "http://192.168.22.102:8001/identify",
-        aec_block_ms: int = 1500,
-        wake_keyword: str = "компьютер",
-        wake_timeout: float = 60.0,
-        vad: object = None,
-        wakeword_model_path: str = "",
-        activation_wav_path: str = "/app/activation.wav",
-    ):
-        if not re.match(r"^[a-zA-Z0-9_-]+$", stream_name):
-            raise ValueError(f"Invalid stream_name: {stream_name}")
-        self.stream_name = stream_name
-        self.go2rtc_host = go2rtc_host
-        self.go2rtc_port = go2rtc_port
-        self.chat_id = chat_id or self._make_chat_id(stream_name)
-        self.http_session = http_session
-        self.whisper_url = whisper_url
-        self.whisper_model = whisper_model
-        self.tts_url = tts_url
-        self.tts_voice = tts_voice
-        self.tts_api_key = tts_api_key
-        self._nanobot_url = nanobot_url.rstrip("/")
-        self._nanobot_token = nanobot_token
-        self._speaker_id_url = speaker_id_url
-        self.aec_block_ms = aec_block_ms
-        self.wake_keyword = wake_keyword
-        self._wake_timeout = wake_timeout
+    def __init__(self, config: CameraConfig):
+        if not re.match(r"^[a-zA-Z0-9_-]+$", config.stream_name):
+            raise ValueError(f"Invalid stream_name: {config.stream_name}")
+        self.stream_name = config.stream_name
+        self.go2rtc_host = config.go2rtc_host
+        self.go2rtc_port = config.go2rtc_port
+        self.chat_id = config.chat_id or self._make_chat_id(config.stream_name)
+        self.http_session = config.http_session
+        self.whisper_url = config.whisper_url
+        self.whisper_model = config.whisper_model
+        self.tts_url = config.tts_url
+        self.tts_voice = config.tts_voice
+        self.tts_api_key = config.tts_api_key
+        self._nanobot_url = config.nanobot_url.rstrip("/")
+        self._nanobot_token = config.nanobot_token
+        self._speaker_id_url = config.speaker_id_url
+        self.aec_block_ms = config.aec_block_ms
+        self.wake_keyword = config.wake_keyword
+        self._wake_timeout = config.wake_timeout
         self._wake_detected = False
         self._wake_expires = 0.0
         self._audio_epoch = 0.0
-        self._vad = vad
+        self._vad = config.vad
         if self._vad is not None:
             self._vad.energy_threshold = 0.005
             self._vad.rms_noise_floor = 0.005
             self._vad.rms_alpha = 0.0
-        self._wakeword_model_path = wakeword_model_path or ""
-        self._activation_wav_path = activation_wav_path
+        self._wakeword_model_path = config.wakeword_model_path or ""
+        self._activation_wav_path = config.activation_wav_path
 
         self._pc: RTCPeerConnection | None = None
         self._out_track: AIVoiceOutputTrack | None = None

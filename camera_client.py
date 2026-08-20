@@ -9,6 +9,7 @@ import hashlib
 import io
 import json
 import logging
+import os
 import re
 import struct
 import time
@@ -875,18 +876,21 @@ class CameraSession:
 
             wav = await asyncio.to_thread(self._encode_wav, buf)
             def _save_debug_wav(wav_data, ts):
-                import os
+                try:
+                    os.makedirs("/tmp/utterances", exist_ok=True)
+                    with open(f"/tmp/utterances/u_{ts}.wav", "wb") as f:
+                        f.write(wav_data)
+                except Exception:
+                    pass
 
-                os.makedirs("/tmp/utterances", exist_ok=True)
-                with open(f"/tmp/utterances/u_{ts}.wav", "wb") as f:
-                    f.write(wav_data)
-
-            try:
-                await asyncio.to_thread(
-                    _save_debug_wav, wav, int(time.time())
-                )
-            except Exception:
-                pass
+            # Fire and forget debug writing task, hold a ref locally to avoid garbage collection
+            # although in practice this short-lived task won't matter much.
+            task = asyncio.create_task(
+                asyncio.to_thread(_save_debug_wav, wav, int(time.time()))
+            )
+            # Add to class level strong reference set if we want to be perfectly safe,
+            # but usually it's fine just to silence the unretrieved exception if one slips through
+            task.add_done_callback(lambda t: t.exception())
             logger.info(
                 f"[{self.stream_name}] 🎤 Whisper IN: {duration_s:.2f}s raw_rms={rms_raw:.0f} peak={peak_raw} dB={rms_dB:.1f} gain={gain_applied:.1f}x ns={int(ns_applied)} wav={len(wav)}B"
             )

@@ -492,40 +492,6 @@ class CameraSession:
                             )
                             return
 
-    def _frame_to_16k_mono(self, frame: av.AudioFrame) -> bytes:
-        if frame.format.name in ("flt", "fltp"):
-            arr = frame.to_ndarray()
-            if arr.ndim == 2:
-                mono = arr.mean(axis=0)
-            else:
-                mono = arr.flatten()
-            mono = (mono * 32767).clip(-32768, 32767).astype(np.int16)
-        else:
-            raw = np.frombuffer(bytes(frame.planes[0]), dtype=np.int16)
-            n_planes = len(frame.planes)
-            if n_planes > 1:
-                channels = [
-                    np.frombuffer(bytes(p), dtype=np.int16) for p in frame.planes
-                ]
-                mono = np.mean(channels, axis=0, dtype=np.int16)
-            else:
-                layout_name = (
-                    frame.layout.name
-                    if hasattr(frame.layout, "name")
-                    else str(frame.layout)
-                )
-                if layout_name in ("mono", "1"):
-                    mono = raw
-                else:
-                    n_ch = (
-                        len(frame.layout.channels)
-                        if hasattr(frame.layout, "channels")
-                        else 2
-                    )
-                    mono = raw.reshape(-1, n_ch).mean(axis=1, dtype=np.int16)
-
-        return bytes(mono.tobytes())
-
     @staticmethod
     def _resample_16k(mono_48k: bytes) -> bytes:
         """Resample a 160ms mono block from 48kHz to 16kHz in a worker thread.

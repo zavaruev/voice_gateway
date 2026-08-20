@@ -13,6 +13,7 @@ import onnxruntime as ort
 import opuslib
 from pydub import AudioSegment
 from loguru import logger
+from dataclasses import dataclass
 from fastapi import FastAPI, Request, Form, WebSocket, HTTPException, UploadFile, File, Depends
 from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
@@ -23,13 +24,14 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 import camera_client
-from camera_client import CameraSession
+from camera_client import CameraSession, CameraConfig
 
 # ==========================================
 # CONFIGURATION & ENVIRONMENT VARIABLES
 # ==========================================
 NANOBOT_WS_URL = os.getenv("NANOBOT_WS_URL", "ws://nanobot:8765/").rstrip("/")
 NANOBOT_TOKEN = os.getenv("NANOBOT_TOKEN", "")
+NANOBOT_SESSION_SALT = os.getenv("NANOBOT_SESSION_SALT", "")
 SPEAKER_ID_URL = os.getenv("SPEAKER_ID_URL", "http://192.168.22.102:8001/identify")
 
 WHISPER_URL = os.getenv(
@@ -161,7 +163,7 @@ def set_cached_chat_id(mac: str, chat_id: str):
 def make_chat_id(mac: str) -> str:
     """Deterministic chat_id from MAC address in UUID format (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx).
     Nanobot reuses the session across reconnects."""
-    h = hashlib.sha256(mac.lower().encode()).hexdigest()
+    h = hashlib.sha256(f"{mac.lower()}{NANOBOT_SESSION_SALT}".encode()).hexdigest()
     return f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
 
 
@@ -945,14 +947,16 @@ async def trigger_emotion(
 # ==========================================
 # NANOBOT WEBSOCKET RESPONSE HANDLER
 # ==========================================
+EMOTION_REGEX = re.compile(r"\[([a-zA-Z0-9_]+)\]")
+
 class NanobotResponseHandler:
     def __init__(self, device_ws, state):
         self.device_ws = device_ws
         self.state = state
-        self.buffer = ""
-        self.full_response_text = ""
+        self.buffer = []
+        self.full_response_text = []
         self.timer = None
-        self.emotion_regex = re.compile(r"\[([a-zA-Z0-9_]+)\]")
+        self.emotion_regex = EMOTION_REGEX
         self.is_flushing = False
         self._first_chunk_time = None
         self._last_chunk_time = None
@@ -1034,35 +1038,36 @@ class NanobotResponseHandler:
             )
         self._chunk_count += 1
         self._last_chunk_time = now
-        self.buffer += chunk
+        self.buffer.append(chunk)
         if self.timer:
             self.timer.cancel()
         # Sentence-level flush: start TTS as soon as a complete sentence has
         # arrived instead of waiting for the whole LLM response to finish.
         # Chunks arrive every ~60ms, so a pending timer would be cancelled by
         # the next chunk before it fires; launch the flush immediately instead.
-        brackets_balanced = self.buffer.count("[") == self.buffer.count("]")
+        buffer_str = "".join(self.buffer)
+        brackets_balanced = buffer_str.count("[") == buffer_str.count("]")
         delay = 2.0 if not brackets_balanced else 1.5
         self.timer = asyncio.get_event_loop().call_later(
             delay, lambda: create_tracked_task(self.flush(), self.state)
         )
-        if brackets_balanced and SENTENCE_END_RE.search(self.buffer) and not self.is_flushing:
+        if brackets_balanced and SENTENCE_END_RE.search(buffer_str) and not self.is_flushing:
             self.timer.cancel()
             self.timer = None
             create_tracked_task(self.flush(), self.state)
 
     async def flush(self):
-        if self.is_flushing or not self.buffer.strip():
+        if self.is_flushing or not "".join(self.buffer).strip():
             return
         self.is_flushing = True
         self.state["status"] = "SPEAKING"
 
-        text = self.buffer
-        self.buffer = ""
+        text = "".join(self.buffer)
+        self.buffer = []
 
         # If emotion tag is still incomplete, wait for next chunk
         if text.count("[") > text.count("]"):
-            self.buffer = text
+            self.buffer = [text]
             self.timer = asyncio.get_event_loop().call_later(
                 0.5, lambda: create_tracked_task(self.flush(), self.state)
             )
@@ -1079,7 +1084,7 @@ class NanobotResponseHandler:
             trailing = text[last_match.end():]
             if trailing.strip():
                 text = text[: last_match.end()]
-                self.buffer = trailing + self.buffer
+                self.buffer = [trailing] + self.buffer
 
         emotions = self.emotion_regex.findall(text)
         for emotion in emotions:
@@ -1133,7 +1138,7 @@ class NanobotResponseHandler:
                 f"+{t_since_last:.1f}s after last chunk, "
                 f"{self._chunk_count} chunks"
             )
-            self.full_response_text += clean_text + " "
+            self.full_response_text.append(clean_text + " ")
             try:
                 await self.device_ws.send_json(
                     {
@@ -1157,7 +1162,7 @@ class NanobotResponseHandler:
         # content shortly after; only finalize (dialogue mode check, return
         # to standby) once the whole response has been produced.
         self.is_flushing = False
-        if self.buffer.strip():
+        if "".join(self.buffer).strip():
             self.timer = asyncio.get_event_loop().call_later(
                 0.15, lambda: create_tracked_task(self.flush(), self.state)
             )
@@ -1165,7 +1170,7 @@ class NanobotResponseHandler:
 
         await self._await_tts_drained()
 
-        clean_for_check = self.full_response_text.strip().lower()
+        clean_for_check = "".join(self.full_response_text).strip().lower()
         has_question = (
             HAS_QUESTION_RE.search(clean_for_check) is not None
             or "повторите пожалуйста" in clean_for_check
@@ -1200,7 +1205,7 @@ class NanobotResponseHandler:
                 self.state["watchdog"] = None
         self.state["last_activity"] = time.time()
         self.state["vad"].reset()
-        self.full_response_text = ""
+        self.full_response_text = []
 
 
 # ==========================================
@@ -1345,7 +1350,25 @@ async def listen_to_nanobot_task(device_ws: WebSocket, state: dict, nano_session
             await asyncio.sleep(5)
 
 
-async def handle_ws_text_message(d: dict, state: dict, device_ws: WebSocket, session_id: str, dec: opuslib.Decoder, nano_session: aiohttp.ClientSession, nano_listener_task):
+@dataclass
+class WSContext:
+    d: dict
+    state: dict
+    device_ws: WebSocket
+    session_id: str
+    dec: opuslib.Decoder
+    nano_session: aiohttp.ClientSession
+    nano_listener_task: asyncio.Task | None
+
+
+async def handle_ws_text_message(ctx: WSContext):
+    d = ctx.d
+    state = ctx.state
+    device_ws = ctx.device_ws
+    session_id = ctx.session_id
+    dec = ctx.dec
+    nano_session = ctx.nano_session
+    nano_listener_task = ctx.nano_listener_task
     if d.get("type") == "mcp":
         _clean_stale_futures()
         payload = d.get("payload", {})
@@ -1555,9 +1578,16 @@ async def voice_ws(device_ws: WebSocket):
             if text_data:
                 state["last_activity"] = time.time()
                 d = json.loads(text_data)
-                nano_listener_task, should_continue = await handle_ws_text_message(
-                    d, state, device_ws, session_id, dec, nano_session, nano_listener_task
+                ctx = WSContext(
+                    d=d,
+                    state=state,
+                    device_ws=device_ws,
+                    session_id=session_id,
+                    dec=dec,
+                    nano_session=nano_session,
+                    nano_listener_task=nano_listener_task
                 )
+                nano_listener_task, should_continue = await handle_ws_text_message(ctx)
                 if should_continue:
                     continue
 
@@ -1676,6 +1706,16 @@ async def api_tts(
     state = session_states.get(session_id)
     if not state:
         return {"error": "No state"}
+
+    if "mac" in state:
+        mac = normalize_mac(state["mac"])
+        db = load_db()
+        device_config = db.get(mac, {})
+        owner = device_config.get("owner")
+        if username != ADMIN_USERNAME:
+            if not owner or owner != username:
+                return {"error": "Forbidden: Not device owner"}
+
     device_ws = active_sessions[session_id]
 
     if state.get("status") == "PLAYING":
@@ -1933,7 +1973,7 @@ async def start_camera_sessions():
 
     for name in streams:
         try:
-            session = CameraSession(
+            config = CameraConfig(
                 stream_name=name,
                 go2rtc_host=go2rtc_host,
                 go2rtc_port=go2rtc_port,
@@ -1947,6 +1987,7 @@ async def start_camera_sessions():
                               onnx_threshold=0.02, rms_noise_floor=0.005,
                               rms_alpha=0.0, onnx_gain=8.0),
             )
+            session = CameraSession(config=config)
             _camera_sessions.append(session)
             await session.start()
             logger.info(f"📷 Camera session started: {name}")

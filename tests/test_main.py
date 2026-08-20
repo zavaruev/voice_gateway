@@ -32,6 +32,7 @@ from main import (
     save_firmware_meta,
     normalize_mac,
     device_online_status,
+    create_tracked_task,
 )
 from audio_utils import (
     WHISPER_HALLUCINATIONS,
@@ -108,6 +109,7 @@ def test_normalize_mac():
     assert normalize_mac("   \n\t  ") == ""
 
 
+@patch.dict(main.__dict__, {"NANOBOT_SESSION_SALT": ""})
 def test_make_chat_id():
     mac1 = "AA:BB:CC:DD:EE:FF"
     mac2 = "aa:bb:cc:dd:ee:ff"
@@ -121,6 +123,11 @@ def test_make_chat_id():
     chat_id = make_chat_id(mac1)
     assert len(chat_id) == 36
     assert chat_id.count("-") == 4
+
+    with patch.dict(main.__dict__, {"NANOBOT_SESSION_SALT": "my_secret_salt"}):
+        # Different salt changes ID
+        assert make_chat_id(mac1) != chat_id
+        assert make_chat_id(mac1) == make_chat_id(mac2)
 
 
 def test_calculate_rms():
@@ -206,6 +213,31 @@ def test_pack_ogg_pagination():
         idx = ogg_data_101.find(b'OggS', idx + 1)
 
 @patch("main.time.time")
+def test_get_cached_chat_id(mock_time):
+    mock_time.return_value = 1000.0
+    mac = "aa:bb:cc:dd:ee:ff"
+    chat_id = "test-chat-id-123"
+
+    test_cache = {
+        mac: {"chat_id": chat_id, "ts": 1000.0}
+    }
+
+    with patch.dict(main.CHAT_ID_CACHE, test_cache, clear=True):
+        # 1. Happy path (within TTL)
+        assert get_cached_chat_id(mac) == chat_id
+
+        # 2. Case insensitivity
+        assert get_cached_chat_id(mac.upper()) == chat_id
+
+        # 3. Missing key
+        assert get_cached_chat_id("00:11:22:33:44:55") is None
+
+        # 4. TTL expiration
+        mock_time.return_value = 1000.0 + main.CHAT_ID_TTL + 1.0
+        assert get_cached_chat_id(mac) is None
+
+
+@patch("main.time.time")
 def test_chat_id_cache(mock_time):
     # Setup
     mock_time.return_value = 1000.0
@@ -214,15 +246,8 @@ def test_chat_id_cache(mock_time):
     mac = "aa:bb:cc:dd:ee:ff"
     chat_id = "test-chat-id-123"
 
-    # Mock file I/O for saving cache
-    with patch("main.open", mock_open()) as m_open:
-        set_cached_chat_id(mac, chat_id)
-
-        # Verify it was cached in memory
-        assert main.CHAT_ID_CACHE[mac] == {"chat_id": chat_id, "ts": 1000.0}
-
-        # Verify it was saved to disk
-        m_open.assert_called_with(main.CHAT_ID_CACHE_FILE, "w")
+    # We only test retrieval logic here; setting logic is heavily tested separately
+    main.CHAT_ID_CACHE[mac] = {"chat_id": chat_id, "ts": 1000.0}
 
     # Get cached ID within TTL
     mock_time.return_value = 1000.0 + (CHAT_ID_TTL - 100)
@@ -231,6 +256,50 @@ def test_chat_id_cache(mock_time):
     # Get cached ID after TTL
     mock_time.return_value = 1000.0 + (CHAT_ID_TTL + 100)
     assert get_cached_chat_id(mac) is None
+
+
+def test_set_cached_chat_id_with_loop():
+    main.CHAT_ID_CACHE.clear()
+    with patch.dict(main.__dict__, {"_chat_id_last_save": 0.0}):
+        with patch("main.time.time") as mock_time:
+            mock_time.return_value = 2000.0
+            with patch("asyncio.get_running_loop") as mock_get_loop:
+                mock_loop = MagicMock()
+                mock_get_loop.return_value = mock_loop
+
+                set_cached_chat_id("AA:BB:CC", "chat1")
+
+                assert main.CHAT_ID_CACHE["aa:bb:cc"] == {"chat_id": "chat1", "ts": 2000.0}
+                mock_loop.run_in_executor.assert_called_once_with(None, main.save_chat_id_cache, main.CHAT_ID_CACHE)
+
+                # Test throttling
+                mock_loop.run_in_executor.reset_mock()
+                mock_time.return_value = 2004.0
+                set_cached_chat_id("AA:BB:CC", "chat2")
+
+                assert main.CHAT_ID_CACHE["aa:bb:cc"] == {"chat_id": "chat2", "ts": 2004.0}
+                mock_loop.run_in_executor.assert_not_called()
+
+
+def test_set_cached_chat_id_no_loop():
+    main.CHAT_ID_CACHE.clear()
+    with patch.dict(main.__dict__, {"_chat_id_last_save": 0.0}):
+        with patch("main.time.time") as mock_time:
+            mock_time.return_value = 3000.0
+            with patch("asyncio.get_running_loop", side_effect=RuntimeError("no loop")):
+                with patch("main.save_chat_id_cache") as mock_save:
+                    set_cached_chat_id("DD:EE:FF", "chat3")
+
+                    assert main.CHAT_ID_CACHE["dd:ee:ff"] == {"chat_id": "chat3", "ts": 3000.0}
+                    mock_save.assert_called_once_with(main.CHAT_ID_CACHE)
+
+                    # Test throttling
+                    mock_save.reset_mock()
+                    mock_time.return_value = 3004.0
+                    set_cached_chat_id("DD:EE:FF", "chat4")
+
+                    assert main.CHAT_ID_CACHE["dd:ee:ff"] == {"chat_id": "chat4", "ts": 3004.0}
+                    mock_save.assert_not_called()
 
 def test_load_speaker_names_success():
     valid_data = {"speaker_1": "Alice", "speaker_2": "Bob"}
@@ -596,3 +665,30 @@ def test_save_chat_id_cache_error(mock_logger_error, mock_open_err):
     main.save_chat_id_cache({"some": "data"})
     mock_logger_error.assert_called_once()
     assert "Failed to save chat_id cache:" in mock_logger_error.call_args[0][0]
+
+@pytest.mark.asyncio
+async def test_create_tracked_task():
+    # Setup state
+    state = {"tasks": set()}
+
+    # Create a dummy coroutine
+    async def dummy_coro():
+        await asyncio.sleep(0.01)
+        return "done"
+
+    # Call the function
+    task = create_tracked_task(dummy_coro(), state, name="test_task")
+
+    # Verify task was added
+    assert task in state["tasks"]
+    assert task.get_name() == "test_task"
+
+    # Await the task
+    result = await task
+
+    # We might need to yield to event loop for callback to fire
+    await asyncio.sleep(0.01)
+
+    # Verify task was removed
+    assert result == "done"
+    assert task not in state["tasks"]

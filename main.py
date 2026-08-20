@@ -945,6 +945,8 @@ async def trigger_emotion(
 # ==========================================
 # NANOBOT WEBSOCKET RESPONSE HANDLER
 # ==========================================
+EMOTION_REGEX = re.compile(r"\[([a-zA-Z0-9_]+)\]")
+
 class NanobotResponseHandler:
     def __init__(self, device_ws, state):
         self.device_ws = device_ws
@@ -952,7 +954,7 @@ class NanobotResponseHandler:
         self.buffer = ""
         self.full_response_text = ""
         self.timer = None
-        self.emotion_regex = re.compile(r"\[([a-zA-Z0-9_]+)\]")
+        self.emotion_regex = EMOTION_REGEX
         self.is_flushing = False
         self._first_chunk_time = None
         self._last_chunk_time = None

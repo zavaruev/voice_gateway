@@ -888,7 +888,7 @@ class CameraSession:
             if not buf_processed or not buf_raw:
                 return
 
-                txt, uid = await self._process_stt(buf_processed, buf_raw, duration_s, stats)
+            txt, uid = await self._process_stt(buf_processed, buf_raw, duration_s, stats)
             if not txt:
                 return
 

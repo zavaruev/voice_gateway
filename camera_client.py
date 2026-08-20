@@ -763,7 +763,10 @@ class CameraSession:
             if chunk_rms >= 400:
                 speech_chunks += 1
         speech_ratio = speech_chunks / max(total_chunks, 1)
-        if speech_ratio < 0.35:
+        # Post-wake commands must always reach STT: the user is talking to
+        # the device and short words (e.g. «свет») yield a low ratio
+        # because of the silence tail the VAD appends.
+        if speech_ratio < 0.35 and not self._wake_detected:
             logger.info(
                 f"[{self.stream_name}] ⏩ Low speech ratio ({speech_ratio:.0%}={speech_chunks}/{total_chunks} rms={rms_raw:.0f} dB={rms_dB:.1f})"
             )
@@ -884,7 +887,7 @@ class CameraSession:
             if not buf_processed or not buf_raw:
                 return
 
-            txt, uid = await self._process_stt(buf_processed, buf_raw, duration_s, stats)
+                txt, uid = await self._process_stt(buf_processed, buf_raw, duration_s, stats)
             if not txt:
                 return
 

@@ -162,14 +162,16 @@ class CameraProcessor:
             self.engine.reset_vad()
 
     async def _send_to_speeches_stt(self, audio_pcm16: np.ndarray) -> str:
-        wav_io = io.BytesIO()
-        with wave.open(wav_io, 'wb') as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(16000)
-            wf.writeframes(audio_pcm16.tobytes())
+        def _write_wav():
+            wav_io = io.BytesIO()
+            with wave.open(wav_io, 'wb') as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(16000)
+                wf.writeframes(audio_pcm16.tobytes())
+            return wav_io.getvalue()
 
-        wav_bytes = wav_io.getvalue()
+        wav_bytes = await asyncio.to_thread(_write_wav)
 
         form = aiohttp.FormData()
         form.add_field('file', wav_bytes, filename='speech.wav', content_type='audio/wav')

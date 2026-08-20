@@ -1676,6 +1676,16 @@ async def api_tts(
     state = session_states.get(session_id)
     if not state:
         return {"error": "No state"}
+
+    if "mac" in state:
+        mac = normalize_mac(state["mac"])
+        db = load_db()
+        device_config = db.get(mac, {})
+        owner = device_config.get("owner")
+        if username != ADMIN_USERNAME:
+            if not owner or owner != username:
+                return {"error": "Forbidden: Not device owner"}
+
     device_ws = active_sessions[session_id]
 
     if state.get("status") == "PLAYING":

@@ -32,6 +32,7 @@ from main import (
     save_firmware_meta,
     normalize_mac,
     device_online_status,
+    create_tracked_task,
 )
 from audio_utils import (
     WHISPER_HALLUCINATIONS,
@@ -618,3 +619,30 @@ def test_verify_auth_success():
     with patch("main.ADMIN_USERNAME", "admin"), patch("main.ADMIN_PASSWORD", "password"):
         result = verify_auth(_auth_request(), HTTPBasicCredentials(username="admin", password="password"))
         assert result == "admin"
+
+@pytest.mark.asyncio
+async def test_create_tracked_task():
+    # Setup state
+    state = {"tasks": set()}
+
+    # Create a dummy coroutine
+    async def dummy_coro():
+        await asyncio.sleep(0.01)
+        return "done"
+
+    # Call the function
+    task = create_tracked_task(dummy_coro(), state, name="test_task")
+
+    # Verify task was added
+    assert task in state["tasks"]
+    assert task.get_name() == "test_task"
+
+    # Await the task
+    result = await task
+
+    # We might need to yield to event loop for callback to fire
+    await asyncio.sleep(0.01)
+
+    # Verify task was removed
+    assert result == "done"
+    assert task not in state["tasks"]

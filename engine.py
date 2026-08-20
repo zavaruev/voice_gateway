@@ -123,12 +123,11 @@ class LocalAudioEngine:
             rms = np.sqrt(np.mean(audio_int16.astype(np.float64)**2))
             logger.info(f"WW peek: peak={peak} rms={rms:.1f}")
         self._ww_calls += 1
-        if peak > 500:
-            normalized = audio_int16.astype(np.float32) / peak
-        else:
-            normalized = audio_int16.astype(np.float32) / 32768.0 * 32.0
-            np.clip(normalized, -1.0, 1.0, out=normalized)
-        prediction = self.oww_model.predict(normalized)
+        # openwakeword's melspec pipeline expects raw int16 samples
+        # (its internal buffer is cast with .astype(np.int16)); feeding
+        # normalized floats quantized everything to {-1,0,1} and broke
+        # every model. The wake-word model was trained on int16 scale.
+        prediction = self.oww_model.predict(audio_int16)
         score = float(max(prediction.values())) if prediction else 0.0
         if score > 0.05:
             logger.info(f"Wake word score: {score:.4f} (peak={peak})")

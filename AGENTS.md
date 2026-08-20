@@ -29,6 +29,7 @@ No test/lint/CI infrastructure.
 - **STT pipeline**: Opus frames → `pack_ogg()` → parallel POST to Whisper + Speaker ID → text sent to Nanobot via WS
 - **TTS pipeline**: Nanobot text → POST to Edge TTS (MP3) → pydub decode + resample to 24kHz → Opus encode → raw Opus frames to ESP32 (60ms chunks, paced via `asyncio.sleep`)
 - **VAD**: Silero ONNX model, server-side (`silero_vad.onnx`), 15 silence frames (~900ms) triggers processing
+- **Wake word**: openwakeword custom model `config/computer.onnx` (96-dim LR trained on TTS «компьютер», end-aligned, W=16), threshold 0.5, evaluated on every live 16k chunk (echo-guarded). Raw int16 required — never feed normalized floats (openwakeword casts its buffer with `.astype(np.int16)`; floats quantize to {-1,0,1}). Wake is suppressed for the first 5s after an RTSP audio (re)connect: the mic/ffmpeg startup transient scores 0.7-0.96 at idle.
 - **Binary frame versions**: v1 = raw Opus, v2 = 16-byte header, v3 = 4-byte header
 - **MCP**: Gateway requests tool list (`tools/list` id=999) on connect; forwards to Nanobot as `tools_update`
 - **Dialogue mode**: If AI response ends with `?` or contains "повторите пожалуйста", mic stays open; otherwise returns to standby
@@ -73,3 +74,6 @@ No test/lint/CI infrastructure.
 - `config/` has its own `.git` (no commits); parent dir not version-controlled
 - Code and comments are in English (Russian string literals kept for TTS/STT data)
 - Whisper hallucination filter rejects transcriptions containing known garbage strings
+- Wake-word model retrains with real corridor mic data (v2 channel-sim, v3 dirty labels, v4 confident real pos/neg) all degraded discrimination (false wakes on idle) — v1 (TTS-only, end-aligned) is the best known; keep `model_stream.npz` weights and re-export with `export_onnx.py` if needed
+- Model backups in `config/`: `computer.onnx.bak_v1` (current), `computer.onnx.bak_v4` (failed retrain), `computer.onnx.bak_degenerate` (original 415KB model)
+- Quiet speech (live rms < ~0.01) never wakes — mic/AGC sensitivity limit, not the model; normal-volume speech scores 0.7-0.9 live

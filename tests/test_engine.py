@@ -18,8 +18,10 @@ def engine():
     engine.oww_model = MagicMock()
     return engine
 
-def test_check_wakeword_peak_gt_500(engine):
-    """Test when peak > 500, it scales by peak."""
+def test_check_wakeword_predict_raw_int16(engine):
+    """Test predict is called with raw int16 samples (openwakeword pipeline
+    casts its buffer with .astype(np.int16); normalized floats would be
+    quantized to {-1,0,1})."""
     audio = np.array([1000, -1000, 500, 0], dtype=np.int16)
 
     engine.oww_model.predict.return_value = {"model1": 0.5}
@@ -27,27 +29,9 @@ def test_check_wakeword_peak_gt_500(engine):
     result = engine.check_wakeword(audio, threshold=0.4)
 
     assert result is True
-    # Verify predict was called with normalized array
     called_args = engine.oww_model.predict.call_args[0][0]
-    expected = audio.astype(np.float32) / 1000.0
-    np.testing.assert_array_equal(called_args, expected)
-
-def test_check_wakeword_peak_le_500(engine):
-    """Test when peak <= 500, it scales by 32768.0 * 32.0 and clips."""
-    # Peak will be 100
-    audio = np.array([100, -100, 50, 0], dtype=np.int16)
-
-    engine.oww_model.predict.return_value = {"model1": 0.5}
-
-    result = engine.check_wakeword(audio, threshold=0.4)
-
-    assert result is True
-    called_args = engine.oww_model.predict.call_args[0][0]
-
-    # Calculate expected
-    expected = audio.astype(np.float32) / 32768.0 * 32.0
-    np.clip(expected, -1.0, 1.0, out=expected)
-    np.testing.assert_array_equal(called_args, expected)
+    np.testing.assert_array_equal(called_args, audio)
+    assert called_args.dtype == np.int16
 
 def test_check_wakeword_prediction_empty(engine):
     """Test when prediction is empty, score is 0.0 and returns False."""

@@ -185,6 +185,7 @@ class CameraSession:
         self._wake_timeout = wake_timeout
         self._wake_detected = False
         self._wake_expires = 0.0
+        self._audio_epoch = 0.0
         self._vad = vad
         if self._vad is not None:
             self._vad.energy_threshold = 0.005
@@ -603,6 +604,7 @@ class CameraSession:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
+                self._audio_epoch = time.time()
                 frame_bytes = 1280 * 2
                 while not self._stopped.is_set():
                     chunk = await asyncio.wait_for(
@@ -750,13 +752,16 @@ class CameraSession:
                 self._vad_start_time = now
                 asyncio.create_task(self._process_utterance(buf))
 
-            # openWakeWord detection on the live 16k feed (echo-guarded)
+            # openWakeWord detection on the live 16k feed (echo-guarded).
+            # Wake is suppressed for the first 5s after an audio (re)connect:
+            # the mic/ffmpeg startup transient scores ~0.7-0.96 at idle.
             if (
                 not self._wake_detected
                 and self._engine.oww_model is not None
                 and time.time() >= self._speaking_until
+                and time.time() - self._audio_epoch > 5.0
             ):
-                wake = await asyncio.to_thread(self._engine.check_wakeword, s16, 0.25)
+                wake = await asyncio.to_thread(self._engine.check_wakeword, s16, 0.5)
                 if wake:
                     logger.info(f"[{self.stream_name}] 🎯 Wake word (openWakeWord)")
                     self._wake_detected = True

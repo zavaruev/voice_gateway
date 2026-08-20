@@ -305,54 +305,6 @@ class CameraSession:
         return "\n".join(out)
 
     @staticmethod
-    def _filter_offer_sdp(sdp: str) -> str:
-        """Remove PCMU/PCMA codecs from audio media lines in offer SDP.
-
-        Camera exposes two audio media lines: opus/48000/2 (mic) and PCMU/8000
-        (backchannel speaker). go2rtc can mismatch them, causing Python to receive
-        μ-law data instead of opus. Remove PCMU/PCMA from the offer so go2rtc
-        can only negotiate opus for audio.
-        """
-        lines = sdp.split("\n")
-        out: list[str] = []
-        in_audio = False
-        removed_pts: set[str] = set()
-        audio_line_indices: list[int] = []
-        for i, line in enumerate(lines):
-            if line.startswith("m=audio"):
-                in_audio = True
-                audio_line_indices.append(len(out))
-                out.append(line)
-                continue
-            if in_audio:
-                if line.startswith("m="):
-                    in_audio = False
-                    out.append(line)
-                    continue
-                low = line.lower()
-                if "pcmu" in low or "pcma" in low or "pcml" in low:
-                    # Keep L16 (raw PCM mic, corridor) — dropping it forces
-                    # go2rtc onto the PCMU backchannel line which adds
-                    # μ-law quantization noise on quiet distant speech.
-                    logger.debug(
-                        f"filter_offer_sdp: dropping codec line: {line.strip()[:60]}"
-                    )
-                    if "a=rtpmap:" in line:
-                        pt = line.split("a=rtpmap:")[1].split(" ")[0]
-                        removed_pts.add(pt)
-                    continue
-            out.append(line)
-        if removed_pts:
-            for idx in audio_line_indices:
-                mline = out[idx]
-                parts = mline.split()
-                if len(parts) >= 4:
-                    pts = [p for p in parts[3:] if p not in removed_pts]
-                    out[idx] = " ".join(parts[:3] + pts)
-                    logger.info(f"filter_offer_sdp: m=audio cleaned: {out[idx]}")
-        return "\n".join(out)
-
-    @staticmethod
     def _parse_candidate(value) -> RTCIceCandidate | None:
         if isinstance(value, dict):
             raw = value.get("candidate", "")

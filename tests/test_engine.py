@@ -115,3 +115,45 @@ async def test_audio_stream_track_recv_timeout():
     received_frame_2 = await track.recv()
     assert received_frame_2.pts == 960
     assert track._pts == 1920
+
+from engine import AgentState, CameraProcessor
+
+@pytest.fixture
+def camera_processor(engine):
+    return CameraProcessor(engine=engine)
+
+def test_camera_processor_set_state_listening(camera_processor):
+    """Test transition to LISTENING state triggers reset_vad."""
+    camera_processor.engine.reset_vad = MagicMock()
+
+    camera_processor.set_state(AgentState.LISTENING)
+
+    assert camera_processor.state == AgentState.LISTENING
+    camera_processor.engine.reset_vad.assert_called_once()
+
+def test_camera_processor_set_state_speaking(camera_processor):
+    """Test transition to SPEAKING state triggers reset_vad."""
+    camera_processor.engine.reset_vad = MagicMock()
+
+    camera_processor.set_state(AgentState.SPEAKING)
+
+    assert camera_processor.state == AgentState.SPEAKING
+    camera_processor.engine.reset_vad.assert_called_once()
+
+def test_camera_processor_set_state_recording(camera_processor):
+    """Test transition to RECORDING state does not trigger reset_vad."""
+    camera_processor.engine.reset_vad = MagicMock()
+
+    camera_processor.set_state(AgentState.RECORDING)
+
+    assert camera_processor.state == AgentState.RECORDING
+    camera_processor.engine.reset_vad.assert_not_called()
+
+def test_camera_processor_set_state_processing(camera_processor):
+    """Test transition to PROCESSING state does not trigger reset_vad."""
+    camera_processor.engine.reset_vad = MagicMock()
+
+    camera_processor.set_state(AgentState.PROCESSING)
+
+    assert camera_processor.state == AgentState.PROCESSING
+    camera_processor.engine.reset_vad.assert_not_called()

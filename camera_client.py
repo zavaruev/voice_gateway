@@ -788,160 +788,186 @@ class CameraSession:
             logger.warning(f"[{self.stream_name}] NS error: {exc}")
             return audio_f, False
 
+    def _preprocess_audio(self, buf: bytes) -> tuple[bytes | None, bytes | None, float, dict]:
+        samples = np.frombuffer(buf, dtype=np.int16)
+        duration_s = len(samples) / 16000.0
+        rms_raw = float(np.sqrt(np.mean(np.square(samples.astype(np.float32)))))
+        peak_raw = int(np.max(np.abs(samples)))
+        rms_dB = 20 * np.log10(max(rms_raw, 1) / 32768)
+
+        # Minimum duration gate — very short utterances produce garbage
+        if duration_s < 0.5:
+            logger.info(
+                f"[{self.stream_name}] ⏩ Too short ({duration_s:.2f}s rms={rms_raw:.0f} peak={peak_raw})"
+            )
+            return None, None, duration_s, {}
+
+        # Minimum energy gate vs adaptive background floor.
+        # Corridor noise sits at rms 500-1400; distant speech (3m) ~950-2500.
+        bg = float(np.median(self._bg_window)) if self._bg_window else 0.0
+        min_rms = max(350, 1.15 * bg)
+        if rms_raw < min_rms:
+            # NS rescue: distant speech sits inside the noise floor — try
+            # cleaning first. Clean noise is ~100-250 int16, speech survives
+            # at 400+.
+            cleaned, ns_ok = self._apply_ns(samples.astype(np.float32))
+            rms_clean = float(np.sqrt(np.mean(np.square(cleaned))))
+            if ns_ok and rms_clean >= 400:
+                logger.info(
+                    f"[{self.stream_name}] 🛟 NS rescue: rms {rms_raw:.0f} -> clean {rms_clean:.0f} (bg={bg:.0f})"
+                )
+                samples = cleaned.astype(np.int16)
+                rms_raw = rms_clean
+            else:
+                logger.info(
+                    f"[{self.stream_name}] ⏩ Too quiet (rms={rms_raw:.0f} peak={peak_raw} dB={rms_dB:.1f} bg={bg:.0f} min={min_rms:.0f})"
+                )
+                return None, None, duration_s, {}
+
+        # Speech-energy ratio gate — count chunks with real energy.
+        # Background noise ~190-500 int16 (AGC), speech chunks ~800+,
+        # distant speech (3m) chunks ~400-900.
+        chunk_samples = 1280  # 80ms at 16kHz
+        speech_chunks = 0
+        total_chunks = 0
+        for i in range(0, len(samples) - chunk_samples + 1, chunk_samples):
+            chunk_rms = float(
+                np.sqrt(
+                    np.mean(
+                        np.square(samples[i : i + chunk_samples].astype(np.float32))
+                    )
+                )
+            )
+            total_chunks += 1
+            if chunk_rms >= 400:
+                speech_chunks += 1
+        speech_ratio = speech_chunks / max(total_chunks, 1)
+        if speech_ratio < 0.35:
+            logger.info(
+                f"[{self.stream_name}] ⏩ Low speech ratio ({speech_ratio:.0%}={speech_chunks}/{total_chunks} rms={rms_raw:.0f} dB={rms_dB:.1f})"
+            )
+            return None, None, duration_s, {}
+
+        # Adaptive peak normalization (max 20x gain for distant speech)
+        audio_f = samples.astype(np.float32)
+
+        # Noise suppression — only when speech is near the noise floor
+        # (distant 3m). Normal near-field speech (rms well above bg) must
+        # pass through untouched so Whisper sees the original spectrum.
+        ns_applied = False
+        if rms_raw < max(1500, 1.8 * bg) and len(audio_f) >= 256:
+            audio_f, ns_applied = self._apply_ns(audio_f)
+
+        peak = np.max(np.abs(audio_f))
+        gain_applied = 1.0
+        if peak > 0:
+            gain = min(32767.0 / peak, 20.0)
+            if gain > 1.5:
+                audio_f = np.clip(audio_f * gain, -32768, 32767)
+                gain_applied = gain
+        buf_processed = audio_f.astype(np.int16).tobytes()
+        buf_raw = samples.astype(np.int16).tobytes()
+
+        stats = {
+            "rms_raw": rms_raw,
+            "peak_raw": peak_raw,
+            "rms_dB": rms_dB,
+            "gain_applied": gain_applied,
+            "ns_applied": ns_applied,
+        }
+        return buf_processed, buf_raw, duration_s, stats
+
+    async def _process_stt(
+        self, buf_processed: bytes, buf_raw: bytes, duration_s: float, stats: dict
+    ) -> tuple[str | None, str | None]:
+        wav = await asyncio.to_thread(self._encode_wav, buf_processed)
+
+        def _save_debug_wav(wav_data, ts):
+            import os
+
+            os.makedirs("/tmp/utterances", exist_ok=True)
+            with open(f"/tmp/utterances/u_{ts}.wav", "wb") as f:
+                f.write(wav_data)
+
+        try:
+            await asyncio.to_thread(_save_debug_wav, wav, int(time.time()))
+        except Exception:
+            pass
+
+        logger.info(
+            f"[{self.stream_name}] 🎤 Whisper IN: {duration_s:.2f}s "
+            f"raw_rms={stats['rms_raw']:.0f} peak={stats['peak_raw']} "
+            f"dB={stats['rms_dB']:.1f} gain={stats['gain_applied']:.1f}x "
+            f"ns={int(stats['ns_applied'])} wav={len(wav)}B"
+        )
+        txt, uid = await asyncio.gather(
+            self._fetch_transcription(wav),
+            self._fetch_speaker_id(wav),
+        )
+        if (not txt or not is_valid_text(txt)) and self._wake_detected:
+            # Post-wake rescue: NS may have eaten the consonants of a
+            # distant command — retry the unprocessed signal.
+            logger.info(
+                f"[{self.stream_name}] 🔁 Post-wake retry raw signal (wake={self._wake_detected})"
+            )
+            txt = await self._fetch_transcription(
+                await asyncio.to_thread(self._encode_wav, buf_raw),
+                temperature="0.7",
+            )
+        if not txt or not is_valid_text(txt):
+            if not txt:
+                logger.info(
+                    f"[{self.stream_name}] ❌ Whisper empty for {len(buf_processed)}-byte ({duration_s:.2f}s)"
+                )
+            else:
+                logger.info(f"[{self.stream_name}] ❌ Rejected: '{txt[:60]}'")
+            return None, None
+
+        logger.info(f"[{self.stream_name}] ✅ Whisper OK: '{txt[:60]}'")
+        return txt, uid
+
+    async def _handle_stt_result(self, txt: str, uid: str | None) -> None:
+        norm = txt.lower().strip().strip(".,!? -")
+        if norm in (
+            "готов",
+            "да",
+            "го",
+            "начинаем",
+            "начали",
+            "готово",
+            "ок",
+            "окей",
+            "давай",
+        ):
+            logger.info(f"[{self.stream_name}] ✅ Acknowledge: '{txt[:60]}'")
+            await self._play_attention("ack")
+            self._back_to_wake()
+            return
+        # Anti-loop: camera hears its own TTS echo with 15-25s delay;
+        # if this transcript matches a recent one, it's the echo.
+        if norm and norm == self._last_transcript:
+            logger.info(f"[{self.stream_name}] ❌ Echo repeat, ignoring: '{txt[:60]}'")
+            return
+        self._last_transcript = norm
+        if uid and uid != "unknown":
+            logger.info(f"[{self.stream_name}] 👤 Speaker: {uid} | '{txt[:60]}'")
+        await self._handle_wake_or_command(txt, uid or "camera")
+
     async def _process_utterance(self, buf: bytes):
         if self._processing_utterance:
             return
 
         self._processing_utterance = True
         try:
-            samples = np.frombuffer(buf, dtype=np.int16)
-            duration_s = len(samples) / 16000.0
-            rms_raw = float(np.sqrt(np.mean(np.square(samples.astype(np.float32)))))
-            peak_raw = int(np.max(np.abs(samples)))
-            rms_dB = 20 * np.log10(max(rms_raw, 1) / 32768)
-
-            # Minimum duration gate — very short utterances produce garbage
-            if duration_s < 0.5:
-                logger.info(
-                    f"[{self.stream_name}] ⏩ Too short ({duration_s:.2f}s rms={rms_raw:.0f} peak={peak_raw})"
-                )
+            buf_processed, buf_raw, duration_s, stats = self._preprocess_audio(buf)
+            if not buf_processed or not buf_raw:
                 return
 
-            # Minimum energy gate vs adaptive background floor.
-            # Corridor noise sits at rms 500-1400; distant speech (3m) ~950-2500.
-            bg = float(np.median(self._bg_window)) if self._bg_window else 0.0
-            min_rms = max(350, 1.15 * bg)
-            if rms_raw < min_rms:
-                # NS rescue: distant speech sits inside the noise floor — try
-                # cleaning first. Clean noise is ~100-250 int16, speech survives
-                # at 400+.
-                cleaned, ns_ok = self._apply_ns(samples.astype(np.float32))
-                rms_clean = float(np.sqrt(np.mean(np.square(cleaned))))
-                if ns_ok and rms_clean >= 400:
-                    logger.info(
-                        f"[{self.stream_name}] 🛟 NS rescue: rms {rms_raw:.0f} -> clean {rms_clean:.0f} (bg={bg:.0f})"
-                    )
-                    samples = cleaned.astype(np.int16)
-                    rms_raw = rms_clean
-                else:
-                    logger.info(
-                        f"[{self.stream_name}] ⏩ Too quiet (rms={rms_raw:.0f} peak={peak_raw} dB={rms_dB:.1f} bg={bg:.0f} min={min_rms:.0f})"
-                    )
-                    return
-
-            # Speech-energy ratio gate — count chunks with real energy.
-            # Background noise ~190-500 int16 (AGC), speech chunks ~800+,
-            # distant speech (3m) chunks ~400-900.
-            chunk_samples = 1280  # 80ms at 16kHz
-            speech_chunks = 0
-            total_chunks = 0
-            for i in range(0, len(samples) - chunk_samples + 1, chunk_samples):
-                chunk_rms = float(
-                    np.sqrt(
-                        np.mean(
-                            np.square(samples[i : i + chunk_samples].astype(np.float32))
-                        )
-                    )
-                )
-                total_chunks += 1
-                if chunk_rms >= 400:
-                    speech_chunks += 1
-            speech_ratio = speech_chunks / max(total_chunks, 1)
-            if speech_ratio < 0.35:
-                logger.info(
-                    f"[{self.stream_name}] ⏩ Low speech ratio ({speech_ratio:.0%}={speech_chunks}/{total_chunks} rms={rms_raw:.0f} dB={rms_dB:.1f})"
-                )
+            txt, uid = await self._process_stt(buf_processed, buf_raw, duration_s, stats)
+            if not txt:
                 return
 
-            # Adaptive peak normalization (max 20x gain for distant speech)
-            audio_f = samples.astype(np.float32)
-
-            # Noise suppression — only when speech is near the noise floor
-            # (distant 3m). Normal near-field speech (rms well above bg) must
-            # pass through untouched so Whisper sees the original spectrum.
-            ns_applied = False
-            if rms_raw < max(1500, 1.8 * bg) and len(audio_f) >= 256:
-                audio_f, ns_applied = self._apply_ns(audio_f)
-
-            peak = np.max(np.abs(audio_f))
-            gain_applied = 1.0
-            if peak > 0:
-                gain = min(32767.0 / peak, 20.0)
-                if gain > 1.5:
-                    audio_f = np.clip(audio_f * gain, -32768, 32767)
-                    gain_applied = gain
-            buf = audio_f.astype(np.int16).tobytes()
-            buf_raw = samples.astype(np.int16).tobytes()
-
-            wav = await asyncio.to_thread(self._encode_wav, buf)
-            def _save_debug_wav(wav_data, ts):
-                import os
-
-                os.makedirs("/tmp/utterances", exist_ok=True)
-                with open(f"/tmp/utterances/u_{ts}.wav", "wb") as f:
-                    f.write(wav_data)
-
-            try:
-                await asyncio.to_thread(
-                    _save_debug_wav, wav, int(time.time())
-                )
-            except Exception:
-                pass
-            logger.info(
-                f"[{self.stream_name}] 🎤 Whisper IN: {duration_s:.2f}s raw_rms={rms_raw:.0f} peak={peak_raw} dB={rms_dB:.1f} gain={gain_applied:.1f}x ns={int(ns_applied)} wav={len(wav)}B"
-            )
-            txt, uid = await asyncio.gather(
-                self._fetch_transcription(wav),
-                self._fetch_speaker_id(wav),
-            )
-            if (not txt or not is_valid_text(txt)) and self._wake_detected:
-                # Post-wake rescue: NS may have eaten the consonants of a
-                # distant command — retry the unprocessed signal.
-                logger.info(
-                    f"[{self.stream_name}] 🔁 Post-wake retry raw signal (wake={self._wake_detected})"
-                )
-                txt = await self._fetch_transcription(
-                    await asyncio.to_thread(self._encode_wav, buf_raw),
-                    temperature="0.7",
-                )
-            if not txt or not is_valid_text(txt):
-                if not txt:
-                    logger.info(
-                        f"[{self.stream_name}] ❌ Whisper empty for {len(buf)}-byte ({duration_s:.2f}s)"
-                    )
-                else:
-                    logger.info(f"[{self.stream_name}] ❌ Rejected: '{txt[:60]}'")
-                return
-
-            logger.info(f"[{self.stream_name}] ✅ Whisper OK: '{txt[:60]}'")
-            norm = txt.lower().strip().strip(".,!? -")
-            if norm in (
-                "готов",
-                "да",
-                "го",
-                "начинаем",
-                "начали",
-                "готово",
-                "ок",
-                "окей",
-                "давай",
-            ):
-                logger.info(f"[{self.stream_name}] ✅ Acknowledge: '{txt[:60]}'")
-                await self._play_attention("ack")
-                self._back_to_wake()
-                return
-            # Anti-loop: camera hears its own TTS echo with 15-25s delay;
-            # if this transcript matches a recent one, it's the echo.
-            if norm and norm == self._last_transcript:
-                logger.info(
-                    f"[{self.stream_name}] ❌ Echo repeat, ignoring: '{txt[:60]}'"
-                )
-                return
-            self._last_transcript = norm
-            if uid != "unknown":
-                logger.info(f"[{self.stream_name}] 👤 Speaker: {uid} | '{txt[:60]}'")
-            await self._handle_wake_or_command(txt, uid)
-            return
+            await self._handle_stt_result(txt, uid)
         finally:
             self._processing_utterance = False
 

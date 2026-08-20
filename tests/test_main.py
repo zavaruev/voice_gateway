@@ -206,6 +206,31 @@ def test_pack_ogg_pagination():
         idx = ogg_data_101.find(b'OggS', idx + 1)
 
 @patch("main.time.time")
+def test_get_cached_chat_id(mock_time):
+    mock_time.return_value = 1000.0
+    mac = "aa:bb:cc:dd:ee:ff"
+    chat_id = "test-chat-id-123"
+
+    test_cache = {
+        mac: {"chat_id": chat_id, "ts": 1000.0}
+    }
+
+    with patch.dict(main.CHAT_ID_CACHE, test_cache, clear=True):
+        # 1. Happy path (within TTL)
+        assert get_cached_chat_id(mac) == chat_id
+
+        # 2. Case insensitivity
+        assert get_cached_chat_id(mac.upper()) == chat_id
+
+        # 3. Missing key
+        assert get_cached_chat_id("00:11:22:33:44:55") is None
+
+        # 4. TTL expiration
+        mock_time.return_value = 1000.0 + main.CHAT_ID_TTL + 1.0
+        assert get_cached_chat_id(mac) is None
+
+
+@patch("main.time.time")
 def test_chat_id_cache(mock_time):
     # Setup
     mock_time.return_value = 1000.0

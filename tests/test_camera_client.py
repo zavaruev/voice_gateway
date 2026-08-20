@@ -107,3 +107,35 @@ def test_stop():
     track = AIVoiceOutputTrack(sample_rate=8000)
     # stop doesn't do anything currently, but we should test it can be called
     track.stop()
+
+
+from camera_client import CameraSession
+from unittest.mock import AsyncMock, patch
+
+@pytest.mark.asyncio
+async def test_delayed_attention_exception():
+    # Initialize CameraSession with minimal parameters
+    session = CameraSession(
+        stream_name="test_stream",
+        go2rtc_host="127.0.0.1",
+        go2rtc_port=1984
+    )
+
+    # We want to test that if asyncio.sleep raises an Exception,
+    # _delayed_attention catches it and doesn't crash,
+    # and also that _attention_played remains False (or unchanged).
+    session._attention_played = False
+
+    # We patch asyncio.sleep to raise an exception
+    with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+        mock_sleep.side_effect = Exception("Test Exception")
+
+        # We also mock _play_attention to make sure it's NOT called
+        with patch.object(session, "_play_attention", new_callable=AsyncMock) as mock_play:
+            # Run the method
+            await session._delayed_attention()
+
+            # Assertions
+            mock_sleep.assert_called_once_with(5)
+            mock_play.assert_not_called()
+            assert session._attention_played is False

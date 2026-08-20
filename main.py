@@ -30,6 +30,7 @@ from camera_client import CameraSession
 # ==========================================
 NANOBOT_WS_URL = os.getenv("NANOBOT_WS_URL", "ws://nanobot:8765/").rstrip("/")
 NANOBOT_TOKEN = os.getenv("NANOBOT_TOKEN", "")
+NANOBOT_SESSION_SALT = os.getenv("NANOBOT_SESSION_SALT", "")
 SPEAKER_ID_URL = os.getenv("SPEAKER_ID_URL", "http://192.168.22.102:8001/identify")
 
 WHISPER_URL = os.getenv(
@@ -161,7 +162,7 @@ def set_cached_chat_id(mac: str, chat_id: str):
 def make_chat_id(mac: str) -> str:
     """Deterministic chat_id from MAC address in UUID format (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx).
     Nanobot reuses the session across reconnects."""
-    h = hashlib.sha256(mac.lower().encode()).hexdigest()
+    h = hashlib.sha256(f"{mac.lower()}{NANOBOT_SESSION_SALT}".encode()).hexdigest()
     return f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
 
 

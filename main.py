@@ -949,8 +949,8 @@ class NanobotResponseHandler:
     def __init__(self, device_ws, state):
         self.device_ws = device_ws
         self.state = state
-        self.buffer = ""
-        self.full_response_text = ""
+        self.buffer = []
+        self.full_response_text = []
         self.timer = None
         self.emotion_regex = re.compile(r"\[([a-zA-Z0-9_]+)\]")
         self.is_flushing = False
@@ -1034,35 +1034,36 @@ class NanobotResponseHandler:
             )
         self._chunk_count += 1
         self._last_chunk_time = now
-        self.buffer += chunk
+        self.buffer.append(chunk)
         if self.timer:
             self.timer.cancel()
         # Sentence-level flush: start TTS as soon as a complete sentence has
         # arrived instead of waiting for the whole LLM response to finish.
         # Chunks arrive every ~60ms, so a pending timer would be cancelled by
         # the next chunk before it fires; launch the flush immediately instead.
-        brackets_balanced = self.buffer.count("[") == self.buffer.count("]")
+        buffer_str = "".join(self.buffer)
+        brackets_balanced = buffer_str.count("[") == buffer_str.count("]")
         delay = 2.0 if not brackets_balanced else 1.5
         self.timer = asyncio.get_event_loop().call_later(
             delay, lambda: create_tracked_task(self.flush(), self.state)
         )
-        if brackets_balanced and SENTENCE_END_RE.search(self.buffer) and not self.is_flushing:
+        if brackets_balanced and SENTENCE_END_RE.search(buffer_str) and not self.is_flushing:
             self.timer.cancel()
             self.timer = None
             create_tracked_task(self.flush(), self.state)
 
     async def flush(self):
-        if self.is_flushing or not self.buffer.strip():
+        if self.is_flushing or not "".join(self.buffer).strip():
             return
         self.is_flushing = True
         self.state["status"] = "SPEAKING"
 
-        text = self.buffer
-        self.buffer = ""
+        text = "".join(self.buffer)
+        self.buffer = []
 
         # If emotion tag is still incomplete, wait for next chunk
         if text.count("[") > text.count("]"):
-            self.buffer = text
+            self.buffer = [text]
             self.timer = asyncio.get_event_loop().call_later(
                 0.5, lambda: create_tracked_task(self.flush(), self.state)
             )
@@ -1079,7 +1080,7 @@ class NanobotResponseHandler:
             trailing = text[last_match.end():]
             if trailing.strip():
                 text = text[: last_match.end()]
-                self.buffer = trailing + self.buffer
+                self.buffer = [trailing] + self.buffer
 
         emotions = self.emotion_regex.findall(text)
         for emotion in emotions:
@@ -1133,7 +1134,7 @@ class NanobotResponseHandler:
                 f"+{t_since_last:.1f}s after last chunk, "
                 f"{self._chunk_count} chunks"
             )
-            self.full_response_text += clean_text + " "
+            self.full_response_text.append(clean_text + " ")
             try:
                 await self.device_ws.send_json(
                     {
@@ -1157,7 +1158,7 @@ class NanobotResponseHandler:
         # content shortly after; only finalize (dialogue mode check, return
         # to standby) once the whole response has been produced.
         self.is_flushing = False
-        if self.buffer.strip():
+        if "".join(self.buffer).strip():
             self.timer = asyncio.get_event_loop().call_later(
                 0.15, lambda: create_tracked_task(self.flush(), self.state)
             )
@@ -1165,7 +1166,7 @@ class NanobotResponseHandler:
 
         await self._await_tts_drained()
 
-        clean_for_check = self.full_response_text.strip().lower()
+        clean_for_check = "".join(self.full_response_text).strip().lower()
         has_question = (
             HAS_QUESTION_RE.search(clean_for_check) is not None
             or "повторите пожалуйста" in clean_for_check
@@ -1200,7 +1201,7 @@ class NanobotResponseHandler:
                 self.state["watchdog"] = None
         self.state["last_activity"] = time.time()
         self.state["vad"].reset()
-        self.full_response_text = ""
+        self.full_response_text = []
 
 
 # ==========================================

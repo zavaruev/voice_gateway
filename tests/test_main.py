@@ -109,6 +109,7 @@ def test_normalize_mac():
     assert normalize_mac("   \n\t  ") == ""
 
 
+@patch.dict(main.__dict__, {"NANOBOT_SESSION_SALT": ""})
 def test_make_chat_id():
     mac1 = "AA:BB:CC:DD:EE:FF"
     mac2 = "aa:bb:cc:dd:ee:ff"
@@ -122,6 +123,11 @@ def test_make_chat_id():
     chat_id = make_chat_id(mac1)
     assert len(chat_id) == 36
     assert chat_id.count("-") == 4
+
+    with patch.dict(main.__dict__, {"NANOBOT_SESSION_SALT": "my_secret_salt"}):
+        # Different salt changes ID
+        assert make_chat_id(mac1) != chat_id
+        assert make_chat_id(mac1) == make_chat_id(mac2)
 
 
 def test_calculate_rms():

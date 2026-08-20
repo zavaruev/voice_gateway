@@ -343,13 +343,6 @@ def test_load_db_file_error(mock_exists):
     finally:
         main._DB_CACHE = original_cache
 
-@patch("builtins.open", side_effect=Exception("Test mock exception"))
-@patch("main.logger.error")
-def test_save_chat_id_cache_error(mock_logger_error, mock_open_err):
-    # This should not raise an exception, but it should log one
-    main.save_chat_id_cache({"some": "data"})
-    mock_logger_error.assert_called_once()
-    assert "Failed to save chat_id cache:" in mock_logger_error.call_args[0][0]
 
 def test_load_firmware_meta_cache_hit():
     with patch.dict(main.__dict__, {"_firmware_meta_cache": {"version": "cached", "filename": "test.bin", "timestamp": 123}}):
@@ -581,3 +574,25 @@ def test_verify_auth_success():
     with patch("main.ADMIN_USERNAME", "admin"), patch("main.ADMIN_PASSWORD", "password"):
         result = verify_auth(_auth_request(), HTTPBasicCredentials(username="admin", password="password"))
         assert result == "admin"
+
+@patch("main.json.dump")
+@patch("builtins.open", new_callable=mock_open)
+def test_save_chat_id_cache_success(mock_open_file, mock_json_dump):
+    main.save_chat_id_cache({"some": "data"})
+    mock_open_file.assert_called_once_with(main.CHAT_ID_CACHE_FILE, "w")
+    mock_json_dump.assert_called_once_with({"some": "data"}, mock_open_file(), indent=2)
+
+@patch("main.json.dump")
+@patch("builtins.open", new_callable=mock_open)
+def test_save_chat_id_cache_none(mock_open_file, mock_json_dump):
+    main.CHAT_ID_CACHE = {"default": "val"}
+    main.save_chat_id_cache(None)
+    mock_open_file.assert_called_once_with(main.CHAT_ID_CACHE_FILE, "w")
+    mock_json_dump.assert_called_once_with({"default": "val"}, mock_open_file(), indent=2)
+
+@patch("builtins.open", side_effect=Exception("Test mock exception"))
+@patch("main.logger.error")
+def test_save_chat_id_cache_error(mock_logger_error, mock_open_err):
+    main.save_chat_id_cache({"some": "data"})
+    mock_logger_error.assert_called_once()
+    assert "Failed to save chat_id cache:" in mock_logger_error.call_args[0][0]

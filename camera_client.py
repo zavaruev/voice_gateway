@@ -707,14 +707,24 @@ class CameraSession:
                 # spuriously scores ~0.7-0.96 on near-silent/boosted-noise
                 # audio, so reject wakes whose raw chunk energy is low.
                 wake = await asyncio.to_thread(self._engine.check_wakeword, s16, 0.30)
-                if wake and raw_peak < 150:
+                # raw_peak guard: reject wakes on near-silent / boosted-noise.
+                # The model spuriously scores ~0.7-0.96 on quiet noise (peaks
+                # 40-60 observed); real speech stays at peak >=100. AGC only
+                # boosts chunks with peak >=100, so below that is the noise
+                # floor and must never trigger.
+                if wake and raw_peak < 100:
                     wake = False
                 if wake:
                     logger.info(f"[{self.stream_name}] 🎯 Wake word (openWakeWord)")
                     self._wake_detected = True
                     self._wake_expires = time.time() + self._wake_timeout
-                    if not self._vad_has_speech:
-                        asyncio.create_task(self._play_attention("oww"))
+                    # Play the pip the instant the model fires — do NOT gate on
+                    # _vad_has_speech (it is almost always True mid-utterance),
+                    # otherwise the pip is dropped whenever Whisper later fails
+                    # to transcribe the keyword (e.g. hears 'ютер' for
+                    # 'компьютер'). The 60s cooldown in _play_attention still
+                    # prevents a duplicate from the STT-side processor_kw call.
+                    asyncio.create_task(self._play_attention("oww"))
 
     def _apply_ns(self, audio_f: np.ndarray):
         """SpeexDSP noise suppression — strips stationary noise (distant speech)."""
@@ -1171,9 +1181,10 @@ class CameraSession:
 
     async def _play_attention(self, reason: str = ""):
         now = time.time()
-        if now - self._last_attention < 60.0:
+        if now - self._last_attention < 15.0:
             return
         self._last_attention = now
+        logger.info(f"[{self.stream_name}] 🔔 attention pip ({reason})")
         try:
             sr = 8000
             duration = 0.3

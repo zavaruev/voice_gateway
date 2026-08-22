@@ -126,10 +126,11 @@ class AIVoiceOutputTrack(MediaStreamTrack):
         if self._queue.qsize() > 0:
             return True
         # WebRTC/go2rtc buffers return the camera's own speaker echo back
-        # with 8-15s delay, in ~3s bursts. Hold the mic closed only long
-        # enough for the echo of WHAT PLAYED (plus a small tail) to finish
-        # arriving: 0.3s beep -> ~0.6s, 20s TTS -> capped 15s.
-        hold = min(15.0, self._last_play_duration + 0.3)
+        # with 8-15s delay, in ~3s bursts. Hold the mic closed for the full
+        # playback duration plus a long tail so the delayed echo of the END
+        # of the clip is still suppressed (prevents the wake model from
+        # re-triggering on its own TTS and looping).
+        hold = min(40.0, self._last_play_duration + 20.0)
         return time.time() - self._last_real_recv < hold
 
     def stop(self):
@@ -1282,15 +1283,17 @@ class CameraSession:
                     # Теперь мы просто асинхронно пушим куски, тайминг задается внутри AIVoiceOutputTrack.recv()
                     await self._out_track.queue_frame(c, sr)
 
-            # Set the lock AFTER the push completes: pushing into a full queue
-            # takes ~audio_dur of real time (backpressure), so a lock set
-            # before the loop would expire while the speaker is still playing.
+            # Suppress wake detection AND inbound commands for the full
+            # playback duration plus a generous echo tail. The TTS echo
+            # returns via the mic/RTSP 8-15s AFTER playback ends, so a short
+            # post-playback lock (as queue_seconds() would give here, since
+            # the frames are already drained by recv()) lets the echo re-wake
+            # the model and start a feedback loop. Use audio_dur explicitly.
+            ECHO_TAIL = 20.0
             if self._out_track:
-                self._speaking_until = (
-                    time.time() + self._out_track.queue_seconds() + echo_tail
-                )
+                self._speaking_until = time.time() + audio_dur + ECHO_TAIL
             global GLOBAL_TTS_UNTIL
-            GLOBAL_TTS_UNTIL = time.time() + audio_dur + 3.0
+            GLOBAL_TTS_UNTIL = time.time() + audio_dur + ECHO_TAIL
         except Exception as e:
             logger.warning(f"[{self.stream_name}] playback error: {e}")
 

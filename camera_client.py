@@ -189,6 +189,8 @@ class CameraSession:
         self._wake_timeout = config.wake_timeout
         self._wake_detected = False
         self._wake_expires = 0.0
+        self._wake_greeting_task = None
+        self._wake_greeting_delay = 5.0
         self._audio_epoch = 0.0
         self._vad = config.vad
         if self._vad is not None:
@@ -612,7 +614,7 @@ class CameraSession:
             # normalized (quiet hours 0.022-0.029); ticks/artifacts reach 0.05+.
             # Distant speech (3m) sits ~0.03-0.12. Gate at 0.030 to reject
             # the idle noise floor while keeping distant speech.
-            if orig_rms < 0.030:
+            if orig_rms < 0.0015:
                 speech = False
 
             if now - self._last_rms_log > 2.0:
@@ -683,7 +685,31 @@ class CameraSession:
                 and time.time() >= self._speaking_until
                 and time.time() - self._audio_epoch > 5.0
             ):
-                wake = await asyncio.to_thread(self._engine.check_wakeword, s16, 0.5)
+                raw_peak = int(np.max(np.abs(s16)))
+                # openWakeWord is level-sensitive: a quiet «компьютер» (peak
+                # ~350) scores ~0.33-0.39 and is missed at threshold 0.4, while
+                # a loud one (peak ~2600) scores ~0.70. Apply light AGC — boost
+                # chunks that have real energy (peak 100..TARGET) up to a
+                # consistent level so recognition is roughly volume-invariant.
+                # Loud chunks are left untouched; silence (peak<100) is skipped.
+                _WW_TARGET_PEAK = 4000
+                chunk_peak = raw_peak
+                if 100 <= raw_peak < _WW_TARGET_PEAK:
+                    s16 = np.clip(
+                        s16.astype(np.float32) * (_WW_TARGET_PEAK / raw_peak),
+                        -32768,
+                        32767,
+                    ).astype(np.int16)
+                    chunk_peak = _WW_TARGET_PEAK
+                # openWakeWord maintains an internal rolling buffer and must be
+                # fed EVERY chunk to stay continuous; skipping quiet chunks
+                # fragments the buffer and kills recognition. Always predict,
+                # but only ACT when there is real speech energy: the model
+                # spuriously scores ~0.7-0.96 on near-silent/boosted-noise
+                # audio, so reject wakes whose raw chunk energy is low.
+                wake = await asyncio.to_thread(self._engine.check_wakeword, s16, 0.30)
+                if wake and raw_peak < 150:
+                    wake = False
                 if wake:
                     logger.info(f"[{self.stream_name}] 🎯 Wake word (openWakeWord)")
                     self._wake_detected = True
@@ -727,14 +753,14 @@ class CameraSession:
         # Minimum energy gate vs adaptive background floor.
         # Corridor noise sits at rms 500-1400; distant speech (3m) ~950-2500.
         bg = float(np.median(self._bg_window)) if self._bg_window else 0.0
-        min_rms = max(350, 1.15 * bg)
+        min_rms = max(40, 1.15 * bg)
         if rms_raw < min_rms:
             # NS rescue: distant speech sits inside the noise floor — try
             # cleaning first. Clean noise is ~100-250 int16, speech survives
             # at 400+.
             cleaned, ns_ok = self._apply_ns(samples.astype(np.float32))
             rms_clean = float(np.sqrt(np.mean(np.square(cleaned))))
-            if ns_ok and rms_clean >= 400:
+            if ns_ok and rms_clean >= 60:
                 logger.info(
                     f"[{self.stream_name}] 🛟 NS rescue: rms {rms_raw:.0f} -> clean {rms_clean:.0f} (bg={bg:.0f})"
                 )
@@ -761,7 +787,7 @@ class CameraSession:
                 )
             )
             total_chunks += 1
-            if chunk_rms >= 400:
+            if chunk_rms >= 100:
                 speech_chunks += 1
         speech_ratio = speech_chunks / max(total_chunks, 1)
         # Post-wake commands must always reach STT: the user is talking to
@@ -911,12 +937,40 @@ class CameraSession:
                 await self._call_nanobot(cmd, uid)
             else:
                 logger.info(f"[{self.stream_name}] 🎯 Wake word (awaiting command)")
+                self._schedule_wake_greeting()
             return
         if not self._wake_detected:
             logger.info(f"[{self.stream_name}] ⏳ No wake word, ignoring: '{txt[:60]}'")
             return
+        self._cancel_wake_greeting()
         logger.info(f"[{self.stream_name}] 🗣 Post-wake dialogue: '{txt[:60]}'")
         await self._call_nanobot(txt, uid)
+
+    def _cancel_wake_greeting(self):
+        task = self._wake_greeting_task
+        if task is not None and not task.done():
+            task.cancel()
+        self._wake_greeting_task = None
+
+    def _schedule_wake_greeting(self):
+        self._cancel_wake_greeting()
+        self._wake_greeting_task = asyncio.create_task(self._wake_greeting())
+
+    async def _wake_greeting(self):
+        try:
+            await asyncio.sleep(self._wake_greeting_delay)
+        except asyncio.CancelledError:
+            return
+        if not self._wake_detected:
+            return
+        logger.info(
+            f"[{self.stream_name}] 🎯 Wake with no command — sending greeting"
+        )
+        # NOTE: keep _wake_detected True so a command the user utters right
+        # after the greeting is still treated as post-wake dialogue and is not
+        # dropped ("No wake word, ignoring"). The 60s _wake_timeout window
+        # governs how long follow-ups are accepted.
+        await self._call_nanobot("привет", self.stream_name)
 
     async def _on_user_command(self, text: str):
         try:

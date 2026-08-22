@@ -612,8 +612,9 @@ class CameraSession:
             # Only trust VAD if original audio has meaningful energy.
             # Corridor noise floor (mic AGC-boosted) sits at 0.015-0.042
             # normalized (quiet hours 0.022-0.029); ticks/artifacts reach 0.05+.
-            # Distant speech (3m) sits ~0.03-0.12. Gate at 0.030 to reject
-            # the idle noise floor while keeping distant speech.
+            # Distant speech (3m) sits ~0.03-0.12. Gate at ~0.0015
+            # (≈ rms_int 49) to reject the idle noise floor while keeping
+            # distant speech.
             if orig_rms < 0.0015:
                 speech = False
 
@@ -693,14 +694,12 @@ class CameraSession:
                 # consistent level so recognition is roughly volume-invariant.
                 # Loud chunks are left untouched; silence (peak<100) is skipped.
                 _WW_TARGET_PEAK = 4000
-                chunk_peak = raw_peak
                 if 100 <= raw_peak < _WW_TARGET_PEAK:
                     s16 = np.clip(
                         s16.astype(np.float32) * (_WW_TARGET_PEAK / raw_peak),
                         -32768,
                         32767,
                     ).astype(np.int16)
-                    chunk_peak = _WW_TARGET_PEAK
                 # openWakeWord maintains an internal rolling buffer and must be
                 # fed EVERY chunk to stay continuous; skipping quiet chunks
                 # fragments the buffer and kills recognition. Always predict,
@@ -934,6 +933,7 @@ class CameraSession:
                 logger.info(
                     f"[{self.stream_name}] 🎯 Wake+cmd: '{txt[:60]}' -> '{cmd[:60]}'"
                 )
+                self._cancel_wake_greeting()
                 await self._call_nanobot(cmd, uid)
             else:
                 logger.info(f"[{self.stream_name}] 🎯 Wake word (awaiting command)")

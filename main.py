@@ -2080,6 +2080,18 @@ async def start_camera_sessions():
                 stream_name=name,
                 go2rtc_host=go2rtc_host,
                 go2rtc_port=go2rtc_port,
+                # Source RTSP URL used by the self-healer to re-register the
+                # stream when go2rtc loses its audio track. Per-stream env wins:
+                #   GO2RTC_SOURCE_URL_CORRIDOR=rtsp://user:pass@cam/stream=0#backchannel=1
+                # fallback: GO2RTC_SOURCE_URL for all streams. Without either,
+                # the healer tries to reuse whatever URL go2rtc still lists.
+                go2rtc_source_url=(
+                    os.getenv(f"GO2RTC_SOURCE_URL_{name.upper()}")
+                    or os.getenv("GO2RTC_SOURCE_URL", "")
+                ),
+                # Consecutive ffmpeg stalls (each ~20s read timeout) before the
+                # healer re-registers the stream in go2rtc.
+                heal_stalls=int(os.getenv("GO2RTC_HEAL_STALLS", "3")),
                 http_session=http,
                 nanobot_url=NANOBOT_WS_URL,
                 nanobot_token=NANOBOT_TOKEN,

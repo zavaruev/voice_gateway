@@ -15,3 +15,4 @@ vosk
 scipy
 openwakeword
 slowapi
+limits  # direct `import limits` in main.py; slowapi dep but kept explicit

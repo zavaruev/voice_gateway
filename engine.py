@@ -129,7 +129,7 @@ class LocalAudioEngine:
         # every model. The wake-word model was trained on int16 scale.
         prediction = self.oww_model.predict(audio_int16)
         score = float(max(prediction.values())) if prediction else 0.0
-        if score > 0.05:
+        if score > 0.5:
             logger.info(f"Wake word score: {score:.4f} (peak={peak})")
         return score > threshold
 

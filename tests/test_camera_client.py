@@ -83,24 +83,28 @@ async def test_echo_active():
     await track.recv()
     assert track._queue.qsize() == 0
 
-    # Just after receive, time.time() - self._last_real_recv is very small
-    # hold is min(15.0, 0.0 + 0.3) = 0.3s
-    # So echo_active should be True
+    # Just after receive, time.time() - _last_real_recv is ~0
+    # hold = min(15.0, 0.0 + 0.3) = 0.3s -> echo_active True
     assert track.echo_active() is True
 
-    # Change _last_real_recv to simulate time passing
+    # After 1s of no real frames: 1.0 > 0.3 -> echo window closed
     track._last_real_recv = time.time() - 1.0
     assert track.echo_active() is False
 
-    # Test with larger last_play_duration
+    # Longer playback extends the hold: min(15.0, 5.0 + 0.3) = 5.3s
     track._last_real_recv = time.time() - 2.0
     track._last_play_duration = 5.0
-    # hold = min(15.0, 5.0 + 0.3) = 5.3s
-    # 2.0 < 5.3, so should be True
     assert track.echo_active() is True
 
     track._last_real_recv = time.time() - 6.0
-    # 6.0 < 5.3 is False
+    assert track.echo_active() is False
+
+    # Hold is capped at 15s even for very long clips
+    track._last_real_recv = time.time() - 14.0
+    track._last_play_duration = 60.0
+    assert track.echo_active() is True
+
+    track._last_real_recv = time.time() - 16.0
     assert track.echo_active() is False
 
 def test_stop():
@@ -139,3 +143,78 @@ async def test_delayed_attention_exception():
             mock_sleep.assert_called_once_with(5)
             mock_play.assert_not_called()
             assert session._attention_played is False
+
+
+import numpy as np
+
+
+def _make_session():
+    s = CameraSession(
+        stream_name="test_stream",
+        go2rtc_host="127.0.0.1",
+        go2rtc_port=1984,
+    )
+    return s
+
+
+@pytest.mark.asyncio
+async def test_is_echo_detects_own_tts():
+    s = _make_session()
+    rng = np.random.default_rng(0)
+    sig_8k = (rng.integers(-3000, 3000, size=1280, dtype=np.int16))
+    sig_16k = np.repeat(sig_8k, 2)  # what _store_tts_echo upsamples to
+    s._store_tts_echo(sig_8k.tobytes())
+    # total is now 2560; simulate 10s passing (echo returns later)
+    s._tts_total += 10 * 16000
+    # The echoed chunk (same content) must be detected as echo
+    assert s._is_echo(sig_16k.tobytes()) is True
+
+
+@pytest.mark.asyncio
+async def test_is_echo_rejects_other_speech():
+    s = _make_session()
+    rng = np.random.default_rng(1)
+    sig_8k = (rng.integers(-3000, 3000, size=1280, dtype=np.int16))
+    other_8k = (rng.integers(-3000, 3000, size=1280, dtype=np.int16))
+    other_16k = np.repeat(other_8k, 2)
+    s._store_tts_echo(sig_8k.tobytes())
+    s._tts_total += 10 * 16000
+    # Different speech must NOT be flagged as echo
+    assert s._is_echo(other_16k.tobytes()) is False
+
+
+@pytest.mark.asyncio
+async def test_is_echo_rejects_silence():
+    s = _make_session()
+    rng = np.random.default_rng(2)
+    sig_8k = (rng.integers(-3000, 3000, size=1280, dtype=np.int16))
+    silence = np.zeros(2560, dtype=np.int16)
+    s._store_tts_echo(sig_8k.tobytes())
+    s._tts_total += 10 * 16000
+    assert s._is_echo(silence.tobytes()) is False
+
+
+@pytest.mark.asyncio
+async def test_recent_wake_mishear_goes_to_greeting():
+    s = _make_session()
+    s._wake_detected = True
+    s._wake_fired_at = time.time() - 1.0  # model fired 1s ago
+    with patch.object(s, "_schedule_wake_greeting") as mock_greet, patch.object(
+        s, "_call_nanobot", new_callable=AsyncMock
+    ) as mock_nano:
+        await s._handle_wake_or_command("бла бла хрень", "cam")
+        mock_greet.assert_called_once()
+        mock_nano.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_old_wake_command_goes_to_nanobot():
+    s = _make_session()
+    s._wake_detected = True
+    s._wake_fired_at = time.time() - 10.0  # real follow-up, not the wake word
+    with patch.object(s, "_schedule_wake_greeting") as mock_greet, patch.object(
+        s, "_call_nanobot", new_callable=AsyncMock
+    ) as mock_nano:
+        await s._handle_wake_or_command("включи свет", "cam")
+        mock_greet.assert_not_called()
+        mock_nano.assert_called_once()

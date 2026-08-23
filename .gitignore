@@ -39,3 +39,6 @@ models/
 # Large downloaded models (not wired in yet)
 config/vosk-model-ru-0.42/
 config/vosk-model-small-ru-0.22/
+
+# local model backups (keep on disk, out of git)
+config/*.onnx.bak*

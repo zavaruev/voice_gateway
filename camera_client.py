@@ -1491,10 +1491,10 @@ class CameraSession:
             # follows. Without this the bare word "компьютер" was forwarded
             # to nanobot as a message.
             if not self._wake_detected:
-                # Another room's mic may have caught this voice louder —
-                # let the closest camera own the interaction.
-                busy, olvl = _arbiter_owner_active(self.stream_name)
-                if busy and self._proximity_level() < olvl * 1.3:
+                # Another camera already owns a dialogue — stand down
+                # unconditionally (same strict rule as the oww path).
+                busy, _olvl = _arbiter_owner_active(self.stream_name)
+                if busy:
                     logger.info(
                         f"[{self.stream_name}] 🤝 transcript wake stands down — owned"
                     )

@@ -7,12 +7,17 @@ Per-camera pipeline (one CameraSession per stream, see main.start_camera_session
     go2rtc RTSP (:8554/<stream>?audio=copy)
       -> ffmpeg -> PCM s16le 16k mono
       -> _feed_audio: echo guards (queue + cross-correlation vs TTS ring buffer)
-      -> _vad_process: Silero VAD + energy gates
-           - quiet-run EOL: corridor noise keeps VAD "speech" alive forever, so a
-             run of near-noise-floor frames also terminates an utterance
-           - openWakeWord on live chunks (AGC boost to peak=4000), adaptive
-             threshold that self-tunes to false fires and decays over time
-      -> Whisper STT (+ parallel SpeakerID, non-blocking) -> wake/command routing
+     -> _vad_process: Silero VAD + energy gates
+          - utterances end after ~10 VAD-silent frames (~1.44s); the noise
+            floor estimate behind the energy gates is floor-biased (median of
+            the QUIETEST half of a sliding window) so sustained loud speech
+            cannot redefine what counts as "silence"
+          - openWakeWord on live chunks (AGC boost to peak=4000), adaptive
+            threshold that self-tunes to false fires and decays over time;
+            every imminent fire is arbitrated ACROSS cameras by raw mic
+            loudness so only the closest device answers (see the arbiter
+            section below)
+       -> Whisper STT (+ parallel SpeakerID, non-blocking) -> wake/command routing
 
   SPEAKER (talk back):
     Nanobot WS (streaming) -> sentence flusher -> Edge TTS per sentence
@@ -180,6 +185,153 @@ class AIVoiceOutputTrack(MediaStreamTrack):
 
 _HAS_QUESTION_RE = re.compile(r"[?？]")
 
+# ---------------------------------------------------------------------------
+# Cross-camera arbitration.
+#
+# Cameras overlap acoustically (a voice in the living room is clearly audible
+# in the corridor), so one spoken phrase wakes several sessions at once and
+# each would answer over the others. Every session registers a claim carrying
+# its RAW mic level (untouched by per-stream AGC, so it is a proximity proxy:
+# the nearest microphone clips highest). After a short grace window the
+# loudest claim wins; losers stand down silently (no pip, no Nanobot call).
+# ---------------------------------------------------------------------------
+_ARB_STATE: dict = {"claims": {}, "sent": {}}
+_ARB_LOCK: asyncio.Lock | None = None
+
+
+def _arbiter_set_owner(stream: str, level: float) -> None:
+    """Mark `stream` as the camera currently owning the interaction."""
+    _ARB_STATE["owner"] = {"stream": stream, "ts": time.time(), "level": level}
+
+
+def _arbiter_owner_active(exclude: str, max_age: float = 45.0):
+    """Return (other_owner_active, owner_level) if another camera is mid-dialogue.
+
+    Ownership is advisory and time-limited: `max_age` (45s) must span one
+    full question->answer exchange, after which a stale entry no longer
+    blocks new wakes (e.g. if the owning session died mid-reply without
+    calling _arbiter_clear_owner).
+    """
+    o = _ARB_STATE.get("owner")
+    if not o:
+        return False, 0.0
+    if time.time() - o["ts"] > max_age:
+        return False, 0.0
+    if o["stream"] == exclude:
+        # The owner asking about itself is never "busy elsewhere" — this is
+        # what lets the owning camera run its own follow-up dialogue.
+        return False, 0.0
+    return True, float(o.get("level", 0.0))
+
+
+def _arbiter_clear_owner(stream: str) -> None:
+    o = _ARB_STATE.get("owner")
+    if o and o.get("stream") == stream:
+        _ARB_STATE["owner"] = None
+
+
+def _arbiter_mark_sent(key: tuple, stream: str) -> None:
+    """Winner reports that it actually dispatched the command.
+
+    Receipts are keyed by (arbitration bucket, stream) and expire after
+    _SENT_TTL seconds; pruning happens here so the dict cannot grow
+    without bound over a long uptime.
+    """
+    now = time.time()
+    sent = _ARB_STATE["sent"]
+    sent[(key, stream)] = now
+    stale = [k for k, ts in sent.items() if now - ts > _SENT_TTL]
+    for k in stale:
+        del sent[k]
+
+
+# How long a "winner dispatched" receipt stays meaningful. Must comfortably
+# exceed the 2.2s fallback wait in CameraSession._cmd_fallback.
+_SENT_TTL = 60.0
+
+
+def _arbiter_sent_recently(key: tuple, stream: str, within: float = 3.0) -> bool:
+    """True if `stream` reported a dispatch within the last `within` seconds.
+
+    Falls back to a stream-only scan because the winner may hold a DIFFERENT
+    bucket key than the loser that is asking (their claims landed in adjacent
+    3s buckets but were merged into one verdict group). An exact
+    (key, stream) lookup alone would miss such dispatches and trigger a
+    bogus take-over of a command that was already answered.
+    """
+    now = time.time()
+    ts = _ARB_STATE["sent"].get((key, stream))
+    if ts and now - ts <= within:
+        return True
+    return any(
+        s == stream and now - t <= within
+        for (_k, s), t in _ARB_STATE["sent"].items()
+    )
+
+
+def _arb_lock() -> asyncio.Lock:
+    global _ARB_LOCK
+    if _ARB_LOCK is None:
+        _ARB_LOCK = asyncio.Lock()
+    return _ARB_LOCK
+
+
+async def _arbiter_submit(kind: str, stream: str, level: float,
+                          grace: float = 0.7, quality: float = 0.0,
+                          respect_owner: bool = False
+                          ) -> tuple[bool, tuple, str]:
+    """Register a claim and report whether `stream` won its group.
+
+    `kind` separates concurrent event types ("wake" vs "cmd"). Claims land in
+    coarse 3s time buckets; the verdict merges the bucket plus its predecessor
+    and filters by recency, so groups straddling a bucket edge still compete
+    together instead of both winning.
+    """
+    # An active interaction owned by another room wins outright. First
+    # detector takes the dialogue; no mid-dialogue takeovers — they produced
+    # double pips and duelling answers.
+    if respect_owner:
+        busy, _olvl = _arbiter_owner_active(stream)
+        if busy:
+            logger.info(
+                f"⚖️ arbiter[{kind}]: '{stream}' stands down — "
+                f"interaction owned elsewhere"
+            )
+            return False, ("owned", 0), "owner"
+
+    now = time.time()
+    bucket_key = (kind, int(now // 3))
+    async with _arb_lock():
+        _ARB_STATE["claims"].setdefault(bucket_key, {})[stream] = (
+            now, float(level), float(quality),
+        )
+    await asyncio.sleep(grace)
+    async with _arb_lock():
+        # prune buckets that are entirely stale
+        for k in [k for k, b in _ARB_STATE["claims"].items()
+                  if all(now - ts > 8 for ts, _, _q in b.values())]:
+            del _ARB_STATE["claims"][k]
+        # Wake detections across rooms can stagger by seconds (different
+        # detectors/debounce), so group them more generously than commands.
+        span = 5.0 if kind == "wake" else 3.0
+        # key=(stream) -> [max_level, max_quality]
+        merged: dict[str, list[float]] = {}
+        for bk in ((kind, bucket_key[1] - 1), (kind, bucket_key[1]), (kind, bucket_key[1] + 1)):
+            for st, (ts, lvl, q) in _ARB_STATE["claims"].get(bk, {}).items():
+                if abs(now - ts) <= span:
+                    cell = merged.setdefault(st, [0.0, 0.0])
+                    cell[0] = max(cell[0], lvl)
+                    cell[1] = max(cell[1], q)
+        # Louder wins; on a clipping tie (both 32767) the richer transcript wins.
+        winner = (
+            max(merged.items(), key=lambda kv: (kv[1][0], kv[1][1]))[0]
+            if merged else stream
+        )
+        pretty = {k: (round(v[0]), round(v[1])) for k, v in merged.items()}
+        logger.info(f"⚖️ arbiter[{kind}]: {pretty} -> '{winner}'")
+        # Tuple so losers know WHO won (for the take-over-if-silent fallback).
+        return winner == stream, bucket_key, winner
+
 # Global: while any TTS playback is running (ESP32 or camera), neither path
 # may send to nanobot — kills echo cascade (camera hears ESP32 TTS, resends).
 GLOBAL_TTS_UNTIL = 0.0
@@ -297,9 +449,10 @@ class CameraSession:
         self._vad_speech_consecutive = 0
         self._vad_window: list[int] = []
         self._vad_silence_limit = 10
-        self._vad_quiet_run = 0
-        self._quiet_rms = 0.05
         self._ww_ring: list[bytes] = []
+        # Raw (pre-AGC) chunk peaks, proximity proxy for cross-camera arbitration.
+        self._recent_peaks: list[int] = []
+        self._last_utt_peak = 0
         self._skipped_noise = 0
         # Adaptive wake threshold (false-wake immunity for the noisy corridor).
         #
@@ -848,9 +1001,6 @@ class CameraSession:
                 self._bg_window.append(rms_int)
                 if len(self._bg_window) > 20:
                     self._bg_window.pop(0)
-                if len(self._bg_window) >= 6:
-                    med = float(np.median(self._bg_window)) / 32768.0
-                    self._quiet_rms = max(0.018, med * 1.7)
                 now_d = time.time()
                 if (
                     self._ww_thresh > 0.58
@@ -865,12 +1015,29 @@ class CameraSession:
 
             asyncio.create_task(self._vad_process(chunk))
 
+    def _proximity_level(self) -> float:
+        """Mean raw chunk peak of the last ~2s — stable closeness proxy.
+
+        Mean over max: two cameras can both clip at 32767 when the user stands
+        between rooms, but the mean still ranks them by how much of the time
+        the signal was loud.
+        """
+        return (
+            float(sum(self._recent_peaks) / len(self._recent_peaks))
+            if self._recent_peaks
+            else 0.0
+        )
+
     async def _vad_process(self, chunk: bytes):
         async with self._vad_lock:
             s16 = np.frombuffer(chunk, dtype=np.int16)
             self._ww_ring.append(chunk)
             if len(self._ww_ring) > 25:
                 self._ww_ring.pop(0)
+            # raw peak of this chunk — feeds the proximity arbiter
+            self._recent_peaks.append(int(np.abs(s16.astype(np.int32)).max()))
+            if len(self._recent_peaks) > 12:  # ~2s window
+                self._recent_peaks.pop(0)
             orig_rms = (
                 float(np.sqrt(np.mean(np.square(s16.astype(np.float64))))) / 32768.0
             )
@@ -901,13 +1068,6 @@ class CameraSession:
 
             if speech:
                 self._vad_speech_consecutive += 1
-                # VAD can't see pauses in the permanent corridor noise, so
-                # utterances only ever ended at the duration cap. Treat a run
-                # of near-noise-floor frames as silence too.
-                if orig_rms < self._quiet_rms:
-                    self._vad_quiet_run += 1
-                else:
-                    self._vad_quiet_run = 0
                 if not self._vad_has_speech:
                     if win_speech >= 3 and not self._processing_utterance:
                         logger.info(
@@ -915,28 +1075,14 @@ class CameraSession:
                         )
                         self._vad_has_speech = True
                         self._vad_silence_frames = 0
-                        self._vad_quiet_run = 0
                         self._vad_start_time = now
                         self._vad_speech_buf.extend(chunk)
                 else:
                     self._vad_speech_buf.extend(chunk)
                 self._vad_silence_frames = 0
-                if (
-                    self._vad_has_speech
-                    and self._vad_quiet_run >= 13
-                ):
-                    dur = len(self._vad_speech_buf) / 32
-                    logger.info(
-                        f"[{self.stream_name}] VAD UTTERANCE END (quiet-run) dur={dur:.0f}ms"
-                    )
-                    b = bytes(self._vad_speech_buf)
-                    self._vad_speech_buf.clear()
-                    self._vad_has_speech = False
-                    self._vad_speech_consecutive = 0
-                    self._vad_silence_frames = 0
-                    self._vad_window.clear()
-                    self._vad_quiet_run = 0
-                    asyncio.create_task(self._process_utterance(b))
+                # ~1.44s of true floor-level audio commits an utterance.
+                # Shorter runs chopped sentences at natural inter-word pauses
+                # into 1.3s shards that Whisper could not assemble.
             else:
                 if self._vad_has_speech:
                     self._vad_silence_frames += 1
@@ -1003,35 +1149,74 @@ class CameraSession:
                     # A loud, confident detection always passes — the adaptive
                     # threshold must never be able to lock the system out.
                     wake = sc >= self._ww_thresh or sc >= 0.88
-                    if sc >= 0.88:
-                        self._ww_consec = 2
-                    elif wake:
-                        self._ww_consec += 1
-                        # Keep evidence: last ~4s of mic audio for offline
-                        # analysis of false fires.
-                        try:
-                            wav = self._encode_wav(b"".join(self._ww_ring))
-                            import os as _os
 
-                            _os.makedirs("/tmp/utterances", exist_ok=True)
-                            with open(
-                                f"/tmp/utterances/wwfire_{int(time.time())}.wav", "wb"
-                            ) as f:
-                                f.write(wav)
-                        except Exception:
-                            pass
-                        if self._ww_consec >= 2:
+                    # --- Debounce counter maintenance -------------------------
+                    # Two consecutive qualifying chunks are required before the
+                    # wake fires; ANY non-qualifying chunk resets the counter.
+                    # This branch ONLY maintains the counter — the actual fire
+                    # happens further below once BOTH the debounce and the
+                    # cross-camera ownership checks have passed.
+                    if not wake:
+                        self._ww_consec = 0
+                    elif self._ww_consec >= 1 or sc >= 0.88:
+                        # Fire is imminent (this is at least the second
+                        # qualifying chunk) or the score bypasses the debounce
+                        # entirely: settle cross-camera ownership NOW.
+                        #
+                        # Arbitration deliberately runs only at this moment,
+                        # never per-chunk: _arbiter_submit sleeps through its
+                        # grace window while this coroutine holds the session
+                        # VAD lock, so earlier calls would stall the whole
+                        # audio pipeline.
+                        w_ok, _, _ = await _arbiter_submit(
+                            "wake", self.stream_name, self._proximity_level()
+                        )
+                        if not w_ok:
+                            # A closer camera claimed the same wake — abandon
+                            # our candidacy entirely (no pip, no state change).
+                            logger.info(
+                                f"[{self.stream_name}] 🤝 wake ceded to a closer camera"
+                            )
+                            self._ww_consec = 0
+                        elif sc >= 0.88:
+                            # Loud-confident single chunk counts as fully
+                            # debounced (bypass path, see `wake` above).
+                            self._ww_consec = 2
+                        else:
+                            self._ww_consec += 1
+                    else:
+                        # First qualifying chunk: remember it but do not
+                        # arbitrate yet — single-chunk scores are too noisy
+                        # to start a cross-camera contest over.
+                        self._ww_consec = 1
+
+                    # --- Fire -------------------------------------------------
+                    # Fires only when fully debounced AND no other camera owns
+                    # this interaction (its pip / reply are already running);
+                    # late echo detections must not add a second beep or steal
+                    # the dialogue.
+                    if wake and self._ww_consec >= 2:
+                        busy, _lvl = _arbiter_owner_active(self.stream_name)
+                        if busy:
+                            logger.info(
+                                f"[{self.stream_name}] 🤝 standing down — "
+                                f"interaction owned by another room"
+                            )
+                            self._ww_consec = 0
+                        else:
                             logger.info(
                                 f"[{self.stream_name}] 🎯 Wake word (openWakeWord)"
                             )
+                            # Claim global interaction ownership so other
+                            # rooms' detectors stand down for this exchange.
+                            _arbiter_set_owner(self.stream_name,
+                                               self._proximity_level())
                             self._wake_cmd_sent = False
                             self._last_fire_ts = time.time()
                             self._wake_detected = True
                             self._wake_expires = time.time() + self._wake_timeout
                             self._ww_consec = 0
                             asyncio.create_task(self._play_attention("oww"))
-                    else:
-                        self._ww_consec = 0
 
     def _apply_ns(self, audio_f: np.ndarray):
         """SpeexDSP noise suppression — strips stationary noise (distant speech)."""
@@ -1187,6 +1372,7 @@ class CameraSession:
 
         uid_task.add_done_callback(_uid_done)
         txt = await stt_task
+        self._last_utt_peak = int(stats.get("peak_raw") or 0)
         uid = (
             uid_task.result()
             if uid_task.done() and not uid_task.exception()
@@ -1265,9 +1451,10 @@ class CameraSession:
             if loud.size:
                 cut = min(s16.size, int(loud[-1]) + 1600)  # keep 100ms tail
                 buf = s16[:cut].tobytes()
-        # Corridor-noise gate: the quiet-run EOL detector produces a steady
-        # stream of noise-only "utterances" (peak <4k, rms <1.1k) — never send
-        # those to Whisper. Real commands measured today: peak 8k-33k.
+        # Corridor-noise gate: with the corridor's permanent noise floor, the
+        # VAD regularly holds "speech" open long enough to form noise-only
+        # "utterances" (peak <4k, rms <1.1k) — never send those to Whisper.
+        # Real commands measured today: peak 8k-33k.
         s16 = np.frombuffer(buf, dtype=np.int16)
         if s16.size:
             pk = int(np.abs(s16.astype(np.int32)).max())
@@ -1304,7 +1491,24 @@ class CameraSession:
             # follows. Without this the bare word "компьютер" was forwarded
             # to nanobot as a message.
             if not self._wake_detected:
+                # Another room's mic may have caught this voice louder —
+                # let the closest camera own the interaction.
+                busy, olvl = _arbiter_owner_active(self.stream_name)
+                if busy and self._proximity_level() < olvl * 1.3:
+                    logger.info(
+                        f"[{self.stream_name}] 🤝 transcript wake stands down — owned"
+                    )
+                    return
+                w_ok, _, _ = await _arbiter_submit(
+                    "wake", self.stream_name, self._proximity_level()
+                )
+                if not w_ok:
+                    logger.info(
+                        f"[{self.stream_name}] 🤝 transcript wake ceded to a closer camera"
+                    )
+                    return
                 asyncio.create_task(self._play_attention("processor_kw"))
+            _arbiter_set_owner(self.stream_name, self._proximity_level())
             self._wake_detected = True
             self._wake_expires = time.time() + self._wake_timeout
             cmd = (txt[: m.start()] + " " + txt[m.end() :]).strip()
@@ -1312,6 +1516,21 @@ class CameraSession:
                 logger.info(
                     f"[{self.stream_name}] 🎯 Wake+cmd: '{txt[:60]}' -> '{cmd[:60]}'"
                 )
+                # In overlapping wake windows several cameras hear the same
+                # answer; only the closest one talks to Nanobot.
+                qual = float(len(cmd)) if is_valid_text(cmd) else 0.0
+                won, gk, winner = await _arbiter_submit(
+                    "cmd", self.stream_name, float(self._last_utt_peak or 0),
+                    0.6, quality=qual, respect_owner=True,
+                )
+                if not won:
+                    logger.info(
+                        f"[{self.stream_name}] 🤝 command ceded to '{winner}' — "
+                        f"will take over if it stays silent"
+                    )
+                    asyncio.create_task(self._cmd_fallback(cmd, uid, gk, winner))
+                    return
+                _arbiter_mark_sent(gk, self.stream_name)
                 self._cancel_wake_greeting()
                 await self._call_nanobot(cmd, uid)
             else:
@@ -1337,6 +1556,44 @@ class CameraSession:
             )
             return
         logger.info(f"[{self.stream_name}] 🗣 Post-wake command: '{cmd[:60]}'")
+        # Overlapping wake windows: several cameras hear the same answer —
+        # only the closest one talks to Nanobot.
+        qual = float(len(cmd)) if is_valid_text(cmd) else 0.0
+        won, gk, winner = await _arbiter_submit(
+            "cmd", self.stream_name, float(self._last_utt_peak or 0),
+            0.6, quality=qual, respect_owner=True,
+        )
+        if not won:
+            logger.info(
+                f"[{self.stream_name}] 🤝 post-wake command ceded to '{winner}' — "
+                f"will take over if it stays silent"
+            )
+            asyncio.create_task(self._cmd_fallback(cmd, uid, gk, winner))
+            return
+        _arbiter_mark_sent(gk, self.stream_name)
+        await self._call_nanobot(cmd, uid)
+
+    async def _cmd_fallback(self, cmd: str, uid: str, gk: tuple, winner: str):
+        """Take over a lost command arbitration if the winner never dispatches.
+
+        Covers the race where BOTH cameras transcribed the same command but
+        only one received a usable Whisper result: this loser waits ~2.2s and
+        dispatches only if the winner stayed completely silent (nothing was
+        ever sent to Nanobot under its name).
+        """
+        if gk == ("owned", 0) or winner == "owner":
+            # We lost to the OWNERSHIP veto, not to a level contest with a
+            # peer claim. Another camera is mid-dialogue and WILL answer;
+            # taking the command over here would fire a duplicate reply
+            # ~2.2s later. No fallback in this case.
+            return
+        await asyncio.sleep(2.2)
+        if _arbiter_sent_recently(gk, winner):
+            # Winner dispatched in time — nothing to rescue.
+            return
+        logger.warning(
+            f"[{self.stream_name}] 🥈 winner '{winner}' silent — taking over command"
+        )
         await self._call_nanobot(cmd, uid)
 
     def _cancel_wake_greeting(self):
@@ -1451,17 +1708,6 @@ class CameraSession:
                         if not last_q:
                             self._back_to_wake()
 
-                    async def _wait_playback_drain() -> None:
-                        ot = self._out_track
-                        if not ot:
-                            return
-                        while not self._stopped.is_set():
-                            if (
-                                ot.queue_seconds() < 0.1
-                                and time.time() >= self._speaking_until - 1.6
-                            ):
-                                return
-                            await asyncio.sleep(0.2)
 
                     player_task = asyncio.create_task(player())
                     _t0 = time.time()
@@ -1684,6 +1930,7 @@ class CameraSession:
 
     def _back_to_wake(self):
         self._wake_detected = False
+        _arbiter_clear_owner(self.stream_name)
         if not self._wake_cmd_sent and self._ww_thresh < 0.70:
             self._ww_thresh = round(min(0.70, self._ww_thresh + 0.07), 2)
             logger.info(
@@ -1749,6 +1996,23 @@ class CameraSession:
                 self._out_track._last_play_duration = len(pcm) / (2 * 8000)
         except Exception:
             pass
+
+    async def _wait_playback_drain(self) -> None:
+        """Block until the WebRTC output queue has actually finished playing.
+
+        Used before opening the dialogue follow-up window: the window must
+        start when the question STOPS sounding, not when it was queued.
+        """
+        ot = self._out_track
+        if not ot:
+            return
+        while not self._stopped.is_set():
+            if (
+                ot.queue_seconds() < 0.1
+                and time.time() >= self._speaking_until - 1.6
+            ):
+                return
+            await asyncio.sleep(0.2)
 
     async def _speak(self, text: str, reply: str = "") -> bool:
         self._speaking = True

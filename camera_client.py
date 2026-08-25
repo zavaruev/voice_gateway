@@ -1435,6 +1435,11 @@ class CameraSession:
                                 self._vad_speech_consecutive = 0
                                 self._vad_silence_frames = 0
                                 asyncio.create_task(self._play_attention("oww"))
+                                # Bare 'компьютер' with no follow-up used to
+                                # end in eternal silence (pip only). After a
+                                # short pause greet via nanobot so the user
+                                # knows they were heard.
+                                self._schedule_wake_greeting()
 
     def _open_stt_confirm(self, sc: float) -> None:
         """Gates held a decent oww score (appliance/quiet-source). Do not pip;
@@ -1668,6 +1673,8 @@ class CameraSession:
                 self._wake_detected = True
                 self._wake_expires = time.time() + self._wake_timeout
                 asyncio.create_task(self._play_attention("oww"))
+                # Confirmed without an inline command? Greet as well.
+                self._schedule_wake_greeting()
             else:
                 logger.info(
                     f"[{self.stream_name}] ❌ stt-confirm dropped: '{txt[:50]}'"
@@ -1827,6 +1834,15 @@ class CameraSession:
             return
         if not self._wake_detected:
             return
+        if self._vad_has_speech:
+            # User is mid-sentence (slow command) — do NOT talk over them;
+            # give one extra quiet period before greeting.
+            try:
+                await asyncio.sleep(4.0)
+            except asyncio.CancelledError:
+                return
+            if not self._wake_detected:
+                return
         logger.info(
             f"[{self.stream_name}] 🎯 Wake with no command — sending greeting"
         )

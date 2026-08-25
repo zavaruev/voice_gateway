@@ -196,6 +196,11 @@ _HAS_QUESTION_RE = re.compile(r"[?？]")
 # loudest claim wins; losers stand down silently (no pip, no Nanobot call).
 # ---------------------------------------------------------------------------
 _ARB_STATE: dict = {"claims": {}, "sent": {}, "cmd_sent": None}
+# stream -> (timestamp, mean_raw_peak of last ~2s). Cross-room loudness map
+# used to veto "distant source" wakes: a camera that hears the wake word
+# much quieter than another room is hearing a muffled through-the-wall
+# copy, which this TTS-trained model scores HIGHER than close live speech.
+_ROOM_PEAKS: dict = {}
 _ARB_LOCK: asyncio.Lock | None = None
 
 
@@ -1047,6 +1052,10 @@ class CameraSession:
             self._recent_peaks.append(int(np.abs(s16.astype(np.int32)).max()))
             if len(self._recent_peaks) > 12:  # ~2s window
                 self._recent_peaks.pop(0)
+            global _ROOM_PEAKS
+            _ROOM_PEAKS[self.stream_name] = (
+                time.time(), self._proximity_level(),
+            )
             orig_rms = (
                 float(np.sqrt(np.mean(np.square(s16.astype(np.float64))))) / 32768.0
             )
@@ -1238,15 +1247,39 @@ class CameraSession:
                             ot.queue_seconds() > 0.3
                             or time.time() < self._speaking_until
                         )
+                        my_lvl = self._proximity_level()
+                        vetoed = False
                         if speaker_active:
                             # Speaker is actively playing: any wake-shaped
                             # sound right now IS our own TTS/pip leaking back
                             # through the mic. Never fire on it.
                             self._ww_consec = 0
                             self._ww_recent.clear()
-                        else:
+                        elif my_lvl < 1600:
+                            # Distant-source veto: our raw signal is very quiet
+                            # (<1600) while another room currently hears the
+                            # same sound >=2x louder. The user is THERE; the
+                            # muffled through-wall copy of "компьютер" scores
+                            # deceptively high on this TTS-trained model.
+                            now_ts = time.time()
+                            louder = [
+                                (s, p) for s, (t, p) in _ROOM_PEAKS.items()
+                                if s != self.stream_name
+                                and now_ts - t < 3.0
+                                and p >= 1.4 * max(my_lvl, 1.0)
+                            ]
+                            if louder:
+                                s, p = max(louder, key=lambda x: x[1])
+                                logger.info(
+                                    f"[{self.stream_name}] 🚫 distant-source "
+                                    f"veto — '{s}' hears {p:.0f} vs our "
+                                    f"{my_lvl:.0f}; wake belongs there"
+                                )
+                                self._ww_consec = 0
+                                self._ww_recent.clear()
+                                vetoed = True
+                        if not speaker_active and not vetoed:
                             busy, olvl = _arbiter_owner_active(self.stream_name)
-                            my_lvl = self._proximity_level()
                             # Proximity steal: the user is clearly standing in
                             # OUR room (peak >=5x the owner's) and the owner
                             # has not even dispatched a command yet — the wake

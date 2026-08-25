@@ -2076,14 +2076,25 @@ async def start_camera_sessions():
     # Wake-word switch: WAKE_WORD_MODEL points at any openWakeWord-format
     # head (built-in pretrained names like 'hey_jarvis' resolve inside the
     # package); WAKE_WORD is the spoken phrase used by the command stripper.
-    wake_model_env = os.getenv("WAKE_WORD_MODEL", "hey_jarvis")
-    if os.path.exists(wake_model_env):
+    wake_model_env = os.getenv(
+        "WAKE_WORD_MODEL",
+        "config/computer.onnx",  # custom RU head; hey_jarvis misses Russian 'джарвис'
+    )
+    if os.path.sep not in wake_model_env:
+        # Bare built-in name -> resolve inside the openwakeword package.
+        # Paths containing a separator are filesystem paths used as-is;
+        # joining them against the package dir produced nonsense like
+        # <pkg>/models/config/computer.onnx (22:51 trace).
+        import glob as _glob
         import openwakeword
-        res = os.path.join(
+        res_dir = os.path.join(
             os.path.dirname(openwakeword.__file__), "resources", "models"
         )
-        wake_model_env = os.path.join(res, wake_model_env)
-    wake_word_env = os.getenv("WAKE_WORD", "джарвис")
+        base = wake_model_env if wake_model_env.endswith(".onnx") else wake_model_env + ".onnx"
+        hits = sorted(_glob.glob(os.path.join(res_dir, base)))
+        if hits:
+            wake_model_env = hits[0]
+    wake_word_env = os.getenv("WAKE_WORD", "компьютер")
 
     for name in streams:
         try:

@@ -526,7 +526,27 @@ class CameraSession:
         logger.info(f"[{self.stream_name}] CameraSession started")
 
     async def _init_engine(self):
-        try:
+        # Startup race: the config bind-mount may not be visible for the
+        # first seconds after container start (observed 22:43 — all three
+        # cameras initialized with a dead engine and never retried).
+        deadline = time.time() + 90.0
+        while True:
+            try:
+                await self._init_engine_once()
+                return
+            except Exception as e:
+                if time.time() >= deadline or self._stopped.is_set():
+                    logger.error(
+                        f"[{self.stream_name}] engine init failed permanently: {e}"
+                    )
+                    return
+                logger.warning(
+                    f"[{self.stream_name}] engine init deferred ({e}); retrying"
+                )
+                await asyncio.sleep(3.0)
+
+    async def _init_engine_once(self):
+        if True:  # exceptions propagate to the retry wrapper on purpose
             model_path = self._wakeword_model_path or "config/computer.onnx"
             if not os.path.exists(model_path):
                 # Bare name (e.g. 'hey_jarvis') -> built-in pretrained model
@@ -551,8 +571,6 @@ class CameraSession:
             await asyncio.to_thread(
                 self._engine.initialize_models, model_path,
             )
-        except Exception as e:
-            logger.warning(f"[{self.stream_name}] Failed to init audio engine: {e}")
 
     async def stop(self):
         self._stopped.set()

@@ -1007,17 +1007,7 @@ class CameraSession:
                 if len(self._bg_window) > 20:
                     self._bg_window.pop(0)
                 now_d = time.time()
-                base_ww = 0.47 if self.stream_name == "kitchen" else 0.52
-                if (
-                    self._ww_thresh > base_ww
-                    and now_d - self._last_fire_ts > 150
-                    and now_d - self._last_decay_ts > 60
-                ):
-                    self._ww_thresh = max(base_ww, round(self._ww_thresh - 0.02, 2))
-                    self._last_decay_ts = now_d
-                    logger.info(
-                        f"[{self.stream_name}] ⤵ quiet 2.5min — wake threshold -> {self._ww_thresh}"
-                    )
+
 
             asyncio.create_task(self._vad_process(chunk))
 
@@ -1240,6 +1230,17 @@ class CameraSession:
                             self._wake_detected = True
                             self._wake_expires = time.time() + self._wake_timeout
                             self._ww_consec = 0
+                            self._ww_recent.clear()
+                            # Reset VAD collection: corridor's permanent noise
+                            # floor keeps _vad_has_speech=True indefinitely
+                            # (consec>100 observed), so the post-wake command
+                            # would otherwise be drowned inside a noise buffer
+                            # that never hits the silence limit. Start the
+                            # command utterance from a clean slate.
+                            self._vad_has_speech = False
+                            self._vad_speech_buf.clear()
+                            self._vad_speech_consecutive = 0
+                            self._vad_silence_frames = 0
                             asyncio.create_task(self._play_attention("oww"))
 
     def _apply_ns(self, audio_f: np.ndarray):
@@ -1487,23 +1488,6 @@ class CameraSession:
             if loud.size:
                 cut = min(s16.size, int(loud[-1]) + 1600)  # keep 100ms tail
                 buf = s16[:cut].tobytes()
-        # Corridor-noise gate: with the corridor's permanent noise floor, the
-        # VAD regularly holds "speech" open long enough to form noise-only
-        # "utterances" (peak <4k, rms <1.1k) — never send those to Whisper.
-        # Real commands measured today: peak 8k-33k.
-        s16 = np.frombuffer(buf, dtype=np.int16)
-        if s16.size:
-            pk = int(np.abs(s16.astype(np.int32)).max())
-            rrms = float(np.sqrt((s16.astype(np.int64) ** 2).mean()))
-            if pk < 4500 or rrms < 1100:
-                self._skipped_noise += 1
-                if self._skipped_noise % 25 == 1:
-                    logger.info(
-                        f"[{self.stream_name}] 🔇 {self._skipped_noise}x noise utterances "
-                        f"skipped (last pk={pk} rms={rrms:.0f})"
-                    )
-                return
-
         self._processing_utterance = True
         try:
             buf_processed, buf_raw, duration_s, stats = self._preprocess_audio(buf)
@@ -1953,14 +1937,10 @@ class CameraSession:
     def _back_to_wake(self):
         self._wake_detected = False
         _arbiter_clear_owner(self.stream_name)
-        # Per-room threshold ceiling: kitchen's base is 0.50 (weak mic), the
-        # false-fire bump must not push it past its usable range.
-        thresh_ceiling = 0.62 if self.stream_name == "kitchen" else 0.70
-        if not self._wake_cmd_sent and self._ww_thresh < thresh_ceiling:
-            self._ww_thresh = round(min(thresh_ceiling, self._ww_thresh + 0.07), 2)
-            logger.info(
-                f"[{self.stream_name}] 🔒 no command after wake — threshold -> {self._ww_thresh}"
-            )
+        # No threshold bump on empty wake windows: the old +0.07 "false-fire
+        # penalty" compounded after every missed/empty command (Whisper glitch,
+        # user silence) and eventually locked wake detection out entirely.
+        # Thresholds now come from measured score distributions and stay put.
 
     async def _delayed_attention(self):
         try:

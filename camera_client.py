@@ -390,6 +390,7 @@ class CameraSession:
         self._wake_detected = False
         self._wake_expires = 0.0
         self._ww_consec = 0  # consecutive openWakeWord fires (debounce)
+        self._ww_recent: list[float] = []  # last 3 oww scores (sliding debounce)
         self._wake_greeting_task = None
         self._last_tts_reply = ""  # normalized text we last spoke (echo guard)
         self._wake_greeting_delay = 5.0
@@ -471,7 +472,7 @@ class CameraSession:
         # (measured live) — its base threshold is lowered so the room stays
         # usable; false-fire protection there still comes from the 2-chunk
         # debounce + cross-camera arbitration.
-        self._ww_thresh = 0.50 if self.stream_name == "kitchen" else 0.58
+        self._ww_thresh = 0.47 if self.stream_name == "kitchen" else 0.52
         self._wake_cmd_sent = False
         self._last_uid = None
         self._last_uid_ts = 0.0
@@ -1006,7 +1007,7 @@ class CameraSession:
                 if len(self._bg_window) > 20:
                     self._bg_window.pop(0)
                 now_d = time.time()
-                base_ww = 0.50 if self.stream_name == "kitchen" else 0.58
+                base_ww = 0.47 if self.stream_name == "kitchen" else 0.52
                 if (
                     self._ww_thresh > base_ww
                     and now_d - self._last_fire_ts > 150
@@ -1166,8 +1167,21 @@ class CameraSession:
                     # This branch ONLY maintains the counter — the actual fire
                     # happens further below once BOTH the debounce and the
                     # cross-camera ownership checks have passed.
+                    self._ww_recent.append(sc)
+                    if len(self._ww_recent) > 3:
+                        self._ww_recent.pop(0)
                     if not wake:
-                        self._ww_consec = 0
+                        # Sliding window: 2 qualifying chunks out of the last
+                        # 3 still count as debounced — the word's score spikes
+                        # for a single 80ms chunk then decays, and strict
+                        # consecutiveness missed real "компьютер" attempts.
+                        if sum(1 for s in self._ww_recent if s >= self._ww_thresh) >= 2:
+                            wake = True
+                            sc = max(self._ww_recent)
+                            if self._ww_consec == 0:
+                                self._ww_consec = 1
+                        else:
+                            self._ww_consec = 0
                     elif self._ww_consec >= 1 or sc >= 0.88:
                         # Fire is imminent (this is at least the second
                         # qualifying chunk) or the score bypasses the debounce
@@ -1617,7 +1631,7 @@ class CameraSession:
         if not txt:
             return
         self._wake_cmd_sent = True
-        base_thresh = 0.50 if self.stream_name == "kitchen" else 0.58
+        base_thresh = 0.47 if self.stream_name == "kitchen" else 0.52
         if self._ww_thresh > base_thresh:
             logger.info(
                 f"[{self.stream_name}] ✅ real command — wake threshold reset to {base_thresh}"

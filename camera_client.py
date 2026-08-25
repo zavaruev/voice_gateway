@@ -904,7 +904,14 @@ class CameraSession:
                 if proc:
                     try:
                         proc.kill()
-                        await proc.wait()
+                    except Exception:
+                        pass
+                    # Bounded reap: asyncio occasionally reports 'exit status
+                    # already read' and an unbounded proc.wait() then blocks
+                    # FOREVER — the audio loop froze silently and the camera
+                    # went deaf until a container restart (18:25 trace).
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=5.0)
                     except Exception:
                         pass
             if not self._stopped.is_set():

@@ -976,6 +976,15 @@ class CameraSession:
                     if now - self._last_echo_log > 2.0:
                         self._last_echo_log = now
                         logger.info(f"[{self.stream_name}] 🔁 Echo chunk dropped (corr)")
+                    # Confirmed TTS echo in the mic feed: keep the wake model
+                    # suppressed while echoes keep arriving. The kitchen's RTSP
+                    # backchannel returns our own speech (incl. the word
+                    # "компьютер" inside replies) 25-40s after playback — far
+                    # past the fixed audio_dur+15 suppress window, which caused
+                    # a fire -> pip -> echo -> fire self-sustaining loop.
+                    self._wake_suppress_until = max(
+                        self._wake_suppress_until, now + 20.0
+                    )
                     continue
                 self._vad_buf.extend(pcm_16k)
                 self._drain_vad_buf()
@@ -1210,38 +1219,50 @@ class CameraSession:
                     # late echo detections must not add a second beep or steal
                     # the dialogue.
                     if wake and self._ww_consec >= 2:
-                        busy, _lvl = _arbiter_owner_active(self.stream_name)
-                        if busy:
-                            logger.info(
-                                f"[{self.stream_name}] 🤝 standing down — "
-                                f"interaction owned by another room"
-                            )
-                            self._ww_consec = 0
-                        else:
-                            logger.info(
-                                f"[{self.stream_name}] 🎯 Wake word (openWakeWord)"
-                            )
-                            # Claim global interaction ownership so other
-                            # rooms' detectors stand down for this exchange.
-                            _arbiter_set_owner(self.stream_name,
-                                               self._proximity_level())
-                            self._wake_cmd_sent = False
-                            self._last_fire_ts = time.time()
-                            self._wake_detected = True
-                            self._wake_expires = time.time() + self._wake_timeout
+                        ot = self._out_track
+                        speaker_active = ot is not None and (
+                            ot.queue_seconds() > 0.3
+                            or time.time() < self._speaking_until
+                        )
+                        if speaker_active:
+                            # Speaker is actively playing: any wake-shaped
+                            # sound right now IS our own TTS/pip leaking back
+                            # through the mic. Never fire on it.
                             self._ww_consec = 0
                             self._ww_recent.clear()
-                            # Reset VAD collection: corridor's permanent noise
-                            # floor keeps _vad_has_speech=True indefinitely
-                            # (consec>100 observed), so the post-wake command
-                            # would otherwise be drowned inside a noise buffer
-                            # that never hits the silence limit. Start the
-                            # command utterance from a clean slate.
-                            self._vad_has_speech = False
-                            self._vad_speech_buf.clear()
-                            self._vad_speech_consecutive = 0
-                            self._vad_silence_frames = 0
-                            asyncio.create_task(self._play_attention("oww"))
+                        else:
+                            busy, _lvl = _arbiter_owner_active(self.stream_name)
+                            if busy:
+                                logger.info(
+                                    f"[{self.stream_name}] 🤝 standing down — "
+                                    f"interaction owned by another room"
+                                )
+                                self._ww_consec = 0
+                            else:
+                                logger.info(
+                                    f"[{self.stream_name}] 🎯 Wake word (openWakeWord)"
+                                )
+                                # Claim global interaction ownership so other
+                                # rooms' detectors stand down for this exchange.
+                                _arbiter_set_owner(self.stream_name,
+                                                   self._proximity_level())
+                                self._wake_cmd_sent = False
+                                self._last_fire_ts = time.time()
+                                self._wake_detected = True
+                                self._wake_expires = time.time() + self._wake_timeout
+                                self._ww_consec = 0
+                                self._ww_recent.clear()
+                                # Reset VAD collection: corridor's permanent noise
+                                # floor keeps _vad_has_speech=True indefinitely
+                                # (consec>100 observed), so the post-wake command
+                                # would otherwise be drowned inside a noise buffer
+                                # that never hits the silence limit. Start the
+                                # command utterance from a clean slate.
+                                self._vad_has_speech = False
+                                self._vad_speech_buf.clear()
+                                self._vad_speech_consecutive = 0
+                                self._vad_silence_frames = 0
+                                asyncio.create_task(self._play_attention("oww"))
 
     def _apply_ns(self, audio_f: np.ndarray):
         """SpeexDSP noise suppression — strips stationary noise (distant speech)."""

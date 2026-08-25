@@ -1620,8 +1620,17 @@ class CameraSession:
         # wake (pip, ownership, command window); anything else -> drop.
         if not self._wake_detected and time.time() < self._stt_confirm_until:
             self._stt_confirm_until = 0.0
-            if re.search(r"(компьютер|компютер|computer)", txt, re.IGNORECASE):
-                logger.info(f"[{self.stream_name}] ✅ STT confirmed wake: '{txt[:60]}'")
+            # The oww detector ALREADY matched the wake sound (that is why
+            # this window is open). The confirming utterance is the COMMAND
+            # that follows the word — it does NOT contain «компьютер» again.
+            # So confirmation = Whisper produced real speech, not silence/
+            # hallucination; the text itself becomes the command.
+            sane = bool(txt.strip()) and is_valid_text(txt)
+            if sane:
+                logger.info(
+                    f"[{self.stream_name}] ✅ STT confirmed wake via command: "
+                    f"'{txt[:60]}'"
+                )
                 won, _, winner = await _arbiter_submit(
                     "wake", self.stream_name, self._proximity_level()
                 )
@@ -2054,6 +2063,21 @@ class CameraSession:
                             await asyncio.wait_for(player_task, timeout=120.0)
                         except asyncio.TimeoutError:
                             player_task.cancel()
+                        if _n_sent == 0:
+                            # Nanobot hung (idle-timeout) or answered empty —
+                            # the camera would go silent forever. Speak the
+                            # same fallback the ESP32 watchdog uses.
+                            logger.warning(
+                                f"[{self.stream_name}] 🕐 nanobot silent — "
+                                f"fallback TTS"
+                            )
+                            fb = "Простите, я задумалась. Повторите пожалуйста."
+                            try:
+                                pcm_fb = await self._tts_fetch(fb)
+                                if pcm_fb:
+                                    await self._speak_pcm(pcm_fb, fb)
+                            except Exception as e:
+                                logger.warning(f"fallback TTS failed: {e}")
         except Exception as e:
             logger.warning(f"[{self.stream_name}] Nanobot error: {e}")
 

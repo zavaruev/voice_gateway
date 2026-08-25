@@ -69,6 +69,7 @@ class LocalAudioEngine:
         self._vad_state = np.zeros((2, 1, 128), dtype=np.float32)
         self._vad_calls = 0
         self._ww_calls = 0
+        self.last_score = 0.0
 
     def initialize_models(self, wakeword_path: str = ""):
         logger.info("Loading Silero VAD (ONNX)...")
@@ -117,11 +118,11 @@ class LocalAudioEngine:
             logger.info(f"VAD calls={self._vad_calls} max_prob={max_prob:.4f} level={level:.6f} (threshold={self.vad_threshold})")
         return max_prob > self.vad_threshold
 
-    def check_wakeword(self, audio_int16: np.ndarray, threshold: float = 0.4) -> bool:
+    def check_wakeword(self, audio_int16: np.ndarray, threshold: float = 0.4, stream: str = "") -> bool:
         peak = int(np.max(np.abs(audio_int16)))
         if self._ww_calls % 500 == 0:
             rms = np.sqrt(np.mean(audio_int16.astype(np.float64)**2))
-            logger.info(f"WW peek: peak={peak} rms={rms:.1f}")
+            logger.info(f"[{stream}] WW peek: peak={peak} rms={rms:.1f}")
         self._ww_calls += 1
         # openwakeword's melspec pipeline expects raw int16 samples
         # (its internal buffer is cast with .astype(np.int16)); feeding
@@ -129,8 +130,14 @@ class LocalAudioEngine:
         # every model. The wake-word model was trained on int16 scale.
         prediction = self.oww_model.predict(audio_int16)
         score = float(max(prediction.values())) if prediction else 0.0
-        if score > 0.5:
-            logger.info(f"Wake word score: {score:.4f} (peak={peak})")
+        # Expose the raw score for camera_client's debounce/fire logic. This
+        # attribute was documented but never written — getattr fallback made
+        # every chunk score 0.0 and the oww fire branch was unreachable.
+        self.last_score = score
+        # Tag scores with the camera so per-room sensitivity can be debugged
+        # (kitchen's distant mic needs different treatment than corridor).
+        if score > 0.4:
+            logger.info(f"[{stream}] Wake word score: {score:.4f} (peak={peak})")
         return score > threshold
 
 

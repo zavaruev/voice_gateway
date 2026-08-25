@@ -1664,6 +1664,19 @@ class CameraSession:
             # hallucination; the text itself becomes the command.
             sane = bool(txt.strip()) and is_valid_text(txt)
             if sane:
+                # Whisper hallucinates fluent garbage over ambient noise
+                # ('и пей девочка, ой, блядь, блядь, блядь...' from hamster
+                # rustle passed is_valid_text and fired a pip). A real command
+                # never loops a word 3+ times.
+                words = re.findall(r"[а-яёa-z0-9]+", txt.lower())
+                top = max((words.count(w) for w in set(words)), default=0)
+                if len(words) < 2 or top > 2:
+                    logger.info(
+                        f"[{self.stream_name}] ❌ stt-confirm looks like "
+                        f"hallucination ({len(words)}w, maxrep {top})"
+                    )
+                    return
+            if sane:
                 logger.info(
                     f"[{self.stream_name}] ✅ STT confirmed wake via command: "
                     f"'{txt[:60]}'"

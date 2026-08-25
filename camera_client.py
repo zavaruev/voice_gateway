@@ -404,6 +404,7 @@ class CameraSession:
         # pip — instead let the next utterance reach Whisper, and a live
         # «компьютер» in the transcript confirms the wake (or drops it).
         self._stt_confirm_until = 0.0   # wall clock: STT-confirmation window
+        self._confirm_saw_text = False  # a transcript arrived during window
         self._tts_play_end = 0.0        # approx wall clock: speaker finishes
         self._veto_until = 0.0          # wall clock: sticky distant-veto
         self._wake_greeting_task = None
@@ -1386,6 +1387,24 @@ class CameraSession:
                                 # next chunk (16:56 trace).
                                 self._veto_until = time.time() + 5.0
                                 vetoed = True
+                        # Ambiguous zone: score passed the room threshold but
+                        # is not overwhelming and the user is not clearly close.
+                        # Rustle/cage noise lands exactly here (LR 20:39-20:45:
+                        # six pips on hamster activity, lvl bursts >=3000 kept
+                        # the quiet-hold from ever running). Route to Whisper
+                        # confirmation instead of beeping; a bare word with no
+                        # follow-up is caught by the expiry watcher.
+                        qual_top = max(sc, max(self._ww_recent or [0]))
+                        if (
+                            not vetoed
+                            and qual_top < 0.90
+                            and my_lvl < 3000
+                            and time.time() >= self._stt_confirm_until
+                        ):
+                            self._ww_consec = 0
+                            self._ww_recent.clear()
+                            self._open_stt_confirm(qual_top)
+                            vetoed = True
                         if (
                             not speaker_active
                             and not vetoed
@@ -1450,6 +1469,26 @@ class CameraSession:
                                 )
                                 self._schedule_wake_greeting()
 
+    async def _confirm_expiry_watch(self):
+        """Confirm window closed with ZERO utterances: that pattern is a bare
+        'компьютер' spoken into an otherwise quiet room (the word triggered
+        oww, the user then waits). Greet them. Noise sources (hamster cage,
+        vacuum) never stay silent — they keep feeding garbage transcripts,
+        which drop without a pip."""
+        try:
+            await asyncio.sleep(11.5)
+        except asyncio.CancelledError:
+            return
+        if (
+            time.time() >= self._stt_confirm_until
+            and not self._confirm_saw_text
+            and not self._wake_detected
+        ):
+            logger.info(
+                f"[{self.stream_name}] 🔎 confirm window silent — bare wake"
+            )
+            self._schedule_wake_greeting()
+
     def _open_stt_confirm(self, sc: float) -> None:
         """Gates held a decent oww score (appliance/quiet-source). Do not pip;
         open a short window during which the next VAD utterance goes to
@@ -1458,6 +1497,8 @@ class CameraSession:
         attempts that threshold gates cannot separate from noise (kitchen
         trace: real 0.91 vs vacuum 0.90 — only STT tells them apart)."""
         self._stt_confirm_until = time.time() + 10.0
+        self._confirm_saw_text = False
+        asyncio.create_task(self._confirm_expiry_watch())
         logger.info(
             f"[{self.stream_name}] 🔎 oww {sc:.2f} held — waiting for STT "
             f"confirmation utterance"
@@ -1657,6 +1698,7 @@ class CameraSession:
         # wake (pip, ownership, command window); anything else -> drop.
         if not self._wake_detected and time.time() < self._stt_confirm_until:
             self._stt_confirm_until = 0.0
+            self._confirm_saw_text = True
             # The oww detector ALREADY matched the wake sound (that is why
             # this window is open). The confirming utterance is the COMMAND
             # that follows the word — it does NOT contain «компьютер» again.

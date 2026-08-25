@@ -407,6 +407,10 @@ class CameraSession:
         self._tts_play_end = 0.0        # approx wall clock: speaker finishes
         self._veto_until = 0.0          # wall clock: sticky distant-veto
         self._wake_greeting_task = None
+        # True while the AUTO-greeting (bare wake, no command yet) is being
+        # spoken: shortens the ownership/follow-up window so other rooms do
+        # not stay deaf for half a minute when the user walks away.
+        self._auto_greeting = False
         self._last_tts_reply = ""  # normalized text we last spoke (echo guard)
         self._wake_greeting_delay = 5.0
         self._audio_epoch = 0.0
@@ -1439,6 +1443,11 @@ class CameraSession:
                                 # end in eternal silence (pip only). After a
                                 # short pause greet via nanobot so the user
                                 # knows they were heard.
+                                # Cap ownership: if nobody responds to pip +
+                                # greeting, release other rooms quickly.
+                                self._wake_expires = min(
+                                    self._wake_expires, time.time() + 14.0
+                                )
                                 self._schedule_wake_greeting()
 
     def _open_stt_confirm(self, sc: float) -> None:
@@ -1822,6 +1831,10 @@ class CameraSession:
         if task is not None and not task.done():
             task.cancel()
         self._wake_greeting_task = None
+        # True while the AUTO-greeting (bare wake, no command yet) is being
+        # spoken: shortens the ownership/follow-up window so other rooms do
+        # not stay deaf for half a minute when the user walks away.
+        self._auto_greeting = False
 
     def _schedule_wake_greeting(self):
         self._cancel_wake_greeting()
@@ -1850,7 +1863,11 @@ class CameraSession:
         # after the greeting is still treated as post-wake dialogue and is not
         # dropped ("No wake word, ignoring"). The 60s _wake_timeout window
         # governs how long follow-ups are accepted.
-        await self._call_nanobot("привет", self.stream_name)
+        self._auto_greeting = True
+        try:
+            await self._call_nanobot("привет", self.stream_name)
+        finally:
+            self._auto_greeting = False
 
     async def _on_user_command(self, text: str):
         try:
@@ -1957,7 +1974,9 @@ class CameraSession:
                                         # the old queue-time expiry).
                                         await self._wait_playback_drain()
                                         self._wake_detected = True
-                                        self._wake_expires = time.time() + 12.0
+                                        self._wake_expires = time.time() + (
+                                            6.0 if self._auto_greeting else 12.0
+                                        )
                                         logger.info(
                                             f"[{self.stream_name}] 💬 Dialogue open until "
                                             f"{self._wake_expires:.1f}"

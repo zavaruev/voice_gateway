@@ -2078,7 +2078,10 @@ async def start_camera_sessions():
     # package); WAKE_WORD is the spoken phrase used by the command stripper.
     wake_model_env = os.getenv(
         "WAKE_WORD_MODEL",
-        "config/computer.onnx",  # custom RU head; hey_jarvis misses Russian 'джарвис'
+        # openwakeword.com library model, Creator #7074 (Classic V3):
+        # recall 55.6%, measured on our audio — positives 0.64, clean
+        # negatives 0.001-0.05 (old custom head: 0.6 vs 0.23 on TV noise).
+        "config/computer_20260706_130638.onnx",
     )
     if os.path.sep not in wake_model_env:
         # Bare built-in name -> resolve inside the openwakeword package.

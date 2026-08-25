@@ -2073,11 +2073,24 @@ async def start_camera_sessions():
     http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
     go2rtc_host = os.getenv("GO2RTC_HOST", "192.168.22.102")
     go2rtc_port = int(os.getenv("GO2RTC_PORT", "1984"))
+    # Wake-word switch: WAKE_WORD_MODEL points at any openWakeWord-format
+    # head (built-in pretrained names like 'hey_jarvis' resolve inside the
+    # package); WAKE_WORD is the spoken phrase used by the command stripper.
+    wake_model_env = os.getenv("WAKE_WORD_MODEL", "hey_jarvis")
+    if os.path.exists(wake_model_env):
+        import openwakeword
+        res = os.path.join(
+            os.path.dirname(openwakeword.__file__), "resources", "models"
+        )
+        wake_model_env = os.path.join(res, wake_model_env)
+    wake_word_env = os.getenv("WAKE_WORD", "джарвис")
 
     for name in streams:
         try:
             config = CameraConfig(
                 stream_name=name,
+                wakeword_model_path=wake_model_env,
+                wake_keyword=wake_word_env,
                 go2rtc_host=go2rtc_host,
                 go2rtc_port=go2rtc_port,
                 # Source RTSP URL used by the self-healer to re-register the

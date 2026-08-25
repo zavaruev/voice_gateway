@@ -412,6 +412,7 @@ class CameraSession:
         # spoken: shortens the ownership/follow-up window so other rooms do
         # not stay deaf for half a minute when the user walks away.
         self._auto_greeting = False
+        self._last_auto_greet_ts = 0.0
         self._last_tts_reply = ""  # normalized text we last spoke (echo guard)
         self._wake_greeting_delay = 5.0
         self._audio_epoch = 0.0
@@ -526,9 +527,29 @@ class CameraSession:
 
     async def _init_engine(self):
         try:
+            model_path = self._wakeword_model_path or "config/computer.onnx"
+            if not os.path.exists(model_path):
+                # Bare name (e.g. 'hey_jarvis') -> built-in pretrained model
+                # shipped inside the openwakeword package.
+                import openwakeword
+                cand = os.path.join(
+                    os.path.dirname(openwakeword.__file__),
+                    "resources", "models", model_path,
+                )
+                if not cand.endswith(".onnx"):
+                    cand += ".onnx"
+                if os.path.exists(cand):
+                    model_path = cand
+                else:
+                    import glob as _glob
+                    hits = sorted(_glob.glob(
+                        os.path.join(res_dir := os.path.dirname(cand),
+                                     os.path.basename(cand)[:-5] + "*.onnx")
+                    ))
+                    if hits:
+                        model_path = hits[0]
             await asyncio.to_thread(
-                self._engine.initialize_models,
-                self._wakeword_model_path or "config/computer.onnx",
+                self._engine.initialize_models, model_path,
             )
         except Exception as e:
             logger.warning(f"[{self.stream_name}] Failed to init audio engine: {e}")
@@ -1404,9 +1425,21 @@ class CameraSession:
                         # confirmation instead of beeping; a bare word with no
                         # follow-up is caught by the expiry watcher.
                         qual_top = max(sc, max(self._ww_recent or [0]))
+                        # A room that was recently auto-greeted but produced
+                        # NO command is almost certainly playing TV/noise:
+                        # humans do not re-say 'компьютер' seconds after
+                        # ignoring a greeting (22:15 trace: TV burst 0.9012
+                        # fired 20s after the greeting). Force such repeats
+                        # through STT confirmation for a full minute.
+                        recent_unanswered_greet = (
+                            time.time() - self._last_auto_greet_ts < 60.0
+                        )
                         if (
                             not vetoed
-                            and qual_top < 0.90
+                            and (
+                                qual_top < 0.92
+                                or recent_unanswered_greet
+                            )
                             and my_lvl < 3000
                             and time.time() >= self._stt_confirm_until
                         ):
@@ -1868,7 +1901,10 @@ class CameraSession:
         # Never forward the wake word itself to nanobot — only the command
         # that follows it. Tolerate Whisper's glued repeats like
         # "компьютеркомпьютер" by matching without word boundaries.
-        m = re.search(r"(компьютер|компютер|computer)", txt, re.IGNORECASE)
+        kw = re.escape(self.wake_keyword.lower())
+        m = re.search(rf"(?:хей\s+)?({kw}|{kw.replace('джарвис','jarvis')})", txt, re.IGNORECASE)
+        if not m:
+            m = re.search(rf"({kw})", txt, re.IGNORECASE)
         cmd = txt
         if m:
             cmd = (txt[: m.start()] + " " + txt[m.end() :]).strip()
@@ -1928,6 +1964,7 @@ class CameraSession:
         # spoken: shortens the ownership/follow-up window so other rooms do
         # not stay deaf for half a minute when the user walks away.
         self._auto_greeting = False
+        self._last_auto_greet_ts = 0.0
 
     def _schedule_wake_greeting(self):
         self._cancel_wake_greeting()
@@ -1957,10 +1994,12 @@ class CameraSession:
         # dropped ("No wake word, ignoring"). The 60s _wake_timeout window
         # governs how long follow-ups are accepted.
         self._auto_greeting = True
+        self._last_auto_greet_ts = time.time()
         try:
             await self._call_nanobot("привет", self.stream_name)
         finally:
             self._auto_greeting = False
+        self._last_auto_greet_ts = 0.0
 
     async def _on_user_command(self, text: str):
         try:

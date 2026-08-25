@@ -1155,8 +1155,15 @@ class CameraSession:
                 # user 3-4x quieter than corridor (peak ~2400 vs ~9500). The
                 # shared default of 4000 left its boosted chunks still too
                 # quiet for openWakeWord, so distant rooms get a higher boost.
+                # Normalize BOTH ways: chunks louder than target are scaled
+                # DOWN to it. Otherwise a mid-distance speaker (raw peak 5k)
+                # reaches the model unamplified while the same sound in a
+                # quieter room gets boosted 3x — and the far room's muffled
+                # copy out-scores the room the user is actually in (14:03
+                # trace: corridor raw 5403 -> no boost, score <0.4; kitchen
+                # raw 1973 -> x3.3 boost, score 0.87 and fired).
                 _WW_TARGET_PEAK = 6500 if self.stream_name == "kitchen" else 4000
-                if 100 <= raw_peak < _WW_TARGET_PEAK:
+                if 100 <= raw_peak:
                     s16_w = np.clip(
                         s16.astype(np.float32) * (_WW_TARGET_PEAK / raw_peak),
                         -32768,

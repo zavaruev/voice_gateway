@@ -1290,13 +1290,14 @@ class CameraSession:
                                 f"sc {sc:.2f} needs >=0.95"
                             )
                             self._ww_consec = 0
+                            top = max(sc, max(self._ww_recent or [0]))
                             self._ww_recent.clear()
-                            if max(sc, max(self._ww_recent or [0])) >= 0.85:
+                            if top >= 0.85:
                                 # Real speech over appliance noise reaches
                                 # 0.85-0.99; the motor whine itself tops out
                                 # ~0.90 but never produces a wake-word
                                 # transcript — let STT arbitrate.
-                                self._open_stt_confirm(sc)
+                                self._open_stt_confirm(top)
                             vetoed = True
                         if speaker_active:
                             # Speaker is actively playing: any wake-shaped
@@ -1331,7 +1332,11 @@ class CameraSession:
                             if max(sc, max(self._ww_recent or [0])) >= 0.60:
                                 self._open_stt_confirm(sc)
                             vetoed = True
-                        elif my_lvl < 2500:
+                        elif my_lvl < 3000:
+                            # Ceiling matches the quiet-source hold ceiling;
+                            # a gap between the two (old 2500 vs 3000) left a
+                            # dead zone where neither gate ran and a muffled
+                            # through-wall copy fired freely (17:43 trace).
                             # Distant-source veto: our raw signal is very quiet
                             # (<1600) while another room currently hears the
                             # same sound >=2x louder. The user is THERE; the

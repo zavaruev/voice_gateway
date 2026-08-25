@@ -132,6 +132,17 @@ class LocalAudioEngine:
         # square wave and Silero's probability collapses to <0.25 even on
         # real commands (measured: rms 3463 clip -> max_prob 0.24; without
         # gain -> 1.0). Natural [-1,1] scaling keeps the VAD honest.
+        # This feeder is NOT called for every chunk of wall-clock audio
+        # (suppressed windows / dialogue mode skip whole stretches), so any
+        # gap >200ms means the LSTM state no longer matches the stream —
+        # measured effect: probabilities stuck at 0.00 for EVERYTHING.
+        # Reset the recurrent state on gap; Silero re-warms within ~5 frames.
+        now_t = time.time()
+        if now_t - getattr(self, "_wwv_last_feed", 0.0) > 0.2:
+            self._wwv_buffer = np.array([], dtype=np.float32)
+            self._wwv_state = np.zeros((2, 1, 128), dtype=np.float32)
+            self._wwv_context = np.zeros((1, 64), dtype=np.float32)
+        self._wwv_last_feed = now_t
         f = audio_int16.astype(np.float32) / 32768.0
         self._wwv_buffer = np.concatenate((self._wwv_buffer, f))
         max_prob = 0.0
@@ -150,14 +161,25 @@ class LocalAudioEngine:
                 [self._wwv_context, chunk[np.newaxis, :]], axis=1
             )[:, -64:]
             max_prob = max(max_prob, out[0][0])
+        self._wwv_calls = getattr(self, "_wwv_calls", 0) + 1
+        if self._wwv_calls % 100 == 0:
+            lvl = int(np.max(np.abs(audio_int16)))
+            logger.info(
+                f"[ww-vad] probe #{self._wwv_calls}: "
+                f"prob={max_prob:.2f} peak={lvl} -> {'PASS' if max_prob > 0.5 else 'gate'}"
+            )
         return max_prob > 0.5
 
-    def check_wakeword(self, audio_int16: np.ndarray, threshold: float = 0.4, stream: str = "") -> bool:
-        peak = int(np.max(np.abs(audio_int16)))
-        if not self._ww_vad_speech(audio_int16):
-            # Not speech: never even show it to the wake model.
+    def check_wakeword(self, audio_int16: np.ndarray, threshold: float = 0.4, stream: str = "", vad_ok: bool | None = None) -> bool:
+        # NOTE: the caller should run _ww_vad_speech on the RAW chunk BEFORE
+        # any AGC normalization and pass the verdict here. Per-chunk peak
+        # normalization flattens amplitude dynamics and Silero goes blind on
+        # the normalized signal (measured: raw feed -> 69 speech chunks;
+        # per-chunk AGC -> 0). vad_ok=None keeps legacy self-gating behavior.
+        if vad_ok is False:
             self.last_score = 0.0
             return False
+        peak = int(np.max(np.abs(audio_int16)))
         if self._ww_calls % 500 == 0:
             rms = np.sqrt(np.mean(audio_int16.astype(np.float64)**2))
             logger.info(f"[{stream}] WW peek: peak={peak} rms={rms:.1f}")

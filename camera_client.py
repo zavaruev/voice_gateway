@@ -1207,8 +1207,17 @@ class CameraSession:
                     self._ww_consec = 0
                     self._ww_recent.clear()
                 else:
+                    # VAD gate on the RAW chunk (before AGC): per-chunk peak
+                    # normalization flattens amplitude dynamics and Silero
+                    # cannot see speech in the normalized signal. The verdict
+                    # is passed INTO check_wakeword so a non-speech chunk just
+                    # scores 0 through the normal not-wake path.
+                    vad_ok = await asyncio.to_thread(
+                        self._engine._ww_vad_speech, s16
+                    )
                     await asyncio.to_thread(
-                        self._engine.check_wakeword, s16_w, self._ww_thresh, self.stream_name
+                        self._engine.check_wakeword, s16_w,
+                        self._ww_thresh, self.stream_name, vad_ok,
                     )
                     sc = float(getattr(self._engine, "last_score", 0.0))
                     # Clipping bang gate: door slams / dropped objects hit the

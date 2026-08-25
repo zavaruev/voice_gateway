@@ -1171,6 +1171,13 @@ class CameraSession:
                     ).astype(np.int16)
                 if raw_peak < 100:
                     self._ww_consec = 0
+                elif raw_peak < 600:
+                    # Below the meaningful-audio floor: boosting this 10-40x
+                    # turns mic noise into plausible model input and scores
+                    # 0.6-0.8 in empty rooms (16:38/16:53 traces). Real
+                    # speech — even through a wall — measures >=1000.
+                    self._ww_consec = 0
+                    self._ww_recent.clear()
                 else:
                     await asyncio.to_thread(
                         self._engine.check_wakeword, s16_w, self._ww_thresh, self.stream_name
@@ -1286,7 +1293,11 @@ class CameraSession:
                             # through the mic. Never fire on it.
                             self._ww_consec = 0
                             self._ww_recent.clear()
-                        elif max(sc, max(self._ww_recent or [0])) < 0.72 and my_lvl < 3000:
+                        elif (
+                            my_lvl < 3000
+                            and max(sc, max(self._ww_recent or [0]))
+                            < (0.80 if my_lvl < 2000 else 0.72)
+                        ):
                             # Quiet-source confirmation gate: a real user even
                             # at mid-distance produces peaks >3k HERE; faint
                             # through-wall copies stay under it while still
@@ -1297,12 +1308,13 @@ class CameraSession:
                             # muffled copy fire in the livingroom).
                             logger.info(
                                 f"[{self.stream_name}] 🔈 quiet-source hold — "
-                                f"lvl {my_lvl:.0f} sc {sc:.2f} needs >=0.72"
+                                f"lvl {my_lvl:.0f} sc {sc:.2f} needs >="
+                                f"{0.80 if my_lvl < 2000 else 0.72}"
                             )
                             self._ww_consec = 0
                             self._ww_recent.clear()
                             vetoed = True
-                        elif my_lvl < 1600:
+                        elif my_lvl < 2500:
                             # Distant-source veto: our raw signal is very quiet
                             # (<1600) while another room currently hears the
                             # same sound >=2x louder. The user is THERE; the

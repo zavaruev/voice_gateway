@@ -1196,7 +1196,7 @@ class CameraSession:
                         sc = 0.0
                     # A loud, confident detection always passes — the adaptive
                     # threshold must never be able to lock the system out.
-                    wake = sc >= self._ww_thresh or sc >= 0.88
+                    wake = sc >= self._ww_thresh or sc >= 0.68
 
                     # --- Debounce counter maintenance -------------------------
                     # Two consecutive qualifying chunks are required before the
@@ -1219,7 +1219,7 @@ class CameraSession:
                                 self._ww_consec = 1
                         else:
                             self._ww_consec = 0
-                    elif self._ww_consec >= 1 or sc >= 0.88:
+                    elif self._ww_consec >= 1 or sc >= 0.68:
                         # Fire is imminent (this is at least the second
                         # qualifying chunk) or the score bypasses the debounce
                         # entirely: settle cross-camera ownership NOW.
@@ -1239,7 +1239,7 @@ class CameraSession:
                                 f"[{self.stream_name}] 🤝 wake ceded to a closer camera"
                             )
                             self._ww_consec = 0
-                        elif sc >= 0.88:
+                        elif sc >= 0.68:
                             # Loud-confident single chunk counts as fully
                             # debounced (bypass path, see `wake` above).
                             self._ww_consec = 2

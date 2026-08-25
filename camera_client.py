@@ -1264,26 +1264,21 @@ class CameraSession:
                             self._ww_consec = 0
                             self._ww_recent.clear()
                         elif max(sc, max(self._ww_recent or [0])) < 0.72 and my_lvl < 3000:
-                            now_ts = time.time()
-                            others = [
-                                p for s, (t, p) in _ROOM_PEAKS.items()
-                                if s != self.stream_name and now_ts - t < 3.0
-                            ]
-                            all_quiet = not others or max(others) < 3000
-                            if all_quiet:
-                                # Quiet-source confirmation gate: a real user
-                                # even at mid-distance produces peaks >3k; TV/
-                                # muffled speech across an empty flat stays
-                                # under it while scoring 0.5-0.77 on this
-                                # TTS-trained model (12:27 trace: feed pk=1767,
-                                # nobody home -> 0.77 fire in silent corridor).
-                                logger.info(
-                                    f"[{self.stream_name}] 🔈 quiet-source hold — "
-                                    f"lvl {my_lvl:.0f} sc {sc:.2f} needs >=0.72"
-                                )
-                                self._ww_consec = 0
-                                self._ww_recent.clear()
-                                vetoed = True
+                            # Quiet-source confirmation gate: a real user even
+                            # at mid-distance produces peaks >3k HERE; faint
+                            # through-wall copies stay under it while still
+                            # scoring 0.53-0.77 on the TTS-trained model.
+                            # Applies regardless of other rooms' noise (13:38
+                            # trace: kitchen vacuum noise kept the old
+                            # "all rooms quiet" check false and let a 0.71
+                            # muffled copy fire in the livingroom).
+                            logger.info(
+                                f"[{self.stream_name}] 🔈 quiet-source hold — "
+                                f"lvl {my_lvl:.0f} sc {sc:.2f} needs >=0.72"
+                            )
+                            self._ww_consec = 0
+                            self._ww_recent.clear()
+                            vetoed = True
                         elif my_lvl < 1600:
                             # Distant-source veto: our raw signal is very quiet
                             # (<1600) while another room currently hears the

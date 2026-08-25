@@ -1174,8 +1174,16 @@ class CameraSession:
                     # 0.80-0.93 at 02:21 on a corridor bang). Speech peaks
                     # stay below ~20k raw; treat clipped non-speech as noise
                     # unless the score is overwhelming.
-                    if raw_peak > 24000 and sc < 0.85:
-                        # Clipping bang: not speech, kill debounce state.
+                    # Speech has a high crest factor (peak >> rms, ratio
+                    # typically 4-7x); impacts and thumps are dense waves
+                    # (ratio <2x) yet transiently score 0.55-0.6 on this model.
+                    rrms = float(np.sqrt((s16.astype(np.int64) ** 2).mean()))
+                    if (
+                        (raw_peak > 24000 and sc < 0.85)
+                        or (raw_peak > 4000 and rrms * 2 > raw_peak and sc < 0.85)
+                    ):
+                        # Clipping bang / dense impact: not speech, kill
+                        # debounce state.
                         self._ww_consec = 0
                         self._ww_recent.clear()
                         sc = 0.0

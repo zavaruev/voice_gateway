@@ -2014,7 +2014,13 @@ class CameraSession:
         self._auto_greeting = True
         self._last_auto_greet_ts = time.time()
         try:
-            await self._call_nanobot("привет", self.stream_name)
+            # Fixed local prompt instead of nanobot 'привет': instant, no
+            # chat-history pollution, and it can't be mistaken for a
+            # misheard transcript ('камера считает что я сказал привет').
+            fb = "Слушаю!"
+            pcm = await self._tts_fetch(fb)
+            if pcm:
+                await self._speak_pcm(pcm, fb)
         finally:
             self._auto_greeting = False
         self._last_auto_greet_ts = 0.0

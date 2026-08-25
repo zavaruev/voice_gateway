@@ -404,6 +404,7 @@ class CameraSession:
         # pip — instead let the next utterance reach Whisper, and a live
         # «компьютер» in the transcript confirms the wake (or drops it).
         self._stt_confirm_until = 0.0   # wall clock: STT-confirmation window
+        self._tts_play_end = 0.0        # approx wall clock: speaker finishes
         self._veto_until = 0.0          # wall clock: sticky distant-veto
         self._wake_greeting_task = None
         self._last_tts_reply = ""  # normalized text we last spoke (echo guard)
@@ -991,13 +992,18 @@ class CameraSession:
                         self._last_echo_log = now
                         logger.info(f"[{self.stream_name}] 🔁 Echo chunk dropped (corr)")
                     # Confirmed TTS echo in the mic feed: keep the wake model
-                    # suppressed while echoes keep arriving. The kitchen's RTSP
-                    # backchannel returns our own speech (incl. the word
-                    # "компьютер" inside replies) 25-40s after playback — far
-                    # past the fixed audio_dur+15 suppress window, which caused
-                    # a fire -> pip -> echo -> fire self-sustaining loop.
+                    # suppressed while echoes keep arriving. The RTSP
+                    # backchannel returns our own speech 3-40s after playback;
+                    # without this a fixed window expired mid-burst and the
+                    # late tail re-fired the wake. Bounded by play_end+45s:
+                    # an unbounded now+N per chunk let the burst push its own
+                    # deadline forward indefinitely and muted the mic for
+                    # minutes after every dialogue (user: перестала
+                    # реагировать на компьютер).
+                    bound = getattr(self, "_tts_play_end", 0.0) + 45.0
                     self._wake_suppress_until = max(
-                        self._wake_suppress_until, now + 20.0
+                        self._wake_suppress_until,
+                        min(now + 20.0, bound),
                     )
                     continue
                 self._vad_buf.extend(pcm_16k)
@@ -1009,6 +1015,11 @@ class CameraSession:
                 if now - self._last_echo_log > 2.0:
                     self._last_echo_log = now
                     logger.info(f"[{self.stream_name}] 🔁 Echo chunk dropped (corr)")
+                bound = getattr(self, "_tts_play_end", 0.0) + 45.0
+                self._wake_suppress_until = max(
+                    self._wake_suppress_until,
+                    min(now + 20.0, bound),
+                )
                 return
             self._vad_buf.extend(pcm_16k)
             self._drain_vad_buf()
@@ -2332,6 +2343,7 @@ class CameraSession:
 
             # Блокируем микрофон только сейчас, когда звук реально готов пойти в канал
             audio_dur = len(pcm) / (sr * 2)
+            self._tts_play_end = time.time() + audio_dur
             if self._out_track:
                 self._out_track._last_play_duration = audio_dur
             echo_tail = 1.5 if is_question else 3.0

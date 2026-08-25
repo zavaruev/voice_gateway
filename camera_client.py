@@ -2132,6 +2132,11 @@ class CameraSession:
             form.add_field("model", self.whisper_model)
             form.add_field("language", "ru")
             form.add_field("temperature", temp)
+            form.add_field(
+                "prompt",
+                "Команда умному дому: включи выключи кофеварку стиралку "
+                "свет чайник телевизор музыку пожалуйста",
+            )
             try:
                 async with self.http_session.post(
                     self.whisper_url,

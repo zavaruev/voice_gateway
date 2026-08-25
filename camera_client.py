@@ -1704,12 +1704,38 @@ class CameraSession:
             # that follows the word — it does NOT contain «компьютер» again.
             # So confirmation = Whisper produced real speech, not silence/
             # hallucination; the text itself becomes the command.
-            sane = bool(txt.strip()) and is_valid_text(txt)
+            # Never confirm on an echo of our own last reply: delayed RTSP
+            # return of TTS audio is LOUD (passes any raw-energy gate) and
+            # transcribes into valid text -> camera would interview itself.
+            norm_c = txt.lower().strip(" .,!?-")
+            if (
+                self._last_tts_reply
+                and _echo_of_reply(norm_c, self._last_tts_reply)
+            ):
+                logger.info(
+                    f"[{self.stream_name}] ❌ stt-confirm: echo of own reply"
+                )
+                return
+            sane = (
+                bool(txt.strip())
+                and is_valid_text(txt)
+                and getattr(self, "_last_utt_rms_raw", 0.0) >= 750.0
+            )
+            if not sane and txt.strip():
+                logger.info(
+                    f"[{self.stream_name}] ❌ stt-confirm dropped: raw rms "
+                    f"{getattr(self, '_last_utt_rms_raw', 0):.0f} < 750 "
+                    f"(amplified ambient noise)"
+                )
+                return
             if sane:
                 # Whisper hallucinates fluent garbage over ambient noise
-                # ('и пей девочка, ой, блядь, блядь, блядь...' from hamster
-                # rustle passed is_valid_text and fired a pip). A real command
-                # never loops a word 3+ times.
+                # ('и пей девочка, ой, блядь...' passed is_valid_text;
+                # 'короче к лицо если придать мне ничего больше не рассыпать'
+                # had all-unique words). SpeakerID also reports 0.97 on such
+                # amplified noise. The only honest discriminator left: RAW
+                # capture energy — real commands measure rms >=1100 even
+                # through a wall; hamster rustle boosted 6x sits at ~640.
                 words = re.findall(r"[а-яёa-z0-9]+", txt.lower())
                 top = max((words.count(w) for w in set(words)), default=0)
                 if len(words) < 2 or top > 2:
@@ -1813,6 +1839,9 @@ class CameraSession:
             if not txt:
                 return
 
+            self._last_utt_rms_raw = float(
+                (stats or {}).get("rms_raw", 0.0)
+            )
             await self._handle_stt_result(txt, uid)
         finally:
             self._processing_utterance = False
@@ -2229,11 +2258,18 @@ class CameraSession:
             form.add_field("model", self.whisper_model)
             form.add_field("language", "ru")
             form.add_field("temperature", temp)
-            form.add_field(
-                "prompt",
-                "Команда умному дому: включи выключи кофеварку стиралку "
-                "свет чайник телевизор музыку пожалуйста",
-            )
+            # Domain prompt ONLY for loud captures: it recovers phonemes
+            # destroyed by ADC clipping ('включи кофеварку' case), but on
+            # quiet ambient noise it actively HALLUCINATES command words
+            # straight from the prompt itself ('чайник телевизор' at
+            # raw_rms=801 -> pip -> nanobot).
+            rms_now = float((stats or {}).get("rms_raw", 0.0))
+            if rms_now >= 2000.0:
+                form.add_field(
+                    "prompt",
+                    "Команда умному дому: включи выключи кофеварку стиралку "
+                    "свет чайник телевизор музыку пожалуйста",
+                )
             try:
                 async with self.http_session.post(
                     self.whisper_url,

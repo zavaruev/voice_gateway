@@ -28,7 +28,11 @@ Camera (RTSP/L16) ─┘          │                        │
 ## Features
 
 - **ESP32 + camera support** — both device classes in one gateway; cameras use WebRTC (go2rtc) with the mic feed taken from the RTSP audio backchannel (`ffmpeg`, raw L16, no μ-law quantisation)
-- **Wake word «компьютер»** — custom-trained openWakeWord model (`config/computer.onnx` + `config/embedding_model.onnx` backbone), detected on the live 16 kHz camera feed, threshold 0.25, 60 s wake window, attention beep
+- **Wake word «компьютер»** — custom-trained openWakeWord model (`config/computer.onnx` + `config/embedding_model.onnx` backbone), detected on the live 16 kHz camera feed with per-room thresholds (kitchen 0.47, other rooms 0.52), sliding-window debounce (2 qualifying chunks out of the last 3), single-chunk bypass at score ≥0.68, attention beep
+- **Bidirectional AGC** — every oww chunk is normalised to a per-room target peak (kitchen 6500, others 4000) in *both* directions; quiet far-room copies are boosted while loud close-range speech is scaled down, so all rooms feed the model equally loud audio
+- **Wake arbitration** — strict first-detector ownership across rooms; a loud room can steal a not-yet-dispatched wake from a far room (proximity steal); muffled through-wall copies are vetoed when another room hears the same sound ≥1.4× louder
+- **Noise-rejection gates** — quiet-source hold (faint audio needs a confident score), appliance hold (continuous background like a robot vacuum requires an overwhelming score), crest-factor gate (dense impacts), clipping-bang gate, own-TTS playback guard
+- **Whisper on demand only** — STT runs solely inside an active wake window; ambient utterances never reach Whisper
 - **Server-side VAD** — Silero ONNX + energy fallback; adaptive background floor
 - **Distant-speech tuned** — corridor/lobby coverage: lowered RMS gates, SpeexDSP noise suppression with "NS rescue" (utterance salvaged from the noise floor), adaptive peak normalisation (up to 20x)
 - **Echo guards** — global `GLOBAL_TTS_UNTIL` gate (no STT while any TTS plays — kills ESP32↔camera echo cascade) + duration-proportional mic hold (0.3 s beep → ~0.6 s hold, 20 s TTS → capped 15 s)
@@ -101,13 +105,26 @@ Set `CAMERA_STREAMS` to a comma-separated list of stream names registered in go2
 Opus frames → VAD (Silero) → energy gate → noise reduction → Ogg → Whisper STT + Speaker ID (parallel)
 
 ### Camera audio pipeline
-RTSP (raw L16 16 kHz) → echo guard → VAD + RMS gates → SpeexDSP NS rescue → adaptive normalisation → Whisper (+ Speaker ID via Ogg) → Nanobot
+RTSP (raw L16 16 kHz) → echo guard (waveform + `_is_echo` cross-correlation vs played-audio ring, delays 2–45 s) → VAD + RMS gates → SpeexDSP NS rescue → adaptive normalisation → **(only after an acoustic wake)** Whisper (+ Speaker ID via Ogg) → Nanobot
 
-### Wake word
-openWakeWord `kompyuter` model (custom-trained, ONNX) on the live 16 kHz feed, echo-guarded. Score threshold 0.25 → 60 s wake window with attention beep, then follow-up commands without re-triggering.
+### Wake-word detector feed
+RTSP 16 kHz → own-echo drop → per-room bidirectional AGC (target peak: kitchen 6500, others 4000) → openWakeWord scoring → gate cascade (see *Wake word & arbitration*)
+
+### Wake word & arbitration
+openWakeWord `kompyuter` model (custom-trained, ONNX) on the live 16 kHz feed of every camera. Each chunk is AGC-normalised to the room's target peak, scored, and pushed through a gate cascade before a wake fires:
+
+1. **Own-playback guard** — no fire while this camera's speaker is playing (any wake-shaped sound then is our own echo)
+2. **Appliance hold** — 60 s background median rms >800 (robot vacuum, hood…) requires a single-chunk score ≥0.92
+3. **Quiet-source hold** — own signal level <3000 requires score ≥0.72 (faint TV/muffled speech scores deceptively high on the TTS-trained model)
+4. **Distant-source veto** — level <1600 while another camera hears the same sound ≥1.4× louder → the wake belongs to that room
+5. **Clipping bang / crest-factor gates** — door slams and dense impacts (peak >24k or rms·2 > peak) are ignored unless overwhelming
+6. **Debounce** — 2 qualifying chunks out of the last 3 (~240 ms), or one confident chunk ≥0.68
+7. **Cross-camera arbiter** — first detector becomes interaction owner; others stand down. A room ≥5× louder than the owner steals a not-yet-dispatched wake so the answer sounds where the user actually is
+
+After a fire: attention pip, VAD state reset, Whisper listens until the command is dispatched (or the ~60 s window expires).
 
 ### TTS Pipeline
-Nanobot text → Edge TTS (MP3) → decode → resample (16/24 kHz) → Opus for ESP32 / PCM for cameras → paced 60 ms chunks
+Nanobot text → sentence splitter → **prefetch pipeline** (sentence N+1 is synthesised while N plays, hiding Edge-TTS latency) → Edge TTS (MP3) → decode → resample (16/24 kHz) → Opus for ESP32 / PCM for cameras → paced 60 ms chunks. Every played clip is registered in the echo-reference ring and extends wake suppression past the delayed-echo window.
 
 ### Dialogue Mode
 - AI response contains `?` (or Russian question patterns) → mic stays open
@@ -138,15 +155,24 @@ Device identifies itself via `device-id` header (fallback: `mac` header), case-i
 
 ## Known Issues & Current Problems
 
-- **Echo cascade ESP32 ↔ camera is only partially solved** — `GLOBAL_TTS_UNTIL` + duration-proportional mic hold are band-aids. Camera speaker echo returns via WebRTC with 8–15 s delay in ~3 s bursts; a bad guess on the hold time either swallows the user's follow-up question or lets echo through. A proper AEC is the real fix.
-- **Wake word not validated in the field** — `config/computer.onnx` was trained synthetically (openWakeWord pipeline) but never tested on the real corridor microphone. Threshold 0.25 is a guess; expect false positives/negatives until tuned. `models/kompyuter.onnx` is a 0-byte leftover.
-- **Vosk models downloaded but unused** — `config/vosk-model-ru-0.42/` (3.5 GB) and `config/vosk-model-small-ru-0.22/` (88 MB) are not wired into the pipeline (gitignored, not in the image). Candidate for a low-latency local STT fallback.
-- **Gates are corridor-calibrated** — RMS/VAD thresholds and NS rescue were tuned for one location (AGC-boosted noise floor ~0.015–0.042, distant speech ~0.03–0.12). They will not generalise to other rooms without recalibration.
+- **go2rtc zombie RTSP sessions** — go2rtc 1.9.2 on the streams host leaks sessions when a camera link is slow; 17–23 half-dead connections with 100–290 KB send queues can stall a camera's majestic until it stops serving :554. Mitigated by a per-camera watchdog (`/etc/watchdog_majestic.sh` + crond) that restarts majestic on dead/blocked RTSP, but the real fix is upgrading/restarting go2rtc on `192.168.22.102`.
+- **Camera WiFi links** — the kitchen camera's link quality fluctuates (21–34/100 vs 80+ elsewhere); its video stream was reduced to fps 10 / bitrate 1024 to keep the audio backchannel stable.
+- **Echo cascade ESP32 ↔ camera is only partially solved** — `GLOBAL_TTS_UNTIL` + duration-proportional mic hold are band-aids. Camera-speaker echo returns via WebRTC with 8–15 s delay; `_is_echo` cross-correlates mic chunks against a reference ring of recently played audio (delays 2–45 s) and confirmed echoes extend wake suppression.
+- **TTS-trained wake model prefers muffled audio** — through-wall copies of «компьютер» can out-score close live speech; the distant-source veto and quiet-source hold compensate, but retraining on real in-room recordings (v2–v4 attempts degraded discrimination — keep v1) remains the proper fix.
+- **Gates are room-calibrated** — thresholds (wake 0.47/0.52, hold/veto levels, bg-median 800) were tuned against measured score distributions in three specific rooms. They will not generalise to other rooms without recalibration.
 - **Whisper retry at temperature 0.5** — empty/`unknown` transcripts trigger a noisier re-transcription; on some engines this doubles STT latency in the worst case.
 - **`Dockerfile` exposes 8080 but nothing listens on it** (18792 is the only real port).
 - **`setup_gateway.sh` is an outdated snapshot** — not authoritative.
-- **`config/` once had its own `.git` (no commits)** — parent repo now version-controls the config files.
-- **`main.py.bak-20260807`** — leftover backup in the working tree (gitignored, not committed).
+- **Vosk models downloaded but unused** — `config/vosk-model-ru-0.42/` (3.5 GB) candidate for a local low-latency STT fallback; not wired into the pipeline.
+
+## Tests
+
+```sh
+pip install pytest
+pytest tests/
+```
+
+Covers engine wake scoring/gates, camera arbitration helpers, OTA auth, and RMS utilities (~1,160 lines).
 
 ## Dependencies
 

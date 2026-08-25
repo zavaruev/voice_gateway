@@ -195,13 +195,16 @@ _HAS_QUESTION_RE = re.compile(r"[?？]")
 # the nearest microphone clips highest). After a short grace window the
 # loudest claim wins; losers stand down silently (no pip, no Nanobot call).
 # ---------------------------------------------------------------------------
-_ARB_STATE: dict = {"claims": {}, "sent": {}}
+_ARB_STATE: dict = {"claims": {}, "sent": {}, "cmd_sent": None}
 _ARB_LOCK: asyncio.Lock | None = None
 
 
 def _arbiter_set_owner(stream: str, level: float) -> None:
     """Mark `stream` as the camera currently owning the interaction."""
     _ARB_STATE["owner"] = {"stream": stream, "ts": time.time(), "level": level}
+    # A new owner starts a fresh interaction: the previous owner's dispatched
+    # command no longer protects it from a proximity steal.
+    _ARB_STATE["cmd_sent"] = None
 
 
 def _arbiter_owner_active(exclude: str, max_age: float = 45.0):
@@ -228,6 +231,7 @@ def _arbiter_clear_owner(stream: str) -> None:
     o = _ARB_STATE.get("owner")
     if o and o.get("stream") == stream:
         _ARB_STATE["owner"] = None
+        _ARB_STATE["cmd_sent"] = None
 
 
 def _arbiter_mark_sent(key: tuple, stream: str) -> None:
@@ -1241,7 +1245,24 @@ class CameraSession:
                             self._ww_consec = 0
                             self._ww_recent.clear()
                         else:
-                            busy, _lvl = _arbiter_owner_active(self.stream_name)
+                            busy, olvl = _arbiter_owner_active(self.stream_name)
+                            my_lvl = self._proximity_level()
+                            # Proximity steal: the user is clearly standing in
+                            # OUR room (peak >=5x the owner's) and the owner
+                            # has not even dispatched a command yet — the wake
+                            # was ours, the far camera just caught the sound
+                            # first. Take over so the answer sounds where the
+                            # user actually is.
+                            if (
+                                busy
+                                and not _ARB_STATE.get("cmd_sent")
+                                and my_lvl >= 5.0 * max(olvl, 1.0)
+                            ):
+                                logger.info(
+                                    f"[{self.stream_name}] 🥇 stealing ownership "
+                                    f"(lvl {my_lvl:.0f} vs owner {olvl:.0f})"
+                                )
+                                busy = False
                             if busy:
                                 logger.info(
                                     f"[{self.stream_name}] 🤝 standing down — "
@@ -1646,6 +1667,7 @@ class CameraSession:
         if not txt:
             return
         self._wake_cmd_sent = True
+        _ARB_STATE["cmd_sent"] = time.time()
         base_thresh = 0.47 if self.stream_name == "kitchen" else 0.52
         if self._ww_thresh > base_thresh:
             logger.info(

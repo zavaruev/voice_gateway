@@ -400,6 +400,11 @@ class CameraSession:
         self._wake_expires = 0.0
         self._ww_consec = 0  # consecutive openWakeWord fires (debounce)
         self._ww_recent: list[float] = []  # last 3 oww scores (sliding debounce)
+        # Gray-zone wake handling: when gates hold a decent oww score, do not
+        # pip — instead let the next utterance reach Whisper, and a live
+        # «компьютер» in the transcript confirms the wake (or drops it).
+        self._stt_confirm_until = 0.0   # wall clock: STT-confirmation window
+        self._veto_until = 0.0          # wall clock: sticky distant-veto
         self._wake_greeting_task = None
         self._last_tts_reply = ""  # normalized text we last spoke (echo guard)
         self._wake_greeting_delay = 5.0
@@ -1286,6 +1291,12 @@ class CameraSession:
                             )
                             self._ww_consec = 0
                             self._ww_recent.clear()
+                            if max(sc, max(self._ww_recent or [0])) >= 0.85:
+                                # Real speech over appliance noise reaches
+                                # 0.85-0.99; the motor whine itself tops out
+                                # ~0.90 but never produces a wake-word
+                                # transcript — let STT arbitrate.
+                                self._open_stt_confirm(sc)
                             vetoed = True
                         if speaker_active:
                             # Speaker is actively playing: any wake-shaped
@@ -1313,6 +1324,12 @@ class CameraSession:
                             )
                             self._ww_consec = 0
                             self._ww_recent.clear()
+                            # NOTE: this branch already implies
+                            # max(sc,recent) < tier threshold, so any held
+                            # score >=0.60 is worth STT arbitration — real
+                            # mid-distance attempts land 0.65-0.75 here.
+                            if max(sc, max(self._ww_recent or [0])) >= 0.60:
+                                self._open_stt_confirm(sc)
                             vetoed = True
                         elif my_lvl < 2500:
                             # Distant-source veto: our raw signal is very quiet
@@ -1336,8 +1353,17 @@ class CameraSession:
                                 )
                                 self._ww_consec = 0
                                 self._ww_recent.clear()
+                                # Sticky: our own level oscillates around the
+                                # 2500 ceiling chunk-to-chunk; a one-shot veto
+                                # was followed 0.7s later by a fire from the
+                                # next chunk (16:56 trace).
+                                self._veto_until = time.time() + 5.0
                                 vetoed = True
-                        if not speaker_active and not vetoed:
+                        if (
+                            not speaker_active
+                            and not vetoed
+                            and time.time() >= self._veto_until
+                        ):
                             busy, olvl = _arbiter_owner_active(self.stream_name)
                             # Proximity steal: the user is clearly standing in
                             # OUR room (peak >=5x the owner's) and the owner
@@ -1386,6 +1412,19 @@ class CameraSession:
                                 self._vad_speech_consecutive = 0
                                 self._vad_silence_frames = 0
                                 asyncio.create_task(self._play_attention("oww"))
+
+    def _open_stt_confirm(self, sc: float) -> None:
+        """Gates held a decent oww score (appliance/quiet-source). Do not pip;
+        open a short window during which the next VAD utterance goes to
+        Whisper. A live «компьютер» in the transcript then fires the real
+        wake; garbage transcripts just expire silently. This rescues strong
+        attempts that threshold gates cannot separate from noise (kitchen
+        trace: real 0.91 vs vacuum 0.90 — only STT tells them apart)."""
+        self._stt_confirm_until = time.time() + 10.0
+        logger.info(
+            f"[{self.stream_name}] 🔎 oww {sc:.2f} held — waiting for STT "
+            f"confirmation utterance"
+        )
 
     def _apply_ns(self, audio_f: np.ndarray):
         """SpeexDSP noise suppression — strips stationary noise (distant speech)."""
@@ -1575,6 +1614,33 @@ class CameraSession:
         return txt, uid
 
     async def _handle_stt_result(self, txt: str, uid: str | None) -> None:
+        # --- Gray-zone STT confirmation ------------------------------------
+        # A gate held a decent oww score and opened a confirmation window.
+        # The utterance just transcribed decides: live «компьютер» -> full
+        # wake (pip, ownership, command window); anything else -> drop.
+        if not self._wake_detected and time.time() < self._stt_confirm_until:
+            self._stt_confirm_until = 0.0
+            if re.search(r"(компьютер|компютер|computer)", txt, re.IGNORECASE):
+                logger.info(f"[{self.stream_name}] ✅ STT confirmed wake: '{txt[:60]}'")
+                won, _, winner = await _arbiter_submit(
+                    "wake", self.stream_name, self._proximity_level()
+                )
+                if not won:
+                    logger.info(
+                        f"[{self.stream_name}] 🤝 stt-confirm ceded to '{winner}'"
+                    )
+                    return
+                _arbiter_set_owner(self.stream_name, self._proximity_level())
+                self._wake_cmd_sent = False
+                self._last_fire_ts = time.time()
+                self._wake_detected = True
+                self._wake_expires = time.time() + self._wake_timeout
+                asyncio.create_task(self._play_attention("oww"))
+            else:
+                logger.info(
+                    f"[{self.stream_name}] ❌ stt-confirm dropped: '{txt[:50]}'"
+                )
+                return
         norm = txt.lower().strip().strip(".,!? -")
         if norm in (
             "готов",
@@ -1617,10 +1683,12 @@ class CameraSession:
             return
 
         # Whisper listens ONLY after the acoustic wake fired (oww pip / active
-        # wake window). Everything else is ambient noise — feeding it to STT
-        # just spams Whisper with TV/radio garbage and burns CPU. The oww
-        # detector runs continuously on the live feed instead (cheap).
-        if not self._wake_detected:
+        # wake window) or while a gray-zone STT-confirmation window is open
+        # (gates held a decent oww score; Whisper arbitrates). Everything else
+        # is ambient noise — feeding it to STT just spams Whisper with TV/
+        # radio garbage and burns CPU. The oww detector runs continuously on
+        # the live feed instead (cheap).
+        if not self._wake_detected and time.time() >= self._stt_confirm_until:
             return
 
         # Trim trailing silence: the corridor noise floor keeps VAD "speech"

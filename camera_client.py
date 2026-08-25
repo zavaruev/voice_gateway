@@ -924,7 +924,7 @@ class CameraSession:
         n = len(x)
         if n == 0:
             return False
-        if self._tts_total < n + 7 * 16000:
+        if self._tts_total < n + 2 * 16000:
             return False
         xn = float(np.linalg.norm(x))
         if xn < 2000.0:  # too quiet to be a played clip echo
@@ -932,7 +932,7 @@ class CameraSession:
         ring = self._tts_ring
         total = self._tts_total
         best = 0.0
-        for d in range(7, 17):  # expected echo delay 8-15s after playback
+        for d in range(2, 46):  # observed RTSP backchannel echo: 3-40s after playback
             ds = d * 16000
             start = total - ds - n
             if start < 0:
@@ -1156,6 +1156,16 @@ class CameraSession:
                         self._engine.check_wakeword, s16_w, self._ww_thresh, self.stream_name
                     )
                     sc = float(getattr(self._engine, "last_score", 0.0))
+                    # Clipping bang gate: door slams / dropped objects hit the
+                    # 24k+ peak range and transiently score high (observed
+                    # 0.80-0.93 at 02:21 on a corridor bang). Speech peaks
+                    # stay below ~20k raw; treat clipped non-speech as noise
+                    # unless the score is overwhelming.
+                    if raw_peak > 24000 and sc < 0.85:
+                        # Clipping bang: not speech, kill debounce state.
+                        self._ww_consec = 0
+                        self._ww_recent.clear()
+                        sc = 0.0
                     # A loud, confident detection always passes — the adaptive
                     # threshold must never be able to lock the system out.
                     wake = sc >= self._ww_thresh or sc >= 0.88
@@ -1997,6 +2007,10 @@ class CameraSession:
             env[-fade_n:] = np.linspace(1, 0, fade_n)
             mix = tone * env
             pcm = (mix * 32767).astype(np.int16).tobytes()
+            # The pip's own echo returns through the RTSP backchannel seconds
+            # later; register it in the reference ring so _is_echo recognizes
+            # (and suppresses wake on) the distorted return signal.
+            self._store_tts_echo(pcm)
             if self._out_track:
                 await self._out_track.queue_frame(pcm, sr)
                 self._out_track._last_play_duration = duration

@@ -1264,6 +1264,22 @@ class CameraSession:
                         )
                         my_lvl = self._proximity_level()
                         vetoed = False
+                        # Appliance gate: a continuously running appliance
+                        # (robot vacuum, hood, AC) keeps the 60s background
+                        # median high — speech between words always dips back
+                        # toward a quiet floor. A loud motor whine also scores
+                        # 0.6-0.9 on this TTS-trained model (14:52 trace:
+                        # vacuum rms ~850 -> scores 0.64/0.90 -> double fire).
+                        # From inside such noise require an overwhelming score.
+                        bg_med = float(np.median(self._bg_window)) if self._bg_window else 0.0
+                        if bg_med > 800 and max(sc, max(self._ww_recent or [0])) < 0.92:
+                            logger.info(
+                                f"[{self.stream_name}] 🧹 appliance hold — bg {bg_med:.0f} "
+                                f"sc {sc:.2f} needs >=0.95"
+                            )
+                            self._ww_consec = 0
+                            self._ww_recent.clear()
+                            vetoed = True
                         if speaker_active:
                             # Speaker is actively playing: any wake-shaped
                             # sound right now IS our own TTS/pip leaking back

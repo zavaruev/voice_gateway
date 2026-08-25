@@ -1361,7 +1361,7 @@ class CameraSession:
                         elif (
                             my_lvl < 3000
                             and max(sc, max(self._ww_recent or [0]))
-                            < (0.85 if my_lvl < 2000 else 0.72)
+                            < (0.58 if my_lvl < 2000 else 0.55)
                         ):
                             # Quiet-source confirmation gate: a real user even
                             # at mid-distance produces peaks >3k HERE; faint
@@ -1374,7 +1374,7 @@ class CameraSession:
                             logger.info(
                                 f"[{self.stream_name}] 🔈 quiet-source hold — "
                                 f"lvl {my_lvl:.0f} sc {sc:.2f} needs >="
-                                f"{0.85 if my_lvl < 2000 else 0.72}"
+                                f"{0.58 if my_lvl < 2000 else 0.55}"
                             )
                             self._ww_consec = 0
                             self._ww_recent.clear()

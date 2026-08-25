@@ -70,6 +70,11 @@ class LocalAudioEngine:
         self._vad_calls = 0
         self._ww_calls = 0
         self.last_score = 0.0
+        # Dedicated Silero state for the wake-word path (independent from the
+        # utterance VAD above — the two consume different chunk boundaries).
+        self._wwv_buffer = np.array([], dtype=np.float32)
+        self._wwv_state = np.zeros((2, 1, 128), dtype=np.float32)
+        self._wwv_context = np.zeros((1, 64), dtype=np.float32)
 
     def initialize_models(self, wakeword_path: str = ""):
         logger.info("Loading Silero VAD (ONNX)...")
@@ -118,8 +123,41 @@ class LocalAudioEngine:
             logger.info(f"VAD calls={self._vad_calls} max_prob={max_prob:.4f} level={level:.6f} (threshold={self.vad_threshold})")
         return max_prob > self.vad_threshold
 
+    def _ww_vad_speech(self, audio_int16: np.ndarray) -> bool:
+        """Silero speech-probability for the wake path. Non-speech transients
+        (hamster cage clicks, thuds, rustle) historically scored 0.6-0.9 on
+        this TTS-trained head while being NOT speech at all; gating the model
+        behind a real VAD removes that entire false-positive class."""
+        # NO extra gain here: a 32x boost hard-clips loud speech into a
+        # square wave and Silero's probability collapses to <0.25 even on
+        # real commands (measured: rms 3463 clip -> max_prob 0.24; without
+        # gain -> 1.0). Natural [-1,1] scaling keeps the VAD honest.
+        f = audio_int16.astype(np.float32) / 32768.0
+        self._wwv_buffer = np.concatenate((self._wwv_buffer, f))
+        max_prob = 0.0
+        while len(self._wwv_buffer) >= 512:
+            chunk = self._wwv_buffer[:512]
+            self._wwv_buffer = self._wwv_buffer[512:]
+            full_input = np.concatenate(
+                [self._wwv_context, chunk[np.newaxis, :]], axis=1
+            )
+            out, self._wwv_state = self.vad_session.run(
+                None,
+                {"input": full_input, "state": self._wwv_state,
+                 "sr": np.array([16000], dtype=np.int64)},
+            )
+            self._wwv_context = np.concatenate(
+                [self._wwv_context, chunk[np.newaxis, :]], axis=1
+            )[:, -64:]
+            max_prob = max(max_prob, out[0][0])
+        return max_prob > 0.5
+
     def check_wakeword(self, audio_int16: np.ndarray, threshold: float = 0.4, stream: str = "") -> bool:
         peak = int(np.max(np.abs(audio_int16)))
+        if not self._ww_vad_speech(audio_int16):
+            # Not speech: never even show it to the wake model.
+            self.last_score = 0.0
+            return False
         if self._ww_calls % 500 == 0:
             rms = np.sqrt(np.mean(audio_int16.astype(np.float64)**2))
             logger.info(f"[{stream}] WW peek: peak={peak} rms={rms:.1f}")

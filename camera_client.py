@@ -1215,6 +1215,17 @@ class CameraSession:
                 and time.time() >= self._wake_suppress_until
                 and time.time() - self._audio_epoch > 5.0
             ):
+                # Corridor mic lost ~5-10x sensitivity after a majestic
+                # restart (voice at the camera reads rms 600-1900 vs 7962
+                # before; speaker-loop test confirms the capture path works,
+                # just quiet). Boost the chunk BEFORE the VAD gate and AGC:
+                # fixed gain preserves dynamics (unlike per-chunk peak
+                # normalization, which blinds Silero), and his raw peaks
+                # <=4k * 5 stay clear of clipping.
+                if self.stream_name == "corridor":
+                    s16 = np.clip(
+                        s16.astype(np.float32) * 5.0, -32768, 32767
+                    ).astype(np.int16)
                 raw_peak = int(np.max(np.abs(s16)))
                 s16_w = s16
                 # Per-room AGC target for the wake detector: the kitchen cam

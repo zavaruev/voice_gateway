@@ -90,7 +90,7 @@ class LocalAudioEngine:
                 wakeword_model_paths=[wakeword_path],
                 embedding_onnx_model_path="config/embedding_model.onnx",
             )
-            logger.info("Loading openWakeWord custom model...")
+            logger.info(f"Loading openWakeWord model: {wakeword_path}")
         else:
             self.oww_model = Model()
             logger.info("Loading openWakeWord built-in models (alexa)...")

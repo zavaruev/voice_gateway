@@ -2101,9 +2101,20 @@ async def start_camera_sessions():
 
     for name in streams:
         try:
+            # Per-room model: the kitchen mic clips hard at close range
+            # (ADC rail 32767) and the library model scores clipped audio
+            # 0.001 — only the custom head tolerates it (0.6-0.9 there).
+            # Clean-mic rooms use the library model (noise <=0.054).
+            per_stream_default = (
+                "config/computer.onnx" if name == "kitchen" else wake_model_env
+            )
+            wm = (
+                os.getenv(f"WAKE_WORD_MODEL_{name.upper()}")
+                or per_stream_default
+            )
             config = CameraConfig(
                 stream_name=name,
-                wakeword_model_path=wake_model_env,
+                wakeword_model_path=wm,
                 wake_keyword=wake_word_env,
                 go2rtc_host=go2rtc_host,
                 go2rtc_port=go2rtc_port,

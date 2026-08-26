@@ -1223,8 +1223,13 @@ class CameraSession:
                 # normalization, which blinds Silero), and his raw peaks
                 # <=4k * 5 stay clear of clipping.
                 if self.stream_name == "corridor":
+                    # Adaptive: loud speech must NOT be pushed into the rail
+                    # (a square-wave chunk blinds both Silero and the model —
+                    # 12:04 trace, raw rms 15500 x5 = clipped).
+                    pk0 = int(np.max(np.abs(s16)))
+                    g = min(5.0, 30000.0 / max(pk0, 1))
                     s16 = np.clip(
-                        s16.astype(np.float32) * 5.0, -32768, 32767
+                        s16.astype(np.float32) * g, -32768, 32767
                     ).astype(np.int16)
                 raw_peak = int(np.max(np.abs(s16)))
                 s16_w = s16
@@ -1726,7 +1731,11 @@ class CameraSession:
         )
         # Speaker ID runs in PARALLEL but never gates the reply — the service
         # can take 5+s while Whisper needs <1s, and uid is only used for logs.
-        stt_task = asyncio.create_task(self._fetch_transcription(wav))
+        stt_task = asyncio.create_task(
+            self._fetch_transcription(
+                wav, rms_raw=float(stats.get("rms_raw") or 0.0)
+            )
+        )
         uid_task = asyncio.create_task(self._fetch_speaker_id(wav))
 
         def _uid_done(t: "asyncio.Task") -> None:
@@ -1756,6 +1765,7 @@ class CameraSession:
             txt = await self._fetch_transcription(
                 await asyncio.to_thread(self._encode_wav, buf_raw),
                 temperature="0.0",
+                rms_raw=float(stats.get("rms_raw") or 0.0),
             )
         if not txt or not is_valid_text(txt):
             if not txt:
@@ -2338,7 +2348,8 @@ class CameraSession:
         return header + pcm_16k
 
     async def _fetch_transcription(
-        self, wav: bytes, temperature: str | None = None
+        self, wav: bytes, temperature: str | None = None,
+        rms_raw: float = 0.0,
     ) -> str:
         for temp in (temperature, "0.0", "0.5"):
             if not temp:
@@ -2353,8 +2364,7 @@ class CameraSession:
             # quiet ambient noise it actively HALLUCINATES command words
             # straight from the prompt itself ('чайник телевизор' at
             # raw_rms=801 -> pip -> nanobot).
-            rms_now = float((stats or {}).get("rms_raw", 0.0))
-            if rms_now >= 2000.0:
+            if rms_raw >= 2000.0:
                 form.add_field(
                     "prompt",
                     "Команда умному дому: включи выключи кофеварку стиралку "

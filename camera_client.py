@@ -1229,7 +1229,14 @@ class CameraSession:
                 # copy out-scores the room the user is actually in (14:03
                 # trace: corridor raw 5403 -> no boost, score <0.4; kitchen
                 # raw 1973 -> x3.3 boost, score 0.87 and fired).
-                _WW_TARGET_PEAK = 6500 if self.stream_name == "kitchen" else 4000
+                # Corridor mic sensitivity dropped after a majestic restart
+                # (voice raw peaks fell from ~30k to <4k); compensate with an
+                # aggressive per-room target.
+                _WW_TARGET_PEAK = (
+                    6500 if self.stream_name == "kitchen"
+                    else 9000 if self.stream_name == "corridor"
+                    else 4000
+                )
                 if 100 <= raw_peak:
                     s16_w = np.clip(
                         s16.astype(np.float32) * (_WW_TARGET_PEAK / raw_peak),

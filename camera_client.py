@@ -493,7 +493,7 @@ class CameraSession:
         # (measured live) — its base threshold is lowered so the room stays
         # usable; false-fire protection there still comes from the 2-chunk
         # debounce + cross-camera arbitration.
-        self._ww_thresh = 0.40 if self.stream_name == "kitchen" else 0.45
+        self._ww_thresh = 0.40 if self.stream_name == "kitchen" else 0.30
         self._wake_cmd_sent = False
         self._last_uid = None
         self._last_uid_ts = 0.0
@@ -2077,7 +2077,7 @@ class CameraSession:
             return
         self._wake_cmd_sent = True
         _ARB_STATE["cmd_sent"] = time.time()
-        base_thresh = 0.40 if self.stream_name == "kitchen" else 0.45
+        base_thresh = 0.40 if self.stream_name == "kitchen" else 0.30
         if self._ww_thresh > base_thresh:
             logger.info(
                 f"[{self.stream_name}] ✅ real command — wake threshold reset to {base_thresh}"

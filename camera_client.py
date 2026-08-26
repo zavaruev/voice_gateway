@@ -1378,7 +1378,7 @@ class CameraSession:
                         # vacuum rms ~850 -> scores 0.64/0.90 -> double fire).
                         # From inside such noise require an overwhelming score.
                         bg_med = float(np.median(self._bg_window)) if self._bg_window else 0.0
-                        if bg_med > 800 and max(sc, max(self._ww_recent or [0])) < 0.92:
+                        if bg_med > 800 and max(sc, max(self._ww_recent or [0])) < 0.60:
                             logger.info(
                                 f"[{self.stream_name}] 🧹 appliance hold — bg {bg_med:.0f} "
                                 f"sc {sc:.2f} needs >=0.95"
@@ -1478,7 +1478,7 @@ class CameraSession:
                         if (
                             not vetoed
                             and (
-                                qual_top < 0.92
+                                qual_top < 0.55
                                 or recent_unanswered_greet
                             )
                             and my_lvl < 3000

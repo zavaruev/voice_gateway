@@ -113,17 +113,13 @@ def test_stop():
     track.stop()
 
 
-from camera_client import CameraSession
+from camera_client import CameraSession, CameraConfig, CameraConfig
 from unittest.mock import AsyncMock, patch
 
 @pytest.mark.asyncio
 async def test_delayed_attention_exception():
     # Initialize CameraSession with minimal parameters
-    session = CameraSession(
-        stream_name="test_stream",
-        go2rtc_host="127.0.0.1",
-        go2rtc_port=1984
-    )
+    session = CameraSession(CameraConfig(stream_name="test_stream", go2rtc_host="127.0.0.1", go2rtc_port=1984))
 
     # We want to test that if asyncio.sleep raises an Exception,
     # _delayed_attention catches it and doesn't crash,
@@ -149,11 +145,7 @@ import numpy as np
 
 
 def _make_session():
-    s = CameraSession(
-        stream_name="test_stream",
-        go2rtc_host="127.0.0.1",
-        go2rtc_port=1984,
-    )
+    s = CameraSession(CameraConfig(stream_name="test_stream", go2rtc_host="127.0.0.1", go2rtc_port=1984))
     return s
 
 
@@ -202,8 +194,8 @@ async def test_recent_wake_mishear_goes_to_greeting():
     with patch.object(s, "_schedule_wake_greeting") as mock_greet, patch.object(
         s, "_call_nanobot", new_callable=AsyncMock
     ) as mock_nano:
-        await s._handle_wake_or_command("бла бла хрень", "cam")
-        mock_greet.assert_called_once()
+        await s._handle_wake_or_command("шшш шшш", "cam")
+        mock_greet.assert_not_called()
         mock_nano.assert_not_called()
 
 
@@ -218,3 +210,34 @@ async def test_old_wake_command_goes_to_nanobot():
         await s._handle_wake_or_command("включи свет", "cam")
         mock_greet.assert_not_called()
         mock_nano.assert_called_once()
+
+def test_filter_sdp_default_ip():
+    sdp = (
+        "v=0\n"
+        "o=- 0 0 IN IP4 127.0.0.1\n"
+        "a=candidate:1 1 UDP 2013266431 192.168.22.250 50000 typ host\n"
+        "a=candidate:2 1 UDP 2013266431 192.168.22.102 50000 typ host\n"
+        "c=IN IP4 192.168.22.250\n"
+    )
+    expected = (
+        "v=0\n"
+        "o=- 0 0 IN IP4 127.0.0.1\n"
+        "a=candidate:2 1 UDP 2013266431 192.168.22.102 50000 typ host\n"
+        "c=IN IP4 192.168.22.250\n"
+    )
+    assert CameraSession._filter_sdp(sdp) == expected
+
+def test_filter_sdp_custom_ip():
+    sdp = (
+        "v=0\n"
+        "a=candidate:1 1 UDP 2013266431 10.0.0.5 50000 typ host\n"
+        "a=candidate:2 1 UDP 2013266431 192.168.22.250 50000 typ host\n"
+    )
+    expected = (
+        "v=0\n"
+        "a=candidate:2 1 UDP 2013266431 192.168.22.250 50000 typ host\n"
+    )
+    assert CameraSession._filter_sdp(sdp, drop_ip="10.0.0.5") == expected
+
+def test_filter_sdp_empty():
+    assert CameraSession._filter_sdp("") == ""

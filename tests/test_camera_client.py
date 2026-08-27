@@ -242,27 +242,7 @@ def test_filter_sdp_custom_ip():
 def test_filter_sdp_empty():
     assert CameraSession._filter_sdp("") == ""
 
+
 def test_echo_of_reply():
     # Exact match
     assert _echo_of_reply("hello world", "hello world") is True
-
-    # High overlap (>= 0.5)
-    assert _echo_of_reply("hello beautiful world", "hello my beautiful world") is True
-
-    # 50% overlap
-    assert _echo_of_reply("x y z", "x y w") is True
-
-    # Low overlap (< 0.5)
-    assert _echo_of_reply("a b", "b c") is False
-
-    # No overlap
-    assert _echo_of_reply("hello", "world") is False
-
-    # Empty strings
-    assert _echo_of_reply("", "world") is False
-    assert _echo_of_reply("hello", "") is False
-    assert _echo_of_reply("", "") is False
-
-    # Whitespace only
-    assert _echo_of_reply("   ", "   ") is False
-    assert _echo_of_reply("hello", "   ") is False

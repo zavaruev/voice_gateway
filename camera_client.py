@@ -46,7 +46,6 @@ import time
 from dataclasses import dataclass
 
 import aiohttp
-import aioice.ice
 import av
 import numpy as np
 from aiortc import RTCPeerConnection, RTCSessionDescription, MediaStreamTrack

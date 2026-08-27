@@ -24,7 +24,6 @@ from main import (
     get_cached_chat_id,
     verify_auth,
     load_chat_id_cache,
-    save_chat_id_cache,
     CHAT_ID_TTL,
     VadEngine,
     load_speaker_names,

@@ -327,6 +327,62 @@ class VadEngine:
             logger.error(f"❌ VAD Error: {e}")
             return False, 0.0
 
+    async def is_speech_batch(
+        self, pcms: list[bytes], rms_list: list[float]
+    ) -> list[bool]:
+        """Process a batch of PCM chunks in a single thread to avoid N+1 async delays."""
+
+        def process_all():
+            results = []
+            for pcm, precomputed_rms in zip(pcms, rms_list):
+                try:
+                    audio_float32 = (
+                        np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+                    )
+                    rms = precomputed_rms
+
+                    # ONNX-based detection (apply gain to compensate for quiet camera audio)
+                    speech_onnx = False
+                    onnx_max = 0.0
+                    onnx_input = audio_float32 * self.onnx_gain
+                    self.buffer = np.concatenate((self.buffer, onnx_input))
+                    while len(self.buffer) >= 512:
+                        chunk = self.buffer[:512]
+                        self.buffer = self.buffer[512:]
+                        out, self._state = self._run_onnx(
+                            chunk, self._state, self._context
+                        )
+                        # Update context: last 64 samples of (context + chunk)
+                        self._context = np.concatenate(
+                            [self._context, chunk[np.newaxis, :]], axis=1
+                        )[:, -self._context_size :]
+                        onnx_max = max(onnx_max, out[0][0])
+                        if out[0][0] > self.onnx_threshold:
+                            speech_onnx = True
+
+                    # Energy-based detection with adaptive threshold
+                    speech_energy = False
+                    if self.energy_fallback:
+                        energy_thresh = max(
+                            self.energy_threshold, self.rms_noise_floor * 1.2
+                        )
+                        if rms > energy_thresh:
+                            speech_energy = True
+
+                    speech_detected = speech_onnx or speech_energy
+
+                    self.rms_noise_floor = (
+                        1 - self.rms_alpha
+                    ) * self.rms_noise_floor + self.rms_alpha * rms
+
+                    results.append(speech_detected)
+                except Exception as e:
+                    logger.error(f"❌ VAD Error in batch: {e}")
+                    results.append(False)
+            return results
+
+        return await asyncio.to_thread(process_all)
+
 
 # ==========================================
 # UTILS & AUDIO PACKING
@@ -649,7 +705,7 @@ async def decode_opus_frames(
     """Decode Opus frames to PCM and return (combined_pcm, rms_list, vad_results)."""
     all_pcm = bytearray()
     rms_list = []
-    vad_results = []
+    pcm_list = []
 
     for frame in frames:
         try:
@@ -658,11 +714,30 @@ async def decode_opus_frames(
 
             rms = calculate_rms(pcm)
             rms_list.append(rms)
-
-            is_sp, _ = await vad.is_speech(pcm, rms)
-            vad_results.append(is_sp)
+            pcm_list.append(pcm)
         except Exception:
             rms_list.append(0.0)
+            pcm_list.append(None)
+
+    valid_pcms = []
+    valid_rms = []
+    for pcm, rms in zip(pcm_list, rms_list):
+        if pcm is not None:
+            valid_pcms.append(pcm)
+            valid_rms.append(rms)
+
+    if valid_pcms:
+        batch_results = await vad.is_speech_batch(valid_pcms, valid_rms)
+    else:
+        batch_results = []
+
+    vad_results = []
+    batch_idx = 0
+    for pcm in pcm_list:
+        if pcm is not None:
+            vad_results.append(batch_results[batch_idx])
+            batch_idx += 1
+        else:
             vad_results.append(False)
 
     return bytes(all_pcm), rms_list, vad_results

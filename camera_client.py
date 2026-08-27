@@ -1646,19 +1646,15 @@ class CameraSession:
         # Background noise ~190-500 int16 (AGC), speech chunks ~800+,
         # distant speech (3m) chunks ~400-900.
         chunk_samples = 1280  # 80ms at 16kHz
-        speech_chunks = 0
-        total_chunks = 0
-        for i in range(0, len(samples) - chunk_samples + 1, chunk_samples):
-            chunk_rms = float(
-                np.sqrt(
-                    np.mean(
-                        np.square(samples[i : i + chunk_samples].astype(np.float32))
-                    )
-                )
-            )
-            total_chunks += 1
-            if chunk_rms >= 400:
-                speech_chunks += 1
+        total_chunks = len(samples) // chunk_samples
+        if total_chunks > 0:
+            reshaped_samples = samples[: total_chunks * chunk_samples].reshape(
+                total_chunks, chunk_samples
+            ).astype(np.float32)
+            chunk_rms = np.sqrt(np.mean(np.square(reshaped_samples), axis=1))
+            speech_chunks = int(np.sum(chunk_rms >= 400))
+        else:
+            speech_chunks = 0
         speech_ratio = speech_chunks / max(total_chunks, 1)
         # Post-wake commands must always reach STT: the user is talking to
         # the device and short words (e.g. «свет») yield a low ratio

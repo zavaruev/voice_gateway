@@ -72,6 +72,8 @@ def _echo_of_reply(norm: str, reply_norm: str) -> bool:
     if not a or not b:
         return False
     return len(a & b) / len(a | b) >= 0.5
+
+
 logger.setLevel(logging.INFO)
 logging.getLogger("aiortc").setLevel(logging.WARNING)
 logging.getLogger().setLevel(logging.INFO)
@@ -272,8 +274,7 @@ def _arbiter_sent_recently(key: tuple, stream: str, within: float = 3.0) -> bool
     if ts and now - ts <= within:
         return True
     return any(
-        s == stream and now - t <= within
-        for (_k, s), t in _ARB_STATE["sent"].items()
+        s == stream and now - t <= within for (_k, s), t in _ARB_STATE["sent"].items()
     )
 
 
@@ -284,10 +285,14 @@ def _arb_lock() -> asyncio.Lock:
     return _ARB_LOCK
 
 
-async def _arbiter_submit(kind: str, stream: str, level: float,
-                          grace: float = 0.7, quality: float = 0.0,
-                          respect_owner: bool = False
-                          ) -> tuple[bool, tuple, str]:
+async def _arbiter_submit(
+    kind: str,
+    stream: str,
+    level: float,
+    grace: float = 0.7,
+    quality: float = 0.0,
+    respect_owner: bool = False,
+) -> tuple[bool, tuple, str]:
     """Register a claim and report whether `stream` won its group.
 
     `kind` separates concurrent event types ("wake" vs "cmd"). Claims land in
@@ -311,20 +316,29 @@ async def _arbiter_submit(kind: str, stream: str, level: float,
     bucket_key = (kind, int(now // 3))
     async with _arb_lock():
         _ARB_STATE["claims"].setdefault(bucket_key, {})[stream] = (
-            now, float(level), float(quality),
+            now,
+            float(level),
+            float(quality),
         )
     await asyncio.sleep(grace)
     async with _arb_lock():
         # prune buckets that are entirely stale
-        for k in [k for k, b in _ARB_STATE["claims"].items()
-                  if all(now - ts > 8 for ts, _, _q in b.values())]:
+        for k in [
+            k
+            for k, b in _ARB_STATE["claims"].items()
+            if all(now - ts > 8 for ts, _, _q in b.values())
+        ]:
             del _ARB_STATE["claims"][k]
         # Wake detections across rooms can stagger by seconds (different
         # detectors/debounce), so group them more generously than commands.
         span = 5.0 if kind == "wake" else 3.0
         # key=(stream) -> [max_level, max_quality]
         merged: dict[str, list[float]] = {}
-        for bk in ((kind, bucket_key[1] - 1), (kind, bucket_key[1]), (kind, bucket_key[1] + 1)):
+        for bk in (
+            (kind, bucket_key[1] - 1),
+            (kind, bucket_key[1]),
+            (kind, bucket_key[1] + 1),
+        ):
             for st, (ts, lvl, q) in _ARB_STATE["claims"].get(bk, {}).items():
                 if abs(now - ts) <= span:
                     cell = merged.setdefault(st, [0.0, 0.0])
@@ -333,12 +347,14 @@ async def _arbiter_submit(kind: str, stream: str, level: float,
         # Louder wins; on a clipping tie (both 32767) the richer transcript wins.
         winner = (
             max(merged.items(), key=lambda kv: (kv[1][0], kv[1][1]))[0]
-            if merged else stream
+            if merged
+            else stream
         )
         pretty = {k: (round(v[0]), round(v[1])) for k, v in merged.items()}
         logger.info(f"⚖️ arbiter[{kind}]: {pretty} -> '{winner}'")
         # Tuple so losers know WHO won (for the take-over-if-silent fallback).
         return winner == stream, bucket_key, winner
+
 
 # Global: while any TTS playback is running (ESP32 or camera), neither path
 # may send to nanobot — kills echo cascade (camera hears ESP32 TTS, resends).
@@ -402,10 +418,10 @@ class CameraSession:
         # Gray-zone wake handling: when gates hold a decent oww score, do not
         # pip — instead let the next utterance reach Whisper, and a live
         # «компьютер» in the transcript confirms the wake (or drops it).
-        self._stt_confirm_until = 0.0   # wall clock: STT-confirmation window
+        self._stt_confirm_until = 0.0  # wall clock: STT-confirmation window
         self._confirm_saw_text = False  # a transcript arrived during window
-        self._tts_play_end = 0.0        # approx wall clock: speaker finishes
-        self._veto_until = 0.0          # wall clock: sticky distant-veto
+        self._tts_play_end = 0.0  # approx wall clock: speaker finishes
+        self._veto_until = 0.0  # wall clock: sticky distant-veto
         self._wake_greeting_task = None
         # True while the AUTO-greeting (bare wake, no command yet) is being
         # spoken: shortens the ownership/follow-up window so other rooms do
@@ -551,9 +567,12 @@ class CameraSession:
                 # Bare name (e.g. 'hey_jarvis') -> built-in pretrained model
                 # shipped inside the openwakeword package.
                 import openwakeword
+
                 cand = os.path.join(
                     os.path.dirname(openwakeword.__file__),
-                    "resources", "models", model_path,
+                    "resources",
+                    "models",
+                    model_path,
                 )
                 if not cand.endswith(".onnx"):
                     cand += ".onnx"
@@ -561,14 +580,20 @@ class CameraSession:
                     model_path = cand
                 else:
                     import glob as _glob
-                    hits = sorted(_glob.glob(
-                        os.path.join(res_dir := os.path.dirname(cand),
-                                     os.path.basename(cand)[:-5] + "*.onnx")
-                    ))
+
+                    hits = sorted(
+                        _glob.glob(
+                            os.path.join(
+                                res_dir := os.path.dirname(cand),
+                                os.path.basename(cand)[:-5] + "*.onnx",
+                            )
+                        )
+                    )
                     if hits:
                         model_path = hits[0]
             await asyncio.to_thread(
-                self._engine.initialize_models, model_path,
+                self._engine.initialize_models,
+                model_path,
             )
 
     async def stop(self):
@@ -836,7 +861,9 @@ class CameraSession:
         if not source_url:
             try:
                 base = f"http://{self.go2rtc_host}:{self.go2rtc_port}"
-                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as s:
+                async with aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(total=8)
+                ) as s:
                     async with s.get(f"{base}/api/streams") as r:
                         if r.status == 200:
                             data = await r.json()
@@ -847,7 +874,9 @@ class CameraSession:
                                     source_url = u
                                     break
             except Exception as e:
-                logger.warning(f"[{self.stream_name}] heal: failed to query go2rtc streams: {e}")
+                logger.warning(
+                    f"[{self.stream_name}] heal: failed to query go2rtc streams: {e}"
+                )
 
         if not source_url:
             logger.warning(
@@ -857,7 +886,9 @@ class CameraSession:
 
         base = f"http://{self.go2rtc_host}:{self.go2rtc_port}"
         try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as s:
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as s:
                 # Best-effort remove the broken entry so POST creates a fresh one.
                 # go2rtc quirk: the DELETE query param is named "src" but holds
                 # the stream NAME ("?src=corridor"); "?name=" silently no-ops.
@@ -865,7 +896,9 @@ class CameraSession:
                     async with s.delete(
                         f"{base}/api/streams", params={"src": self.stream_name}
                     ) as r:
-                        logger.info(f"[{self.stream_name}] heal: DELETE stream -> HTTP {r.status}")
+                        logger.info(
+                            f"[{self.stream_name}] heal: DELETE stream -> HTTP {r.status}"
+                        )
                 except Exception as e:
                     logger.info(f"[{self.stream_name}] heal: DELETE skipped ({e})")
                 # Re-register with the source URL. go2rtc-under-Frigate rejects
@@ -1040,7 +1073,9 @@ class CameraSession:
                     now = time.time()
                     if now - self._last_echo_log > 2.0:
                         self._last_echo_log = now
-                        logger.info(f"[{self.stream_name}] 🔁 Echo chunk dropped (corr)")
+                        logger.info(
+                            f"[{self.stream_name}] 🔁 Echo chunk dropped (corr)"
+                        )
                     # Confirmed TTS echo in the mic feed: keep the wake model
                     # suppressed while echoes keep arriving. The RTSP
                     # backchannel returns our own speech 3-40s after playback;
@@ -1092,7 +1127,6 @@ class CameraSession:
                     self._bg_window.pop(0)
                 now_d = time.time()
 
-
             asyncio.create_task(self._vad_process(chunk))
 
     def _proximity_level(self) -> float:
@@ -1120,7 +1154,8 @@ class CameraSession:
                 self._recent_peaks.pop(0)
             global _ROOM_PEAKS
             _ROOM_PEAKS[self.stream_name] = (
-                time.time(), self._proximity_level(),
+                time.time(),
+                self._proximity_level(),
             )
             orig_rms = (
                 float(np.sqrt(np.mean(np.square(s16.astype(np.float64))))) / 32768.0
@@ -1227,9 +1262,9 @@ class CameraSession:
                     # 12:04 trace, raw rms 15500 x5 = clipped).
                     pk0 = int(np.max(np.abs(s16)))
                     g = min(5.0, 30000.0 / max(pk0, 1))
-                    s16 = np.clip(
-                        s16.astype(np.float32) * g, -32768, 32767
-                    ).astype(np.int16)
+                    s16 = np.clip(s16.astype(np.float32) * g, -32768, 32767).astype(
+                        np.int16
+                    )
                 raw_peak = int(np.max(np.abs(s16)))
                 s16_w = s16
                 # Per-room AGC target for the wake detector: the kitchen cam
@@ -1248,9 +1283,9 @@ class CameraSession:
                 # (voice raw peaks fell from ~30k to <4k); compensate with an
                 # aggressive per-room target.
                 _WW_TARGET_PEAK = (
-                    6500 if self.stream_name == "kitchen"
-                    else 9000 if self.stream_name == "corridor"
-                    else 4000
+                    6500
+                    if self.stream_name == "kitchen"
+                    else 9000 if self.stream_name == "corridor" else 4000
                 )
                 if 100 <= raw_peak:
                     s16_w = np.clip(
@@ -1273,12 +1308,13 @@ class CameraSession:
                     # cannot see speech in the normalized signal. The verdict
                     # is passed INTO check_wakeword so a non-speech chunk just
                     # scores 0 through the normal not-wake path.
-                    vad_ok = await asyncio.to_thread(
-                        self._engine._ww_vad_speech, s16
-                    )
+                    vad_ok = await asyncio.to_thread(self._engine._ww_vad_speech, s16)
                     await asyncio.to_thread(
-                        self._engine.check_wakeword, s16_w,
-                        self._ww_thresh, self.stream_name, vad_ok,
+                        self._engine.check_wakeword,
+                        s16_w,
+                        self._ww_thresh,
+                        self.stream_name,
+                        vad_ok,
                     )
                     sc = float(getattr(self._engine, "last_score", 0.0))
                     # Clipping bang gate: door slams / dropped objects hit the
@@ -1290,9 +1326,8 @@ class CameraSession:
                     # typically 4-7x); impacts and thumps are dense waves
                     # (ratio <2x) yet transiently score 0.55-0.6 on this model.
                     rrms = float(np.sqrt((s16.astype(np.int64) ** 2).mean()))
-                    if (
-                        (raw_peak > 24000 and sc < 0.85)
-                        or (raw_peak > 4000 and rrms * 2 > raw_peak and sc < 0.85)
+                    if (raw_peak > 24000 and sc < 0.85) or (
+                        raw_peak > 4000 and rrms * 2 > raw_peak and sc < 0.85
                     ):
                         # Clipping bang / dense impact: not speech, kill
                         # debounce state.
@@ -1376,7 +1411,11 @@ class CameraSession:
                         # 0.6-0.9 on this TTS-trained model (14:52 trace:
                         # vacuum rms ~850 -> scores 0.64/0.90 -> double fire).
                         # From inside such noise require an overwhelming score.
-                        bg_med = float(np.median(self._bg_window)) if self._bg_window else 0.0
+                        bg_med = (
+                            float(np.median(self._bg_window))
+                            if self._bg_window
+                            else 0.0
+                        )
                         if bg_med > 800 and max(sc, max(self._ww_recent or [0])) < 0.60:
                             logger.info(
                                 f"[{self.stream_name}] 🧹 appliance hold — bg {bg_med:.0f} "
@@ -1398,10 +1437,8 @@ class CameraSession:
                             # through the mic. Never fire on it.
                             self._ww_consec = 0
                             self._ww_recent.clear()
-                        elif (
-                            my_lvl < 3000
-                            and max(sc, max(self._ww_recent or [0]))
-                            < (0.58 if my_lvl < 2000 else 0.55)
+                        elif my_lvl < 3000 and max(sc, max(self._ww_recent or [0])) < (
+                            0.58 if my_lvl < 2000 else 0.55
                         ):
                             # Quiet-source confirmation gate: a real user even
                             # at mid-distance produces peaks >3k HERE; faint
@@ -1437,7 +1474,8 @@ class CameraSession:
                             # deceptively high on this TTS-trained model.
                             now_ts = time.time()
                             louder = [
-                                (s, p) for s, (t, p) in _ROOM_PEAKS.items()
+                                (s, p)
+                                for s, (t, p) in _ROOM_PEAKS.items()
                                 if s != self.stream_name
                                 and now_ts - t < 3.0
                                 and p >= 1.4 * max(my_lvl, 1.0)
@@ -1476,10 +1514,7 @@ class CameraSession:
                         )
                         if (
                             not vetoed
-                            and (
-                                qual_top < 0.55
-                                or recent_unanswered_greet
-                            )
+                            and (qual_top < 0.55 or recent_unanswered_greet)
                             and my_lvl < 3000
                             and time.time() >= self._stt_confirm_until
                         ):
@@ -1521,8 +1556,9 @@ class CameraSession:
                                 )
                                 # Claim global interaction ownership so other
                                 # rooms' detectors stand down for this exchange.
-                                _arbiter_set_owner(self.stream_name,
-                                                   self._proximity_level())
+                                _arbiter_set_owner(
+                                    self.stream_name, self._proximity_level()
+                                )
                                 self._wake_cmd_sent = False
                                 self._last_fire_ts = time.time()
                                 self._wake_detected = True
@@ -1566,9 +1602,7 @@ class CameraSession:
             and not self._confirm_saw_text
             and not self._wake_detected
         ):
-            logger.info(
-                f"[{self.stream_name}] 🔎 confirm window silent — bare wake"
-            )
+            logger.info(f"[{self.stream_name}] 🔎 confirm window silent — bare wake")
             self._schedule_wake_greeting()
 
     def _open_stt_confirm(self, sc: float) -> None:
@@ -1605,7 +1639,9 @@ class CameraSession:
             logger.warning(f"[{self.stream_name}] NS error: {exc}")
             return audio_f, False
 
-    def _preprocess_audio(self, buf: bytes) -> tuple[bytes | None, bytes | None, float, dict]:
+    def _preprocess_audio(
+        self, buf: bytes
+    ) -> tuple[bytes | None, bytes | None, float, dict]:
         samples = np.frombuffer(buf, dtype=np.int16)
         duration_s = len(samples) / 16000.0
         rms_raw = float(np.sqrt(np.mean(np.square(samples.astype(np.float32)))))
@@ -1727,9 +1763,7 @@ class CameraSession:
         # Speaker ID runs in PARALLEL but never gates the reply — the service
         # can take 5+s while Whisper needs <1s, and uid is only used for logs.
         stt_task = asyncio.create_task(
-            self._fetch_transcription(
-                wav, rms_raw=float(stats.get("rms_raw") or 0.0)
-            )
+            self._fetch_transcription(wav, rms_raw=float(stats.get("rms_raw") or 0.0))
         )
         uid_task = asyncio.create_task(self._fetch_speaker_id(wav))
 
@@ -1747,9 +1781,7 @@ class CameraSession:
         txt = await stt_task
         self._last_utt_peak = int(stats.get("peak_raw") or 0)
         uid = (
-            uid_task.result()
-            if uid_task.done() and not uid_task.exception()
-            else None
+            uid_task.result() if uid_task.done() and not uid_task.exception() else None
         )
         if (not txt or not is_valid_text(txt)) and self._wake_detected:
             # Post-wake rescue: NS may have eaten the consonants of a
@@ -1791,13 +1823,8 @@ class CameraSession:
             # return of TTS audio is LOUD (passes any raw-energy gate) and
             # transcribes into valid text -> camera would interview itself.
             norm_c = txt.lower().strip(" .,!?-")
-            if (
-                self._last_tts_reply
-                and _echo_of_reply(norm_c, self._last_tts_reply)
-            ):
-                logger.info(
-                    f"[{self.stream_name}] ❌ stt-confirm: echo of own reply"
-                )
+            if self._last_tts_reply and _echo_of_reply(norm_c, self._last_tts_reply):
+                logger.info(f"[{self.stream_name}] ❌ stt-confirm: echo of own reply")
                 return
             sane = (
                 bool(txt.strip())
@@ -1918,13 +1945,13 @@ class CameraSession:
             if not buf_processed or not buf_raw:
                 return
 
-            txt, uid = await self._process_stt(buf_processed, buf_raw, duration_s, stats)
+            txt, uid = await self._process_stt(
+                buf_processed, buf_raw, duration_s, stats
+            )
             if not txt:
                 return
 
-            self._last_utt_rms_raw = float(
-                (stats or {}).get("rms_raw", 0.0)
-            )
+            self._last_utt_rms_raw = float((stats or {}).get("rms_raw", 0.0))
             await self._handle_stt_result(txt, uid)
         finally:
             self._processing_utterance = False
@@ -1943,7 +1970,9 @@ class CameraSession:
         # that follows it. Tolerate Whisper's glued repeats like
         # "компьютеркомпьютер" by matching without word boundaries.
         kw = re.escape(self.wake_keyword.lower())
-        m = re.search(rf"(?:хей\s+)?({kw}|{kw.replace('джарвис','jarvis')})", txt, re.IGNORECASE)
+        m = re.search(
+            rf"(?:хей\s+)?({kw}|{kw.replace('джарвис','jarvis')})", txt, re.IGNORECASE
+        )
         if not m:
             m = re.search(rf"({kw})", txt, re.IGNORECASE)
         cmd = txt
@@ -1960,8 +1989,12 @@ class CameraSession:
         # only the closest one talks to Nanobot.
         qual = float(len(cmd)) if is_valid_text(cmd) else 0.0
         won, gk, winner = await _arbiter_submit(
-            "cmd", self.stream_name, float(self._last_utt_peak or 0),
-            0.6, quality=qual, respect_owner=True,
+            "cmd",
+            self.stream_name,
+            float(self._last_utt_peak or 0),
+            0.6,
+            quality=qual,
+            respect_owner=True,
         )
         if not won:
             logger.info(
@@ -2027,9 +2060,7 @@ class CameraSession:
                 return
             if not self._wake_detected:
                 return
-        logger.info(
-            f"[{self.stream_name}] 🎯 Wake with no command — sending greeting"
-        )
+        logger.info(f"[{self.stream_name}] 🎯 Wake with no command — sending greeting")
         # NOTE: keep _wake_detected True so a command the user utters right
         # after the greeting is still treated as post-wake dialogue and is not
         # dropped ("No wake word, ignoring"). The 60s _wake_timeout window
@@ -2102,211 +2133,22 @@ class CameraSession:
                     # waiting for the full LLM reply — cuts perceived latency
                     # from (full LLM completion + TTS) to (first sentence + TTS).
                     q: asyncio.Queue = asyncio.Queue()
-
-                    async def player() -> None:
-                        last_q = False
-                        # Pipeline TTS: while sentence N is PLAYING, sentence
-                        # N+1 is already being synthesized. Without this overlap
-                        # the playback queue runs dry between sentences (each
-                        # Edge-TTS call takes 1-3s) and the speaker stutters
-                        # with silence gaps. Chain: text -> fetch(N) starts ->
-                        # wait text(N+1) -> fetch(N+1) starts -> play(N) pcm ->
-                        # play(N+1) pcm ... The prefetch of N+1 hides its whole
-                        # synthesis latency behind N's playback.
-                        pending: asyncio.Task | None = None  # prefetched pcm for `sent`
-                        sent: str | None = None
-                        try:
-                            while True:
-                                if sent is None:
-                                    sent = await q.get()
-                                    if sent is None:
-                                        break
-                                # Reuse the prefetched result if it matches this
-                                # sentence, otherwise synthesize now.
-                                if pending is not None:
-                                    tts_task, pending = pending, None
-                                else:
-                                    tts_task = asyncio.create_task(
-                                        self._tts_fetch(sent)
-                                    )
-                                # Pull the NEXT sentence while ours synthesizes,
-                                # then start its TTS immediately too — its
-                                # latency hides behind our playback as well.
-                                nxt = await q.get()
-                                if nxt is not None:
-                                    pending = asyncio.create_task(
-                                        self._tts_fetch(nxt)
-                                    )
-                                try:
-                                    pcm = await asyncio.wait_for(tts_task, timeout=90.0)
-                                    self._wake_expires = (
-                                        time.time() + self._wake_timeout
-                                    )
-                                    is_q = await asyncio.wait_for(
-                                        self._speak_pcm(pcm, sent), timeout=90.0
-                                    ) if pcm else False
-                                    last_q = bool(is_q)
-                                    if is_q:
-                                        # Open the follow-up window when the question
-                                        # actually FINISHES sounding, not when it was
-                                        # merely queued (long replies played long past
-                                        # the old queue-time expiry).
-                                        await self._wait_playback_drain()
-                                        self._wake_detected = True
-                                        self._wake_expires = time.time() + (
-                                            6.0 if self._auto_greeting else 12.0
-                                        )
-                                        logger.info(
-                                            f"[{self.stream_name}] 💬 Dialogue open until "
-                                            f"{self._wake_expires:.1f}"
-                                        )
-                                    sent = nxt
-                                    nxt = None
-                                except Exception as e:
-                                    logger.warning(
-                                        f"[{self.stream_name}] TTS sentence failed: {e}"
-                                    )
-                                    break
-                        finally:
-                            if pending:
-                                pending.cancel()
-                            if not last_q:
-                                self._back_to_wake()
-
-
-                    player_task = asyncio.create_task(player())
-                    _t0 = time.time()
-                    _t_first = None
+                    player_task = asyncio.create_task(self._nanobot_player_task(q))
                     _n_sent = 0
-                    _seen_ev: set = set()
-
-                    def speakable(s: str) -> str:
-                        s = re.sub(r"\[[a-z]{2,30}\]", "", s)
-                        return re.sub(r"\s+", " ", s).strip()
-
-                    buf = ""
-                    spoke_any = False
-
-                    def flush(final: bool) -> None:
-                        nonlocal buf, spoke_any, _n_sent
-                        # Hold back an unterminated [thinking block or any
-                        # dangling "[tag" so its inner text never leaks to TTS.
-                        m = re.search(r"\[thinking\]", buf)
-                        if m and not re.search(r"\[/thinking\]", buf[m.start():]):
-                            part, holder = (
-                                (buf[: m.start()], buf[m.start():])
-                                if not final
-                                else (buf, "")
-                            )
-                        else:
-                            idx = buf.rfind("[")
-                            if idx != -1 and not re.search(r"\]", buf[idx:]):
-                                part, holder = buf[:idx], buf[idx:]
-                            else:
-                                part, holder = buf, ""
-                        while True:
-                            mm = re.search(
-                                r"\[thinking\](.*?)\[/thinking\]", part, flags=re.S
-                            )
-                            if not mm:
-                                break
-                            part = part[: mm.start()] + part[mm.end():]
-                        mm = re.search(r"^(.*[.!?…])([^.!?…]*)$", part, flags=re.S)
-                        if mm:
-                            done = [mm.group(1)] if mm.group(1).strip() else []
-                            tail = mm.group(2)
-                        else:
-                            done, tail = [], part
-                        if final and tail.strip():
-                            done.append(tail)
-                            tail = ""
-                        for s in done:
-                            s2 = speakable(s)
-                            if s2:
-                                spoke_any = True
-                                _n_sent += 1
-                                logger.info(
-                                    f"[{self.stream_name}] ⏱ nanobot sentence #{_n_sent} "
-                                    f"@ +{time.time()-_t0:.1f}s: '{s2[:40]}'"
-                                )
-                                q.put_nowait(s2)
-                        buf = (tail + " " + holder).strip()
-
                     try:
-                        while True:
-                            try:
-                                msg = await asyncio.wait_for(
-                                    ws.receive(), timeout=45.0
-                                )
-                            except asyncio.TimeoutError:
-                                logger.warning(
-                                    f"[{self.stream_name}] Nanobot stream idle 45s"
-                                )
-                                break
-                            if msg.type in (
-                                aiohttp.WSMsgType.CLOSED,
-                                aiohttp.WSMsgType.ERROR,
-                            ):
-                                break
-                            if msg.type != aiohttp.WSMsgType.TEXT:
-                                continue
-                            data = json.loads(msg.data)
-                            ev = data.get("event")
-                            evk = str(data.get("type")) + "/" + str(ev)
-                            if evk not in _seen_ev:
-                                _seen_ev.add(evk)
-                                logger.info(
-                                    f"[{self.stream_name}] ⏱ nanobot ev: {evk} "
-                                    f"+{time.time()-_t0:.1f}s data_keys={list(data.keys())[:6]}"
-                                )
-                            if ev in ("done", "error", "final"):
-                                break
-                            if ev == "stream_end":
-                                if data.get("resuming") and not buf and not spoke_any:
-                                    continue  # end of a PREVIOUS resumed stream
-                                break
-                            delta = None
-                            if (
-                                "text" in data
-                                and data.get("type") not in ("stt", "listen")
-                                and ev not in ("reasoning_delta", "thinking", "ready")
-                            ):
-                                delta = str(data["text"])
-                            elif "parts" in data:
-                                delta = str(data["parts"])
-                            if delta is None:
-                                continue
-                            if _t_first is None:
-                                _t_first = time.time()
-                                logger.info(
-                                    f"[{self.stream_name}] ⏱ nanobot first token +{_t_first-_t0:.1f}s"
-                                )
-                            buf += delta
-                            got = buf and (
-                                re.search(r"[.!?…](\s|$)", buf)
-                                or "\n" in buf
-                                or len(buf) > 400
-                            )
-                            if got or len(buf) > 900:
-                                flush(final=False)
+                        _n_sent = await self._nanobot_read_loop(ws, q)
                     finally:
-                        flush(final=True)
-                        await q.put(None)
-                        logger.info(
-                            f"[{self.stream_name}] ⏱ nanobot done: sentences={_n_sent} "
-                            f"leftover={buf[:80]!r}"
-                        )
                         try:
                             await asyncio.wait_for(player_task, timeout=120.0)
                         except asyncio.TimeoutError:
                             player_task.cancel()
+
                         if _n_sent == 0:
                             # Nanobot hung (idle-timeout) or answered empty —
                             # the camera would go silent forever. Speak the
                             # same fallback the ESP32 watchdog uses.
                             logger.warning(
-                                f"[{self.stream_name}] 🕐 nanobot silent — "
-                                f"fallback TTS"
+                                f"[{self.stream_name}] 🕐 nanobot silent — fallback TTS"
                             )
                             fb = "Простите, я задумалась. Повторите пожалуйста."
                             try:
@@ -2318,6 +2160,185 @@ class CameraSession:
         except Exception as e:
             logger.warning(f"[{self.stream_name}] Nanobot error: {e}")
 
+    async def _nanobot_read_loop(
+        self, ws: aiohttp.ClientWebSocketResponse, q: asyncio.Queue
+    ) -> int:
+        _t0 = time.time()
+        _t_first = None
+        _n_sent = 0
+        _seen_ev: set = set()
+
+        def speakable(s: str) -> str:
+            s = re.sub(r"\[[a-z]{2,30}\]", "", s)
+            return re.sub(r"\s+", " ", s).strip()
+
+        buf = ""
+        spoke_any = False
+
+        def flush(final: bool) -> None:
+            nonlocal buf, spoke_any, _n_sent
+            # Hold back an unterminated [thinking block or any
+            # dangling "[tag" so its inner text never leaks to TTS.
+            m = re.search(r"\[thinking\]", buf)
+            if m and not re.search(r"\[/thinking\]", buf[m.start() :]):
+                part, holder = (
+                    (buf[: m.start()], buf[m.start() :]) if not final else (buf, "")
+                )
+            else:
+                idx = buf.rfind("[")
+                if idx != -1 and not re.search(r"\]", buf[idx:]):
+                    part, holder = buf[:idx], buf[idx:]
+                else:
+                    part, holder = buf, ""
+            while True:
+                mm = re.search(r"\[thinking\](.*?)\[/thinking\]", part, flags=re.S)
+                if not mm:
+                    break
+                part = part[: mm.start()] + part[mm.end() :]
+            mm = re.search(r"^(.*[.!?…])([^.!?…]*)$", part, flags=re.S)
+            if mm:
+                done = [mm.group(1)] if mm.group(1).strip() else []
+                tail = mm.group(2)
+            else:
+                done, tail = [], part
+            if final and tail.strip():
+                done.append(tail)
+                tail = ""
+            for s in done:
+                s2 = speakable(s)
+                if s2:
+                    spoke_any = True
+                    _n_sent += 1
+                    logger.info(
+                        f"[{self.stream_name}] ⏱ nanobot sentence #{_n_sent} "
+                        f"@ +{time.time()-_t0:.1f}s: '{s2[:40]}'"
+                    )
+                    q.put_nowait(s2)
+            buf = (tail + " " + holder).strip()
+
+        try:
+            while True:
+                try:
+                    msg = await asyncio.wait_for(ws.receive(), timeout=45.0)
+                except asyncio.TimeoutError:
+                    logger.warning(f"[{self.stream_name}] Nanobot stream idle 45s")
+                    break
+                if msg.type in (
+                    aiohttp.WSMsgType.CLOSED,
+                    aiohttp.WSMsgType.ERROR,
+                ):
+                    break
+                if msg.type != aiohttp.WSMsgType.TEXT:
+                    continue
+                data = json.loads(msg.data)
+                ev = data.get("event")
+                evk = str(data.get("type")) + "/" + str(ev)
+                if evk not in _seen_ev:
+                    _seen_ev.add(evk)
+                    logger.info(
+                        f"[{self.stream_name}] ⏱ nanobot ev: {evk} "
+                        f"+{time.time()-_t0:.1f}s data_keys={list(data.keys())[:6]}"
+                    )
+                if ev in ("done", "error", "final"):
+                    break
+                if ev == "stream_end":
+                    if data.get("resuming") and not buf and not spoke_any:
+                        continue  # end of a PREVIOUS resumed stream
+                    break
+                delta = None
+                if (
+                    "text" in data
+                    and data.get("type") not in ("stt", "listen")
+                    and ev not in ("reasoning_delta", "thinking", "ready")
+                ):
+                    delta = str(data["text"])
+                elif "parts" in data:
+                    delta = str(data["parts"])
+                if delta is None:
+                    continue
+                if _t_first is None:
+                    _t_first = time.time()
+                    logger.info(
+                        f"[{self.stream_name}] ⏱ nanobot first token +{_t_first-_t0:.1f}s"
+                    )
+                buf += delta
+                got = buf and (
+                    re.search(r"[.!?…](\s|$)", buf) or "\n" in buf or len(buf) > 400
+                )
+                if got or len(buf) > 900:
+                    flush(final=False)
+        finally:
+            flush(final=True)
+            await q.put(None)
+            logger.info(
+                f"[{self.stream_name}] ⏱ nanobot done: sentences={_n_sent} "
+                f"leftover={buf[:80]!r}"
+            )
+        return _n_sent
+
+    async def _nanobot_player_task(self, q: asyncio.Queue) -> None:
+        last_q = False
+        # Pipeline TTS: while sentence N is PLAYING, sentence
+        # N+1 is already being synthesized. Without this overlap
+        # the playback queue runs dry between sentences (each
+        # Edge-TTS call takes 1-3s) and the speaker stutters
+        # with silence gaps. Chain: text -> fetch(N) starts ->
+        # wait text(N+1) -> fetch(N+1) starts -> play(N) pcm ->
+        # play(N+1) pcm ... The prefetch of N+1 hides its whole
+        # synthesis latency behind N's playback.
+        pending: asyncio.Task | None = None  # prefetched pcm for `sent`
+        sent: str | None = None
+        try:
+            while True:
+                if sent is None:
+                    sent = await q.get()
+                    if sent is None:
+                        break
+                # Reuse the prefetched result if it matches this
+                # sentence, otherwise synthesize now.
+                if pending is not None:
+                    tts_task, pending = pending, None
+                else:
+                    tts_task = asyncio.create_task(self._tts_fetch(sent))
+                # Pull the NEXT sentence while ours synthesizes,
+                # then start its TTS immediately too — its
+                # latency hides behind our playback as well.
+                nxt = await q.get()
+                if nxt is not None:
+                    pending = asyncio.create_task(self._tts_fetch(nxt))
+                try:
+                    pcm = await asyncio.wait_for(tts_task, timeout=90.0)
+                    self._wake_expires = time.time() + self._wake_timeout
+                    is_q = (
+                        await asyncio.wait_for(self._speak_pcm(pcm, sent), timeout=90.0)
+                        if pcm
+                        else False
+                    )
+                    last_q = bool(is_q)
+                    if is_q:
+                        # Open the follow-up window when the question
+                        # actually FINISHES sounding, not when it was
+                        # merely queued (long replies played long past
+                        # the old queue-time expiry).
+                        await self._wait_playback_drain()
+                        self._wake_detected = True
+                        self._wake_expires = time.time() + (
+                            6.0 if self._auto_greeting else 12.0
+                        )
+                        logger.info(
+                            f"[{self.stream_name}] 💬 Dialogue open until "
+                            f"{self._wake_expires:.1f}"
+                        )
+                    sent = nxt
+                    nxt = None
+                except Exception as e:
+                    logger.warning(f"[{self.stream_name}] TTS sentence failed: {e}")
+                    break
+        finally:
+            if pending:
+                pending.cancel()
+            if not last_q:
+                self._back_to_wake()
 
     def _encode_wav(self, pcm_16k: bytes) -> bytes:
         sample_rate = 16000
@@ -2343,7 +2364,9 @@ class CameraSession:
         return header + pcm_16k
 
     async def _fetch_transcription(
-        self, wav: bytes, temperature: str | None = None,
+        self,
+        wav: bytes,
+        temperature: str | None = None,
         rms_raw: float = 0.0,
     ) -> str:
         for temp in (temperature, "0.0", "0.5"):
@@ -2451,11 +2474,14 @@ class CameraSession:
             t = np.arange(n) / sr
             # Clear two-tone "di-ding" so the wake is unmistakable even in a
             # noisy corridor (a single short 880Hz blip was easy to miss).
-            tone = np.where(
-                t < 0.2,
-                np.sin(2 * np.pi * 988 * t),
-                np.sin(2 * np.pi * 1319 * (t - 0.2)),
-            ) * 0.5
+            tone = (
+                np.where(
+                    t < 0.2,
+                    np.sin(2 * np.pi * 988 * t),
+                    np.sin(2 * np.pi * 1319 * (t - 0.2)),
+                )
+                * 0.5
+            )
             fade_n = int(sr * 0.03)
             env = np.ones(n)
             env[:fade_n] = np.linspace(0, 1, fade_n)
@@ -2502,10 +2528,7 @@ class CameraSession:
         if not ot:
             return
         while not self._stopped.is_set():
-            if (
-                ot.queue_seconds() < 0.1
-                and time.time() >= self._speaking_until - 1.6
-            ):
+            if ot.queue_seconds() < 0.1 and time.time() >= self._speaking_until - 1.6:
                 return
             await asyncio.sleep(0.2)
 

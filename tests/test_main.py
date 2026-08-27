@@ -4,7 +4,6 @@ import os
 import json
 import time
 import numpy as np
-import struct
 import aiohttp
 from unittest.mock import patch, MagicMock, mock_open, AsyncMock
 

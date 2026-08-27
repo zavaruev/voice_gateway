@@ -690,3 +690,16 @@ async def test_create_tracked_task():
     # Verify task was removed
     assert result == "done"
     assert task not in state["tasks"]
+
+@pytest.mark.asyncio
+async def test_voice_ws_auth_bypass():
+    with patch("main.NANOBOT_TOKEN", ""):
+        from fastapi.testclient import TestClient
+        from main import app
+
+        # Test client requires auth overrides for the regular API but WS should hit voice_ws
+        client = TestClient(app)
+
+        with pytest.raises(Exception):
+            with client.websocket_connect("/?token=") as websocket:
+                pass

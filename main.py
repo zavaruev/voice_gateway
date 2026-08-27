@@ -1665,7 +1665,7 @@ async def voice_ws(device_ws: WebSocket):
         if auth_header.startswith("Bearer "):
             token = auth_header[7:]
 
-    if token != NANOBOT_TOKEN:
+    if not token or not NANOBOT_TOKEN or not isinstance(token, str) or not secrets.compare_digest(token, NANOBOT_TOKEN):
         await device_ws.close(code=1008, reason="Unauthorized")
         return
 

@@ -1112,12 +1112,7 @@ class NanobotResponseHandler:
             self.timer = None
             create_tracked_task(self.flush(), self.state)
 
-    async def flush(self):
-        if self.is_flushing or not "".join(self.buffer).strip():
-            return
-        self.is_flushing = True
-        self.state["status"] = "SPEAKING"
-
+    def _process_buffer(self) -> str | None:
         text = "".join(self.buffer)
         self.buffer = []
 
@@ -1127,8 +1122,7 @@ class NanobotResponseHandler:
             self.timer = asyncio.get_event_loop().call_later(
                 0.5, lambda: create_tracked_task(self.flush(), self.state)
             )
-            self.is_flushing = False
-            return
+            return None
 
         # Flush only up to the last complete sentence; any trailing partial
         # text stays in the buffer so phrases are not cut mid-thought and
@@ -1142,59 +1136,17 @@ class NanobotResponseHandler:
                 text = text[: last_match.end()]
                 self.buffer = [trailing] + self.buffer
 
-        emotions = self.emotion_regex.findall(text)
-        for emotion in emotions:
-            create_tracked_task(
-                trigger_emotion(emotion, self.device_ws, self.state["sid"]), self.state
-            )
+        return text
 
-        clean_text = self.emotion_regex.sub("", text).strip()
+    async def _handle_disconnect(self, clean_text: str) -> bool:
+        if "[disconnect]" not in clean_text:
+            return False
 
-        # [disconnect] command — user said "disconnect", Nanobot confirmed
-        if "[disconnect]" in clean_text:
-            clean_text = clean_text.replace("[disconnect]", "").strip()
-            if clean_text:
-                logger.info(
-                    f"📝 [TTS Input] Sending to TTS: '{clean_text[:100]}...' (len={len(clean_text)})"
-                )
-                try:
-                    await self.device_ws.send_json(
-                        {
-                            "type": "tts",
-                            "state": "sentence_start",
-                            "text": clean_text,
-                            "session_id": self.state["sid"],
-                        }
-                    )
-                except Exception:
-                    pass
-                mp3_data = await synthesize_tts_mp3(clean_text, self.state)
-                if mp3_data is not None:
-                    await stream_tts_pcm(
-                        mp3_data, self.device_ws, self.state["sid"], self.state
-                    )
-            # Close session — user explicitly requested disconnect
-            logger.info("🔌 [Disconnect] User requested disconnect — closing session")
-            try:
-                await self.device_ws.close()
-            except Exception:
-                pass
-            self.is_flushing = False
-            return
-
+        clean_text = clean_text.replace("[disconnect]", "").strip()
         if clean_text:
-            t_flush = time.time()
-            t_since_first = t_flush - (self._first_chunk_time or t_flush)
-            t_since_last = t_flush - (self._last_chunk_time or t_flush)
             logger.info(
                 f"📝 [TTS Input] Sending to TTS: '{clean_text[:100]}...' (len={len(clean_text)})"
             )
-            logger.info(
-                f"⏱ [Timing] Flush→TTS: +{t_since_first:.1f}s after first chunk, "
-                f"+{t_since_last:.1f}s after last chunk, "
-                f"{self._chunk_count} chunks"
-            )
-            self.full_response_text.append(clean_text + " ")
             try:
                 await self.device_ws.send_json(
                     {
@@ -1206,24 +1158,55 @@ class NanobotResponseHandler:
                 )
             except Exception:
                 pass
+            mp3_data = await synthesize_tts_mp3(clean_text, self.state)
+            if mp3_data is not None:
+                await stream_tts_pcm(
+                    mp3_data, self.device_ws, self.state["sid"], self.state
+                )
+        # Close session — user explicitly requested disconnect
+        logger.info("🔌 [Disconnect] User requested disconnect — closing session")
+        try:
+            await self.device_ws.close()
+        except Exception:
+            pass
+        return True
 
-            # Pipeline TTS: synthesize in background while the previous
-            # segment is still playing, so phrases flow without gaps.
-            self._ensure_tts_player()
-            task = create_tracked_task(self._enqueue_tts(clean_text), self.state)
-            self._synth_tasks.add(task)
-            task.add_done_callback(self._synth_tasks.discard)
-
-        # End of flush: if the LLM is still streaming, flush the remaining
-        # content shortly after; only finalize (dialogue mode check, return
-        # to standby) once the whole response has been produced.
-        self.is_flushing = False
-        if "".join(self.buffer).strip():
-            self.timer = asyncio.get_event_loop().call_later(
-                0.15, lambda: create_tracked_task(self.flush(), self.state)
-            )
+    async def _handle_tts(self, clean_text: str):
+        if not clean_text:
             return
 
+        t_flush = time.time()
+        t_since_first = t_flush - (self._first_chunk_time or t_flush)
+        t_since_last = t_flush - (self._last_chunk_time or t_flush)
+        logger.info(
+            f"📝 [TTS Input] Sending to TTS: '{clean_text[:100]}...' (len={len(clean_text)})"
+        )
+        logger.info(
+            f"⏱ [Timing] Flush→TTS: +{t_since_first:.1f}s after first chunk, "
+            f"+{t_since_last:.1f}s after last chunk, "
+            f"{self._chunk_count} chunks"
+        )
+        self.full_response_text.append(clean_text + " ")
+        try:
+            await self.device_ws.send_json(
+                {
+                    "type": "tts",
+                    "state": "sentence_start",
+                    "text": clean_text,
+                    "session_id": self.state["sid"],
+                }
+            )
+        except Exception:
+            pass
+
+        # Pipeline TTS: synthesize in background while the previous
+        # segment is still playing, so phrases flow without gaps.
+        self._ensure_tts_player()
+        task = create_tracked_task(self._enqueue_tts(clean_text), self.state)
+        self._synth_tasks.add(task)
+        task.add_done_callback(self._synth_tasks.discard)
+
+    async def _finalize_response(self):
         await self._await_tts_drained()
 
         clean_for_check = "".join(self.full_response_text).strip().lower()
@@ -1262,6 +1245,43 @@ class NanobotResponseHandler:
         self.state["last_activity"] = time.time()
         self.state["vad"].reset()
         self.full_response_text = []
+
+    async def flush(self):
+        if self.is_flushing or not "".join(self.buffer).strip():
+            return
+        self.is_flushing = True
+        self.state["status"] = "SPEAKING"
+
+        text = self._process_buffer()
+        if text is None:
+            self.is_flushing = False
+            return
+
+        emotions = self.emotion_regex.findall(text)
+        for emotion in emotions:
+            create_tracked_task(
+                trigger_emotion(emotion, self.device_ws, self.state["sid"]), self.state
+            )
+
+        clean_text = self.emotion_regex.sub("", text).strip()
+
+        if await self._handle_disconnect(clean_text):
+            self.is_flushing = False
+            return
+
+        await self._handle_tts(clean_text)
+
+        # End of flush: if the LLM is still streaming, flush the remaining
+        # content shortly after; only finalize (dialogue mode check, return
+        # to standby) once the whole response has been produced.
+        self.is_flushing = False
+        if "".join(self.buffer).strip():
+            self.timer = asyncio.get_event_loop().call_later(
+                0.15, lambda: create_tracked_task(self.flush(), self.state)
+            )
+            return
+
+        await self._finalize_response()
 
 
 # ==========================================

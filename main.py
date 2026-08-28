@@ -81,18 +81,7 @@ import camera_client
 from camera_client import CameraSession, CameraConfig
 
 # ==========================================
-# CONFIGURATION & ENVIRONMENT VARIABLES
-LLM_BACKEND = os.getenv("LLM_BACKEND", "nanobot").lower()
-HERMES_API_URL = os.getenv("HERMES_API_URL", "http://192.168.22.102:8000")
-HERMES_API_KEY = os.getenv("HERMES_API_KEY", "")
-# ==========================================
-import backends
-LLM_BACKEND = os.getenv("LLM_BACKEND", "nanobot").lower()
-HERMES_API_URL = os.getenv("HERMES_API_URL", "http://192.168.22.102:8000")
-HERMES_API_KEY = os.getenv("HERMES_API_KEY", "")
-LLM_BACKEND = os.getenv("LLM_BACKEND", "nanobot").lower()
-HERMES_API_URL = os.getenv("HERMES_API_URL", "http://192.168.22.102:8000")
-HERMES_API_KEY = os.getenv("HERMES_API_KEY", "")
+# CONFIGURATION & ENVIRONMENT VARIABLES (continued)
 NANOBOT_WS_URL = os.getenv("NANOBOT_WS_URL", "ws://nanobot:8765/").rstrip("/")
 NANOBOT_TOKEN = os.getenv("NANOBOT_TOKEN", "")
 NANOBOT_SESSION_SALT = os.getenv("NANOBOT_SESSION_SALT", "")

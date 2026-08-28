@@ -115,41 +115,82 @@ class HermesBackend(BaseLLMBackend):
         self.url = url.rstrip("/")
         self.api_key = api_key
 
+    @staticmethod
+    def _speakable(s: str) -> str:
+        s = re.sub(r"\[[a-z]{2,30}\]", "", s)
+        return re.sub(r"\s+", " ", s).strip()
+
     async def generate_response(self, text: str, session_id: str, stream_name: str, response_queue: asyncio.Queue):
         try:
+            headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+            headers["Accept"] = "text/event-stream"
+            # Hermes API Server: OpenAI-compatible /v1/chat/completions (streaming)
+            payload = {
+                "model": "omniroute/oc/hy3-free",
+                "messages": [{"role": "user", "content": text}],
+                "stream": True,
+            }
             async with aiohttp.ClientSession() as session:
-                # Using the API server endpoint. 
-                # If streaming is not available, we'll fetch the whole response and split by sentences.
-                payload = {
-                    "message": text,
-                    "session_id": session_id,
-                    "user_name": stream_name
-                }
-                headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
-                
-                # Hermes API Server: OpenAI-compatible /v1/chat/completions
-                payload = {
-                    "model": "omniroute/oc/hy3-free",
-                    "messages": [{"role": "user", "content": text}],
-                    "stream": False,
-                }
-                async with session.post(f"{self.url}/v1/chat/completions", json=payload, headers=headers) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        try:
-                            reply = data["choices"][0]["message"]["content"]
-                        except (KeyError, IndexError, TypeError):
-                            reply = ""
-                        if reply:
-                            # Split into sentences to maintain the flow for TTS
-                            sentences = re.split(r"(?<=[.!?…])\s+", reply)
-                            for s in sentences:
-                                if s.strip():
-                                    response_queue.put_nowait(s.strip())
-                        await response_queue.put(None)
-                    else:
+                async with session.post(
+                    f"{self.url}/v1/chat/completions", json=payload, headers=headers
+                ) as resp:
+                    if resp.status != 200:
                         logger.error(f"Hermes API error: {resp.status}")
                         await response_queue.put(None)
+                        return
+
+                    buf = ""
+                    holder = ""
+
+                    def flush(final: bool) -> None:
+                        nonlocal buf, holder
+                        m = re.search(r"\[thinking\]", buf)
+                        if m and not re.search(r"\[/thinking\]", buf[m.start():]):
+                            part, holder = (buf[:m.start()], buf[m.start():]) if not final else (buf, "")
+                        else:
+                            idx = buf.rfind("[")
+                            if idx != -1 and not re.search(r"\]", buf[idx:]):
+                                part, holder = buf[:idx], buf[idx:]
+                            else:
+                                part, holder = buf, ""
+                        while True:
+                            mm = re.search(r"\[thinking\](.*?)\[/thinking\]", part, flags=re.S)
+                            if not mm:
+                                break
+                            part = part[:mm.start()] + part[mm.end():]
+                        mm = re.search(r"^(.*[.!?…])([^.!?…]*)$", part, flags=re.S)
+                        if mm:
+                            done = [mm.group(1)] if mm.group(1).strip() else []
+                            tail = mm.group(2)
+                        else:
+                            done, tail = [], part
+                        if final and tail.strip():
+                            done.append(tail)
+                            tail = ""
+                        for s in done:
+                            s2 = HermesBackend._speakable(s)
+                            if s2:
+                                response_queue.put_nowait(s2)
+                        buf = (tail + " " + holder).strip()
+
+                    async for raw in resp.content:
+                        line = raw.decode("utf-8", errors="replace").strip()
+                        if not line or not line.startswith("data:"):
+                            continue
+                        data = line[len("data:"):].strip()
+                        if data == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(data)
+                            delta = chunk["choices"][0]["delta"].get("content", "")
+                        except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+                            continue
+                        if delta:
+                            buf += delta
+                            if re.search(r"[.!?…](\s|$)", buf) or "\n" in buf or len(buf) > 400:
+                                flush(final=False)
+                    flush(final=True)
+                    await response_queue.put(None)
         except Exception as e:
             logger.error(f"Hermes error: {e}")
             await response_queue.put(None)

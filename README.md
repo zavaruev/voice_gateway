@@ -1,6 +1,8 @@
 # Voice Gateway
 
-WebSocket gateway bridging [Xiaozhi ESP32](https://github.com/78/xiaozhi-esp32) smart speakers **and WebRTC/IP cameras** to the [Nanobot](https://github.com/HKUDS/nanobot) AI agent with real-time speech processing.
+> **Version 2.8** — pluggable LLM backend: added **Hermes** (OpenAI-compatible) alongside Nanobot. See *LLM Backend* below.
+
+WebSocket gateway bridging [Xiaozhi ESP32](https://github.com/78/xiaozhi-esp32) smart speakers **and WebRTC/IP cameras** to an AI agent (**[Nanobot](https://github.com/HKUDS/nanobot)** or **Hermes**) with real-time speech processing.
 
 ```
 ESP32 (Opus WS)  ──┐
@@ -22,8 +24,8 @@ Camera (RTSP/L16) ─┘          │                        │
 3. **openWakeWord** listens for the wake word «компьютер» (custom-trained model) on camera streams
 4. **Whisper STT** transcribes audio to text (Russian, retries at temperature 0.0/0.5)
 5. **Speaker ID** identifies the speaker (parallel with STT)
-6. **Nanobot** processes text, returns response with optional emotions `[emotion_name]`
-7. **Edge TTS** synthesizes speech; Opus streamed to ESP32, PCM queued to camera speakers
+ 6. **LLM backend** (Nanobot *or* Hermes) processes text, returns response with optional emotions `[emotion_name]`
+ 7. **Edge TTS** synthesizes speech; Opus streamed to ESP32, PCM queued to camera speakers
 
 ## Features
 
@@ -42,6 +44,7 @@ Camera (RTSP/L16) ─┘          │                        │
 - **Activity monitor** — dims screen to 25% after 30 s idle, closes abandoned sessions after 45 s in LISTENING
 - **OTA** — ESP32 firmware handshake returning WS URL + firmware info
 - **Emotions** — extracted from Nanobot text via `[emotion_name]` regex
+- **Pluggable LLM backend** — switch the AI brain between **Nanobot** (`nanobot`, WebSocket, streaming) and **Hermes** (`hermes`, OpenAI-compatible `/v1/chat/completions`) with a single env var. Both paths feed the same VAD → STT → TTS pipeline; Hermes replies are sentence-split and streamed through the prefetch TTS player exactly like Nanobot delta text.
 
 ## Quick Start
 
@@ -57,6 +60,22 @@ docker run -p 18792:18792 \
 
 ESP32 connects to `ws://gateway:18792/` with header `device-id: <MAC>`.
 
+### Using Hermes instead of Nanobot
+
+Set `LLM_BACKEND=hermes` and point `HERMES_API_URL` at the Hermes API server (OpenAI-compatible). The gateway posts to `${HERMES_API_URL}/v1/chat/completions` and streams the reply through the same TTS pipeline:
+
+```sh
+docker run -p 18792:18792 \
+  -e LLM_BACKEND=hermes \
+  -e HERMES_API_URL=http://hermes:8000 \
+  -e HERMES_API_KEY=your-key \
+  -e WHISPER_URL=http://whisper:8000/v1/audio/transcriptions \
+  -e TTS_URL=http://edge_tts:5050/v1/audio/speech \
+  voice_gateway
+```
+
+The model is fixed in `backends.py` (`HermesBackend` → `model: "omniroute/oc/hy3-free"`); adjust there if your Hermes deployment exposes a different model id.
+
 ### Cameras
 
 Set `CAMERA_STREAMS` to a comma-separated list of stream names registered in go2rtc. The gateway pulls each stream's audio from `rtsp://<GO2RTC_HOST>:8554/<name>?audio=copy` and writes replies back to the camera's WebRTC audio track.
@@ -67,6 +86,9 @@ Set `CAMERA_STREAMS` to a comma-separated list of stream names registered in go2
 |---|---|---|
 | `NANOBOT_WS_URL` | `ws://nanobot:8765/` | Nanobot AI agent WebSocket URL |
 | `NANOBOT_TOKEN` | `token` | Token appended to Nanobot WS URL |
+| `LLM_BACKEND` | `nanobot` | AI brain: `nanobot` (default) or `hermes` |
+| `HERMES_API_URL` | `http://192.168.22.102:8000` | Hermes OpenAI-compatible base URL (used when `LLM_BACKEND=hermes`) |
+| `HERMES_API_KEY` | `""` | Bearer token sent to Hermes if set |
 | `WHISPER_URL` | `http://192.168.22.111:8000/v1/audio/transcriptions` | OpenAI-compatible STT endpoint |
 | `TTS_URL` | `http://edge_tts:5050/v1/audio/speech` | OpenAI-compatible TTS endpoint |
 | `TTS_VOICE` | `ru-RU-SvetlanaNeural` | TTS voice identifier |
@@ -126,6 +148,15 @@ After a fire: attention pip, VAD state reset, Whisper listens until the command 
 ### TTS Pipeline
 Nanobot text → sentence splitter → **prefetch pipeline** (sentence N+1 is synthesised while N plays, hiding Edge-TTS latency) → Edge TTS (MP3) → decode → resample (16/24 kHz) → Opus for ESP32 / PCM for cameras → paced 60 ms chunks. Every played clip is registered in the echo-reference ring and extends wake suppression past the delayed-echo window.
 
+### LLM Backend (Nanobot / Hermes)
+
+The AI brain is selected by `LLM_BACKEND` and implemented as a `BaseLLMBackend` (`backends.py`):
+
+- **`NanobotBackend`** (default) — opens a WebSocket to `NANOBOT_WS_URL?token=…&chat_id=…`, streams `text` deltas, handles `[thinking]` blocks, and pushes sentence-split replies into the response queue.
+- **`HermesBackend`** — posts the user message to `${HERMES_API_URL}/v1/chat/completions` (non-streaming, `stream: false`), splits the returned `choices[].message.content` into sentences on `. ! ? …`, and pushes each into the response queue.
+
+Both backends expose the same `generate_response(text, session_id, stream_name, response_queue)` contract. The ESP32 path dispatches via `_dispatch_hermes`/`_hermes_player_task`; camera sessions receive the backend instance at construction and call `_call_backend` → `_nanobot_player_task` (the player is backend-agnostic). Either way replies reach the prefetch TTS player, so sentence-level latency hiding works identically for both brains.
+
 ### Dialogue Mode
 - AI response contains `?` (or Russian question patterns) → mic stays open
 - AI response is a statement → returns to standby
@@ -181,4 +212,8 @@ Covers engine wake scoring/gates, camera arbitration helpers, OTA auth, and RMS 
 - Silero VAD ONNX model (downloaded at build time)
 - openWakeWord + custom `computer.onnx` / `embedding_model.onnx` (baked into the image)
 - SpeexDSP noise suppression (`speexdsp-ns`)
-- External services: Whisper STT, Nanobot, Edge TTS, Speaker ID, go2rtc (for cameras)
+- External services: Whisper STT, Nanobot (or Hermes), Edge TTS, Speaker ID, go2rtc (for cameras)
+
+## Changelog
+
+- **2.8** — Pluggable LLM backend. Added `backends.py` with `BaseLLMBackend`, `NanobotBackend` (moved out of `main.py`/`camera_client.py`), and `HermesBackend` (OpenAI-compatible `/v1/chat/completions`). Select via `LLM_BACKEND` (`nanobot` | `hermes`); Hermes configured with `HERMES_API_URL` / `HERMES_API_KEY`. Same VAD→STT→TTS pipeline, emotion tags, watchdog and echo guards apply to both backends.

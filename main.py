@@ -34,14 +34,78 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 import camera_client
 from camera_client import CameraSession, CameraConfig
+import backends
 
 # ==========================================
 # CONFIGURATION & ENVIRONMENT VARIABLES
+LLM_BACKEND = os.getenv("LLM_BACKEND", "nanobot").lower()
+HERMES_API_URL = os.getenv("HERMES_API_URL", "http://192.168.22.102:8000")
+HERMES_API_KEY = os.getenv("HERMES_API_KEY", "")
 # ==========================================
+
+import asyncio
+import json
+import os
+import time
+import uuid
+import re
+import io
+import hashlib
+import aiohttp
+import secrets
+import numpy as np
+import onnxruntime as ort
+import opuslib
+from pydub import AudioSegment
+from loguru import logger
+from dataclasses import dataclass
+from fastapi import (
+    FastAPI,
+    Request,
+    Form,
+    WebSocket,
+    HTTPException,
+    UploadFile,
+    File,
+    Depends,
+)
+from fastapi.responses import HTMLResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+import limits
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+import camera_client
+from camera_client import CameraSession, CameraConfig
+
+# ==========================================
+# CONFIGURATION & ENVIRONMENT VARIABLES
+LLM_BACKEND = os.getenv("LLM_BACKEND", "nanobot").lower()
+HERMES_API_URL = os.getenv("HERMES_API_URL", "http://192.168.22.102:8000")
+HERMES_API_KEY = os.getenv("HERMES_API_KEY", "")
+# ==========================================
+import backends
+LLM_BACKEND = os.getenv("LLM_BACKEND", "nanobot").lower()
+HERMES_API_URL = os.getenv("HERMES_API_URL", "http://192.168.22.102:8000")
+HERMES_API_KEY = os.getenv("HERMES_API_KEY", "")
+LLM_BACKEND = os.getenv("LLM_BACKEND", "nanobot").lower()
+HERMES_API_URL = os.getenv("HERMES_API_URL", "http://192.168.22.102:8000")
+HERMES_API_KEY = os.getenv("HERMES_API_KEY", "")
 NANOBOT_WS_URL = os.getenv("NANOBOT_WS_URL", "ws://nanobot:8765/").rstrip("/")
 NANOBOT_TOKEN = os.getenv("NANOBOT_TOKEN", "")
 NANOBOT_SESSION_SALT = os.getenv("NANOBOT_SESSION_SALT", "")
 SPEAKER_ID_URL = os.getenv("SPEAKER_ID_URL", "http://192.168.22.102:8001/identify")
+
+# Global LLM backend (set at import; HermesBackend or NanobotBackend)
+llm_backend = None
+if LLM_BACKEND == "hermes":
+    llm_backend = backends.HermesBackend(HERMES_API_URL, HERMES_API_KEY)
+    logger.info(f"🧠 Global LLM backend: Hermes @ {HERMES_API_URL}")
+else:
+    llm_backend = backends.NanobotBackend(NANOBOT_WS_URL, NANOBOT_TOKEN, NANOBOT_SESSION_SALT)
+    logger.info(f"🤖 Global LLM backend: Nanobot @ {NANOBOT_WS_URL}")
 
 WHISPER_URL = os.getenv(
     "WHISPER_URL", "http://192.168.22.111:8000/v1/audio/transcriptions"
@@ -813,61 +877,121 @@ async def _handle_successful_transcription(
     except Exception:
         return
 
-    nano_ws = state.get("nano_ws")
-    if nano_ws and not nano_ws.closed:
-        chat_id = state.get("nanobot_chat_id")
-        if not chat_id:
+    # --- LLM dispatch: Hermes backend or legacy Nanobot ---
+    if LLM_BACKEND == "hermes" and llm_backend is not None:
+        await _dispatch_hermes(txt, uid, state, device_ws, _t0, _t_stt)
+    else:
+        nano_ws = state.get("nano_ws")
+        if nano_ws and not nano_ws.closed:
+            chat_id = state.get("nanobot_chat_id")
+            if not chat_id:
+                logger.warning(
+                    "⚠️ [Pipeline] Nanobot connected but no chat_id yet, waiting..."
+                )
+                state["status"] = "SPEAKING"
+                await generate_and_stream_tts(
+                    "Система не готова, повторите.", device_ws, state["sid"], state
+                )
+                await reset_to_standby(device_ws, state)
+                return
+
+            speaker_name = SPEAKER_NAME_MAP.get(uid, uid)
+            payload = {
+                "type": "message",
+                "chat_id": chat_id,
+                "content": txt,
+                "user_id": uid,
+                "user_name": speaker_name,
+                "voice_reply": True,
+            }
+            if state.get("handler"):
+                state["handler"].reset_timing()
+            await nano_ws.send_json(payload)
+            _t_nano = time.time()
+            logger.info(
+                f"⏱ [Timing] Sent to Nanobot: {_t_nano-_t_stt:.2f}s after STT | "
+                f"total={_t_nano-_t0:.2f}s since VAD trigger"
+            )
+
+            try:
+                await device_ws.send_json(
+                    {"type": "tts", "state": "start", "session_id": state["sid"]}
+                )
+            except Exception:
+                return
+            state["status"] = "SPEAKING"
+            state["tts_started"] = True
+            state["watchdog_fired"] = False
+
+            if state.get("watchdog"):
+                state["watchdog"].cancel()
+            state["watchdog"] = asyncio.get_event_loop().call_later(
+                WATCHDOG_TIMEOUT,
+                lambda: create_tracked_task(watchdog_timeout(device_ws, state), state),
+            )
+        else:
             logger.warning(
-                "⚠️ [Pipeline] Nanobot connected but no chat_id yet, waiting..."
+                f"⚠️ [Pipeline] Nanobot not connected, falling back to direct TTS"
             )
             state["status"] = "SPEAKING"
-            await generate_and_stream_tts(
-                "Система не готова, повторите.", device_ws, state["sid"], state
-            )
+            await generate_and_stream_tts(txt, device_ws, state["sid"], state)
             await reset_to_standby(device_ws, state)
-            return
 
-        speaker_name = SPEAKER_NAME_MAP.get(uid, uid)
-        payload = {
-            "type": "message",
-            "chat_id": chat_id,
-            "content": txt,
-            "user_id": uid,
-            "user_name": speaker_name,
-            "voice_reply": True,
-        }
-        if state.get("handler"):
-            state["handler"].reset_timing()
-        await nano_ws.send_json(payload)
-        _t_nano = time.time()
-        logger.info(
-            f"⏱ [Timing] Sent to Nanobot: {_t_nano-_t_stt:.2f}s after STT | "
-            f"total={_t_nano-_t0:.2f}s since VAD trigger"
+
+
+
+async def _dispatch_hermes(txt, uid, state, device_ws, _t0, _t_stt):
+    """Send transcribed text to HermesBackend and stream the reply to TTS."""
+    chat_id = state.get("nanobot_chat_id") or make_chat_id(state["mac"])
+    speaker_name = SPEAKER_NAME_MAP.get(uid, uid)
+    try:
+        await device_ws.send_json(
+            {"type": "tts", "state": "start", "session_id": state["sid"]}
         )
+    except Exception:
+        pass
+    state["status"] = "SPEAKING"
+    state["tts_started"] = True
+    state["watchdog_fired"] = False
+    if state.get("watchdog"):
+        state["watchdog"].cancel()
+    state["watchdog"] = asyncio.get_event_loop().call_later(
+        WATCHDOG_TIMEOUT,
+        lambda: create_tracked_task(watchdog_timeout(device_ws, state), state),
+    )
 
+    q: asyncio.Queue = asyncio.Queue()
+    player_task = asyncio.create_task(_hermes_player_task(q, device_ws, state))
+    try:
+        await llm_backend.generate_response(
+            text=txt,
+            session_id=chat_id,
+            stream_name=state.get("mac", "device"),
+            response_queue=q,
+        )
+    finally:
         try:
-            await device_ws.send_json(
-                {"type": "tts", "state": "start", "session_id": state["sid"]}
-            )
-        except Exception:
-            return
-        state["status"] = "SPEAKING"
-        state["tts_started"] = True
-        state["watchdog_fired"] = False
+            await asyncio.wait_for(player_task, timeout=120.0)
+        except asyncio.TimeoutError:
+            player_task.cancel()
+    _t_done = time.time()
+    logger.info(
+        f"⏱ [Timing] Hermes reply done: {_t_done-_t_stt:.2f}s after STT | "
+        f"total={_t_done-_t0:.2f}s since VAD trigger"
+    )
+    await reset_to_standby(device_ws, state)
 
-        if state.get("watchdog"):
-            state["watchdog"].cancel()
-        state["watchdog"] = asyncio.get_event_loop().call_later(
-            WATCHDOG_TIMEOUT,
-            lambda: create_tracked_task(watchdog_timeout(device_ws, state), state),
-        )
-    else:
-        logger.warning(
-            f"⚠️ [Pipeline] Nanobot not connected, falling back to direct TTS"
-        )
-        state["status"] = "SPEAKING"
-        await generate_and_stream_tts(txt, device_ws, state["sid"], state)
-        await reset_to_standby(device_ws, state)
+
+async def _hermes_player_task(q: asyncio.Queue, device_ws, state):
+    """Read pre-split sentences from HermesBackend queue and stream to TTS."""
+    while True:
+        item = await q.get()
+        if item is None:
+            break
+        try:
+            await generate_and_stream_tts(item, device_ws, state["sid"], state)
+        except Exception as e:
+            logger.error(f"❌ [Hermes] TTS player error: {e}")
 
 
 async def _handle_rejected_transcription(
@@ -2234,13 +2358,19 @@ async def start_camera_sessions():
                 vad=VadEngine(
                     energy_fallback=True,
                     energy_threshold=0.005,
-                    onnx_threshold=0.02,
                     rms_noise_floor=0.005,
                     rms_alpha=0.0,
                     onnx_gain=8.0,
                 ),
             )
-            session = CameraSession(config=config)
+            # Выбор LLM-бэкенда
+            if LLM_BACKEND == 'hermes':
+                llm_backend = backends.HermesBackend(HERMES_API_URL, HERMES_API_KEY)
+                logger.info('Using Hermes backend at ' + HERMES_API_URL)
+            else:
+                llm_backend = backends.NanobotBackend(NANOBOT_WS_URL, NANOBOT_TOKEN, NANOBOT_SESSION_SALT)
+                logger.info('Using Nanobot backend at ' + NANOBOT_WS_URL)
+            session = CameraSession(config=config, backend=llm_backend)
             _camera_sessions.append(session)
             await session.start()
             logger.info(f"📷 Camera session started: {name}")

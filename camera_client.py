@@ -392,10 +392,13 @@ class CameraConfig:
 
 class CameraSession:
 
-    def __init__(self, config: CameraConfig):
+    def __init__(self, config: CameraConfig, backend=None):
         if not re.match(r"^[a-zA-Z0-9_-]+$", config.stream_name):
             raise ValueError(f"Invalid stream_name: {config.stream_name}")
         self.stream_name = config.stream_name
+
+        # LLM backend (BaseLLMBackend from backends.py). None => legacy Nanobot path.
+        self.backend = None
         self.go2rtc_host = config.go2rtc_host
         self.go2rtc_port = config.go2rtc_port
         self.chat_id = config.chat_id or self._make_chat_id(config.stream_name)
@@ -2098,8 +2101,43 @@ class CameraSession:
             logger.error(f"[{self.stream_name}] Error handling command: {e}")
             self._processor.set_state(AgentState.LISTENING)
 
+    async def _call_backend(self, txt: str, uid: str = "camera"):
+        """Universal path: stream LLM reply from self.backend into the speaker
+        queue via the same player task used by the Nanobot path."""
+        if not txt:
+            return
+        self._wake_cmd_sent = True
+        _ARB_STATE["cmd_sent"] = time.time()
+        base_thresh = 0.40 if self.stream_name == "kitchen" else 0.30
+        if self._ww_thresh > base_thresh:
+            self._ww_thresh = base_thresh
+        if time.time() < GLOBAL_TTS_UNTIL:
+            logger.info(f"[{self.stream_name}] Ignoring '{txt[:40]}' — TTS playback active (echo guard)")
+            return
+        try:
+            q: asyncio.Queue = asyncio.Queue()
+            player_task = asyncio.create_task(self._nanobot_player_task(q))
+            try:
+                await self.backend.generate_response(
+                    text=txt,
+                    session_id=self.chat_id,
+                    stream_name=self.stream_name,
+                    response_queue=q,
+                )
+            finally:
+                try:
+                    await asyncio.wait_for(player_task, timeout=120.0)
+                except asyncio.TimeoutError:
+                    player_task.cancel()
+        except Exception as e:
+            logger.warning(f"[{self.stream_name}] Backend error: {e}")
+
     async def _call_nanobot(self, txt: str, uid: str = "camera"):
         if not txt:
+            return
+        # Backend dispatch: Hermes (or any BaseLLMBackend) instead of Nanobot
+        if self.backend is not None:
+            await self._call_backend(txt, uid)
             return
         self._wake_cmd_sent = True
         _ARB_STATE["cmd_sent"] = time.time()

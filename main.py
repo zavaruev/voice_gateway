@@ -1475,6 +1475,11 @@ class NanobotResponseHandler:
 # ==========================================
 # WEB UI
 # ==========================================
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
 @app.get("/", response_class=HTMLResponse)
 async def web_index(req: Request, username: str = Depends(verify_auth)):
     return templates.TemplateResponse(req, "index.html")

@@ -124,6 +124,7 @@ Do **not** start the container manually with `docker run` on the default bridge 
 | Path | Method | Description |
 |---|---|---|
 | `/` | GET | Web UI dashboard (devices + sessions) |
+| `/health` | GET | Liveness probe, no auth: `{"status":"ok"}` |
 | `/` | WebSocket | Main device gateway (`?token=` required) |
 | `/api/devices` | GET | Active WebSocket sessions |
 | `/api/devices/config` | GET/POST | Registered device list / register |

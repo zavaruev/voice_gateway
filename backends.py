@@ -124,6 +124,9 @@ class HermesBackend(BaseLLMBackend):
         try:
             headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
             headers["Accept"] = "text/event-stream"
+            headers["X-Source"] = "voice_gateway"
+            headers["X-Device-MAC"] = session_id
+            headers["X-Stream-Name"] = stream_name
             # Hermes API Server: OpenAI-compatible /v1/chat/completions (streaming)
             payload = {
                 "model": "omniroute/oc/hy3-free",

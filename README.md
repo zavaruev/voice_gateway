@@ -1,6 +1,6 @@
 # Voice Gateway
 
-> **Version 2.8** — pluggable LLM backend: added **Hermes** (OpenAI-compatible) alongside Nanobot. See *LLM Backend* below.
+> **Version 2.24** — Hermes-mode hardening: no more reconnect loop to Nanobot when `LLM_BACKEND=hermes`, `DISABLE_CAMERAS` is now actually honored, Hermes requests carry device-identifying headers. See Changelog below.
 
 WebSocket gateway bridging [Xiaozhi ESP32](https://github.com/78/xiaozhi-esp32) smart speakers **and WebRTC/IP cameras** to an AI agent (**[Nanobot](https://github.com/HKUDS/nanobot)** or **Hermes**) with real-time speech processing.
 
@@ -39,11 +39,11 @@ Camera (RTSP/L16) ─┘          │                        │
 - **Distant-speech tuned** — corridor/lobby coverage: lowered RMS gates, SpeexDSP noise suppression with "NS rescue" (utterance salvaged from the noise floor), adaptive peak normalisation (up to 20x)
 - **Echo guards** — global `GLOBAL_TTS_UNTIL` gate (no STT while any TTS plays — kills ESP32↔camera echo cascade) + duration-proportional mic hold (0.3 s beep → ~0.6 s hold, 20 s TTS → capped 15 s)
 - **Dialogue mode** — mic stays open after questions (`?` anywhere in the reply, question words, imperative verbs); returns to standby after statements
-- **MCP hardware control** — camera/ESP32 tools (screen, volume, LEDs) forwarded to Nanobot as `tools_update`
+- **MCP hardware control** — ESP32/camera tools (screen, volume, LEDs) are requested via `tools/list`; in Nanobot mode device events are forwarded to Nanobot, in Hermes mode the tool list is kept for future use (Hermes chat requests currently carry no `tools` payload)
 - **Watchdog** — 30 s timeout → fallback TTS «Простите, я задумалась. Повторите пожалуйста.»
 - **Activity monitor** — dims screen to 25% after 30 s idle, closes abandoned sessions after 45 s in LISTENING
-- **OTA** — ESP32 firmware handshake returning WS URL + firmware info
-- **Emotions** — extracted from Nanobot text via `[emotion_name]` regex
+- **OTA** — ESP32 firmware handshake returning WS URL + `access_token` + firmware info
+- **Emotions** — extracted from LLM text via `[emotion_name]` regex (both backends strip them before TTS)
 - **Pluggable LLM backend** — switch the AI brain between **Nanobot** (`nanobot`, WebSocket, streaming) and **Hermes** (`hermes`, OpenAI-compatible `/v1/chat/completions`) with a single env var. Both paths feed the same VAD → STT → TTS pipeline; Hermes replies are sentence-split and streamed through the prefetch TTS player exactly like Nanobot delta text.
 
 ## Quick Start
@@ -58,7 +58,7 @@ docker run -p 18792:18792 \
   voice_gateway
 ```
 
-ESP32 connects to `ws://gateway:18792/` with header `device-id: <MAC>`.
+ESP32 connects to `ws://gateway:18792/?token=<NANOBOT_TOKEN>` with header `device-id: <MAC>`. The token is mandatory (unauthenticated sockets are closed); `/ota` returns both the WS URL and the current `access_token`.
 
 ### Using Hermes instead of Nanobot
 
@@ -78,7 +78,17 @@ The model is fixed in `backends.py` (`HermesBackend` → `model: "omniroute/oc/h
 
 ### Cameras
 
-Set `CAMERA_STREAMS` to a comma-separated list of stream names registered in go2rtc. The gateway pulls each stream's audio from `rtsp://<GO2RTC_HOST>:8554/<name>?audio=copy` and writes replies back to the camera's WebRTC audio track.
+Set `CAMERA_STREAMS` to a comma-separated list of stream names registered in go2rtc. The gateway pulls each stream's audio from `rtsp://<GO2RTC_HOST>:8554/<name>?audio=copy` and writes replies back to the camera's WebRTC audio track. Set `DISABLE_CAMERAS=true` to shut the whole camera subsystem off (no RTSP, no ffmpeg, no VAD/wake threads).
+
+### Production deployment (docker compose)
+
+Run via the compose project in `ai-prod` — it sets `network_mode: host`, all required env vars, and bind-mounts `main.py`, `backends.py`, `camera_client.py`, `engine.py`, `audio_utils.py` and `config/` into the container:
+
+```sh
+docker compose up -d --no-deps --build voice_gateway
+```
+
+Do **not** start the container manually with `docker run` on the default bridge network: the ESP32s reach the gateway at `<host>:18792` from the LAN, and an unpublished bridge container is unreachable (this exact misconfiguration caused a total ESP32 outage). `network_mode: host` also keeps `req.url.hostname` in `/ota` responses correct.
 
 ## Configuration
 
@@ -95,6 +105,7 @@ Set `CAMERA_STREAMS` to a comma-separated list of stream names registered in go2
 | `TTS_API_KEY` | `""` | Sends `Authorization: Bearer` if set |
 | `SPEAKER_ID_URL` | `http://192.168.22.102:8001/identify` | Speaker recognition ([speaker-id](https://github.com/zavaruev/speaker-id) container) |
 | `CAMERA_STREAMS` | `""` | Comma-separated go2rtc stream names to attach to |
+| `DISABLE_CAMERAS` | `""` | Set to `true`/`1`/`yes` to disable all camera sessions entirely (takes precedence over `CAMERA_STREAMS`) |
 | `GO2RTC_HOST` / `GO2RTC_PORT` | `192.168.22.102` / `1984` | go2rtc control host |
 | `VAD_SILENCE_FRAMES` | `8` | Silence frames before processing (~60 ms each) |
 | `WATCHDOG_TIMEOUT` | `30` | AI response timeout before fallback TTS |
@@ -113,7 +124,7 @@ Set `CAMERA_STREAMS` to a comma-separated list of stream names registered in go2
 | Path | Method | Description |
 |---|---|---|
 | `/` | GET | Web UI dashboard (devices + sessions) |
-| `/ws` | WebSocket | Main device gateway |
+| `/` | WebSocket | Main device gateway (`?token=` required) |
 | `/api/devices` | GET | Active WebSocket sessions |
 | `/api/devices/config` | GET/POST | Registered device list / register |
 | `/api/devices/config/{mac}` | PUT/DELETE | Update / remove device |
@@ -182,7 +193,7 @@ Create `config/devices.json` (auto-created as `{}` if missing):
 }
 ```
 
-Device identifies itself via `device-id` header (fallback: `mac` header), case-insensitive. Duplicate MACs with varying case exist in the DB.
+Device identifies itself via `device-id` header (fallback: `mac` header). MAC keys are normalized to upper case on lookup — keep a single entry per device.
 
 ## Known Issues & Current Problems
 
@@ -198,9 +209,13 @@ Device identifies itself via `device-id` header (fallback: `mac` header), case-i
 
 ## Tests
 
+Host Python usually lacks the runtime deps (`opuslib`, `onnxruntime`, …), and the image has no `pytest` — run the suite inside the running container:
+
 ```sh
-pip install pytest
-pytest tests/
+docker exec voice_gateway pip install -q pytest httpx pytest-asyncio
+docker cp tests voice_gateway:/tmp/vg_tests
+docker exec voice_gateway python3 -m pytest /tmp/vg_tests -q
+docker exec voice_gateway rm -rf /tmp/vg_tests
 ```
 
 Covers engine wake scoring/gates, camera arbitration helpers, OTA auth, and RMS utilities (~1,160 lines).
@@ -216,4 +231,9 @@ Covers engine wake scoring/gates, camera arbitration helpers, OTA auth, and RMS 
 
 ## Changelog
 
+- **2.24** — Hermes-mode hardening + camera kill-switch.
+  - The per-device Nanobot listener no longer starts when `LLM_BACKEND=hermes` (previously it retried `localhost:8765` every 10 s forever, spamming the log; the Hermes reply path never used that socket).
+  - `DISABLE_CAMERAS=true|1|yes` is now honored by `start_camera_sessions()` (previously the flag existed in compose but was ignored, so cameras ran anyway).
+  - `HermesBackend` sends `X-Source: voice_gateway`, `X-Device-MAC` and `X-Stream-Name` headers for per-device routing upstream.
+  - Removed the stale `(managed by nanobot in v0.3.0)` suffix from the MCP tools log line; deduped the MAC entry in `config/devices.json`.
 - **2.8** — Pluggable LLM backend. Added `backends.py` with `BaseLLMBackend`, `NanobotBackend` (moved out of `main.py`/`camera_client.py`), and `HermesBackend` (OpenAI-compatible `/v1/chat/completions`). Select via `LLM_BACKEND` (`nanobot` | `hermes`); Hermes configured with `HERMES_API_URL` / `HERMES_API_KEY`. Same VAD→STT→TTS pipeline, emotion tags, watchdog and echo guards apply to both backends.

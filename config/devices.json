@@ -1,9 +1,4 @@
 {
-    "44:1b:f6:cf:78:b8": {
-        "friendly_name": "",
-        "ws_url": "ws://192.168.22.102:18792/",
-        "allowed": true
-    },
     "44:1B:F6:CF:78:B8": {
         "friendly_name": "Device 78:B8",
         "ws_url": "ws://192.168.22.102:18792/",

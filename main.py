@@ -1657,7 +1657,7 @@ async def handle_ws_text_message(ctx: WSContext):
             tool_names = [t.get("name") for t in state["available_tools"]]
             logger.info(f"🛠 [MCP] ESP32 returned tools: {tool_names}")
             logger.info(
-                f"🛠 [MCP] Tools available: {len(state['available_tools'])} (managed by nanobot in v0.3.0)"
+                f"🛠 [MCP] Tools available: {len(state['available_tools'])}"
             )
             return nano_listener_task, True
 
@@ -1683,7 +1683,11 @@ async def handle_ws_text_message(ctx: WSContext):
     elif d.get("type") == "hello":
         state["version"] = d.get("version", 1)
         logger.info(f"🤝 [Device] Hello received (v{state['version']})")
-        if nano_listener_task is None:
+        # In Hermes mode the LLM reply path (_dispatch_hermes) never uses
+        # nano_ws, so don't open a pointless reconnect loop to Nanobot.
+        if nano_listener_task is None and not (
+            LLM_BACKEND == "hermes" and llm_backend is not None
+        ):
             nano_listener_task = create_tracked_task(
                 listen_to_nanobot_task(device_ws, state, nano_session), state
             )
@@ -2271,6 +2275,9 @@ _camera_sessions: list[CameraSession] = []
 
 async def start_camera_sessions():
     global _camera_sessions
+    if os.getenv("DISABLE_CAMERAS", "").lower() in ("1", "true", "yes"):
+        logger.info("📷 Cameras disabled via DISABLE_CAMERAS")
+        return
     raw = os.getenv("CAMERA_STREAMS", "")
     streams = [s.strip() for s in raw.split(",") if s.strip()]
     if not streams:

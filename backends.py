@@ -1,6 +1,7 @@
 import asyncio
 import json
 import re
+import time
 import logging
 import aiohttp
 from abc import ABC, abstractmethod
@@ -110,6 +111,48 @@ class NanobotBackend(BaseLLMBackend):
             logger.error(f"Nanobot error: {e}")
             await response_queue.put(None)
 
+
+# Chars that may start a new sentence (after ". " / "? " / "! ").
+# A period counts as a sentence boundary only before one of these —
+# this keeps abbreviations ("мм рт. ст.", "т.д.", "г.", "16.09")
+# from being torn into separate TTS utterances (audible stutter).
+_BOUNDARY_NEXT = frozenset(
+    "АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    "0123456789\"«'("
+)
+
+# Voice answers MUST start with an emotion tag ([happy]/[neutral]/...).
+# Anything before the first tag is internal monologue and must NEVER reach TTS.
+_EMOTION_TAG = re.compile(r"\[(happy|neutral|thinking|surprised|sad|angry)\]")
+
+# Fail-open: if the model never emits a tag (prompt not enforcing it),
+# don't buffer the whole reply in silence — start streaming as-is after
+# this many seconds. Bounded prefix loss beats minutes of dead air
+# (which would also trip the 30 s watchdog and nuke the whole reply).
+_TAG_WAIT_S = 12.0
+
+# Max chars of pre-tag sentences held back while waiting for the tag.
+# Overflow is released (spoken) rather than dropped — silence is worse
+# than a leaked fragment.
+_HELD_MAX_CHARS = 500
+
+
+def _sentence_boundary(text: str) -> int:
+    """End offset just past the last real sentence boundary, or -1."""
+    best = -1
+    for m in re.finditer(r"[.!?…]+", text):
+        after = text[m.end():]
+        if after == "":
+            best = m.end()
+            continue
+        if after[0] in " \t\n":
+            rest = after.lstrip()
+            if rest == "" or rest[0] in _BOUNDARY_NEXT:
+                best = m.end()
+    return best
+
+
 class HermesBackend(BaseLLMBackend):
     def __init__(self, url: str, api_key: str = ""):
         self.url = url.rstrip("/")
@@ -128,9 +171,25 @@ class HermesBackend(BaseLLMBackend):
             headers["X-Device-MAC"] = session_id
             headers["X-Stream-Name"] = stream_name
             # Hermes API Server: OpenAI-compatible /v1/chat/completions (streaming)
+            # System prompt: force a leading emotion tag (the TTS gate keys
+            # on it) and forbid verbalized tool-talk — this endpoint offers
+            # no tools, so "Need to execute code…" must never be spoken.
             payload = {
                 "model": "omniroute/oc/hy3-free",
-                "messages": [{"role": "user", "content": text}],
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "Ты голосовой ассистент умной колонки. Начинай КАЖДЫЙ "
+                            "ответ ровно с одного тега эмоции из списка [happy] "
+                            "[neutral] [surprised] [sad] [angry] — без преамбул. "
+                            "Тебе недоступны никакие инструменты: никогда не "
+                            "озвучивай вызовы инструментов, служебные рассуждения "
+                            "и внутренний монолог, отвечай сразу по существу."
+                        ),
+                    },
+                    {"role": "user", "content": text},
+                ],
                 "stream": True,
             }
             async with aiohttp.ClientSession() as session:
@@ -144,9 +203,12 @@ class HermesBackend(BaseLLMBackend):
 
                     buf = ""
                     holder = ""
+                    seen_tag = False
+                    held = []  # pre-tag sentences: discarded on tag, spoken on release
+                    t_start = time.monotonic()
 
                     def flush(final: bool) -> None:
-                        nonlocal buf, holder
+                        nonlocal buf, holder, seen_tag, held
                         m = re.search(r"\[thinking\]", buf)
                         if m and not re.search(r"\[/thinking\]", buf[m.start():]):
                             part, holder = (buf[:m.start()], buf[m.start():]) if not final else (buf, "")
@@ -161,14 +223,47 @@ class HermesBackend(BaseLLMBackend):
                             if not mm:
                                 break
                             part = part[:mm.start()] + part[mm.end():]
-                        mm = re.search(r"^(.*[.!?…])([^.!?…]*)$", part, flags=re.S)
-                        if mm:
-                            done = [mm.group(1)] if mm.group(1).strip() else []
-                            tail = mm.group(2)
+                        mtag = _EMOTION_TAG.search(part)
+                        if not seen_tag:
+                            if mtag:
+                                seen_tag = True
+                                held = []
+                                part = part[mtag.start():]
+                                # re-strip thinking blocks after cut
+                                while True:
+                                    mm0 = re.search(r"\[thinking\](.*?)\[/thinking\]", part, flags=re.S)
+                                    if not mm0:
+                                        break
+                                    part = part[:mm0.start()] + part[mm0.end():]
+                            elif not final and time.monotonic() - t_start <= _TAG_WAIT_S and sum(len(h) for h in held) < _HELD_MAX_CHARS:
+                                # No tag yet: HOLD completed sentences (don't speak,
+                                # don't discard) and keep only the tail buffered.
+                                bi0 = _sentence_boundary(part)
+                                if bi0 != -1:
+                                    if part[:bi0].strip():
+                                        held.append(part[:bi0])
+                                    part = part[bi0:]
+                                buf = (part + " " + holder).strip()
+                                return
+                            else:
+                                # Release: tag wait over, held cap hit, or final
+                                # flush — speak the held prefix in order, then
+                                # process the rest normally. Never go silent.
+                                seen_tag = True
+                                if held:
+                                    part = " ".join(held) + " " + part
+                                    held = []
+                        bi = _sentence_boundary(part)
+                        if bi != -1:
+                            done = [part[:bi]] if part[:bi].strip() else []
+                            tail = part[bi:]
                         else:
                             done, tail = [], part
                         if final and tail.strip():
-                            done.append(tail)
+                            # Never speak a dangling "[abc" fragment cut off mid-tag.
+                            tail = re.sub(r"\[[^\]]*$", "", tail).strip()
+                            if tail:
+                                done.append(tail)
                             tail = ""
                         for s in done:
                             s2 = HermesBackend._speakable(s)

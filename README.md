@@ -1,6 +1,6 @@
 # Voice Gateway
 
-> **Version 2.24** — Hermes-mode hardening: no more reconnect loop to Nanobot when `LLM_BACKEND=hermes`, `DISABLE_CAMERAS` is now actually honored, Hermes requests carry device-identifying headers. See Changelog below.
+> **Version 2.25** — TTS stutter fixes + monologue gate: abbreviation-aware splitter, prefetching Hermes player, emotion-tag gate with system prompt. See Changelog below.
 
 WebSocket gateway bridging [Xiaozhi ESP32](https://github.com/78/xiaozhi-esp32) smart speakers **and WebRTC/IP cameras** to an AI agent (**[Nanobot](https://github.com/HKUDS/nanobot)** or **Hermes**) with real-time speech processing.
 
@@ -232,6 +232,11 @@ Covers engine wake scoring/gates, camera arbitration helpers, OTA auth, and RMS 
 
 ## Changelog
 
+- **2.25** — TTS stutter fixes + monologue gate.
+  - Abbreviation-aware sentence splitter (`_sentence_boundary`): a `.`/`!`/`?`/`…` splits only before whitespace + uppercase/digit/quote or end-of-string, so «мм рт. ст.», «т.д.», «16.09» survive as one utterance instead of audible fragments.
+  - Hermes player (`_hermes_player_task`) with one-ahead synth prefetch: sentence N+1 synthesizes while N plays (was sequential: 1–4 s of silence between sentences). First flowing audio cancels the watchdog; sentences arriving after the watchdog apology are dropped instead of played stale.
+  - Monologue gate: reply must start with `[happy]`/`[neutral]`/`[thinking]`/`[surprised]`/`[sad]`/`[angry]`; pre-tag sentences are held (≤500 chars) and discarded on tag, spoken on release — never silent. `HermesBackend` sends a system prompt enforcing the leading tag and forbidding verbalized tool-talk («Need to execute code…» class of leaks).
+  - `tests/test_tts_gate.py` (4 tests: gate, loss-free, fail-open, abbreviations); suite 78 passed.
 - **2.24** — Hermes-mode hardening + camera kill-switch.
   - The per-device Nanobot listener no longer starts when `LLM_BACKEND=hermes` (previously it retried `localhost:8765` every 10 s forever, spamming the log; the Hermes reply path never used that socket).
   - `DISABLE_CAMERAS=true|1|yes` is now honored by `start_camera_sessions()` (previously the flag existed in compose but was ignored, so cameras ran anyway).

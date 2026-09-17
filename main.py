@@ -121,7 +121,7 @@ LOG_TRANSCRIPTIONS = os.getenv("LOG_TRANSCRIPTIONS", "false").lower() == "true"
 DB_FILE = "/app/config/devices.json"
 VAD_SILENCE_FRAMES = int(os.getenv("VAD_SILENCE_FRAMES", 8))
 MAX_FIRMWARE_SIZE = int(os.getenv("MAX_FIRMWARE_SIZE", 10 * 1024 * 1024))
-WATCHDOG_TIMEOUT = int(os.getenv("WATCHDOG_TIMEOUT", 30))
+WATCHDOG_TIMEOUT = int(os.getenv("WATCHDOG_TIMEOUT", 90))
 STANDBY_TIMEOUT_QUESTION = int(os.getenv("STANDBY_TIMEOUT_QUESTION", 30))
 STANDBY_TIMEOUT_STATEMENT = int(os.getenv("STANDBY_TIMEOUT_STATEMENT", 10))
 CHAT_ID_TTL = int(
@@ -972,15 +972,50 @@ async def _dispatch_hermes(txt, uid, state, device_ws, _t0, _t_stt):
 
 
 async def _hermes_player_task(q: asyncio.Queue, device_ws, state):
-    """Read pre-split sentences from HermesBackend queue and stream to TTS."""
-    while True:
-        item = await q.get()
-        if item is None:
-            break
+    """Play reply sentences back-to-back with one-ahead synth prefetch.
+
+    Sentence N+1 is synthesized while sentence N plays, hiding Edge-TTS
+    latency (sequential synth-then-play left 1-4 s of silence between
+    sentences — heard as stutter). Sentences that arrive after the
+    watchdog apology are dropped instead of played stale.
+    """
+
+    def start_synth(text):
+        return asyncio.create_task(synthesize_tts_mp3(text, state))
+
+    async def play(mp3_data):
         try:
-            await generate_and_stream_tts(item, device_ws, state["sid"], state)
+            await stream_tts_pcm(mp3_data, device_ws, state["sid"], state)
         except Exception as e:
             logger.error(f"❌ [Hermes] TTS player error: {e}")
+        # Audio is flowing — upstream proved alive, drop the guard so a
+        # slow tail of the reply can't trigger a duplicate apology.
+        wd = state.get("watchdog")
+        if wd is not None:
+            try:
+                wd.cancel()
+            except Exception:
+                pass
+            state["watchdog"] = None
+
+    first = await q.get()
+    if first is None:
+        return
+    synth_task = start_synth(first) if not state.get("watchdog_fired") else None
+    while True:
+        nxt = await q.get()
+        mp3 = await synth_task if synth_task is not None else None
+        synth_task = None
+        if state.get("watchdog_fired"):
+            if nxt is None:
+                return
+            continue  # stale: apology already spoken, keep draining
+        if nxt is not None:
+            synth_task = start_synth(nxt)  # prefetch while mp3 plays
+        if mp3 is not None:
+            await play(mp3)
+        if nxt is None:
+            return
 
 
 async def _handle_rejected_transcription(

@@ -31,6 +31,7 @@ from main import (
     normalize_mac,
     device_online_status,
     create_tracked_task,
+    decode_opus_frames,
 )
 from audio_utils import (
     WHISPER_HALLUCINATIONS,
@@ -703,3 +704,80 @@ async def test_voice_ws_auth_bypass():
         with pytest.raises(Exception):
             with client.websocket_connect("/?token=") as websocket:
                 pass
+
+
+@pytest.mark.asyncio
+async def test_decode_opus_frames_happy_path():
+    frames = [b"frame1", b"frame2"]
+
+    mock_decoder = MagicMock()
+    # Mock decoder.decode to return some fake PCM data
+    # Let's use np.zeros or some bytes so calculate_rms won't crash
+    # calculate_rms expects bytes, let's give it 960 * 2 bytes of zeros
+    fake_pcm_1 = (np.zeros(960, dtype=np.int16)).tobytes()
+    fake_pcm_2 = (np.ones(960, dtype=np.int16)).tobytes()
+    mock_decoder.decode.side_effect = [fake_pcm_1, fake_pcm_2]
+
+    mock_vad = MagicMock()
+    mock_vad.is_speech_batch = AsyncMock(return_value=[True, False])
+
+    all_pcm, rms_list, vad_results = await decode_opus_frames(frames, mock_decoder, mock_vad)
+
+    assert all_pcm == fake_pcm_1 + fake_pcm_2
+    assert len(rms_list) == 2
+    assert rms_list[0] == 0.0 # zeros
+    assert rms_list[1] > 0.0 # ones
+    assert vad_results == [True, False]
+    mock_decoder.decode.assert_any_call(b"frame1", 960)
+    mock_decoder.decode.assert_any_call(b"frame2", 960)
+    mock_vad.is_speech_batch.assert_called_once()
+
+@pytest.mark.asyncio
+async def test_decode_opus_frames_partial_failure():
+    frames = [b"frame1", b"frame2", b"frame3"]
+
+    mock_decoder = MagicMock()
+    fake_pcm_1 = (np.zeros(960, dtype=np.int16)).tobytes()
+    fake_pcm_3 = (np.ones(960, dtype=np.int16)).tobytes()
+
+    # frame 2 fails
+    mock_decoder.decode.side_effect = [fake_pcm_1, Exception("Decode error"), fake_pcm_3]
+
+    mock_vad = MagicMock()
+    # is_speech_batch will only be called with the 2 successful PCMs
+    mock_vad.is_speech_batch = AsyncMock(return_value=[True, False])
+
+    all_pcm, rms_list, vad_results = await decode_opus_frames(frames, mock_decoder, mock_vad)
+
+    assert all_pcm == fake_pcm_1 + fake_pcm_3
+    assert len(rms_list) == 3
+    assert rms_list[0] == 0.0
+    assert rms_list[1] == 0.0 # Failed frame
+    assert rms_list[2] > 0.0
+
+    assert vad_results == [True, False, False]
+    assert mock_decoder.decode.call_count == 3
+
+    # Verify is_speech_batch was called with the correct valid_pcms
+    args, _ = mock_vad.is_speech_batch.call_args
+    assert args[0] == [fake_pcm_1, fake_pcm_3]
+    assert len(args[1]) == 2 # valid_rms
+
+@pytest.mark.asyncio
+async def test_decode_opus_frames_total_failure():
+    frames = [b"frame1", b"frame2"]
+
+    mock_decoder = MagicMock()
+    mock_decoder.decode.side_effect = Exception("Decode error")
+
+    mock_vad = MagicMock()
+    mock_vad.is_speech_batch = AsyncMock()
+
+    all_pcm, rms_list, vad_results = await decode_opus_frames(frames, mock_decoder, mock_vad)
+
+    assert all_pcm == b""
+    assert rms_list == [0.0, 0.0]
+    assert vad_results == [False, False]
+
+    assert mock_decoder.decode.call_count == 2
+    mock_vad.is_speech_batch.assert_not_called()

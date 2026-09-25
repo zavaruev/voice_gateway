@@ -1,0 +1,4 @@
+fastapi
+uvicorn
+smolagents==1.26.0
+openai>=1.40

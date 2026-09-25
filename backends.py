@@ -292,3 +292,143 @@ class HermesBackend(BaseLLMBackend):
         except Exception as e:
             logger.error(f"Hermes error: {e}")
             await response_queue.put(None)
+
+
+class CascadeBackend(BaseLLMBackend):
+    """Routes text through jev-router (SSE POST /route).
+
+    Contract-compatible with HermesBackend but without the emotion-tag gate:
+    router output is already curated, so we only strip tags and manage the
+    *ack* timing the manifest requires for long L2 turns:
+
+      * route complex_logic/expert -> immediate ack «Секунду, занимаюсь…»
+        (Level-2 CodeAgent takes 48-120 s; silence would trip the 90 s
+        watchdog and cut the reply);
+      * route chat/easy            -> 3 s ack timer; cancelled as soon as
+        the first real sentence arrives (fast paths never hear the ack);
+      * progress events from L2    -> spoken as short sentences (worker
+        emits them at most every 20 s), replacing watchdog-driven apologies;
+      * error with nothing spoken  -> immediate apology sentence instead of
+        dead air.
+
+    The first played audio cancels the gateway watchdog downstream
+    (_hermes_player_task.play), so one ack keeps the whole turn alive.
+    """
+
+    ACK_COMPLEX = "Секунду, занимаюсь…"
+    ACK_THINK = "Секунду, думаю…"
+    SORRY = "Простите, что-то пошло не так."
+
+    def __init__(self, router_url: str, ack_delay: float = 3.0,
+                 total_timeout: float = 200.0, sock_read_timeout: float = 60.0):
+        self.router_url = router_url.rstrip("/")
+        self.ack_delay = ack_delay
+        self.total_timeout = total_timeout
+        self.sock_read_timeout = sock_read_timeout
+
+    async def generate_response(self, text: str, session_id: str, stream_name: str, response_queue: asyncio.Queue):
+        spoken = False   # any real sentence reached the queue
+        ack_sent = False
+        ack_task: asyncio.Task | None = None
+
+        def put(s: str) -> None:
+            nonlocal spoken
+            s2 = HermesBackend._speakable(s)
+            if s2:
+                response_queue.put_nowait(s2)
+                spoken = True
+
+        def put_ack(phrase: str) -> None:
+            nonlocal ack_sent
+            if ack_sent or spoken:
+                return
+            response_queue.put_nowait(phrase)
+            ack_sent = True
+
+        async def ack_later(phrase: str) -> None:
+            await asyncio.sleep(self.ack_delay)
+            put_ack(phrase)
+
+        try:
+            headers = {"Accept": "text/event-stream"}
+            payload = {
+                "text": text,
+                "session_id": session_id,
+                "stream_name": stream_name,
+            }
+            timeout = aiohttp.ClientTimeout(
+                total=self.total_timeout,
+                sock_connect=5,
+                sock_read=self.sock_read_timeout,
+            )
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(
+                    f"{self.router_url}/route", json=payload, headers=headers
+                ) as resp:
+                    if resp.status != 200:
+                        body = await resp.text()
+                        raise RuntimeError(f"router http {resp.status}: {body[:200]}")
+
+                    async for raw in resp.content:
+                        line = raw.decode("utf-8", errors="replace").strip()
+                        if not line or not line.startswith("data:"):
+                            continue
+                        data = line[len("data:"):].strip()
+                        if data == "[DONE]":
+                            break
+                        try:
+                            ev = json.loads(data)
+                        except json.JSONDecodeError:
+                            continue
+                        etype = ev.get("type")
+
+                        if etype == "route":
+                            route = ev.get("route", "")
+                            logger.info(
+                                f"🔀 [Cascade] route={route} conf={ev.get('confidence')} "
+                                f"reason={ev.get('reason') or '-'}"
+                            )
+                            if route in ("complex_logic", "expert"):
+                                if ack_task is not None:
+                                    ack_task.cancel()
+                                    ack_task = None
+                                put_ack(self.ACK_COMPLEX)
+                            elif not ack_sent and not spoken and ack_task is None:
+                                ack_task = asyncio.create_task(
+                                    ack_later(self.ACK_THINK)
+                                )
+                        elif etype == "sentence":
+                            if ack_task is not None:
+                                ack_task.cancel()
+                                ack_task = None
+                            if ev.get("text"):
+                                put(ev["text"])
+                        elif etype == "progress":
+                            if ev.get("text"):
+                                put(ev["text"])
+                        elif etype == "error":
+                            logger.error(
+                                f"❌ [Cascade] router error: {ev.get('message')}"
+                            )
+                            # ack alone is not content: after it the watchdog is
+                            # already cancelled, so silence here would be final.
+                            if not spoken:
+                                put(self.SORRY)
+                        elif etype == "done":
+                            logger.info(
+                                f"⏱ [Cascade] done route={ev.get('route')} "
+                                f"elapsed={ev.get('elapsed')}s"
+                            )
+                            break
+        except Exception as e:
+            logger.error(f"Cascade error: {e}")
+            if not spoken:
+                put(self.SORRY)
+        finally:
+            if ack_task is not None:
+                ack_task.cancel()
+            if not spoken:
+                # Stream ended empty without an error event: never leave the
+                # caller in silence (watchdog would apologize 90 s later).
+                response_queue.put_nowait(self.SORRY)
+            response_queue.put_nowait(None)

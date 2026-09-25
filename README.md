@@ -1,6 +1,6 @@
 # Voice Gateway
 
-> **Version 2.25** — TTS stutter fixes + monologue gate: abbreviation-aware splitter, prefetching Hermes player, emotion-tag gate with system prompt. See Changelog below.
+> **Version 2.27** — Cascade AI architecture (jev-router → smolagents CodeAgent → Hermes Expert) + E2E honesty fixes for side effects. See Changelog below.
 
 WebSocket gateway bridging [Xiaozhi ESP32](https://github.com/78/xiaozhi-esp32) smart speakers **and WebRTC/IP cameras** to an AI agent (**[Nanobot](https://github.com/HKUDS/nanobot)** or **Hermes**) with real-time speech processing.
 
@@ -44,7 +44,8 @@ Camera (RTSP/L16) ─┘          │                        │
 - **Activity monitor** — dims screen to 25% after 30 s idle, closes abandoned sessions after 45 s in LISTENING
 - **OTA** — ESP32 firmware handshake returning WS URL + `access_token` + firmware info
 - **Emotions** — extracted from LLM text via `[emotion_name]` regex (both backends strip them before TTS)
-- **Pluggable LLM backend** — switch the AI brain between **Nanobot** (`nanobot`, WebSocket, streaming) and **Hermes** (`hermes`, OpenAI-compatible `/v1/chat/completions`) with a single env var. Both paths feed the same VAD → STT → TTS pipeline; Hermes replies are sentence-split and streamed through the prefetch TTS player exactly like Nanobot delta text.
+- **Pluggable LLM backend** — switch the AI brain between **Nanobot** (`nanobot`, WebSocket, streaming), **Hermes** (`hermes`, OpenAI-compatible `/v1/chat/completions`) and **Cascade** (`cascade`, 3-level router) with a single env var. All paths feed the same VAD → STT → TTS pipeline; replies are sentence-split and streamed through the prefetch TTS player exactly like Nanobot delta text.
+- **Cascade AI (3 levels)** — `LLM_BACKEND=cascade` routes every utterance through **jev-router** (semantic classifier on local Ollama embeddings, 5 routes: `easy_action`/`easy_query`/`general_qa`/`expert`/`complex_logic`). Easy routes resolve slots offline and call Home Assistant MCP directly; general chat streams from the OmniRoute combo; expert goes to Hermes; complex logic escalates to the **smolagents-worker** (CodeAgent with HA/memory/expert tools, 120 s cap + progress heartbeats). Every failure or ambiguity escalates to L2 — never a wrong side-effect. Qdrant `voice_turns`/`voice_facts` store dialogue memory (written by the router, read by the L2 tool).
 
 ## Quick Start
 
@@ -96,9 +97,11 @@ Do **not** start the container manually with `docker run` on the default bridge 
 |---|---|---|
 | `NANOBOT_WS_URL` | `ws://nanobot:8765/` | Nanobot AI agent WebSocket URL |
 | `NANOBOT_TOKEN` | `token` | Token appended to Nanobot WS URL |
-| `LLM_BACKEND` | `nanobot` | AI brain: `nanobot` (default) or `hermes` |
+| `LLM_BACKEND` | `nanobot` | AI brain: `nanobot` (default), `hermes` or `cascade` |
 | `HERMES_API_URL` | `http://192.168.22.102:8000` | Hermes OpenAI-compatible base URL (used when `LLM_BACKEND=hermes`) |
 | `HERMES_API_KEY` | `""` | Bearer token sent to Hermes if set |
+| `ROUTER_URL` | `http://localhost:8091` | jev-router SSE endpoint (used when `LLM_BACKEND=cascade`) |
+| `ROUTER_ACK_DELAY` | `3` | Seconds before the fallback ack «Секунду…» when the first sentence is slow (chat/easy routes; complex/expert ack immediately) |
 | `WHISPER_URL` | `http://192.168.22.111:8000/v1/audio/transcriptions` | OpenAI-compatible STT endpoint |
 | `TTS_URL` | `http://edge_tts:5050/v1/audio/speech` | OpenAI-compatible TTS endpoint |
 | `TTS_VOICE` | `ru-RU-SvetlanaNeural` | TTS voice identifier |
@@ -166,6 +169,7 @@ The AI brain is selected by `LLM_BACKEND` and implemented as a `BaseLLMBackend` 
 
 - **`NanobotBackend`** (default) — opens a WebSocket to `NANOBOT_WS_URL?token=…&chat_id=…`, streams `text` deltas, handles `[thinking]` blocks, and pushes sentence-split replies into the response queue.
 - **`HermesBackend`** — streams the user message to `${HERMES_API_URL}/v1/chat/completions` (OpenAI-compatible SSE, `stream: true`); each `choices[].delta.content` chunk is accumulated and flushed sentence-by-sentence on `. ! ? …` into the response queue. `[thinking]` reasoning blocks and `[emotion_name]` tags are stripped before TTS, identical to `NanobotBackend`. Streaming keeps first-token latency low so the prefetch TTS player starts before the full reply arrives (avoiding the 30 s watchdog fallback).
+- **`CascadeBackend`** — POSTs the text to `${ROUTER_URL}/route` (SSE) and replays router events into the same queue: `sentence`/`progress` are spoken (emotion tags stripped, no monologue gate — the router output is already curated), `route` events drive the ack timer (immediate «Секунду, занимаюсь…» for `complex_logic`/`expert`, `ROUTER_ACK_DELAY`-second fallback for chat/easy), `error`/empty streams produce an immediate apology so the user is never left in silence. The first played audio (usually the ack) cancels the watchdog downstream, which is what makes 48–120 s L2 turns possible.
 
 Both backends expose the same `generate_response(text, session_id, stream_name, response_queue)` contract. The ESP32 path dispatches via `_dispatch_hermes`/`_hermes_player_task`; camera sessions receive the backend instance at construction and call `_call_backend` → `_nanobot_player_task` (the player is backend-agnostic). Either way replies reach the prefetch TTS player, so sentence-level latency hiding works identically for both brains.
 
@@ -232,6 +236,17 @@ Covers engine wake scoring/gates, camera arbitration helpers, OTA auth, and RMS 
 
 ## Changelog
 
+- **2.27** — E2E fixes: a promised side effect must be a performed side effect.
+  - **Area canonical names (root cause of «пообещало выключить и не выключило»)** — the resolver now sends area-registry *display* names (`Living Room`, `Kitchen`, `Corridor`, `Bedroom`...): RU «гостиная»/«ванная»/«туалет» have no alias in the live HA registry and the intent matcher rejected them with `MatchFailedError INVALID_AREA` (E2E via ESP32, 25.09). RU words remain the lookup keys; `_area_phrase` gained a table so EN names still produce Russian phrases («В гостиной», «На кухне»).
+  - **On/off target resolution from the live registry** — `find_action_targets()` + `HAClient.get_entity_areas()` (cached `area_name` template map): the living-room lamp is `switch.living_room_light_swith_relay` while every `light.*` there is an unavailable ESP indicator, so a blind `domain:["light"]+area` match both missed the relay and could no-op on `unavailable` states. The executor now: picks concrete entities (bilingual «свет»→light), calls the intent with the exact friendly name, skips entities not exposed to the voice assistant (`MatchFailedReason.ASSISTANT`) without failing the rest, and answers «В гостиной уже выключено.» when every target is already in the requested state instead of pretending. Result: «Выключи/Включи свет в гостиной» → 0.08–0.11 s, no escalation, state change verified in HA; 0 escalations across the regression batch (state/datetime queries with EN areas intact).
+  - **Escalation context + worker honesty** — a failed `easy_action` now escalates to L2 with tool, args, plain-Russian error decoding (`INVALID_AREA`, `ASSISTANT` → «не открыто голосовому ассистенту») and any confirmed partial results (`done`); the worker prompt explicitly forbids promising an action («выключаю/сделал») before the tool confirmed success — the L2 previously answered «Хорошо, выключаю свет в гостиной» right after its own `ha_action` failed (log-verified).
+  - **Tests** — 45 passed on host (`test_router_resolution.py` incl. new area/target/hint cases + `test_cascade_backend.py` + `test_tts_gate.py`).
+- **2.26** — Cascade AI architecture (3 levels) + dialogue memory.
+  - **`services/jev-router` (L1, port 8091)** — semantic route classifier: local Ollama `qwen3-embedding:0.6b` (1024-dim cosine, calibrated Sep 2026: conf = clip((score−0.50)/0.40), threshold 0.85 + margin ≥0.05) over 5 routes (`easy_action`, `easy_query`, `general_qa`, `expert`, `complex_logic`), regex fast-paths for imperatives, negation guard («не включи свет» never reaches HA), slot resolver for HA MCP intents (RU/EN room dictionary, stream→room defaults, brightness/color/temp, vacuum, timers, broadcast). SSE `POST /route` emits `route`/`sentence`/`progress`/`done`/`error`. Any ambiguity, missing MCP tool or HA failure escalates to `complex_logic` (self-healing retry via a second `route` event).
+  - **`services/smolagents-worker` (L2, port 8092)** — smolagents 1.26 `CodeAgent` (MAX_STEPS=15) over the OmniRoute free combo (`gemma4_31b_free`) with Hermes (`hermes-agent`) failover; tools: `ha_action` (MCP side effects), `ha_read` (GetLiveContext + REST fallback), `qdrant_search` (dialogue memory), `hermes_expert` (L3 delegation), `get_datetime`. SSE `POST /invoke` with progress heartbeats every 15 s (replace the old watchdog) and a hard 120 s cap; final answer is split into TTS sentences with the same boundary rules as `backends.py`.
+  - **`CascadeBackend` in `backends.py`** — third gateway backend (`LLM_BACKEND=cascade`): ack-timer instead of the emotion gate (immediate ack for `complex_logic`/`expert`, `ROUTER_ACK_DELAY`=3 s for chat/easy), progress events spoken as short phrases, immediate apology on error/empty stream. Existing `hermes`/`nanobot` paths untouched — rollback is one env line.
+  - **Qdrant memory** — collections `voice_turns` + `voice_facts` (dim 1024, cosine) created idempotently at router startup; every turn is written fire-and-forget and searchable by the L2 `qdrant_search` tool.
+  - **Tests** — `tests/test_cascade_backend.py` (8: ack timing, escalation acks, tag stripping, apology paths) + `tests/test_router_resolution.py` (25: resolver slots, escalation cases, regex fast-paths, calibration); `test_tts_gate.py` unchanged, 33 passed on host.
 - **2.25** — TTS stutter fixes + monologue gate.
   - Abbreviation-aware sentence splitter (`_sentence_boundary`): a `.`/`!`/`?`/`…` splits only before whitespace + uppercase/digit/quote or end-of-string, so «мм рт. ст.», «т.д.», «16.09» survive as one utterance instead of audible fragments.
   - Hermes player (`_hermes_player_task`) with one-ahead synth prefetch: sentence N+1 synthesizes while N plays (was sequential: 1–4 s of silence between sentences). First flowing audio cancels the watchdog; sentences arriving after the watchdog apology are dropped instead of played stale.

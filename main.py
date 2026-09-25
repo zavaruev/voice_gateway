@@ -41,6 +41,9 @@ import backends
 LLM_BACKEND = os.getenv("LLM_BACKEND", "nanobot").lower()
 HERMES_API_URL = os.getenv("HERMES_API_URL", "http://192.168.22.102:8000")
 HERMES_API_KEY = os.getenv("HERMES_API_KEY", "")
+# Cascade mode (LLM_BACKEND=cascade): jev-router SSE endpoint
+ROUTER_URL = os.getenv("ROUTER_URL", "http://localhost:8091")
+ROUTER_ACK_DELAY = float(os.getenv("ROUTER_ACK_DELAY", "3"))
 # ==========================================
 
 import asyncio
@@ -87,11 +90,14 @@ NANOBOT_TOKEN = os.getenv("NANOBOT_TOKEN", "")
 NANOBOT_SESSION_SALT = os.getenv("NANOBOT_SESSION_SALT", "")
 SPEAKER_ID_URL = os.getenv("SPEAKER_ID_URL", "http://192.168.22.102:8001/identify")
 
-# Global LLM backend (set at import; HermesBackend or NanobotBackend)
+# Global LLM backend (set at import; HermesBackend, CascadeBackend or NanobotBackend)
 llm_backend = None
 if LLM_BACKEND == "hermes":
     llm_backend = backends.HermesBackend(HERMES_API_URL, HERMES_API_KEY)
     logger.info(f"🧠 Global LLM backend: Hermes @ {HERMES_API_URL}")
+elif LLM_BACKEND == "cascade":
+    llm_backend = backends.CascadeBackend(ROUTER_URL, ack_delay=ROUTER_ACK_DELAY)
+    logger.info(f"🔀 Global LLM backend: Cascade @ {ROUTER_URL}")
 else:
     llm_backend = backends.NanobotBackend(NANOBOT_WS_URL, NANOBOT_TOKEN, NANOBOT_SESSION_SALT)
     logger.info(f"🤖 Global LLM backend: Nanobot @ {NANOBOT_WS_URL}")
@@ -866,8 +872,8 @@ async def _handle_successful_transcription(
     except Exception:
         return
 
-    # --- LLM dispatch: Hermes backend or legacy Nanobot ---
-    if LLM_BACKEND == "hermes" and llm_backend is not None:
+    # --- LLM dispatch: Hermes/Cascade backend or legacy Nanobot ---
+    if LLM_BACKEND in ("hermes", "cascade") and llm_backend is not None:
         await _dispatch_hermes(txt, uid, state, device_ws, _t0, _t_stt)
     else:
         nano_ws = state.get("nano_ws")
@@ -1723,10 +1729,10 @@ async def handle_ws_text_message(ctx: WSContext):
     elif d.get("type") == "hello":
         state["version"] = d.get("version", 1)
         logger.info(f"🤝 [Device] Hello received (v{state['version']})")
-        # In Hermes mode the LLM reply path (_dispatch_hermes) never uses
-        # nano_ws, so don't open a pointless reconnect loop to Nanobot.
+        # In Hermes/Cascade mode the LLM reply path (_dispatch_hermes) never
+        # uses nano_ws, so don't open a pointless reconnect loop to Nanobot.
         if nano_listener_task is None and not (
-            LLM_BACKEND == "hermes" and llm_backend is not None
+            LLM_BACKEND in ("hermes", "cascade") and llm_backend is not None
         ):
             nano_listener_task = create_tracked_task(
                 listen_to_nanobot_task(device_ws, state, nano_session), state
@@ -2403,6 +2409,9 @@ async def start_camera_sessions():
             if LLM_BACKEND == 'hermes':
                 llm_backend = backends.HermesBackend(HERMES_API_URL, HERMES_API_KEY)
                 logger.info('Using Hermes backend at ' + HERMES_API_URL)
+            elif LLM_BACKEND == 'cascade':
+                llm_backend = backends.CascadeBackend(ROUTER_URL, ack_delay=ROUTER_ACK_DELAY)
+                logger.info('Using Cascade router at ' + ROUTER_URL)
             else:
                 llm_backend = backends.NanobotBackend(NANOBOT_WS_URL, NANOBOT_TOKEN, NANOBOT_SESSION_SALT)
                 logger.info('Using Nanobot backend at ' + NANOBOT_WS_URL)

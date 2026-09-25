@@ -2,11 +2,11 @@
 
 > **Version 2.27** — Cascade AI architecture (jev-router → smolagents CodeAgent → Hermes Expert) + E2E honesty fixes for side effects. See Changelog below.
 
-WebSocket gateway bridging [Xiaozhi ESP32](https://github.com/78/xiaozhi-esp32) smart speakers **and WebRTC/IP cameras** to an AI agent (**[Nanobot](https://github.com/HKUDS/nanobot)** or **Hermes**) with real-time speech processing.
+WebSocket gateway bridging [Xiaozhi ESP32](https://github.com/78/xiaozhi-esp32) smart speakers **and WebRTC/IP cameras** to an AI backend (**Cascade** 3-level router, **[Nanobot](https://github.com/HKUDS/nanobot)** or **Hermes**) with real-time speech processing.
 
 ```
 ESP32 (Opus WS)  ──┐
-                   ├──▶ Voice Gateway ──STT text──▶ Nanobot AI Agent
+                   ├──▶ Voice Gateway ──STT text──▶ AI backend (Cascade | Nanobot | Hermes)
 Camera (RTSP/L16) ─┘          │                        │
                         Silero VAD               Edge TTS
                         Wake word (openWakeWord)  emotions
@@ -24,8 +24,8 @@ Camera (RTSP/L16) ─┘          │                        │
 3. **openWakeWord** listens for the wake word «компьютер» (custom-trained model) on camera streams
 4. **Whisper STT** transcribes audio to text (Russian, retries at temperature 0.0/0.5)
 5. **Speaker ID** identifies the speaker (parallel with STT)
- 6. **LLM backend** (Nanobot *or* Hermes) processes text, returns response with optional emotions `[emotion_name]`
- 7. **Edge TTS** synthesizes speech; Opus streamed to ESP32, PCM queued to camera speakers
+6. **LLM backend** (Cascade *or* Nanobot *or* Hermes) processes text, returns response with optional emotions `[emotion_name]`
+7. **Edge TTS** synthesizes speech; Opus streamed to ESP32, PCM queued to camera speakers
 
 ## Features
 
@@ -39,11 +39,11 @@ Camera (RTSP/L16) ─┘          │                        │
 - **Distant-speech tuned** — corridor/lobby coverage: lowered RMS gates, SpeexDSP noise suppression with "NS rescue" (utterance salvaged from the noise floor), adaptive peak normalisation (up to 20x)
 - **Echo guards** — global `GLOBAL_TTS_UNTIL` gate (no STT while any TTS plays — kills ESP32↔camera echo cascade) + duration-proportional mic hold (0.3 s beep → ~0.6 s hold, 20 s TTS → capped 15 s)
 - **Dialogue mode** — mic stays open after questions (`?` anywhere in the reply, question words, imperative verbs); returns to standby after statements
-- **MCP hardware control** — ESP32/camera tools (screen, volume, LEDs) are requested via `tools/list`; in Nanobot mode device events are forwarded to Nanobot, in Hermes mode the tool list is kept for future use (Hermes chat requests currently carry no `tools` payload)
+- **MCP hardware control** — ESP32/camera tools (screen, volume, LEDs) are requested via `tools/list`; in Nanobot mode device events are forwarded to Nanobot, in Hermes/Cascade mode the tool list is kept for future use (neither Hermes nor the router sends a `tools` payload)
 - **Watchdog** — 30 s timeout → fallback TTS «Простите, я задумалась. Повторите пожалуйста.»
 - **Activity monitor** — dims screen to 25% after 30 s idle, closes abandoned sessions after 45 s in LISTENING
 - **OTA** — ESP32 firmware handshake returning WS URL + `access_token` + firmware info
-- **Emotions** — extracted from LLM text via `[emotion_name]` regex (both backends strip them before TTS)
+- **Emotions** — extracted from LLM text via `[emotion_name]` regex (Nanobot/Hermes strip them before TTS; router output in cascade mode carries none)
 - **Pluggable LLM backend** — switch the AI brain between **Nanobot** (`nanobot`, WebSocket, streaming), **Hermes** (`hermes`, OpenAI-compatible `/v1/chat/completions`) and **Cascade** (`cascade`, 3-level router) with a single env var. All paths feed the same VAD → STT → TTS pipeline; replies are sentence-split and streamed through the prefetch TTS player exactly like Nanobot delta text.
 - **Cascade AI (3 levels)** — `LLM_BACKEND=cascade` routes every utterance through **jev-router** (semantic classifier on local Ollama embeddings, 5 routes: `easy_action`/`easy_query`/`general_qa`/`expert`/`complex_logic`). Easy routes resolve slots offline and call Home Assistant MCP directly; general chat streams from the OmniRoute combo; expert goes to Hermes; complex logic escalates to the **smolagents-worker** (CodeAgent with HA/memory/expert tools, 120 s cap + progress heartbeats). Every failure or ambiguity escalates to L2 — never a wrong side-effect. Qdrant `voice_turns`/`voice_facts` store dialogue memory (written by the router, read by the L2 tool).
 
@@ -76,6 +76,21 @@ docker run -p 18792:18792 \
 ```
 
 The model is fixed in `backends.py` (`HermesBackend` → `model: "omniroute/oc/hy3-free"`); adjust there if your Hermes deployment exposes a different model id.
+
+### Using Cascade (3-level AI router)
+
+Set `LLM_BACKEND=cascade` (plus `ROUTER_URL`, default `http://localhost:8091`) and run the two companion services — they are part of the `ai-prod` compose project and run with `network_mode: host`:
+
+```sh
+docker compose up -d --no-deps --build jev-router smolagents-worker voice_gateway
+```
+
+- **L1 `jev-router`** (port 8091) — semantic route classifier (local Ollama embeddings) + offline slot resolver. Easy commands execute directly against Home Assistant (~0.1 s), state queries are answered from the live registry, `general_qa` streams from OmniRoute, `expert` goes to Hermes; anything ambiguous or failed escalates to L2 with decoded error context.
+- **L2 `smolagents-worker`** (port 8092) — smolagents `CodeAgent` (`ha_action`/`ha_read`/`qdrant_search`/`hermes_expert`/`get_datetime`), 120 s cap with progress heartbeats, and a programmatic honesty veto: an answer claiming success after only failed tool calls is replaced with the recorded truth.
+
+External dependencies (env, see `services/*/config.py`): Ollama `qwen3-embedding`, Qdrant, OmniRoute combo, Home Assistant MCP.
+
+Rollback to a single backend: `LLM_BACKEND=hermes` (or `nanobot`) + `docker compose up -d --no-deps --build voice_gateway`.
 
 ### Cameras
 
@@ -142,7 +157,7 @@ Do **not** start the container manually with `docker run` on the default bridge 
 Opus frames → VAD (Silero) → energy gate → noise reduction → Ogg → Whisper STT + Speaker ID (parallel)
 
 ### Camera audio pipeline
-RTSP (raw L16 16 kHz) → echo guard (waveform + `_is_echo` cross-correlation vs played-audio ring, delays 2–45 s) → VAD + RMS gates → SpeexDSP NS rescue → adaptive normalisation → **(only after an acoustic wake)** Whisper (+ Speaker ID via Ogg) → Nanobot
+RTSP (raw L16 16 kHz) → echo guard (waveform + `_is_echo` cross-correlation vs played-audio ring, delays 2–45 s) → VAD + RMS gates → SpeexDSP NS rescue → adaptive normalisation → **(only after an acoustic wake)** Whisper (+ Speaker ID via Ogg) → LLM backend
 
 ### Wake-word detector feed
 RTSP 16 kHz → own-echo drop → per-room bidirectional AGC (target peak: kitchen 6500, others 4000) → openWakeWord scoring → gate cascade (see *Wake word & arbitration*)
@@ -161,9 +176,9 @@ openWakeWord `kompyuter` model (custom-trained, ONNX) on the live 16 kHz feed of
 After a fire: attention pip, VAD state reset, Whisper listens until the command is dispatched (or the ~60 s window expires).
 
 ### TTS Pipeline
-Nanobot text → sentence splitter → **prefetch pipeline** (sentence N+1 is synthesised while N plays, hiding Edge-TTS latency) → Edge TTS (MP3) → decode → resample (16/24 kHz) → Opus for ESP32 / PCM for cameras → paced 60 ms chunks. Every played clip is registered in the echo-reference ring and extends wake suppression past the delayed-echo window.
+Backend text → sentence splitter → **prefetch pipeline** (sentence N+1 is synthesised while N plays, hiding Edge-TTS latency) → Edge TTS (MP3) → decode → resample (16/24 kHz) → Opus for ESP32 / PCM for cameras → paced 60 ms chunks. Every played clip is registered in the echo-reference ring and extends wake suppression past the delayed-echo window.
 
-### LLM Backend (Nanobot / Hermes)
+### LLM Backend (Nanobot / Hermes / Cascade)
 
 The AI brain is selected by `LLM_BACKEND` and implemented as a `BaseLLMBackend` (`backends.py`):
 
@@ -232,7 +247,7 @@ Covers engine wake scoring/gates, camera arbitration helpers, OTA auth, and RMS 
 - Silero VAD ONNX model (downloaded at build time)
 - openWakeWord + custom `computer.onnx` / `embedding_model.onnx` (baked into the image)
 - SpeexDSP noise suppression (`speexdsp-ns`)
-- External services: Whisper STT, Nanobot (or Hermes), Edge TTS, Speaker ID, go2rtc (for cameras)
+- External services: Whisper STT, Edge TTS, Speaker ID, go2rtc (for cameras), plus one of the backends — Nanobot; Hermes; or (cascade) Ollama embeddings + Qdrant + OmniRoute + Home Assistant MCP
 
 ## Changelog
 

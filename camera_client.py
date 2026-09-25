@@ -414,6 +414,22 @@ class CameraSession:
         self.aec_block_ms = config.aec_block_ms
         self.wake_keyword = config.wake_keyword
         self._wake_timeout = config.wake_timeout
+
+        self.go2rtc_source_url = config.go2rtc_source_url
+        self._heal_stalls = config.heal_stalls
+
+        self._vad = config.vad
+        if self._vad is not None:
+            self._vad.energy_threshold = 0.005
+            self._vad.rms_noise_floor = 0.005
+            self._vad.rms_alpha = 0.0
+        self._wakeword_model_path = config.wakeword_model_path or ""
+        self._activation_wav_path = config.activation_wav_path
+
+        self._init_state()
+        self._init_audio_processing()
+
+    def _init_state(self):
         self._wake_detected = False
         self._wake_expires = 0.0
         self._ww_consec = 0  # consecutive openWakeWord fires (debounce)
@@ -434,13 +450,6 @@ class CameraSession:
         self._last_tts_reply = ""  # normalized text we last spoke (echo guard)
         self._wake_greeting_delay = 5.0
         self._audio_epoch = 0.0
-        self._vad = config.vad
-        if self._vad is not None:
-            self._vad.energy_threshold = 0.005
-            self._vad.rms_noise_floor = 0.005
-            self._vad.rms_alpha = 0.0
-        self._wakeword_model_path = config.wakeword_model_path or ""
-        self._activation_wav_path = config.activation_wav_path
 
         self._pc: RTCPeerConnection | None = None
         self._out_track: AIVoiceOutputTrack | None = None
@@ -452,11 +461,30 @@ class CameraSession:
         # the model). This is separate from _speaking_until (which hard-mutes the
         # mic) so the user's real follow-up still reaches the mic.
         self._wake_suppress_until = 0.0
-        self.go2rtc_source_url = config.go2rtc_source_url
-        self._heal_stalls = config.heal_stalls
         self._stall_count = 0
         self._last_heal_ts = 0.0
 
+        # Статистика и таймеры
+        self._last_attention = 0.0
+        self._last_feed_log = 0.0
+        self._last_rms_log = 0.0
+
+        self._wake_cmd_sent = False
+        self._last_uid = None
+        self._last_uid_ts = 0.0
+        self._last_fire_ts = 0.0
+        self._last_decay_ts = 0.0
+        self._vad_max_duration = 7.0
+        self._vad_start_time = 0.0
+        self._vad_lock = asyncio.Lock()
+        self._processing_utterance = False
+
+        self._tasks: set[asyncio.Task] = set()
+        self._stopped = asyncio.Event()
+
+        self._attention_played = False
+
+    def _init_audio_processing(self):
         # Echo reference ring buffer (16 kHz float32) — holds recently played
         # TTS audio so the mic feed can be checked for our own echo (the camera
         # speaker returns via the mic 8-15s later). Cross-correlation against
@@ -468,10 +496,6 @@ class CameraSession:
         self._echo_corr_threshold = 0.4
         self._last_echo_log = 0.0
 
-        # Статистика и таймеры
-        self._last_attention = 0.0
-        self._last_feed_log = 0.0
-        self._last_rms_log = 0.0
         self._bg_window: list[int] = []
         self._resample_buf = bytearray()
 
@@ -512,20 +536,6 @@ class CameraSession:
         # usable; false-fire protection there still comes from the 2-chunk
         # debounce + cross-camera arbitration.
         self._ww_thresh = 0.40 if self.stream_name == "kitchen" else 0.30
-        self._wake_cmd_sent = False
-        self._last_uid = None
-        self._last_uid_ts = 0.0
-        self._last_fire_ts = 0.0
-        self._last_decay_ts = 0.0
-        self._vad_max_duration = 7.0
-        self._vad_start_time = 0.0
-        self._vad_lock = asyncio.Lock()
-        self._processing_utterance = False
-
-        self._tasks: set[asyncio.Task] = set()
-        self._stopped = asyncio.Event()
-
-        self._attention_played = False
 
     @staticmethod
     def _make_chat_id(name: str) -> str:

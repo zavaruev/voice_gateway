@@ -9,6 +9,7 @@ Tools (manifest mapping):
   ha_read        -> HA MCP GetLiveContext, REST /api/states fallback
   qdrant_search  -> semantic search over voice_turns + voice_facts (memory)
   hermes_expert  -> delegate hard diagnostics to L3 Hermes Agent
+  weather_forecast -> GET jev-router /weather (open-meteo, deterministic)
   get_datetime   -> local date/time for the voice assistant
 """
 
@@ -18,6 +19,7 @@ import json
 import logging
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
@@ -34,17 +36,27 @@ _MSK = timezone(timedelta(hours=3))  # Moscow fixed UTC+3 (no DST since 2014)
 # module-level behind a lock: _run_agent resets it before each run and reads
 # it after the final answer is produced.
 _ACTION_EVENTS: list[dict] = []
+# Weather outcomes are recorded separately from side effects: a successful
+# weather_forecast must never count as "confirmed side effect" and suppress
+# the action veto in a compound query («включи кофеварку и какая погода»).
+_WEATHER_EVENTS: list[dict] = []
 _EVENTS_LOCK = threading.Lock()
 
 
 def reset_action_events() -> None:
     with _EVENTS_LOCK:
         _ACTION_EVENTS.clear()
+        _WEATHER_EVENTS.clear()
 
 
 def get_action_events() -> list[dict]:
     with _EVENTS_LOCK:
         return list(_ACTION_EVENTS)
+
+
+def get_weather_events() -> list[dict]:
+    with _EVENTS_LOCK:
+        return list(_WEATHER_EVENTS)
 
 
 def _record_action(tool_name: str, result: str) -> None:
@@ -300,4 +312,41 @@ def get_datetime() -> str:
     )
 
 
-TOOLS = [ha_action, ha_read, qdrant_search, hermes_expert, get_datetime]
+@tool
+def weather_forecast(text: str) -> str:
+    """Прогноз погоды (open-meteo): текущая погода и прогноз на день.
+
+    Используй для любых вопросов про погоду, температуру на улице, ветер и
+    осадки. Возвращённый текст — истина в последней инстанции: в final_answer
+    переноси его числа и описание погоды БЕЗ изменений (можно сократить
+    фразу, но не факты). Если данных нет — так и верни, не выдумывай.
+
+    Args:
+        text: Полный вопрос пользователя про погоду («какая завтра погода»,
+            «сколько градусов на улице», «нужен ли зонт в пятницу»).
+    """
+    try:
+        data = _http_json(
+            f"{config.ROUTER_URL}/weather?{urllib.parse.urlencode({'text': text})}",
+            timeout=15,
+        )
+    except Exception as e:
+        result = f"Не удалось получить прогноз погоды: {e}"
+    else:
+        sentences = data.get("sentences") if isinstance(data, dict) else None
+        result = (
+            " ".join(sentences)
+            if sentences
+            else "Прогноз погоды недоступен (сетевая ошибка или нет данных)."
+        )
+    # Recorded for the weather veto in honesty.py: the model writes
+    # final_answer before reading this output (field case 25.09), so the
+    # spoken answer is checked against the recorded forecast afterwards.
+    with _EVENTS_LOCK:
+        _WEATHER_EVENTS.append(
+            {"tool": "weather_forecast", "detail": result[:400]}
+        )
+    return result
+
+
+TOOLS = [ha_action, ha_read, qdrant_search, hermes_expert, get_datetime, weather_forecast]

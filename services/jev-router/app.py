@@ -445,6 +445,19 @@ async def route_ep(req: RouteRequest):
     )
 
 
+@app.get("/weather")
+async def weather_ep(text: str = ""):
+    """Deterministic forecast for L2 (smolagents weather_forecast tool).
+
+    Same open-meteo chain the easy_query weather branch uses — the worker
+    calls this instead of duplicating WMO codes/coordinates logic. Empty
+    sentences = upstream failed: the tool must report «не смог получить»
+    rather than guess (L2 hallucinated a forecast on 25.09 before this).
+    """
+    parts = await weather.weather_sentences(text)
+    return {"sentences": parts, "ok": bool(parts)}
+
+
 @app.get("/health")
 async def health():
     return {

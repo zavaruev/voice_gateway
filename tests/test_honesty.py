@@ -12,7 +12,7 @@ _WORKER = os.path.abspath(
 )
 sys.path.insert(0, _WORKER)
 
-from honesty import vet_answer  # noqa: E402
+from honesty import vet_answer, vet_weather  # noqa: E402
 
 _FAIL_NAME = [
     {"tool": "intent__HassTurnOn", "ok": False,
@@ -64,3 +64,56 @@ def test_unexposed_device_message():
 def test_non_action_answers_untouched():
     out, replaced = vet_answer("Расскажу анекдот: заходит кактус...", _FAIL_NAME)
     assert replaced is False
+
+# --- Weather veto (field case 25.09.2026) ---------------------------------
+# Tool recorded the real forecast, the model wrote final_answer in the same
+# code block (before reading it) and distorted both cloudiness and numbers.
+
+_FORECAST = [{"tool": "weather_forecast",
+              "detail": "Завтра ожидается пасмурно: днём до 16°, ночью до 9°."}]
+_LIE = ("Завтра будет переменная облачность, без осадков. Днём температура "
+        "составит +22.5°C, а ночью +12.1°C.")
+_FAILED = [{"tool": "weather_forecast",
+            "detail": "Прогноз погоды недоступен (сетевая ошибка или нет данных)."}]
+
+
+def test_weather_lie_replaced_with_recorded_forecast():
+    out, replaced = vet_weather(_LIE, _FORECAST)
+    assert replaced is True
+    assert out == _FORECAST[0]["detail"]
+
+
+def test_faithful_forecast_passes():
+    honest = "Завтра пасмурно, днём до 16 градусов, ночью около 9."
+    out, replaced = vet_weather(honest, _FORECAST)
+    assert replaced is False and out == honest
+
+
+def test_weather_numbers_must_match_even_if_conditions_do():
+    # cloudiness carries over but the numbers are invented -> replace
+    wrong_nums = "Завтра пасмурно, днём до 22 градусов, ночью до 12."
+    out, replaced = vet_weather(wrong_nums, _FORECAST)
+    assert replaced is True and out == _FORECAST[0]["detail"]
+
+
+def test_failed_fetch_vetoes_forecast_claim():
+    out, replaced = vet_weather("Завтра будет солнечно и тепло.", _FAILED)
+    assert replaced is True
+    assert "недоступен" in out
+
+
+def test_failed_fetch_admission_passes():
+    honest = "Не смогла получить прогноз погоды."
+    out, replaced = vet_weather(honest, _FAILED)
+    assert replaced is False and out == honest
+
+
+def test_no_weather_events_no_veto():
+    out, replaced = vet_weather(_LIE, [])
+    assert replaced is False and out == _LIE
+
+
+def test_weather_veto_skipped_when_action_attempted():
+    """Whole-answer replacement must not wipe an action report."""
+    out, replaced = vet_weather(_LIE, _FORECAST, action_attempted=True)
+    assert replaced is False and out == _LIE

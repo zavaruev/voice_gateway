@@ -31,8 +31,8 @@ from pydantic import BaseModel
 from smolagents import CodeAgent, OpenAIModel
 
 import config
-from honesty import vet_answer
-from tools import TOOLS, get_action_events, reset_action_events
+from honesty import vet_answer, vet_weather
+from tools import TOOLS, get_action_events, get_weather_events, reset_action_events
 
 logging.basicConfig(
     level=logging.INFO,
@@ -55,10 +55,17 @@ TASK_TEMPLATE = """Пользователь сказал голосом: «{text
 - ha_action — действие в HA (включить/выключить, яркость/цвет света, пылесос, таймеры, громкое сообщение);
 - qdrant_search — долговременная память диалога (что пользователь говорил раньше);
 - hermes_expert — старший эксперт по инфраструктуре (сложная диагностика сети/серверов);
+- weather_forecast — погода и прогноз на улице (для вопросов о погоде/температуре
+  вызывай ЕГО, а не ha_read; если вернул «недоступен» — так и скажи, не выдумывай);
 - get_datetime — текущие дата и время.
 
 Правила:
 - Опирайся на факты из тулов, ничего не выдумывай.
+- НИКОГДА не вызывай final_answer в том же блоке кода, что и тул: сначала выполни
+  тул и прочитай его вывод, ответ составляй ТОЛЬКО на следующем шаге. Ответ,
+  написанный до чтения вывода, — это выдумка, даже если звучит правдоподобно.
+- Числа и факты из вывода weather_forecast переноси в ответ БЕЗ изменений
+  (температура, осадки, слово о погоде); не округляй и не заменяй их своими.
 - Если тул вернул ошибку, «не найдено» или пусто — так и скажи в финальном ответе
   («не нашёл такого устройства» / «данных нет»). НИКОГДА не отвечай «да/включено/работает»
   на основе предположений: выдуманный статус хуже любого отказа.
@@ -182,9 +189,19 @@ def _run_agent(text: str, context: str = "") -> str:
             # Free models claimed «включено» right after a failed ha_action
             # (3 field regressions) — the recorded outcomes decide, not the
             # prompt: a success claim without one confirmed call is replaced.
-            answer, replaced = vet_answer(answer, get_action_events())
+            events = get_action_events()
+            answer, replaced = vet_answer(answer, events)
             if replaced:
                 logger.warning("honesty veto: claim replaced with recorded truth")
+            # Same pattern for weather: the model wrote final_answer before
+            # reading weather_forecast (2 field regressions, 25.09) — the
+            # recorded forecast decides instead. Skipped whenever a ha_action
+            # was attempted this run: the full-answer replacement must never
+            # wipe an action report (true success or honest refusal).
+            w_events = get_weather_events()
+            answer, w_replaced = vet_weather(answer, w_events, bool(events))
+            if w_replaced:
+                logger.warning("weather veto: answer replaced with recorded forecast")
             logger.info(
                 "agent run done in %.1fs (attempt %d)",
                 time.monotonic() - t0, attempt,

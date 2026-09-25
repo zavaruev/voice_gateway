@@ -22,6 +22,7 @@ HERMES_MODEL = os.getenv("HERMES_MODEL", "hermes-agent")
 # --- Tool backends ---
 HA_URL = os.getenv("HA_URL", "http://192.168.22.111:8123").rstrip("/")
 HA_TOKEN = os.getenv("HA_TOKEN", "")
+ROUTER_URL = os.getenv("ROUTER_URL", "http://localhost:8091").rstrip("/")
 
 QDRANT_URL = os.getenv("QDRANT_URL", "http://192.168.22.102:6333").rstrip("/")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://192.168.22.102:11434").rstrip("/")

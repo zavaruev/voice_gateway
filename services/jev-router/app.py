@@ -37,6 +37,7 @@ from classifier import Classifier
 from ha_client import (
     HAClient,
     _area_phrase,
+    dedupe_device_facets,
     describe_entity,
     find_action_targets,
     find_entity,
@@ -152,10 +153,24 @@ async def _execute_action(call) -> tuple[str | None, dict | None]:
     if call.tool in _ONOFF_TOOLS:
         states = await ha.get_states(force=True)
         if states:
+            # Deterministic refusal: a device absent from the whole registry
+            # must never reach L2 — a free model happily «включает» ghost
+            # devices (field case: «Включи кафеварку», STT typo + wrong name).
+            if call.hint and find_entity(states, call.hint, None) is None:
+                return "Не нашла такого устройства. Может, уточните название?", None
             area_map = await ha.get_entity_areas()
-            targets = find_action_targets(
-                states, area_map, call.hint, call.args.get("area")
+            targets = dedupe_device_facets(
+                find_action_targets(
+                    states, area_map, call.hint, call.args.get("area")
+                )
             )
+            if not call.args.get("area") and len(targets) > 1:
+                # No room in the utterance and several devices match —
+                # acting would mean guessing which one.
+                return None, {
+                    "ok": False,
+                    "error": f"ambiguous_no_area: {len(targets)} targets, команда без комнаты",
+                }
             want_on = call.tool.endswith("HassTurnOn")
             opposite = "off" if want_on else "on"
             todo = [

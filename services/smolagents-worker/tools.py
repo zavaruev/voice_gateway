@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -27,6 +28,43 @@ import config
 logger = logging.getLogger("worker.tools")
 
 _MSK = timezone(timedelta(hours=3))  # Moscow fixed UTC+3 (no DST since 2014)
+
+# --- Side-effect recorder (feeds the honesty veto in honesty.py) ------------
+# smolagents executes tools inside its thread pool, so the buffer is
+# module-level behind a lock: _run_agent resets it before each run and reads
+# it after the final answer is produced.
+_ACTION_EVENTS: list[dict] = []
+_EVENTS_LOCK = threading.Lock()
+
+
+def reset_action_events() -> None:
+    with _EVENTS_LOCK:
+        _ACTION_EVENTS.clear()
+
+
+def get_action_events() -> list[dict]:
+    with _EVENTS_LOCK:
+        return list(_ACTION_EVENTS)
+
+
+def _record_action(tool_name: str, result: str) -> None:
+    """Append the outcome of one ha_action call (ok is decided here so the
+    veto in honesty.py never has to re-parse MCP payloads)."""
+    head = result.lstrip()
+    ok = not head.startswith(
+        ("Ошибка", "Тул вернул ошибку", "Некорректный", "Неожиданный")
+    )
+    if ok:
+        try:
+            data = json.loads(head)
+        except json.JSONDecodeError:
+            data = None
+        if isinstance(data, dict) and data.get("success") is False:
+            ok = False
+    with _EVENTS_LOCK:
+        _ACTION_EVENTS.append(
+            {"tool": tool_name, "ok": ok, "detail": result[:300]}
+        )
 
 
 def _http_json(
@@ -106,8 +144,12 @@ def ha_action(tool_name: str, arguments_json: str) -> str:
         if not isinstance(args, dict):
             raise ValueError("arguments must be a JSON object")
     except (json.JSONDecodeError, ValueError) as e:
-        return f"Некорректный arguments_json: {e}"
-    return mcp_call(tool_name, args)
+        msg = f"Некорректный arguments_json: {e}"
+        _record_action(tool_name, msg)
+        return msg
+    result = mcp_call(tool_name, args)
+    _record_action(tool_name, result)
+    return result
 
 
 @tool

@@ -143,6 +143,34 @@ def test_turn_off_carries_spoken_hint_and_registry_area():
     assert r.hint == "свет"
 
 
+def test_stt_typo_coffemaker_resolves():
+    """E2E regression: STT heard «кафеварку» (dropped «о») and the command
+    fell through to L2, where the model invented a success."""
+    r = resolve_action("Включи кафеварку.", "device")
+    assert r is not None
+    assert r.tool == "intent__HassTurnOn"
+    assert r.args == {"domain": ["switch"], "name": "кофеварка"}
+    assert r.hint == "кофеварка"
+
+
+def test_dedupe_device_facets():
+    """switch.coffemaker_child_lock must not ride along with the device root."""
+    from ha_client import dedupe_device_facets
+
+    ts = [
+        {"entity_id": "switch.coffemaker_child_lock"},
+        {"entity_id": "switch.coffemaker"},
+        {"entity_id": "switch.living_room_light_swith_relay"},
+        {"entity_id": "switch.living_room_light_swith_network_led_switch"},
+    ]
+    ids = {t["entity_id"] for t in dedupe_device_facets(ts)}
+    assert ids == {
+        "switch.coffemaker",
+        "switch.living_room_light_swith_relay",
+        "switch.living_room_light_swith_network_led_switch",
+    }
+
+
 def test_brightness_with_percent():
     r = resolve_action("сделай свет ярче на 50%", "device")
     assert r is not None

@@ -357,6 +357,27 @@ def find_action_targets(
     return out
 
 
+def dedupe_device_facets(targets: list[dict]) -> list[dict]:
+    """Drop sub-entities of a matched device root.
+
+    «Включи кофеварку» matches both `switch.coffemaker` and
+    `switch.coffemaker_child_lock` (the «coffee» fragment is in both ids) —
+    toggling every facet would flip the child lock as well. When one entity
+    id is a strict prefix of another they belong to the same device: keep the
+    root, drop the facets.
+    """
+    ids = [t.get("entity_id", "").split(".", 1)[1] for t in targets]
+    out: list[dict] = []
+    for i, base in enumerate(ids):
+        if any(
+            j != i and base.startswith(ids[j]) and base != ids[j]
+            for j in range(len(ids))
+        ):
+            continue  # facet (coffemaker_child_lock) of a kept root
+        out.append(targets[i])
+    return out
+
+
 def describe_entity(e: dict, area: str | None = None) -> str:
     """Human phrase for TTS from an HA state object.
 

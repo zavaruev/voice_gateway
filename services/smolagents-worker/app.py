@@ -31,7 +31,8 @@ from pydantic import BaseModel
 from smolagents import CodeAgent, OpenAIModel
 
 import config
-from tools import TOOLS
+from honesty import vet_answer
+from tools import TOOLS, get_action_events, reset_action_events
 
 logging.basicConfig(
     level=logging.INFO,
@@ -169,6 +170,7 @@ def _run_agent(text: str, context: str = "") -> str:
     last_err: Exception | None = None
     for attempt, primary in enumerate((True, False), start=1):
         try:
+            reset_action_events()  # per-run side-effect log for the honesty veto
             agent = CodeAgent(
                 tools=TOOLS,
                 model=_build_model(primary),
@@ -176,12 +178,18 @@ def _run_agent(text: str, context: str = "") -> str:
             )
             logger.info("agent run start (attempt %d, primary=%s)", attempt, primary)
             t0 = time.monotonic()
-            answer = agent.run(task, stream=False)
+            answer = str(agent.run(task, stream=False))
+            # Free models claimed «включено» right after a failed ha_action
+            # (3 field regressions) — the recorded outcomes decide, not the
+            # prompt: a success claim without one confirmed call is replaced.
+            answer, replaced = vet_answer(answer, get_action_events())
+            if replaced:
+                logger.warning("honesty veto: claim replaced with recorded truth")
             logger.info(
                 "agent run done in %.1fs (attempt %d)",
                 time.monotonic() - t0, attempt,
             )
-            return str(answer)
+            return answer
         except Exception as e:
             last_err = e
             logger.warning("agent run failed (attempt %d): %s", attempt, e)

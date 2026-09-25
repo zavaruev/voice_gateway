@@ -1,8 +1,10 @@
-"""Streaming chat proxies: OmniRoute combo (primary) with failover to Hermes.
+"""Streaming chat proxies: OmniRoute combo with failover to Hermes L3.
 
 Used for two routes:
-  * general_qa — quick chat that must bypass the L2 CodeAgent entirely;
-  * expert     — deep diagnostics delegated to the L3 Hermes Agent.
+  * general_qa — quick chat that must bypass the L2 CodeAgent entirely
+                 (OmniRoute first, Hermes failover);
+  * expert     — Hermes L3 FIRST (OmniRoute failover): the escalation
+                 «вопрос не решается ниже» lands directly on the agent brain.
 
 Both upstreams are OpenAI-compatible /v1/chat/completions SSE. Output is
 pre-split into speakable sentences so voice_gateway receives ready-to-TTS
@@ -182,31 +184,48 @@ EXPERT_SYSTEM = (
 
 
 async def stream_chat(text: str, expert: bool = False):
-    """general_qa/expert route: OmniRoute combo → failover to Hermes L3."""
+    """general_qa: OmniRoute combo → Hermes failover (fast chat brain).
+    expert: Hermes L3 FIRST, OmniRoute failover — the expert route is the
+    «вопрос не решается ниже → Гермес» path (README promised it; before
+    2.28 the free combo answered expert questions too, and its polite
+    refusals are exactly what hid the missing escalation)."""
     system = EXPERT_SYSTEM if expert else CHAT_SYSTEM
     messages = [
         {"role": "system", "content": system},
         {"role": "user", "content": text},
     ]
-    # Primary: OmniRoute free combo (no API key required).
-    try:
-        got = False
-        async for s in stream_sentences(
-            config.OMNIROUTE_URL, config.OMNIROUTE_COMBO, messages
-        ):
-            got = True
-            yield s
-        if got:
-            return
-        logger.warning("omniroute returned empty, falling back to hermes")
-    except Exception as e:
-        logger.warning("omniroute failed (%s), falling back to hermes", e)
+    omni = (config.OMNIROUTE_URL, config.OMNIROUTE_COMBO, "")
+    hermes = (config.HERMES_URL, "hermes-agent", config.HERMES_API_KEY)
+    targets = (hermes, omni) if expert else (omni, hermes)
+    logger.info(
+        "stream_chat expert=%s primary=%s",
+        expert, "hermes" if expert else "omniroute",
+    )
+    for url, model, api_key in targets:
+        try:
+            got = False
+            async for s in stream_sentences(url, model, messages, api_key=api_key):
+                got = True
+                yield s
+            if got:
+                return
+            logger.warning("%s returned empty, trying next target", model)
+        except Exception as e:
+            logger.warning("%s failed (%s), trying next target", model, e)
 
-    # Failover: Hermes L3 (always available in this stack).
-    try:
-        async for s in stream_sentences(
-            config.HERMES_URL, "hermes-agent", messages, api_key=config.HERMES_API_KEY
-        ):
-            yield s
-    except Exception as e:
-        logger.error("hermes failover failed: %s", e)
+
+async def stream_hermes(text: str, system: str = CHAT_SYSTEM):
+    """Direct Hermes L3 stream (weather fallback after open-meteo failed).
+
+    Raises on transport/status errors like stream_sentences — the caller
+    treats «nothing yielded» as unsolved and escalates to complex_logic.
+    """
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": text},
+    ]
+    logger.info("stream_hermes: direct L3 call (weather fallback)")
+    async for s in stream_sentences(
+        config.HERMES_URL, "hermes-agent", messages, api_key=config.HERMES_API_KEY
+    ):
+        yield s

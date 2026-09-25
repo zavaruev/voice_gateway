@@ -33,6 +33,7 @@ from pydantic import BaseModel
 import chat_proxy
 import config
 import memory
+import weather
 from classifier import Classifier
 from ha_client import (
     HAClient,
@@ -354,9 +355,19 @@ async def _handle(req: RouteRequest):
                 if res.get("ok"):
                     sentence = _datetime_phrase(res.get("result"))
             elif q.kind == "weather":
-                # No guaranteed weather entity: answer via chat (search-capable
-                # hermes is the failover target of stream_chat).
-                async for s in chat_proxy.stream_chat(text):
+                # Hybrid chain (25.09.2026): open-meteo builds the forecast
+                # deterministically (instant, cannot invent dates); Hermes L3
+                # is the knowledge fallback; if it also says nothing, fall
+                # through to the shared query_unresolved -> complex_logic
+                # escalation below — every level gets its chance in order.
+                parts = await weather.weather_sentences(text)
+                if not parts:
+                    try:
+                        async for s in chat_proxy.stream_hermes(text):
+                            parts.append(s)
+                    except Exception as e:
+                        logger.warning("weather hermes fallback failed: %s", e)
+                for s in parts:
                     emitted = True
                     reply_parts.append(s)
                     yield _sse({"type": "sentence", "text": s})

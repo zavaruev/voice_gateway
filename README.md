@@ -1,6 +1,6 @@
 # Voice Gateway
 
-> **Version 2.27** — Cascade AI architecture (jev-router → smolagents CodeAgent → Hermes Expert) + E2E honesty fixes for side effects. See Changelog below.
+> **Version 2.28** — Cascade AI architecture (jev-router → smolagents CodeAgent → Hermes Expert), hybrid weather chain (open-meteo → Hermes → L2) + E2E honesty fixes for side effects. See Changelog below.
 
 WebSocket gateway bridging [Xiaozhi ESP32](https://github.com/78/xiaozhi-esp32) smart speakers **and WebRTC/IP cameras** to an AI backend (**Cascade** 3-level router, **[Nanobot](https://github.com/HKUDS/nanobot)** or **Hermes**) with real-time speech processing.
 
@@ -85,7 +85,7 @@ Set `LLM_BACKEND=cascade` (plus `ROUTER_URL`, default `http://localhost:8091`) a
 docker compose up -d --no-deps --build jev-router smolagents-worker voice_gateway
 ```
 
-- **L1 `jev-router`** (port 8091) — semantic route classifier (local Ollama embeddings) + offline slot resolver. Easy commands execute directly against Home Assistant (~0.1 s), state queries are answered from the live registry, `general_qa` streams from OmniRoute, `expert` goes to Hermes; anything ambiguous or failed escalates to L2 with decoded error context.
+- **L1 `jev-router`** (port 8091) — semantic route classifier (local Ollama embeddings) + offline slot resolver. Easy commands execute directly against Home Assistant (~0.1 s), state queries are answered from the live registry, `general_qa` streams from OmniRoute, `expert` hits Hermes first (OmniRoute failover), weather is built from open-meteo (Hermes on API failure, L2 as last resort); anything ambiguous or failed escalates to L2 with decoded error context.
 - **L2 `smolagents-worker`** (port 8092) — smolagents `CodeAgent` (`ha_action`/`ha_read`/`qdrant_search`/`hermes_expert`/`get_datetime`), 120 s cap with progress heartbeats, and a programmatic honesty veto: an answer claiming success after only failed tool calls is replaced with the recorded truth.
 
 External dependencies (env, see `services/*/config.py`): Ollama `qwen3-embedding`, Qdrant, OmniRoute combo, Home Assistant MCP.
@@ -251,6 +251,11 @@ Covers engine wake scoring/gates, camera arbitration helpers, OTA auth, and RMS 
 
 ## Changelog
 
+- **2.28** — Weather hybrid chain + expert route really on Hermes («не решается ниже → Гермес» now works).
+  - **Root cause** — «Какая завтра будет погода?» was routed `easy_query` → the weather branch streamed the free combo; its polite refusal counted as *success* (`chat_proxy` failed over to Hermes only on transport errors), and the `query_unresolved → complex_logic` escalation was unreachable for weather because any stream sets `emitted=True`. Nothing ever switched to Hermes — by construction, not by accident.
+  - **Hybrid weather (L1)** — `services/jev-router/weather.py`: a deterministic forecast from open-meteo (free, no key) using coordinates from HA `/api/config` (cached): current conditions with wind («сейчас»), «завтра»/«послезавтра»/«в пятницу» (7-day window; WMO codes → RU phrases; precip probability spoken only when ≥30%). Instant, no LLM, cannot invent dates (E2E: the free model refused, Hermes named a wrong date). API unreachable → **direct Hermes L3 stream** (`stream_hermes`); Hermes silent too → the existing `query_unresolved → complex_logic` escalation finally fires, where the L2 can call `hermes_expert`.
+  - **expert = Hermes first** — `stream_chat(expert=True)` now tries Hermes before OmniRoute (README always promised this; previously the free combo answered expert questions too), OmniRoute stays as failover; a `stream_chat expert=… primary=…` log line shows which brain took the call.
+  - **Tests** — `tests/test_weather.py` (target picking, RU phrasing, weekday window, fallbacks); suite 63 passed on host.
 - **2.27** — E2E fixes: a promised side effect must be a performed side effect.
   - **Area canonical names (root cause of «пообещало выключить и не выключило»)** — the resolver now sends area-registry *display* names (`Living Room`, `Kitchen`, `Corridor`, `Bedroom`...): RU «гостиная»/«ванная»/«туалет» have no alias in the live HA registry and the intent matcher rejected them with `MatchFailedError INVALID_AREA` (E2E via ESP32, 25.09). RU words remain the lookup keys; `_area_phrase` gained a table so EN names still produce Russian phrases («В гостиной», «На кухне»).
   - **On/off target resolution from the live registry** — `find_action_targets()` + `HAClient.get_entity_areas()` (cached `area_name` template map): the living-room lamp is `switch.living_room_light_swith_relay` while every `light.*` there is an unavailable ESP indicator, so a blind `domain:["light"]+area` match both missed the relay and could no-op on `unavailable` states. The executor now: picks concrete entities (bilingual «свет»→light), calls the intent with the exact friendly name, skips entities not exposed to the voice assistant (`MatchFailedReason.ASSISTANT`) without failing the rest, and answers «В гостиной уже выключено.» when every target is already in the requested state instead of pretending. Result: «Выключи/Включи свет в гостиной» → 0.08–0.11 s, no escalation, state change verified in HA; 0 escalations across the regression batch (state/datetime queries with EN areas intact).

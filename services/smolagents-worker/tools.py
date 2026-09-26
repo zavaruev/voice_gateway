@@ -145,11 +145,16 @@ def ha_action(tool_name: str, arguments_json: str) -> str:
 
     Args:
         tool_name: Имя MCP-тула, напр. intent__HassTurnOn, intent__HassTurnOff,
-            light__HassLightSet, vacuum__HassVacuumStart, vacuum__HassVacuumReturnToBase,
-            intent__HassCancelAllTimers, assist_satellite__HassBroadcast.
+            light__HassLightSet, vacuum__HassVacuumCleanArea (уборка в комнате),
+            vacuum__HassVacuumStart (просто запустить пылесос БЕЗ указания комнаты),
+            vacuum__HassVacuumReturnToBase, intent__HassCancelAllTimers,
+            assist_satellite__HassBroadcast.
         arguments_json: JSON-строка аргументов, напр. {"area": "кухня", "domain": ["light"]}
             или {"message": "обед готов"}. Ключи: name, area, floor, domain, device_class,
             color, temperature, brightness, message — в зависимости от тула.
+            ВАЖНО для пылесоса: уборка в конкретной комнате — только
+            vacuum__HassVacuumCleanArea с {"area": "кухня"}; у HassVacuumStart
+            area означает ГДЕ стоит пылесос (комната-фильтр), а не цель уборки.
     """
     try:
         args = json.loads(arguments_json) if arguments_json.strip() else {}
@@ -160,6 +165,27 @@ def ha_action(tool_name: str, arguments_json: str) -> str:
         _record_action(tool_name, msg)
         return msg
     result = mcp_call(tool_name, args)
+    # Field regression 25.09.2026 («Пусть робот уберется на кухне»): in
+    # HassVacuumStart the area slot filters by the vacuum's LOCATION, and the
+    # robot is assigned to no area in HA -> MatchFailedReason.AREA every time,
+    # while the user's intent with a room is "clean there". Fallback:
+    # Start+area -> CleanArea (area = cleaning target, entity match ignores
+    # the robot's area), ReturnToBase+area -> same tool without area (a
+    # location filter is meaningless for docking). Original behaviour is kept
+    # when Start+area actually matches.
+    if "area" in args and "MatchFailedReason.AREA" in result:
+        if tool_name == "vacuum__HassVacuumStart":
+            retry_tool = "vacuum__HassVacuumCleanArea"
+            retry_args = {k: v for k, v in args.items() if k in ("area", "name")}
+        elif tool_name == "vacuum__HassVacuumReturnToBase":
+            retry_tool = tool_name
+            retry_args = {k: v for k, v in args.items() if k != "area"}
+        else:
+            retry_tool, retry_args = "", {}
+        if retry_tool:
+            logger.info("vacuum AREA mismatch -> retry %s %s",
+                        retry_tool, retry_args)
+            tool_name, result = retry_tool, mcp_call(retry_tool, retry_args)
     _record_action(tool_name, result)
     return result
 

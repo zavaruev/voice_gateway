@@ -1,6 +1,6 @@
 # Voice Gateway
 
-> **Version 2.29** — L2 weather tool + programmatic weather honesty (the free model wrote forecasts before reading the tool). Cascade AI architecture (jev-router → smolagents CodeAgent → Hermes Expert), hybrid weather chain (open-meteo → Hermes → L2) + E2E honesty fixes for side effects. See Changelog below.
+> **Version 2.30** — Vacuum E2E fix: room-targeted cleaning goes to `HassVacuumCleanArea` (in `HassVacuumStart` the area slot filters by the robot's LOCATION, and the robot is assigned to no room → `MatchFailedReason.AREA` every time). Deterministic fallback in L2, correct intent in L1, honesty veto learns the vacuum verbs («отправляю/запускаю/убираю»). See Changelog below.
 
 WebSocket gateway bridging [Xiaozhi ESP32](https://github.com/78/xiaozhi-esp32) smart speakers **and WebRTC/IP cameras** to an AI backend (**Cascade** 3-level router, **[Nanobot](https://github.com/HKUDS/nanobot)** or **Hermes**) with real-time speech processing.
 
@@ -251,6 +251,14 @@ Covers engine wake scoring/gates, camera arbitration helpers, OTA auth, and RMS 
 
 ## Changelog
 
+- **2.30** — «Пусть робот уберется на кухне» failed end-to-end; the fix is the right intent, not a prompt.
+  - **What happened** — the model called `vacuum__HassVacuumStart(area="кухня")`. In HA **2026.9.3** the `area` slot of `HassVacuumStart` filters by the vacuum's **LOCATION** (entity matching), not by the cleaning target: the robot is assigned to no room in HA (`area_id=None`) → `MatchFailedReason.AREA`, `states=[]`, the robot stayed `docked`. The same step also wrote `final_answer` («отправляю робота-пылесоса») in the code block — and the honesty veto stayed silent because `_RE_CLAIM` had no «отправляю».
+  - **The right intent** — `vacuum__HassVacuumCleanArea`: there `area` is a service parameter (`cleaning_area_id`), the entity matches by domain + `CLEAN_AREA` feature only. Verified on the live HA: `CLEAN_AREA=16384` is set in `supported_features=29372`, `area_mapping` is configured (**Kitchen → segment 16**), `last_seen_segments` present, `should_expose=true`.
+  - **L2 (`tools.py`)** — deterministic fallback: `Start+area` failing with `MatchFailedReason.AREA` → retry `CleanArea(area)`; `ReturnToBase+area` → retry without `area` (a location filter is meaningless for docking); original behaviour kept when Start+area actually matches. `ha_action` docstring steers the model to CleanArea for a room.
+  - **L1 (`resolver.py`)** — a room NAMED in the utterance («на кухне») → `CleanArea`; the stream's default area stays a speaker-location hint and keeps `Start+area` (never silently changes a plain Start into a room clean).
+  - **Honesty (`honesty.py`)** — `_RE_CLAIM` learns the vacuum/movement verbs (`отправ\w*|запусти\w*|запуска\w*|начина\w*|убира\w*|убер[её]т\w*`) with a `(?<!не )` guard so an honest status («робот не убирается») is not a claim; `_truth` gets an `AREA` branch — «устройство не привязано к этой комнате» instead of the generic «HA отклонил команду».
+  - **Tests** — `test_honesty.py` +3 (field promise replaced, start/clean verbs, negated status untouched), `test_router_resolution.py` +2 (named room → CleanArea, stream default → Start) → suite **75 passed**.
+  - **E2E** — «Пусть робот уберется на кухне» → 2.4s → model itself called `CleanArea({"area": "кухня"})` → vacuum `state: cleaning` (20s+ confirmed, segment 16), veto silent **because the claim was backed by the recorded success**.
 - **2.29** — L2 gets a weather tool, and the forecast it returns is enforced (field case: «подвоя»).
   - **What happened** — STT garbled «погоду» → «подвоя», the L1 weather regex missed, the resolver escalated to `complex_logic` (correct), but the L2 CodeAgent called `ha_read("погода")` (no such entity), **made up** «солнечно, 10–22°» and its honesty veto stayed silent: `get_datetime`/`qdrant_search` had succeeded, so the «0 successes» condition didn't hold. On retry it did call the new tool, saw the right forecast in the logs — and still wrote `final_answer` **in the same code block, before reading it** (twice out of two; prompt rules ignored).
   - **`weather_forecast` tool** — GET jev-router `/weather` (the same open-meteo chain, single source of WMO/coordinates logic); empty → honest «прогноз недоступен», never a guess. Manifest line added to `TASK_TEMPLATE`.

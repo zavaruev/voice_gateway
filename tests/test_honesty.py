@@ -65,6 +65,40 @@ def test_non_action_answers_untouched():
     out, replaced = vet_answer("Расскажу анекдот: заходит кактус...", _FAIL_NAME)
     assert replaced is False
 
+
+# --- Vacuum field case 25.09.2026 -------------------------------------------
+# «Пусть робот уберется на кухне» -> HassVacuumStart failed with AREA (robot
+# is assigned to no area in HA), the model promised «отправляю робота» in the
+# same code block — and the old claim regex had no «отправляю»/«запускаю».
+
+_FAIL_AREA = [
+    {"tool": "vacuum__HassVacuumStart", "ok": False,
+     "detail": "Тул вернул ошибку: MatchFailedReason.AREA: 2, "
+               "areas=[AreaEntry(name='Kitchen')]"}
+]
+
+
+def test_veto_catches_vacuum_promise():
+    """The exact field case: promise after AREA failure -> truthful refusal."""
+    out, replaced = vet_answer("Хорошо, отправляю робота-пылесоса на кухню!",
+                               _FAIL_AREA)
+    assert replaced is True
+    assert "не привязано к этой комнате" in out
+
+
+def test_veto_catches_start_and_clean_verbs():
+    for claim in ("Запустил пылесос!", "Начинаю уборку на кухне!",
+                  "Пылесос убирается, всё чисто!"):
+        out, replaced = vet_answer(claim, _FAIL_AREA)
+        assert replaced is True, claim
+
+
+def test_negated_status_not_vetoed():
+    """«робот не убирается» — status report, not a promise."""
+    out, replaced = vet_answer("Робот не убирается — команда не прошла.",
+                               _FAIL_AREA)
+    assert replaced is False
+
 # --- Weather veto (field case 25.09.2026) ---------------------------------
 # Tool recorded the real forecast, the model wrote final_answer in the same
 # code block (before reading it) and distorted both cloudiness and numbers.

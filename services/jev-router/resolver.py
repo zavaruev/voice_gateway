@@ -215,6 +215,19 @@ def resolve_action(text: str, stream_name: str) -> ResolvedCall | None:
         and re.search(r"пылесос|уборк|прибери|убери пол", t, re.I)
         and not RE_OFF.search(t)
     ):
+        # Field regression 25.09.2026 («уберется на кухне»): in HassVacuumStart
+        # the area slot filters by the vacuum's LOCATION, and the robot is
+        # assigned to no room in HA -> MatchFailedReason.AREA every time.
+        # A room NAMED in the utterance is the cleaning target — that is
+        # HassVacuumCleanArea, where area is a service parameter and the
+        # entity match does not depend on the robot's location. The stream's
+        # default area is only a speaker-location hint (not the user's
+        # cleaning target), so it keeps the old Start+area behaviour.
+        if area and area_src == "explicit":
+            return ResolvedCall(
+                "vacuum__HassVacuumCleanArea", {"area": area},
+                speak_ok="Запустила уборку", area_source=area_src,
+            )
         args = {"domain": ["vacuum"]}
         if area:
             args["area"] = area

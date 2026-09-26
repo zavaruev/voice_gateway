@@ -28,9 +28,15 @@ from __future__ import annotations
 import re
 
 # Success claims about an action (what must not be said without a result).
+# Field regression 25.09.2026: «Хорошо, отправляю робота-пылесоса на кухню!»
+# was spoken after vacuum__HassVacuumStart failed with MatchFailedReason.AREA
+# — «отправляю/запускаю/начинаю/убираю» were missing from this list. The
+# (?<!не ) guard keeps honest negations («робот не убирается») out of the
+# claim set: a negated verb is a status report, not a promise.
 _RE_CLAIM = re.compile(
-    r"\b(?:включ\w*|выключ\w*|зажг\w*|погас\w*|сдела(?:л\w*|но|на)|выполнено|"
-    r"запущен\w*|подготовлен\w*|передала|активир\w*|открыл\w*|закрыл\w*)\b",
+    r"(?<!не )\b(?:включ\w*|выключ\w*|зажг\w*|погас\w*|сдела(?:л\w*|но|на)|"
+    r"выполнено|запущен\w*|запусти\w*|запуска\w*|подготовлен\w*|передала|"
+    r"активир\w*|открыл\w*|закрыл\w*|отправ\w*|начина\w*|убира\w*|убер[её]т\w*)\b",
     re.IGNORECASE,
 )
 
@@ -60,6 +66,12 @@ def _truth(events: list[dict]) -> str:
         return "Не нашла такого устройства в Home Assistant."
     if "INVALID_AREA" in detail:
         return "Не нашла такую комнату в Home Assistant."
+    if "MatchFailedReason.AREA" in detail:
+        # The room exists, but no device in it matched — for the vacuum this
+        # means it is not assigned to any area in HA (HassVacuumStart's area
+        # slot filters by the vacuum's LOCATION, not the cleaning target).
+        return ("Не получилось: устройство не привязано к этой комнате "
+                "в Home Assistant.")
     if "Некорректный arguments_json" in detail:
         return "Не получилось: команда собрана с ошибкой, попробуй переформулировать."
     return "Не получилось: Home Assistant отклонил команду."

@@ -191,6 +191,26 @@ def test_vacuum_start_and_dock():
     assert r2 is not None and r2.tool == "vacuum__HassVacuumReturnToBase"
 
 
+def test_vacuum_clean_with_named_room_uses_clean_area():
+    """Field regression 25.09.2026: «уберется на кухне» went to HassVacuumStart
+    whose area slot filters by the vacuum's LOCATION (robot unassigned in HA ->
+    MatchFailedReason.AREA, robot never started). A room named in the utterance
+    is the cleaning target -> HassVacuumCleanArea."""
+    r = resolve_action("запусти пылесос на кухне", "device")
+    assert r is not None
+    assert r.tool == "vacuum__HassVacuumCleanArea"
+    assert r.args == {"area": "Kitchen"}
+
+
+def test_vacuum_clean_stream_default_area_keeps_start():
+    """The stream's default area is a speaker-location hint, not a cleaning
+    target — it must not silently switch a plain Start into CleanArea."""
+    r = resolve_action("запусти пылесос", "kitchen")
+    assert r is not None
+    assert r.tool == "vacuum__HassVacuumStart"
+    assert r.args == {"domain": ["vacuum"], "area": "Kitchen"}
+
+
 def test_cancel_timers():
     r = resolve_action("выключи таймеры", "device")
     assert r is not None

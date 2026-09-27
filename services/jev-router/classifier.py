@@ -1,11 +1,30 @@
 """Semantic route classification: Ollama embeddings + calibrated cosine scoring.
 
+PURPOSE
+  First decision point of every voice turn in the L1 router (see app.py):
+  map the utterance to one of the five cascade routes BEFORE anything is
+  executed, so cheap deterministic handling (resolver + HA) runs for easy
+  commands and the expensive L2 CodeAgent only for what needs it.
+
+  Output contract: `Classifier.classify(text)` -> RouteDecision with the
+  winning `route`, a calibrated `confidence` in [0,1], per-route `scores`
+  and a non-empty `reason` whenever the verdict was ESCALATED to
+  `complex_logic` (reason = why: low_confidence/low_margin/ambiguous/
+  no_mcp_tool_for_request/classifier_unavailable/embed_failed/empty_text).
+  app.py logs that reason into the SSE `route` event — it is the primary
+  debugging aid when a command takes the slow path.
+
 Scoring model mirrors semantic-router's Route/utterance approach (one centroid-free
 max-cosine per route) but is hand-rolled because:
   * embeddings come from a self-hosted Ollama model (semantic-router's built-in
     encoders all require cloud/HF model downloads);
   * the repo has no pip on the test host, so a numpy-only module stays unit-testable;
   * thresholds are calibrated against real measurements (see config.py).
+
+  Deterministic regex fast-paths sit ON TOP of the cosine verdict for plain
+  Russian imperatives («включи свет»): an unambiguous verb pattern beats a
+  doubtful cosine, except when the embedding verdict is a *confident*
+  expert/complex one — «поччини и включи роутер» must stay expert.
 
 Swap-in point: `Classifier.classify()` is the only entry — a semantic-router backend
 could replace the body without touching callers.
@@ -24,6 +43,11 @@ logger = logging.getLogger("router.classifier")
 
 # ---------------------------------------------------------------------------
 # Route definitions (utterance sets = semantic-router Route configs)
+# Embedded ONCE in warmup(); a route's score is the max cosine over its own
+# set, so each paraphrase widens that route's net. Sets stay deliberately
+# small (10-17 lines): warmup must remain a single Ollama call, and an
+# oversized example set would blur the top1/top2 margin the escalation
+# rules compare against.
 # ---------------------------------------------------------------------------
 ROUTES: dict[str, list[str]] = {
     "easy_action": [

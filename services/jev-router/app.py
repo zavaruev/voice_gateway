@@ -1,5 +1,15 @@
 """jev-router — cascade level-1 semantic router (SSE /route).
 
+PURPOSE
+  This is the FAST path of the three-level voice-control cascade:
+  ESP32 satellite -> main.py (root repo, port 6050: audio/VAD/STT/TTS)
+    -> jev-router (L1, this service, port 8091)
+    -> smolagents-worker (L2, smolagents CodeAgent on a free LLM, port 8092)
+    -> Hermes (L3 expert) -> Home Assistant via MCP tools.
+  L1 answers deterministic commands and queries directly (~0.1 s, no LLM);
+  everything it cannot resolve with certainty is escalated to L2, which may
+  in turn delegate to L3. The router never guesses a side-effect.
+
 Pipeline per request:
   classify (Ollama embeddings + calibrated cosine)
     -> easy_action  : regex/lexicon slot resolver -> HA MCP intent call
@@ -11,12 +21,24 @@ Pipeline per request:
 Escalation rule: any ambiguity (resolver -> None, HA failure, low confidence)
 falls through to complex_logic — never a wrong side-effect.
 
+HTTP contract (FastAPI, uvicorn 0.0.0.0:8091, `network_mode: host`):
+  POST /route    {"text": str, "session_id": str, "stream_name": str}
+                 -> text/event-stream of the events below (see SSE schema)
+  GET  /weather?text=... -> {"sentences": [..], "ok": bool} (open-meteo for L2)
+  GET  /health   -> {"status", "classifier_warmed", "routes"}
+  Port 8091 carries NO authentication: a deliberate user decision — the
+  service is reachable on the home LAN only, and an auth layer would add
+  latency to every voice turn without protecting anything outside the house.
+
 SSE event schema (one JSON object per `data:` line):
   {"type":"route",   "route":str,"confidence":float,"reason":str}
   {"type":"sentence","text":str}          # speakable TTS chunk
   {"type":"progress","text":str}          # L2 progress heartbeat
   {"type":"done",    "route":str,"elapsed":float}
   {"type":"error",   "message":str}
+  A `route` event may be emitted TWICE: once up front and again with
+  "complex_logic" when the fast path fails — the caller (main.py) treats
+  the second one as the self-healing retry signal.
 """
 
 import asyncio
@@ -45,18 +67,31 @@ from ha_client import (
 )
 from resolver import resolve_action, resolve_query
 
+# stdout logging: uvicorn does not configure root logging by default, and the
+# route decisions logged here are the main debugging surface in `docker logs`.
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(name)s %(levelname)s %(message)s",
 )
 logger = logging.getLogger("router")
 
+# Process-wide singletons: one embedder connection (Ollama) and one HA client
+# (whose /api/states + area-map caches are shared by every request). Both are
+# closed in `lifespan` below — creating them per request would lose the cache
+# and burn a TCP handshake on every voice turn.
 classifier = Classifier()
 ha = HAClient()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """Startup/shutdown hook: warm the classifier and the memory collections.
+
+    Warmup failures are deliberately non-fatal — `classify()` retries lazily
+    and the escalation chain (everything -> complex_logic) keeps the service
+    useful even with Ollama or Qdrant down. On shutdown the embedder session
+    and the HA session are closed so uvicorn exits without pending sockets.
+    """
     ok = await classifier.warmup()
     logger.info("classifier warmup: %s", "ok" if ok else "FAILED (escalations active)")
     mem_ok = await memory.ensure_collections()
@@ -70,20 +105,36 @@ app = FastAPI(title="jev-router", lifespan=lifespan)
 
 
 class RouteRequest(BaseModel):
+    """POST /route body.
+
+    `stream_name` is the physical satellite (kitchen/livingroom/...) — the
+    resolver uses it as the default room when the utterance names none;
+    `session_id` tags the memory write for L2's qdrant_search.
+    """
+
     text: str
     session_id: str = ""
     stream_name: str = ""
 
 
 def _sse(obj: dict) -> str:
+    """Serialize one SSE `data:` line.
+
+    ensure_ascii=False keeps the Russian TTS sentences readable on the wire;
+    the double newline terminates the event for the EventSource reader in
+    main.py.
+    """
     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
 
+# RU names for the English fields HA returns from llm__GetDateTime — the
+# phrase is spoken aloud, so the translation happens here, not in TTS.
 _WEEKDAYS_RU = {
     "Monday": "понедельник", "Tuesday": "вторник", "Wednesday": "среда",
     "Thursday": "четверг", "Friday": "пятница", "Saturday": "суббота",
     "Sunday": "воскресенье",
 }
+# Keyed by the "MM" slice of the ISO date returned by HA (date[5:7]).
 _MONTHS_RU = {
     "01": "января", "02": "февраля", "03": "марта", "04": "апреля",
     "05": "мая", "06": "июня", "07": "июля", "08": "августа",
@@ -97,6 +148,8 @@ def _datetime_phrase(result) -> str | None:
     Shape verified live: {"date": "2026-09-24", "time": "17:52:46",
     "timezone": "MSK", "weekday": "Thursday"} — a plain string is also
     accepted for forward compatibility.
+    Returns None when nothing speakable could be built; the caller then
+    escalates instead of staying silent (a voice turn must always answer).
     """
     if isinstance(result, str):
         return result.strip() or None
@@ -104,11 +157,14 @@ def _datetime_phrase(result) -> str | None:
         return None
     parts: list[str] = []
     date = str(result.get("date", ""))
+    # len/date[4] guards distinguish a real "YYYY-MM-DD" from a short or
+    # differently formatted value before slicing it apart.
     if len(date) >= 10 and date[4] == "-":
         month = _MONTHS_RU.get(date[5:7], "")
         date_ru = f"{int(date[8:10])} {month} {date[:4]}".strip()
         wd = _WEEKDAYS_RU.get(str(result.get("weekday", "")), "")
         parts.append(f"Сегодня {wd}, {date_ru}." if wd else f"Сегодня {date_ru}.")
+    # "17:52:46" -> "17:52": seconds are noise for speech.
     t = str(result.get("time", ""))[:5]
     if t:
         parts.append(f"Сейчас {t}.")
@@ -119,10 +175,19 @@ def _datetime_phrase(result) -> str | None:
 # On/off intents only: a wrong side-effect on other domains (broadcast,
 # timers, vacuum) is a different class of mistake and keeps the blind path.
 _ONOFF_TOOLS = ("intent__HassTurnOn", "intent__HassTurnOff")
+# Upper bound of devices one utterance may toggle: "выключи весь свет" must
+# not become an unbounded fan-out of MCP calls with per-call timeouts.
 _MAX_ONOFF_TARGETS = 5
 
 
 def _err_text(res: dict | None) -> str:
+    """Collapse an HA error dict into one bounded string for logs and for the
+    `ha_call_failed:` reason that goes to L2.
+
+    `raw` (the tool's full JSON body) is truncated to 300 chars and the whole
+    text to 400 so an SSE `reason` field and a log line stay readable — the
+    L2 prompt only needs the failure class (INVALID_AREA, ASSISTANT, ...).
+    """
     if not res:
         return "unknown"
     err = str(res.get("error") or "unknown")
@@ -133,7 +198,12 @@ def _err_text(res: dict | None) -> str:
 
 
 def _target_rank(e: dict) -> tuple:
-    """A real lamp beats auxiliary switches; shorter name = core device."""
+    """Sort key deciding WHICH entity speaks for the device in `speak_ok`.
+
+    A real lamp beats auxiliary switches; shorter name = core device;
+    entity_id is the final deterministic tie-break so repeated runs call
+    the same entity first. Returns (domain_rank, name_len, entity_id).
+    """
     eid = e.get("entity_id", "")
     dom = eid.split(".", 1)[0]
     name = (e.get("attributes", {}) or {}).get("friendly_name") or eid
@@ -174,6 +244,9 @@ async def _execute_action(call) -> tuple[str | None, dict | None]:
                 }
             want_on = call.tool.endswith("HassTurnOn")
             opposite = "off" if want_on else "on"
+            # Only devices currently in the OPPOSITE state are worth calling;
+            # the rest need no MCP call at all — and if nothing needed
+            # changing, the "already ..." branch below says so truthfully.
             todo = [
                 e for e in targets
                 if str(e.get("state", "")).lower() == opposite
@@ -195,6 +268,9 @@ async def _execute_action(call) -> tuple[str | None, dict | None]:
                 for ent in todo:
                     eid = ent["entity_id"]
                     name = (ent.get("attributes", {}) or {}).get("friendly_name") or eid
+                    # Fresh copy per entity: name/domain are pinned to the
+                    # registry entry so the matcher targets exactly what was
+                    # resolved, and the next iteration starts from clean args.
                     args = dict(call.args)
                     args["name"] = name
                     args["domain"] = [eid.split(".", 1)[0]]
@@ -211,6 +287,8 @@ async def _execute_action(call) -> tuple[str | None, dict | None]:
                         logger.info("target not exposed to assistant: %s", eid)
                     else:
                         fatal.append(f"{eid}: {et}")
+                # Confirmed success with no fatal error = success; entities
+                # merely not exposed to the assistant were skipped, not failed.
                 if ok and not fatal:
                     return call.speak_ok, None
                 fails = fatal + [
@@ -232,7 +310,19 @@ async def _execute_action(call) -> tuple[str | None, dict | None]:
 
 
 async def _run_worker(text: str, session_id: str, stream_name: str, context: str = ""):
-    """Forward smolagents-worker SSE events; yields router-level dicts."""
+    """Forward smolagents-worker (L2) SSE events; yields router-level dicts.
+
+    The worker speaks the same event schema, so its `sentence`/`progress`
+    objects are re-emitted verbatim to the client. `context` is the decoded
+    failure reason from a fast-path attempt — that is what makes the L2 retry
+    self-healing instead of a blind repeat of the rejected call.
+
+    Raises RuntimeError on a non-200 response (surfaced as an SSE `error`
+    event by _handle); non-JSON `data:` lines are skipped, and `[DONE]`
+    terminates the upstream stream.
+    """
+    # total=WORKER_TIMEOUT caps the whole agent run, sock_connect=5 fails fast
+    # when the worker is not listening (it may be restarting between turns).
     timeout = aiohttp.ClientTimeout(total=config.WORKER_TIMEOUT, sock_connect=5)
     async with aiohttp.ClientSession(timeout=timeout) as sess:
         async with sess.post(
@@ -258,12 +348,26 @@ async def _run_worker(text: str, session_id: str, stream_name: str, context: str
 
 
 async def _handle(req: RouteRequest):
-    """Async generator of router SSE events for one request."""
+    """Async generator of router SSE events for one request.
+
+    Event order: one `route` event (possibly re-emitted as `complex_logic`
+    after an escalation), zero or more `sentence`/`progress` events, then a
+    final `done` carrying the *effective* route and elapsed seconds. Even an
+    unhandled handler exception produces an `error` event and still reaches
+    `done` — the caller must never be left waiting on a silent stream.
+
+    `reply_parts` accumulates only what the user will actually hear (no
+    progress heartbeats) and is written to memory right before `done`.
+    """
     t0 = time.monotonic()
     text = (req.text or "").strip()
+    # Everything speakable across all branches; feeds the fire-and-forget
+    # memory write (route metadata + what was really said).
     reply_parts: list[str] = []
 
     if not text:
+        # STT can produce an empty string; answer immediately instead of
+        # letting classify() burn an embedding round-trip on nothing.
         yield _sse({"type": "error", "message": "empty_text"})
         return
 
@@ -276,6 +380,9 @@ async def _handle(req: RouteRequest):
     )
 
     # --- Escalation hooks before emitting the route event ----------------
+    # The resolvers are pure and cheap (regex only), so they run HERE as a
+    # pre-flight: a downgrade is visible in the very first route event and
+    # the caller never sees an easy_* verdict it would have to roll back.
     if route == "easy_action":
         call = resolve_action(text, req.stream_name)
         if call is None:
@@ -287,6 +394,8 @@ async def _handle(req: RouteRequest):
             logger.info("query resolver ambiguous -> complex_logic: %r", text[:80])
             route, reason = "complex_logic", "query_resolver_ambiguous"
 
+    # The (usually single) route event: emitted before any execution so the
+    # caller can log/telemetry the verdict immediately.
     yield _sse(
         {"type": "route", "route": route, "confidence": round(confidence, 3),
          "reason": reason}
@@ -295,6 +404,8 @@ async def _handle(req: RouteRequest):
     try:
         # --- easy_action: HA MCP intent call ------------------------------
         if route == "easy_action":
+            # Resolved a second time (pure regex, no I/O): the pre-flight
+            # already turned this branch off if the resolver said None.
             call = resolve_action(text, req.stream_name)
             sentence, err = await _execute_action(call)
             if sentence:
@@ -347,10 +458,17 @@ async def _handle(req: RouteRequest):
 
         # --- easy_query: states/history/datetime --------------------------
         elif route == "easy_query":
+            # Same double-resolve pattern as easy_action (pure, cheap).
             q = resolve_query(text, req.stream_name)
             sentence = None
             emitted = False  # weather streams its own sentences
+            # Three kinds, answered deterministically where possible:
+            # datetime (HA-side tool), weather (open-meteo -> Hermes chain),
+            # state (live registry lookup with a binding area).
             if q.kind == "datetime":
+                # Clock lives in HA, not in this container — timezone and DST
+                # are already correct there. On failure `sentence` stays None
+                # and the common unresolved branch escalates to L2.
                 res = await ha.call_tool("llm__GetDateTime", {})
                 if res.get("ok"):
                     sentence = _datetime_phrase(res.get("result"))
@@ -376,6 +494,8 @@ async def _handle(req: RouteRequest):
                 area = q.args.get("area")
                 hint = q.entity_hint
                 # Area is binding: never answer with another room's sensor.
+                # (area=None -> unconstrained global match; a room that was
+                # named — explicitly or via the satellite default — narrows it.)
                 ent = find_entity(states, hint, area) if area else find_entity(states, hint, None)
                 if ent is not None:
                     sentence = describe_entity(ent, area)
@@ -391,6 +511,9 @@ async def _handle(req: RouteRequest):
                 reply_parts.append(sentence)
                 yield _sse({"type": "sentence", "text": sentence})
             else:
+                # Nothing speakable at any step: emit a SECOND route event
+                # downgrading to complex_logic (the self-healing retry the
+                # caller expects) and hand the text to L2 unchanged.
                 logger.info("query unresolved -> complex_logic: %r", text[:80])
                 yield _sse({"type": "route", "route": "complex_logic",
                             "confidence": round(confidence, 3),
@@ -405,6 +528,8 @@ async def _handle(req: RouteRequest):
 
         # --- general_qa / expert: chat proxy ------------------------------
         elif route in ("general_qa", "expert"):
+            # expert=True flips the failover order inside stream_chat
+            # (Hermes-first). No HA side-effects are possible on this path.
             async for s in chat_proxy.stream_chat(text, expert=(route == "expert")):
                 reply_parts.append(s)
                 yield _sse({"type": "sentence", "text": s})
@@ -412,11 +537,15 @@ async def _handle(req: RouteRequest):
         # --- complex_logic: L2 CodeAgent ----------------------------------
         else:
             async for chunk in _run_worker(text, req.session_id, req.stream_name):
+                # Heartbeats are forwarded for UX but only sentences are
+                # remembered (memory stores what the user actually heard).
                 if chunk.get("type") == "sentence" and chunk.get("text"):
                     reply_parts.append(chunk["text"])
                 yield _sse(chunk)
 
     except Exception as e:
+        # Any handler failure degrades to an error event + done instead of a
+        # hung stream — a voice turn must always terminate.
         logger.exception("route handler failed")
         yield _sse({"type": "error", "message": str(e)[:300]})
 
@@ -438,9 +567,16 @@ async def _handle(req: RouteRequest):
 
 @app.post("/route")
 async def route_ep(req: RouteRequest):
+    """Main SSE endpoint (the one main.py calls for every voice turn).
+
+    Returns a StreamingResponse over the `_handle` generator; no auth on
+    port 8091 is a deliberate LAN-only decision (see module header).
+    """
     return StreamingResponse(
         _handle(req),
         media_type="text/event-stream",
+        # no-cache + X-Accel-Buffering=no: any proxy/buffer in between would
+        # hold sentences back and turn a streaming answer into a burst.
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
@@ -460,6 +596,12 @@ async def weather_ep(text: str = ""):
 
 @app.get("/health")
 async def health():
+    """Liveness probe for compose/monitoring and manual checks.
+
+    `classifier_warmed` distinguishes "up but degrading to L2 on every turn"
+    from "fully functional"; `routes` is read from the classifier module at
+    call time so a routes change needs no restart of this handler.
+    """
     return {
         "status": "ok",
         "classifier_warmed": classifier.warmed,

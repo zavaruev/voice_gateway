@@ -1,3 +1,10 @@
+"""Tests for main.calculate_rms (PCM16 energy levels used by VAD).
+
+onnxruntime is mocked before importing main (see test_engine.py): the
+tests feed synthetic int16 buffers and check RMS math, empty input and
+dtype handling — no model, no audio device. Docker-only (imports main,
+which pulls opuslib/av).
+"""
 import sys
 from unittest.mock import MagicMock
 import numpy as np

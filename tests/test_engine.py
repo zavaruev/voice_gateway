@@ -1,3 +1,10 @@
+"""Tests for engine.py (wake-word / VAD ONNX inference pipeline).
+
+onnxruntime's InferenceSession is mocked BEFORE engine is imported — the
+real silero_vad.onnx file is not needed for these unit tests and the mock
+avoids loading it. Like test_main/test_rms this file needs `av`/numpy and
+is therefore part of the Docker-only test set, not the 5-file host suite.
+"""
 import sys
 from unittest.mock import MagicMock
 import numpy as np

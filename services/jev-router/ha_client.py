@@ -1,5 +1,29 @@
 """Home Assistant client: MCP JSON-RPC (streamableHttp, stateless) + REST.
 
+PURPOSE
+  The ONLY module in jev-router that talks to Home Assistant, and the
+  boundary where the L1 fast path actually touches the house (see app.py):
+  side effects and answers go through here, so caching, timeouts and the
+  ok/error contract live in one place.
+
+  Two protocols, both with the same Bearer auth (HA_TOKEN from env — never
+  hardcode tokens; the repo is public):
+    * MCP  POST /api/mcp         — jsonrpc `tools/call` / `tools/list` for
+      intent execution and read tools (llm__GetDateTime, ...);
+    * REST /api/states, /api/history/period/..., /api/template — registry
+      snapshots, history and the area map, i.e. everything the MCP intent
+      matcher does NOT give us.
+
+  Failure contract: no public method raises. Every error path returns an
+  empty list / None / {"ok": False, "error": ...} — app.py turns that into
+  a `ha_call_failed:` escalation to L2 (self-healing retry with the decoded
+  error) instead of a stack trace in the voice stream.
+
+  Caches: /api/states and the entity->area map are TTL-cached
+  (config.STATES_TTL) because every easy_query and every on/off command
+  needs them; `force=True` re-reads states before a side effect so the
+  router never acts on a stale "off".
+
 Token/source: nanobot_config/config.json `home_assistant` section (Bearer JWT).
 Verified Sep 2026: server is stateless — no initialize handshake required;
 POST /api/mcp accepts jsonrpc `tools/list` and `tools/call` directly.
@@ -36,6 +60,11 @@ _HINT_LAT: dict[str, list[str]] = {
     "музык": ["media_player", "speaker", "receiver"],
 }
 
+# RU area stem -> latin fragments that occur in entity_ids/friendly_names.
+# The same bilingual expansion problem as _HINT_LAT, but for rooms: the
+# resolver speaks «кухня», the registry says `kitchen`. Entries are matched
+# as substrings, so an alias that matches nothing simply never fires — that
+# is what makes the typo-tolerant extras below free insurance.
 _AREA_LAT: dict[str, list[str]] = {
     "кухн": ["kitchen"],
     "гостин": ["living"],
@@ -69,22 +98,39 @@ _AREA_LAT: dict[str, list[str]] = {
 
 
 class HAClient:
+    """Async Home Assistant gateway with TTL caches (module-level singleton).
+
+    Owns one aiohttp session for its whole lifetime (connection reuse), the
+    /api/states cache and the entity->area cache. All public methods are
+    coroutine and never raise — see the module header for the failure
+    contract that lets app.py escalate instead of crashing the voice turn.
+    """
+
     def __init__(
         self,
         url: str = config.HA_URL,
         token: str = config.HA_TOKEN,
         timeout: float = config.HA_TIMEOUT,
     ):
+        # Defaults are read from config at *definition* time, which is fine:
+        # config itself already resolved the env vars at import time.
         self.url = url.rstrip("/")
         self.token = token
         self.timeout = timeout
         self._session: aiohttp.ClientSession | None = None
+        # (states, fetched_at) and (entity->area, fetched_at) — timestamps are
+        # monotonic so a wall-clock jump cannot pin a stale cache forever.
         self._states: list[dict] = []
         self._states_at: float = 0.0
         self._entity_areas: dict[str, str] = {}
         self._entity_areas_at: float = 0.0
 
     async def _sess(self) -> aiohttp.ClientSession:
+        """Lazily created session; recreated if something closed it.
+
+        Re-checking `closed` on every call protects against an exception
+        outside this class having torn the session down mid-flight.
+        """
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=self.timeout)
@@ -92,6 +138,12 @@ class HAClient:
         return self._session
 
     def _headers(self) -> dict:
+        """Bearer auth for both REST and MCP.
+
+        The Accept list is why `json(content_type=None)` is used everywhere
+        below: HA may answer the MCP endpoint with text/event-stream even
+        for a plain POST, so the content type cannot be trusted.
+        """
         return {
             "Authorization": f"Bearer {self.token}",
             "Content-Type": "application/json",
@@ -99,8 +151,18 @@ class HAClient:
         }
 
     async def call_tool(self, name: str, arguments: dict, rpc_id: int = 1) -> dict:
-        """Invoke an MCP tool. Returns {"ok": bool, "result": ..., "error": ...}."""
+        """Invoke an MCP tool. Returns {"ok": bool, "result": ..., "error": ...}.
+
+        Never raises: transport errors, non-200 HTTP, jsonrpc-level errors
+        and tool-level `isError` all come back as {"ok": False, ...} (plus
+        "raw" when HA returned a body worth showing L2). The MCP payload
+        wraps its own JSON (`{"success": bool, ...}`) inside content[0].text,
+        so that inner envelope is decoded and unwrapped here — a non-JSON
+        text payload is returned verbatim under "result".
+        """
         sess = await self._sess()
+        # Stateless server (verified Sep 2026): no initialize handshake, the
+        # rpc id only correlates the response.
         payload = {
             "jsonrpc": "2.0",
             "id": rpc_id,
@@ -120,12 +182,17 @@ class HAClient:
             logger.error("HA MCP %s transport error: %s", name, e)
             return {"ok": False, "error": str(e)}
 
+        # jsonrpc-level failure: transport worked, the RPC did not (unknown
+        # tool, bad params) — distinct from an HTTP error above.
         if "error" in data:
             logger.error("HA MCP %s jsonrpc error: %s", name, data["error"])
             return {"ok": False, "error": str(data["error"])}
 
         result = data.get("result") or {}
         if result.get("isError"):
+            # MCP convention: the call succeeded but the TOOL failed (e.g.
+            # MatchFailedError) — `raw` is kept so app.py can build a useful
+            # escalation context for L2.
             return {"ok": False, "error": "tool_is_error", "raw": result}
 
         # Payload shape: content[0].text = JSON string {"success": bool, ...}
@@ -134,6 +201,8 @@ class HAClient:
         try:
             inner = json.loads(text)
         except (json.JSONDecodeError, IndexError):
+            # Not JSON: a plain-text answer is a legitimate result (read
+            # tools return prose) — report ok, hand the text over as-is.
             return {"ok": True, "result": text}
 
         if isinstance(inner, dict) and inner.get("success") is False:
@@ -143,7 +212,14 @@ class HAClient:
         return {"ok": True, "result": inner}
 
     async def get_states(self, force: bool = False) -> list[dict]:
-        """Cached /api/states for topology + easy_query entity lookup."""
+        """Cached /api/states for topology + easy_query entity lookup.
+
+        `force=True` bypasses the TTL and is used before a SIDE EFFECT (the
+        router must see the device's current state, not a 30 s old one).
+        On any failure the previous snapshot is returned instead of
+        raising — stale-but-valid beats an exception here, and a first-call
+        failure simply yields [] (the caller escalates).
+        """
         now = time.monotonic()
         if not force and self._states and (now - self._states_at) < config.STATES_TTL:
             return self._states
@@ -161,11 +237,19 @@ class HAClient:
             return self._states
         if isinstance(data, list):
             self._states = data
+            # `now` was taken before the request: the TTL ages from the
+            # fetch START, not from whenever the response landed.
             self._states_at = now
         return self._states
 
     async def get_history(self, entity_id: str, hours: int = 24) -> list | None:
-        """REST /api/history/period/{t0}?filter_entity_id=... (manifest mapping)."""
+        """REST /api/history/period/{t0}?filter_entity_id=... (manifest mapping).
+
+        Returns the raw HA history payload, or None on any failure (no
+        caller among the L1 routes today — kept as the history accessor
+        for query kinds that need it). `minimal_response` keeps the payload
+        to state+timestamp pairs instead of full attribute dumps.
+        """
         from datetime import datetime, timedelta, timezone
 
         t0 = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
@@ -194,6 +278,8 @@ class HAClient:
         now = time.monotonic()
         if self._entity_areas and (now - self._entity_areas_at) < config.STATES_TTL:
             return self._entity_areas
+        # One line per entity: "entity_id <TAB> area_name"; area_name()
+        # renders "None" for entities assigned to no room, hence the filter.
         tpl = (
             "{% for e in states %}"
             "{{ e.entity_id }}\t{{ area_name(e.entity_id) }}\n"
@@ -223,11 +309,14 @@ class HAClient:
             if eid and area and area != "None":
                 out[eid] = area
         if out:
+            # Never replace a good map with an empty one: a truncated or
+            # garbled template answer must not disable area matching.
             self._entity_areas = out
             self._entity_areas_at = now
         return self._entity_areas
 
     async def close(self) -> None:
+        """Release the aiohttp session (lifespan shutdown hook)."""
         if self._session and not self._session.closed:
             await self._session.close()
 
@@ -245,6 +334,9 @@ def find_entity(states: list[dict], hint: str, area: str | None = None) -> dict 
     hint_l = (hint or "").lower().strip()
     area_l = (area or "").lower().strip()
 
+    # Bidirectional containment: a RU stem in the hint expands to latin
+    # fragments, and a latin hint still matches the RU stem (or vice versa)
+    # — the STT produces either language depending on the device name.
     hints: set[str] = set()
     if hint_l:
         hints.add(hint_l)
@@ -254,6 +346,8 @@ def find_entity(states: list[dict], hint: str, area: str | None = None) -> dict 
     areas: set[str] = set()
     if area_l:
         areas.add(area_l)
+        # Stem prefix as extra variant: «гостиная» -> «гостин»,
+        # «living room» -> «living» (substring match below).
         areas.add(area_l[:5])
         for stem, lats in _AREA_LAT.items():
             if stem in area_l or area_l in stem:
@@ -331,6 +425,8 @@ def find_action_targets(
             hints.update(lats)
 
     area_n = _norm(area)
+    # Registry map not loaded -> substring fallback on the haystack, in both
+    # separator spellings (entity_ids use "_", display names use spaces).
     variants = {area_n, area_n.replace(" ", "_"), area_n.replace("_", " ")} \
         if area_n else set()
 
@@ -415,6 +511,8 @@ def describe_entity(e: dict, area: str | None = None) -> str:
         "paused": "на паузе",
     }
     state_ru = state_map.get(state.lower(), state)
+    # Numeric states: '22.94' -> '22,9' (Russian decimal comma) and '22.0'
+    # -> '22'; anything non-numeric keeps the state_map word from above.
     try:
         f = float(state)
         if f == int(f):
@@ -423,6 +521,8 @@ def describe_entity(e: dict, area: str | None = None) -> str:
             state_ru = f"{f:.1f}".replace(".", ",")
     except (ValueError, TypeError):
         pass
+    # Latin technical names read terribly aloud: lead with the room when it
+    # is known, otherwise flatten underscores; RU names are spoken as-is.
     if not re.search(r"[А-Яа-я]", name):
         if area:
             head = _area_phrase(area)

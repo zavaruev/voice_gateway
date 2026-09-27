@@ -1,13 +1,53 @@
-"""Central env configuration for smolagents-worker (cascade level 2)."""
+"""Central env configuration for smolagents-worker (cascade level 2).
+
+PURPOSE
+    One import-time configuration surface for this service: every URL,
+    credential and timeout is read from the environment here, once, so
+    app.py / tools.py / honesty.py just `import config` and no address or
+    secret is ever written into the code (the repository is PUBLIC — env
+    vars only, defaults below point at the home LAN and are overridden in
+    docker-compose.yml `environment:`).
+
+ROLE IN THE CASCADE
+    ESP32 satellite -> main.py (FastAPI :6050, audio/VAD/STT/TTS)
+    -> jev-router (L1, :8091) -> THIS SERVICE (L2, :8092, POST /invoke)
+    -> Hermes (L3 expert) / Home Assistant (MCP+REST) / Qdrant / Ollama.
+    Each URL constant below is exactly one hop of that chain.
+
+ENV VARS (all optional; override before the process starts)
+    OMNIROUTE_URL, OMNIROUTE_COMBO   primary FREE LLM, OpenAI-compatible /v1
+    HERMES_URL, HERMES_API_KEY, HERMES_MODEL   L3 failover + hermes_expert
+    HA_URL, HA_TOKEN                 Home Assistant REST + /api/mcp (Bearer)
+    ROUTER_URL                       jev-router (/weather, SSE /route)
+    QDRANT_URL, OLLAMA_URL, EMBED_MODEL   dialogue memory (embed + search)
+    WORKER_TIMEOUT       hard cap per /invoke request, seconds
+    MAX_STEPS            CodeAgent step ceiling — bounds a looping model
+    HEARTBEAT_INTERVAL   SSE progress period, kept <= 20 s so the turn
+                         watchdog upstream hears a live gateway instead of
+                         silence (replaces the old 30 s watchdog)
+    LLM_CALL_TIMEOUT     per-completion OpenAI timeout (plus 1 retry)
+    TOOL_TIMEOUT         per-tool HTTP budget (ha_*)
+    EXPERT_TIMEOUT       hermes_expert budget — L3 diagnostics are slow
+
+CONTRACT / FAILURE MODES
+    Plain module-level constants evaluated at import. `_f`/`_i` raise
+    ValueError on a malformed numeric env value — deliberately fail fast at
+    startup instead of misbehaving mid-conversation. Ports 8091/8092 carry
+    no auth by deliberate decision (home LAN only): never expose them.
+"""
 
 import os
 
 
 def _f(name: str, default: str) -> float:
+    """Env var as float (falls back to `default` string). Raises ValueError
+    at import time if the variable is set but not numeric."""
     return float(os.getenv(name, default))
 
 
 def _i(name: str, default: str) -> int:
+    """Env var as int. Goes through float first so values like "15.0"
+    (a compose file may render numbers that way) still parse."""
     return int(float(os.getenv(name, default)))
 
 

@@ -28,6 +28,10 @@ import config
 logger = logging.getLogger("router.weather")
 
 _OPEN_METEO = "https://api.open-meteo.com/v1/forecast"
+
+# 8 s is a deliberate compromise: a voice turn tolerates ~2-3 s of silence
+# before it feels broken, and the caller has the Hermes failover after us —
+# hanging longer here would eat the whole budget of the answer.
 _TIMEOUT = 8.0
 
 # WMO weather interpretation codes -> short Russian phrases. The phrasing is
@@ -65,6 +69,10 @@ _WMO = {
 }
 
 # Weekday stems -> spoken label; iso weekday index (Monday = 0).
+# Matched with re.search(r"\b" + stem): only the START of a word, so the
+# stem «сред» does not fire inside unrelated words, while «в среду» and
+# «среда» are both covered by the single stem. The label is already in the
+# right case («В среду», not «В среда») — do not "fix" it to nominative.
 _WEEKDAYS = (
     (r"понедельн", "В понедельник", 0),
     (r"вторник", "Во вторник", 1),
@@ -75,6 +83,9 @@ _WEEKDAYS = (
     (r"воскресень", "В воскресенье", 6),
 )
 
+# Day-after is checked BEFORE tomorrow because «послезавтра» contains no
+# «завтра» as a separate word (\b barrier), but ordering keeps the intent
+# obvious; both are one-shot matches on the lowercased utterance.
 _RE_DAY_AFTER = re.compile(r"послезавтра")
 _RE_TOMORROW = re.compile(r"\bзавтра\b", re.IGNORECASE)
 
@@ -98,6 +109,9 @@ def pick_target(text: str) -> tuple[str, int]:
 
 
 def _wmo(code) -> str:
+    """WMO code -> Russian phrase; anything unparseable/unknown degrades to
+    a neutral «условия уточняются» instead of raising — an invented detail
+    is worse than a vague one for a spoken forecast."""
     try:
         key = int(code)
     except (TypeError, ValueError):
@@ -106,11 +120,19 @@ def _wmo(code) -> str:
 
 
 def _deg(v) -> str:
+    """Round to whole degrees: the TTS reads «минус пять» fine, but
+    «минус пять целых четыре десятых» would make the answer useless."""
     return f"{round(float(v))}°"
 
 
 def build_sentences(text: str, data: dict) -> list[str]:
-    """Pure builder from an open-meteo payload. [] means 'cannot answer'."""
+    """Pure builder from an open-meteo payload. [] means 'cannot answer'.
+
+    No I/O and no clock reads (day offsets come from the payload's own
+    `daily.time[0]`, which open-meteo anchors to the requested timezone) —
+    that is what makes this function unit-testable on the host and immune
+    to "yesterday's forecast" bugs around midnight.
+    """
     kind, arg = pick_target(text)
 
     if kind == "now":
@@ -166,15 +188,32 @@ def build_sentences(text: str, data: dict) -> list[str]:
 # --- I/O -------------------------------------------------------------------
 
 def _http_json(url: str, headers: dict | None = None) -> dict:
+    """Blocking urllib GET -> parsed JSON.
+
+    Runs only inside asyncio.to_thread (see callers): the rest of the
+    router is async, and a sync socket here would stall the whole event
+    loop for up to _TIMEOUT seconds. urllib instead of aiohttp on purpose —
+    this module keeps a stdlib-only import surface so tests/test_weather.py
+    can import the pure helpers on the host, where aiohttp may be absent.
+    """
     req = urllib.request.Request(url, headers=headers or {})
     with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
         return json.loads(resp.read().decode("utf-8", errors="replace"))
 
 
+# Process-lifetime cache of the HA coordinates. Written only from the event
+# loop (single writer) and only after a successful load, so a failed first
+# attempt is retried on the next request instead of caching None forever.
 _coords: tuple[float, float] | None = None
 
 
 async def _ha_coords() -> tuple[float, float]:
+    """Lat/lon from HA /api/config, fetched once per process.
+
+    Using HA's own location keeps "погода" consistent with what the HA
+    frontend shows and removes any need for a city env var (README: "no
+    city configuration is needed").
+    """
     global _coords
     if _coords is not None:
         return _coords
@@ -191,7 +230,13 @@ async def _ha_coords() -> tuple[float, float]:
 
 
 async def weather_sentences(text: str) -> list[str]:
-    """Fetch + build. Returns [] on any failure (caller escalates)."""
+    """Fetch + build. Returns [] on any failure (caller escalates).
+
+    [] is the ONLY failure signal — there is no exception path on purpose:
+    the route handler treats "nothing yielded" as «not solved here» and
+    tries the Hermes stream next, then query_unresolved -> complex_logic.
+    That ordering is the hybrid chain decided by the user (25.09.2026).
+    """
     try:
         lat, lon = await _ha_coords()
         url = (

@@ -1,3 +1,10 @@
+"""Tests for main.py helpers (chat-id cache, RMS, text/sentence utils, routes).
+
+IMPORTANT: this module mutates os.environ BEFORE importing main — main.py
+reads every config value at import time, so the test env must exist first.
+It needs numpy/aiohttp (and, through main, opuslib) — available in Docker;
+on the host this file fails at collection, use the 5-file suite instead.
+"""
 import pytest
 import asyncio
 import os

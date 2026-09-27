@@ -1,3 +1,11 @@
+"""Tests for the OTA/admin auth guards in main.py (FastAPI TestClient).
+
+Covers /ota and admin login rules: missing/incorrect ADMIN_USERNAME or
+ADMIN_PASSWORD env, basic-auth header handling, and the 401/403 matrix.
+The environment is deliberately reset at import (vars deleted first) so a
+developer's real .env cannot leak into the assertions — keep that reset
+when adding cases. Requires the FastAPI stack; Docker-only like test_main.
+"""
 import pytest
 from fastapi.testclient import TestClient
 from unittest.mock import patch

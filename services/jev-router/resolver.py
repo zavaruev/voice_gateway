@@ -1,8 +1,36 @@
 """Intent/slot resolver for easy routes.
 
+PURPOSE
+  The deterministic brain of the L1 fast path (see app.py): after the
+  classifier picked `easy_action`/`easy_query`, this module turns the Russian
+  utterance into a concrete Home Assistant MCP call description *without any
+  network I/O or LLM* — pure dict lookups and compiled regexes, which is why
+  a voice command executes in ~0.1 s and why it is unit-testable offline
+  (tests/test_router_resolution.py).
+
 Maps a Russian voice command to an HA MCP tool call. Returns None whenever the
 command is ambiguous or has no MCP counterpart — the caller then escalates to
 COMPLEX (L2 CodeAgent), never a wrong side-effect.
+
+Contracts / key behaviours
+  * `resolve_action` -> ResolvedCall | None
+        None  = escalate (missing verb, negation, no device noun, no slots,
+                direction-only brightness, ...).
+        call  = {tool, args, speak_ok, area_source, hint} — app.py executes
+                it against HA and speaks `speak_ok` only after a confirmed
+                success.
+  * `resolve_query` -> ResolvedQuery | None
+        None  = escalate; otherwise one of the kinds "datetime" / "state" /
+                "weather", which app.py answers from HA, the registry or the
+                open-meteo chain.
+  * Areas: the dict sends the HA *registry display name* («Kitchen», not
+    «кухня») — RU aliases exist only for some areas and «гостиная» used to
+    fail with MatchFailedError INVALID_AREA (E2E regression, Sep 2026).
+  * Order of the checks matters: broadcast -> timers -> vacuum -> light set
+    -> plain on/off, so a sentence matching several families falls to the
+    most specific one.
+  * Everything here is intentionally conservative: STT typos are handled by
+    stem matching («кафеварку»), but any doubt escalates to L2.
 """
 
 import logging
@@ -36,6 +64,9 @@ ROOMS: dict[str, list[str]] = {
 }
 
 # Default area when the speaker does not name one (from the device stream name).
+# Why: "выключи свет" said in the kitchen satellite must act on the kitchen —
+# the physical origin of the voice is the only room information available.
+# Keys are lowercased `stream_name` values from the ESP32 satellite config.
 STREAM_DEFAULT_AREA: dict[str, str] = {
     "kitchen": "Kitchen",
     "livingroom": "Living Room",
@@ -46,6 +77,12 @@ STREAM_DEFAULT_AREA: dict[str, str] = {
 }
 
 # Device/thing keywords -> (domain filter, name passed to HA)
+# Keys are word STEMS matched by plain substring (`stem in lowered_text`), so
+# every inflected form (лампочку, шторы, пылесосом) hits the same entry and
+# STT typos with the stem intact still match. Value semantics:
+#   domain  -> forwarded as args["domain"] (None = let the matcher decide);
+#   name    -> args["name"], the exact device word for the intent matcher,
+#              or None when the stem alone (свет, штор) is enough.
 THING: dict[str, tuple[list[str] | None, str | None]] = {
     "свет": (["light"], None),
     "света": (["light"], None),
@@ -75,7 +112,18 @@ THING: dict[str, tuple[list[str] | None, str | None]] = {
     "обогревател": (["climate"], None),
 }
 
+# --- Compiled matchers -------------------------------------------------------
+# All are case-insensitive and match STEMS rather than whole words, because
+# Russian inflection («включи», «включить», «включён») and STT typos both
+# change word endings. RE_ON/RE_OFF deliberately mirror
+# classifier.ACTION_VERBS_ON/ACTION_VERBS_OFF: the classifier decides the
+# ROUTE from those verbs, this module decides the TOOL — if the two lists
+# drifted apart, a command would be routed easy_action and then escalated
+# as unresolvable (a silent loss of the fast path).
 RE_AREA = re.compile(
+    # Longest stem first: Python alternation is ordered, so a shorter stem
+    # can never shadow a longer alternative sharing the same start position.
+    # The trailing \w* swallows the rest of the word (кухня/кухне/кухонный).
     r"\b(" + "|".join(re.escape(k) for k in sorted(ROOMS, key=len, reverse=True)) + r")\w*",
     re.IGNORECASE,
 )
@@ -88,18 +136,32 @@ RE_BRIGHTER = re.compile(r"\b(ярче|яркость|светлее|приба�
 RE_DIMMER = re.compile(
     r"\b(тусклее|темнее|приглуши|убавь|уменьши свет|потемнее)\b", re.IGNORECASE
 )
+# Percent is captured, not just matched: the digit (clamped to 0..100 when
+# stored) becomes args["brightness"] — see the light-set branch below.
 RE_PCT = re.compile(r"(\d{1,3})\s*%")
+# Vacuum "go back to the dock" vocabulary. resolve_action additionally
+# requires an explicit vacuum word, so a stray «вернись»/«домой» alone can
+# never trigger a device call.
 RE_VACUUM_DOCK = re.compile(
     r"\b(на зарядку|в док|домой|подзарядк\w*|вернись)\b", re.IGNORECASE
 )
 RE_VACUUM_CLEAN = re.compile(
     r"\b(пылесос\w*|уборк\w*|прибери|убери пол|пыль)\b", re.IGNORECASE
 )
+# Timer/reminder vocabulary: meaningful only together with RE_OFF — that
+# combination is what builds the cancel-all intent («выключи таймеры»).
 RE_TIMERS = re.compile(r"\bтаймер\w*|\bнапоминан\w*|\btimer", re.IGNORECASE)
+# Anchored at ^: only a LEADING announcement verb + audience is a broadcast.
+# resolve_action strips this prefix with sub(count=1) and speaks the rest —
+# «скажи всем что обед готов» -> message «что обед готов».
 RE_BROADCAST = re.compile(
     r"^\s*(?:скажи|объяви|передай|позови)\s+(?:всем|всему дому|по дому)\b",
     re.IGNORECASE,
 )
+# Light-modulation matchers (checked BEFORE plain on/off — these commands
+# have their own vocabulary and no on/off verb): RE_COLOR captures a hue
+# stem (красн -> красный/красная), RE_WARM/RE_COOL cover colour TEMPERATURE
+# («теплее/холоднее» -> 300 K / 500 K, i.e. Kelvin for a light, never a hue).
 RE_COLOR = re.compile(
     r"\b(красн\w*|син\w*|зелен\w*|жёлт\w*|желт\w*|бел\w*|оранжев\w*|розов\w*|голуб\w*|фиолетов\w*)\b",
     re.IGNORECASE,
@@ -107,6 +169,9 @@ RE_COLOR = re.compile(
 RE_WARM = re.compile(r"\b(тепл\w*|теплее|тёпл\w*)\b", re.IGNORECASE)
 RE_COOL = re.compile(r"\b(холодн\w*|холоднее)\b", re.IGNORECASE)
 
+# Russian colour stem -> HA colour name. Looked up with stem.startswith on
+# the word RE_COLOR captured, so «красную»/«красная»/«красный» all -> "red"
+# (the captured group is matched case-insensitively and lowered first).
 COLOR_MAP = {
     "красн": "red",
     "син": "blue",
@@ -123,6 +188,22 @@ COLOR_MAP = {
 
 @dataclass
 class ResolvedCall:
+    """One resolved easy_action — the complete input of app._execute_action.
+
+    tool       -> HA MCP tool name (intent__*, light__*, vacuum__*,
+                  assist_satellite__*).
+    args       -> matcher slots (domain/name/area/brightness/color/
+                  temperature); `area` holds the HA registry DISPLAY name
+                  («Kitchen»), never the raw RU word.
+    speak_ok   -> phrase to speak, but only after HA confirms the call.
+    area_source-> "explicit" (named in the utterance) | "default" (taken
+                  from the satellite stream) | "none" — lets the caller tell
+                  a room the user said from one the router assumed.
+    hint       -> spoken device stem ("свет"), used to locate the concrete
+                  entity in the live registry when the blind domain+area
+                  match fails (latin entity names, see ha_client).
+    """
+
     tool: str
     args: dict = field(default_factory=dict)
     speak_ok: str = "Готово"
@@ -131,9 +212,17 @@ class ResolvedCall:
 
 
 def _find_area(text: str, stream_name: str) -> tuple[str | None, str]:
+    """(HA area display name or None, source) for the utterance.
+
+    Priority: a room word in the text > the satellite's default room >
+    no area at all. Returns the registry display name from ROOMS[names[0]],
+    which is what the HA intent matcher accepts (RU aliases are incomplete).
+    """
     m = RE_AREA.search(text)
     if m:
         key = m.group(1).lower()
+        # RE_AREA may have appended \w* to the stem («кухонный»); startswith
+        # maps the match back to the ROOMS key that produced it.
         for stem, names in ROOMS.items():
             if key.startswith(stem):
                 return names[0], "explicit"
@@ -144,7 +233,12 @@ def _find_area(text: str, stream_name: str) -> tuple[str | None, str]:
 
 
 def _find_thing(text: str) -> tuple[list[str] | None, str | None, str, str]:
-    """-> (domain, name, lowered text, matched THING stem or "")."""
+    """-> (domain, name, lowered text, matched THING stem or "").
+
+    First THING stem contained in the (lowered) text wins — dict order is
+    the priority, and callers reuse the returned lowered text for their own
+    regex checks instead of re-lowering.
+    """
     low = text.lower()
     for stem, (domain, name) in THING.items():
         if stem in low:
@@ -152,6 +246,10 @@ def _find_thing(text: str) -> tuple[list[str] | None, str | None, str, str]:
     return None, None, low, ""
 
 
+# Fallback noun list for the plain on/off branch: broader than THING (adds
+# «освещение», «люстра», «насос» ...) and used for two things — refusing a
+# bare «включи» with no device at all (escalate), and deriving the `hint`
+# when THING had no stem to offer.
 _DEVICE_NOUN = re.compile(
     r"свет|ламп|подсветк|штор|пылесос|чайник|розетк|телевизор|музык|кофеварк|"
     r"кафеварк|кофемашин|утюг|кондиционер|обогревател|освещени|люстр|жалюзи|насос",
@@ -169,7 +267,17 @@ RE_NEGATION = re.compile(
 
 
 def resolve_action(text: str, stream_name: str) -> ResolvedCall | None:
-    """Map an imperative device command to an MCP intent tool. None = escalate."""
+    """Map an imperative device command to an MCP intent tool. None = escalate.
+
+    Returns a ResolvedCall only when EVERY required slot is known; returns
+    None (caller escalates to L2) for an empty/negated command, a missing
+    action verb, an unrecognizable device, an empty args dict, or a
+    direction-only brightness request that would need the current value.
+
+    Check order is significant: broadcast -> timers -> vacuum -> light
+    modulation -> plain on/off, so a sentence matching several families
+    resolves to the most specific intent.
+    """
     t = (text or "").strip()
     if not t:
         return None
@@ -285,6 +393,7 @@ def resolve_action(text: str, stream_name: str) -> ResolvedCall | None:
         return None
 
     # --- Plain on/off ---
+    # Tie-break: when both verb families appear in one sentence, ON wins.
     turn_on = bool(RE_ON.search(t))
     if thing_domain is None and not _DEVICE_NOUN.search(t):
         # No recognizable device noun ("включи" alone) -> ambiguous -> escalate
@@ -299,6 +408,8 @@ def resolve_action(text: str, stream_name: str) -> ResolvedCall | None:
     if area:
         args["area"] = area
     if not args:
+        # No slot at all (device known only from _DEVICE_NOUN, no room, no
+        # default area): a filterless call would toggle an arbitrary entity.
         return None
     # Spoken device word: used to locate the concrete entity in the live
     # registry when the blind domain+area match fails (latin entity names).
@@ -316,11 +427,17 @@ def resolve_action(text: str, stream_name: str) -> ResolvedCall | None:
 
 # --- Queries ----------------------------------------------------------------
 
+# Query regexes: they pick the ANSWER SOURCE, not a tool. The captured kind
+# decides which backend app.py talks to (HA datetime tool / open-meteo /
+# live registry), and `entity_hint` is always a RU stem — ha_client._HINT_LAT
+# expands it to the latin fragments that exist in entity_ids.
 RE_TEMP = re.compile(
     r"\b(температур\w*|градус\w*)\b", re.IGNORECASE
 )
 RE_HUMID = re.compile(r"\b(влажност\w*|влажно)\b", re.IGNORECASE)
 RE_BATT = re.compile(r"\b(заряд\w*|батаре\w*)\b", re.IGNORECASE)
+# Two shapes: the yes/no form («включён ли свет») and the what-is-playing
+# form («что сейчас играет») — both resolve to a registry state read.
 RE_STATE_Q = re.compile(
     r"\b(включ[её]н|горит|работает|открыт|открыта|занят|активен|запущен|играет)\s+ли\b"
     r"|^\s*(?:а\s+)?что\s+(?:с\s+)?(?:сейчас\s+)?(?:играет|включено|идёт|идет)",
@@ -335,25 +452,49 @@ RE_WEATHER_Q = re.compile(r"\bпогод\w*|улице\s+(?:жарко|холо�
 
 @dataclass
 class ResolvedQuery:
+    """One resolved easy_query — the input of the app.py easy_query branch.
+
+    kind       -> "datetime" (HA llm__GetDateTime), "weather" (open-meteo
+                  hybrid chain) or "state" (live registry lookup).
+    args       -> optional matcher slots for the state read: domain/name/
+                  area, with `area` again the HA registry display name.
+    entity_hint-> RU stem handed to ha_client.find_entity() for the
+                  bilingual (RU stem -> latin entity) match.
+    """
+
     kind: str  # "datetime" | "state" | "weather"
     args: dict = field(default_factory=dict)
     entity_hint: str = ""
 
 
 def resolve_query(text: str, stream_name: str) -> ResolvedQuery | None:
+    """Classify an easy_query utterance -> ResolvedQuery, or None = escalate.
+
+    Order matters: datetime first (unambiguous phrasing), then weather —
+    but only when the question carries NO temperature word, otherwise a
+    mixed «градусы и погода» question would be answered from the forecast
+    instead of the sensor — then the sensor/state families.
+    Returns None for an empty input or a phrasing none of the regexes
+    cover; app.py then escalates to complex_logic.
+    """
     t = (text or "").strip()
     if not t:
         return None
 
+    # datetime: HA-side clock, no slots to fill.
     if RE_TIME_Q.search(t):
         return ResolvedQuery("datetime")
 
+    # Weather only if no temperature word (see docstring).
     if RE_WEATHER_Q.search(t) and not RE_TEMP.search(t):
         return ResolvedQuery("weather")
 
+    # The area *source* is irrelevant for queries (nothing is toggled).
     area, _src = _find_area(t, stream_name)
     thing_domain, thing_name, *_ = _find_thing(t)
 
+    # Sensor reads: domain=sensor (+ room when known); the RU stem travels
+    # in entity_hint and ha_client.find_entity() does the bilingual lookup.
     if RE_TEMP.search(t):
         args: dict = {"domain": ["sensor"]}
         if area:

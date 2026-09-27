@@ -16,6 +16,35 @@ SSE event schema (one JSON object per `data:` line):
   {"type":"sentence","text":str}   # speakable TTS chunk of the final answer
   {"type":"done","elapsed":float}
   {"type":"error","message":str}
+
+ROLE IN THE CASCADE (three-level voice control of the smart home)
+  ESP32 satellite -> main.py (FastAPI :6050, audio/VAD/STT/TTS)
+  -> jev-router (L1, :8091) -> THIS SERVICE (L2, :8092, FastAPI)
+  -> Hermes (L3 expert) -> Home Assistant via MCP tools.
+  L1 escalates here for complex_logic/expert routes; the `context` field of
+  the request explains which HA call failed and why.
+
+CONTRACT
+  POST /invoke  {"text": RU utterance, "session_id", "stream_name",
+                 "context": escalation reason}
+             -> text/event-stream: one JSON object per data line, events
+                listed above, UTF-8, blank-line terminated.
+  GET  /health  -> config snapshot + tool names, for compose/monitoring.
+  Ports 8091/8092 are UNAUTHENTICATED BY DELIBERATE DECISION (home LAN
+  only) — never expose them, and never put addresses/keys in this file:
+  everything comes from config.py / env (the repo is public).
+
+WHY THIS SERVICE IS SHAPED THE WAY IT IS — the single most important fact
+  about it: the CodeAgent runs on a FREE LLM that routinely writes
+  `final_answer` in the SAME code block as its tool call, i.e. it announces
+  success before the tool ever ran. Prompt rules alone were ignored in 3/3
+  field cases, so honesty is enforced PROGRAMMATICALLY after agent.run():
+  vet_answer() cross-checks the draft against the recorded ha_action
+  outcomes, vet_weather() against the recorded forecast (honesty.py), and
+  tools.ha_action() carries a deterministic vacuum-retry fallback. The
+  TASK_TEMPLATE rules below are only a supporting layer — treat them as
+  prompt text, never as the enforcement mechanism (they must stay
+  byte-identical: they are the model's instructions, not commentary).
 """
 
 import asyncio
@@ -48,6 +77,13 @@ _BOUNDARY_NEXT = frozenset(
 )
 _TAG = re.compile(r"\[(happy|neutral|thinking|surprised|sad|angry)\]")
 
+# --- PROMPT TEXT -----------------------------------------------------------
+# TASK_TEMPLATE is the task string handed to CodeAgent.run(): it is read by
+# the FREE model as its instruction sheet, so its Russian wording is
+# behaviour-critical and must stay byte-identical (comments go AROUND it,
+# never inside). Note that its "never claim before the tool ran" rules are
+# only the supporting layer — the model ignored them in 3/3 field cases,
+# which is why the hard guarantee lives in honesty.py + tools.py instead.
 TASK_TEMPLATE = """Пользователь сказал голосом: «{text}»{context}
 
 Ты — голосовой ассистент умного дома (колонка). Решай задачу по шагам, вызывая тулы:
@@ -79,6 +115,9 @@ TASK_TEMPLATE = """Пользователь сказал голосом: «{text
 - Если данных не хватает или действие неоднозначно — коротко попроси уточнение в одном предложении.
 """
 
+# Rotating RU heartbeat phrases: short enough for TTS, neutral enough to
+# repeat; emitted by the SSE poll loop while the (synchronous) agent runs
+# so the voice turn never goes silent for more than HEARTBEAT_INTERVAL.
 PROGRESS_PHRASES = [
     "Анализирую запрос…",
     "Проверяю устройства…",
@@ -89,6 +128,9 @@ PROGRESS_PHRASES = [
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """Log the effective model/limits once at startup (uvicorn :8092).
+    Nothing is opened here: every HTTP client is created per run, so a
+    cold config can never leave a stale connection behind on shutdown."""
     logger.info(
         "smolagents-worker up: combo=%s max_steps=%s timeout=%ss",
         config.OMNIROUTE_COMBO, config.MAX_STEPS, config.WORKER_TIMEOUT,
@@ -96,10 +138,17 @@ async def lifespan(app: FastAPI):
     yield
 
 
+# ASGI app served by `uvicorn app:app --port 8092` (see Dockerfile CMD);
+# no auth middleware on purpose — home LAN only (see module header).
 app = FastAPI(title="smolagents-worker", lifespan=lifespan)
 
 
 class InvokeRequest(BaseModel):
+    """POST /invoke body. `text` is the transcribed user utterance (RU);
+    `session_id`/`stream_name` are passed through for logging parity with
+    L1; `context` is why L1 escalated (failed HA call args + error) and is
+    injected into the task as the «Контекст эскалации» block."""
+
     text: str
     session_id: str = ""
     stream_name: str = ""
@@ -107,11 +156,20 @@ class InvokeRequest(BaseModel):
 
 
 def _sse(obj: dict) -> str:
+    """Serialize one SSE event: `data: <json>` + blank line. UTF-8 kept
+    readable (ensure_ascii=False) because the payload is Russian text."""
     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
 
 def _sentence_boundary(text: str) -> int:
-    """End offset just past the last real sentence boundary, or -1."""
+    """End offset just past the last real sentence boundary, or -1.
+
+    A [.!?…] run only counts when followed by whitespace and then a
+    capital/quote/digit (or end of text): without that, abbreviations
+    ("т.д.", "г.", "16.09") would be cut into separate TTS chunks and the
+    speaker would stutter. Returns the LAST valid boundary so callers can
+    peel the text off head-first; -1 means "no completed sentence yet".
+    """
     best = -1
     for m in re.finditer(r"[.!?…]+", text):
         after = text[m.end():]
@@ -127,7 +185,11 @@ def _sentence_boundary(text: str) -> int:
 
 def _speakable(s: str) -> str:
     """Strip tags/markdown and collapse whitespace (TTS-safe); mirrors the
-    sanitizer in jev-router/chat_proxy.py (free models leak markdown)."""
+    sanitizer in jev-router/chat_proxy.py (free models leak markdown).
+
+    Removes emotion/emphasis tags, [short-bracket] leftovers, $math$ and
+    arrow LaTeX, markdown emphasis chars and list bullets — TTS would
+    otherwise spell them out ("звёздочка…"). Returns "" for debris."""
     s = _TAG.sub("", s)
     s = re.sub(r"\[[^\]]{0,40}\]", "", s)
     s = re.sub(r"\$[^$]{0,80}\$|\\rightarrow|\\Rightarrow|\\to\b", " ", s)
@@ -137,6 +199,13 @@ def _speakable(s: str) -> str:
 
 
 def split_sentences(text: str) -> list[str]:
+    """Split the final answer into speakable TTS chunks.
+
+    Newlines are flattened first (the model likes lists), then complete
+    sentences are peeled off via `_sentence_boundary`; whatever is left is
+    emitted as a final tail. Chunks that survive sanitizing but contain no
+    letters (pure punctuation/emoji) are dropped. Returns [] for an empty
+    or fully-symbolic answer — the caller turns that into an SSE error."""
     buf = _speakable(text.replace("\n", " "))
     out: list[str] = []
     while True:
@@ -154,6 +223,15 @@ def split_sentences(text: str) -> list[str]:
 
 
 def _build_model(primary: bool) -> OpenAIModel:
+    """Build the OpenAI-compatible chat model for one attempt.
+
+    primary=True  -> OmniRoute FREE combo (cloud, no key required): the
+                     cheap default that produces most of the answers.
+    primary=False -> Hermes (L3) as failover, authenticated via env key.
+    Both are bounded by LLM_CALL_TIMEOUT with max_retries=1 so one hung
+    completion cannot eat the whole WORKER_TIMEOUT budget; connection
+    errors propagate up to _run_agent's retry loop.
+    """
     client_kwargs = {"timeout": config.LLM_CALL_TIMEOUT, "max_retries": 1}
     if primary:
         return OpenAIModel(
@@ -171,7 +249,18 @@ def _build_model(primary: bool) -> OpenAIModel:
 
 
 def _run_agent(text: str, context: str = "") -> str:
-    """Sync agent run (executed in a thread). OmniRoute combo -> Hermes failover."""
+    """Sync agent run (executed in a thread). OmniRoute combo -> Hermes failover.
+
+    Params: `text` = transcribed utterance; `context` = why L1 escalated
+    (appended as the «Контекст эскалации» block, empty for direct calls).
+    Returns the final answer AFTER the honesty vetoes. Failure: raises the
+    second attempt's exception if both models fail (surfaced as SSE error).
+
+    Non-obvious: the per-run side-effect log is reset inside the loop
+    (each attempt starts clean, so a failed first attempt cannot make the
+    veto trust stale successes), and the vetoes run on every attempt —
+    the failover model is free too and gets the same treatment.
+    """
     ctx = f"\nКонтекст эскалации: {context}" if context else ""
     task = TASK_TEMPLATE.format(text=text, context=ctx)
     last_err: Exception | None = None
@@ -214,10 +303,29 @@ def _run_agent(text: str, context: str = "") -> str:
 
 
 async def _handle(req: InvokeRequest):
+    """SSE generator for one /invoke call.
+
+    Runs _run_agent in a worker thread (smolagents is synchronous) while
+    this coroutine polls a shared `box` dict every second: a "progress"
+    heartbeat phrase is emitted each HEARTBEAT_INTERVAL so the upstream
+    turn watchdog hears a live gateway, and a "sentence" event per
+    speakable chunk once the answer exists. Emits "error" on failure or
+    WORKER_TIMEOUT overrun, and always finishes with "done".
+
+    Failure modes: agent exceptions and the timeout both collapse into an
+    SSE error event (the HTTP status stays 200 — the stream already
+    started); an answer that sanitizes to nothing becomes "empty_answer".
+    """
     t0 = time.monotonic()
+    # `box` is shared with the worker thread: single-key dict writes are
+    # atomic enough under the GIL, and the poll loop only ever READs keys,
+    # so no lock is needed (and a lock here would defeat the point — the
+    # thread can be stuck inside agent.run() for up to WORKER_TIMEOUT).
     box: dict = {}
 
     def worker() -> None:
+        # Everything, vetoes included, must land in `box`: an unhandled
+        # exception here would otherwise hang the poll loop until timeout.
         try:
             box["answer"] = _run_agent(req.text, req.context)
         except Exception as e:  # noqa: BLE001 — must surface as SSE error
@@ -228,10 +336,15 @@ async def _handle(req: InvokeRequest):
     hb_idx = 0
 
     try:
+        # 1 s poll: responsive enough for heartbeats, cheap enough to run
+        # for the whole WORKER_TIMEOUT without burning CPU.
         while "answer" not in box and "error" not in box:
             await asyncio.sleep(1.0)
             now = time.monotonic()
             if now - t0 > config.WORKER_TIMEOUT:
+                # The worker thread cannot be interrupted here; its result
+                # is simply discarded (the "error" branch below is checked
+                # before "answer", so a late write never reaches TTS).
                 box["error"] = f"timeout>{int(config.WORKER_TIMEOUT)}s"
                 break
             if now - last_hb >= config.HEARTBEAT_INTERVAL:
@@ -261,6 +374,10 @@ async def _handle(req: InvokeRequest):
 
 @app.post("/invoke")
 async def invoke(req: InvokeRequest):
+    """Start one agent turn. Returns a StreamingResponse immediately; the
+    work happens inside the `_handle` generator (200 + text/event-stream —
+    errors are reported in-band as SSE "error" events, since the status
+    line is already sent by then)."""
     return StreamingResponse(
         _handle(req),
         media_type="text/event-stream",
@@ -270,6 +387,8 @@ async def invoke(req: InvokeRequest):
 
 @app.get("/health")
 async def health():
+    """Liveness/config probe for compose and L1: echoes the effective
+    combo, step cap, timeout and the tool manifest (tool names only)."""
     return {
         "status": "ok",
         "combo": config.OMNIROUTE_COMBO,

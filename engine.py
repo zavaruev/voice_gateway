@@ -1,3 +1,46 @@
+"""Local audio engine: VAD, wake word, utterance state machine, STT.
+
+PURPOSE
+    Front half of the voice pipeline. Feeds it raw PCM (int16, 16 kHz,
+    mono, one chunk at a time) and it decides: is this speech (Silero VAD
+    via ONNX), was it addressed to us (openWakeWord), when does an
+    utterance start/end (CameraProcessor state machine), and finally it
+    sends the recorded WAV to the STT HTTP endpoint and hands the
+    transcript to main.py through callbacks.
+
+ROLE IN THE CASCADE (three-level voice control of the smart home)
+    ESP32 satellite -> main.py (FastAPI :6050, audio/VAD/STT/TTS) ->
+    jev-router (L1 :8091) -> smolagents-worker (L2 :8092) -> Hermes (L3)
+    -> Home Assistant. This module produces the TRANSCRIPT that feeds the
+    whole chain; everything after STT (routing, agent, tools) happens
+    elsewhere. camera_client.py imports LocalAudioEngine/CameraProcessor/
+    AgentState for the always-on camera microphones.
+
+CONTRACTS
+    LocalAudioEngine
+      initialize_models(wakeword_path)  load ONNX models once at startup
+      check_vad(audio_int16) -> bool    per-chunk speech verdict
+      check_wakeword(audio_int16, threshold, stream, vad_ok) -> bool
+                                         wake verdict + self.last_score
+      reset_vad()                       clear state between utterances
+    CameraProcessor
+      process_chunk(audio_int16)        async entry point, call per chunk
+      on_activation_cb / on_command_cb  async callbacks wired by main.py
+    STT: POST a WAV (16 kHz mono) to SPEECHES_STT_URL with a faster-whisper
+    model + language=ru; any HTTP/transport failure returns "" and the
+    chunk is treated as "nothing to do" — STT must never crash the loop.
+
+DESIGN NOTES / WHY
+    The two VAD paths keep SEPARATE recurrent state (utterance vs wake)
+    because they see different chunk boundaries; the wake path resets its
+    state on any feed gap >200 ms and must be fed RAW int16 (no gain, no
+    per-chunk AGC) — see the measured numbers in _ww_vad_speech/ 
+    check_wakeword, both failure modes were observed in the field.
+    `SPEECHES_STT_URL` is a legacy hardcoded default; point deployments at
+    an env-configured URL instead of committing new addresses (repo is
+    public — no IPs/keys in code).
+"""
+
 import asyncio
 import io
 import logging
@@ -25,10 +68,19 @@ if not logger.handlers:
     logger.addHandler(_h)
 
 
+# Legacy hardcoded STT endpoint (Speeches-style faster-whisper API).
+# Kept as-is for compatibility; deployments should point this at their own
+# instance — never commit NEW addresses or credentials here (public repo).
 SPEECHES_STT_URL = "http://192.168.22.111:8000/v1/audio/transcriptions"
 
 
 class AgentState(Enum):
+    """Utterance lifecycle of one microphone session.
+    LISTENING  waiting for a (wake) trigger;
+    RECORDING  buffering speech until end-of-utterance silence;
+    PROCESSING STT + LLM dispatch in flight;
+    SPEAKING   TTS is playing — input chunks are ignored (echo guard)."""
+
     LISTENING = 1
     RECORDING = 2
     PROCESSING = 3
@@ -36,6 +88,12 @@ class AgentState(Enum):
 
 
 class AudioStreamTrack(MediaStreamTrack):
+    """aiortc audio source backed by an asyncio queue.
+
+    Consumers pull frames via recv(); when nothing is queued for >1 s the
+    method synthesizes a silent 20 ms frame instead of blocking — a WebRTC
+    receiver must keep seeing media or it tears the track down."""
+
     kind = "audio"
 
     def __init__(self):
@@ -44,6 +102,8 @@ class AudioStreamTrack(MediaStreamTrack):
         self._pts = 0
 
     async def recv(self):
+        """Next frame, or silence (correct PTS/time_base) after 1 s of
+        queue inactivity so the stream clock keeps advancing."""
         try:
             frame = await asyncio.wait_for(self._queue.get(), timeout=1.0)
             return frame
@@ -57,10 +117,18 @@ class AudioStreamTrack(MediaStreamTrack):
             return frame
 
     async def put_frame(self, frame: av.AudioFrame):
+        """Enqueue one encoded frame for recv()."""
         await self._queue.put(frame)
 
 
 class LocalAudioEngine:
+    """Shared inference state for VAD + wake word (one instance per mic).
+
+    Holds the Silero ONNX session, the openWakeWord model and the
+    recurrent state of BOTH VAD paths. Not thread-safe by design: main/
+    camera loops call it from a single worker thread per stream (the few
+    asyncio callers use asyncio.to_thread to stay off the event loop)."""
+
     def __init__(self, vad_threshold: float = 0.5):
         self.vad_session = None
         self.oww_model = None
@@ -77,6 +145,14 @@ class LocalAudioEngine:
         self._wwv_context = np.zeros((1, 64), dtype=np.float32)
 
     def initialize_models(self, wakeword_path: str = ""):
+        """Load Silero VAD (+ optional openWakeWord) once at startup.
+
+        VAD is loaded from `silero_vad.onnx` in the working directory;
+        threads are pinned to 1 (the model is tiny — a thread pool would
+        cost more than it saves on this box). `wakeword_path` selects a
+        custom wake model with the shared embedding model, otherwise the
+        built-in "alexa" model is used. Raises on missing model files —
+        deliberately, so a bad deploy fails at boot, not mid-utterance."""
         logger.info("Loading Silero VAD (ONNX)...")
         opts = ort.SessionOptions()
         opts.inter_op_num_threads = 1
@@ -97,11 +173,29 @@ class LocalAudioEngine:
         logger.info("Local models initialized.")
 
     def reset_vad(self):
+        """Clear utterance VAD buffer + recurrent state (call between
+        utterances / on state transitions).
+
+        Note: this also (re)creates `_vad_context`, which __init__ does
+        NOT set — so reset_vad() must run before the first check_vad()
+        call (CameraProcessor.set_state does it for LISTENING/SPEAKING).
+        Stale LSTM state from the previous utterance would mis-score the
+        first windows of the next one."""
         self._vad_buffer = np.array([], dtype=np.float32)
         self._vad_state = np.zeros((2, 1, 128), dtype=np.float32)
         self._vad_context = np.zeros((1, 64), dtype=np.float32)
 
     def check_vad(self, audio_int16: np.ndarray) -> bool:
+        """Speech verdict for one chunk (True = speech above threshold).
+
+        The chunk is scaled to float32 (with a 32x gain for quiet mics,
+        then hard-clipped to [-1,1] — safe for this utterance head; do NOT
+        copy the gain into the wake path, see _ww_vad_speech), appended to
+        the buffer and consumed in Silero's 512-sample windows. Returns
+        whether the BEST window probability exceeds `vad_threshold`, i.e.
+        speech anywhere in the chunk wins; the buffer keeps the ragged
+        remainder until the next call.
+        """
         self._vad_calls += 1
         gain = 32.0
         audio_float32 = audio_int16.astype(np.float32) * gain / 32768.0
@@ -109,6 +203,9 @@ class LocalAudioEngine:
         self._vad_buffer = np.concatenate((self._vad_buffer, audio_float32))
         max_prob = 0.0
         while len(self._vad_buffer) >= 512:
+            # Silero's native window at 16 kHz is 512 samples; the model
+            # input is the previous 64-sample context prefixed to it, and
+            # only the tail survives as the next context.
             chunk = self._vad_buffer[:512]
             self._vad_buffer = self._vad_buffer[512:]
             full_input = np.concatenate([self._vad_context, chunk[np.newaxis, :]], axis=1)
@@ -118,6 +215,7 @@ class LocalAudioEngine:
             )
             self._vad_context = np.concatenate([self._vad_context, chunk[np.newaxis, :]], axis=1)[:, -64:]
             max_prob = max(max_prob, out[0][0])
+        # Throttled telemetry: per-chunk logging would drown the gateway.
         if self._vad_calls % 200 == 0:
             level = np.sqrt(np.mean(audio_float32**2))
             logger.info(f"VAD calls={self._vad_calls} max_prob={max_prob:.4f} level={level:.6f} (threshold={self.vad_threshold})")
@@ -171,6 +269,17 @@ class LocalAudioEngine:
         return max_prob > 0.5
 
     def check_wakeword(self, audio_int16: np.ndarray, threshold: float = 0.4, stream: str = "", vad_ok: bool | None = None) -> bool:
+        """Wake-word verdict for one RAW int16 chunk.
+
+        Params: `threshold` = per-stream sensitivity (distant microphones
+        need tuning), `stream` = label used in logs only, `vad_ok` =
+        caller's _ww_vad_speech verdict computed BEFORE any AGC — False
+        short-circuits (non-speech transients are the dominant false-
+        positive source), None keeps the legacy self-gating behaviour.
+        Returns True when the best openWakeWord score beats `threshold`;
+        the raw score is always mirrored to self.last_score, which
+        camera_client's debounce/fire logic reads.
+        """
         # NOTE: the caller should run _ww_vad_speech on the RAW chunk BEFORE
         # any AGC normalization and pass the verdict here. Per-chunk peak
         # normalization flattens amplitude dynamics and Silero goes blind on
@@ -202,6 +311,16 @@ class LocalAudioEngine:
 
 
 class CameraProcessor:
+    """Per-microphone utterance state machine on top of LocalAudioEngine.
+
+    Wires the engine to STT and to main.py: `on_activation_cb` fires the
+    moment recording starts (play the attention cue / open the mic),
+    `on_command_cb` receives the final transcript (returns a coroutine that
+    is awaited, so the reply can drive TTS synchronously). End of
+    utterance = SILENCE_TIMEOUT (1.5 s) of non-speech after the first
+    second of audio. Chunks arriving in SPEAKING are dropped on purpose —
+    the mic hears its own TTS otherwise."""
+
     def __init__(
         self,
         engine: LocalAudioEngine,
@@ -223,12 +342,22 @@ class CameraProcessor:
         self._record_start = 0.0
 
     def set_state(self, new_state: AgentState):
+        """FSM transition + log. Entering LISTENING or SPEAKING resets the
+        utterance VAD: a new utterance starts from clean recurrent state,
+        and while TTS plays the VAD must not accumulate the echo."""
         logger.info(f"State transition: {self.state} -> {new_state}")
         self.state = new_state
         if new_state in (AgentState.LISTENING, AgentState.SPEAKING):
             self.engine.reset_vad()
 
     async def _send_to_speeches_stt(self, audio_pcm16: np.ndarray) -> str:
+        """PCM16 (16 kHz mono) -> WAV -> multipart POST to the STT service.
+
+        The WAV is built in a worker thread (wave encoding would stall
+        the event loop). Returns the transcript, or "" on any HTTP or
+        transport failure — empty text is handled by the caller as
+        "nothing recognised", never as an error to the user.
+        """
         def _write_wav():
             wav_io = io.BytesIO()
             with wave.open(wav_io, 'wb') as wf:
@@ -240,6 +369,9 @@ class CameraProcessor:
 
         wav_bytes = await asyncio.to_thread(_write_wav)
 
+        # OpenAI-style multipart transcription request; model + language
+        # are pinned (household speaks Russian only) — changing either
+        # changes STT quality for every satellite.
         form = aiohttp.FormData()
         form.add_field('file', wav_bytes, filename='speech.wav', content_type='audio/wav')
         form.add_field('model', 'koekaverna/faster-whisper-podlodka-turbo')
@@ -260,6 +392,15 @@ class CameraProcessor:
             return ""
 
     async def _handle_stt_and_llm(self):
+        """Transcribe the finished utterance and dispatch it.
+
+        STATE/PROCESSING: the buffer is taken (and cleared) first so a
+        late chunk cannot double-feed this run; then STT, then the
+        `on_command_cb` pipeline (awaited — it drives the whole reply),
+        or back to LISTENING when the transcript was empty or no callback
+        is wired. Empty STT text is normal (noise, hall-effect echo) and
+        is NOT reported to the user.
+        """
         self.set_state(AgentState.PROCESSING)
         full_audio = np.concatenate(self.record_buffer)
         self.record_buffer.clear()
@@ -274,6 +415,19 @@ class CameraProcessor:
             self.set_state(AgentState.LISTENING)
 
     async def process_chunk(self, audio_int16: np.ndarray):
+        """Entry point — feed one raw PCM chunk (int16, 16 kHz).
+
+        LISTENING: 3 consecutive speech chunks are required to trigger
+        (debounce against a single noisy window); a non-speech chunk
+        decays the counter, so an interrupted trigger starts over.
+        RECORDING: every chunk is buffered; the first second is exempt
+        from the silence timer (a clipped initial word must not end the
+        utterance), then 1.5 s of non-speech finishes it and hands the
+        job to _handle_stt_and_llm (spawned, not awaited — this loop must
+        return immediately or the mic would drop audio).
+        SPEAKING: dropped entirely (echo guard). VAD runs in a worker
+        thread (ONNX inference is blocking).
+        """
         if self.state == AgentState.SPEAKING:
             return
 
@@ -283,6 +437,8 @@ class CameraProcessor:
             if speech:
                 self._wake_hold_speech += 1
                 if self._wake_hold_speech >= 3:
+                    # Debounce: only SUSTAINED speech wakes us — a single
+                    # VAD window can fire on a door click or a cough.
                     logger.info(f"VAD speech detected — waking")
                     logger.warning("VAD WAKE! Recording...")
                     self.set_state(AgentState.RECORDING)
@@ -300,13 +456,15 @@ class CameraProcessor:
             if self._record_start == 0.0:
                 self._record_start = now
             elif speech:
-                self.silence_start = None
+                self.silence_start = None  # speech resumed: restart the timer
             else:
                 elapsed = now - self._record_start
                 if elapsed < 1.0:
-                    pass
+                    pass  # grace: don't cut off a clipped first word
                 elif self.silence_start is None:
                     self.silence_start = now
                 elif now - self.silence_start > self.SILENCE_TIMEOUT:
+                    # End of utterance: hand over to STT without awaiting
+                    # (see process_chunk docstring).
                     logger.info(f"VAD silence ({len(self.record_buffer)} frames). Processing STT...")
                     asyncio.create_task(self._handle_stt_and_llm())

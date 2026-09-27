@@ -70,6 +70,9 @@ def _speakable(s: str) -> str:
 
 
 def _has_letters(s: str) -> bool:
+    """Drop punctuation/emoji-only fragments: TTS would either skip them or
+    read them as noise, and a sentence without a single letter is never a
+    real answer («...», «—», «$$$»)."""
     return bool(re.search(r"[A-Za-zА-Яа-яЁё]", s))
 
 
@@ -94,6 +97,13 @@ async def stream_sentences(
         headers.update(extra_headers)
     payload = {"model": model, "messages": messages, "stream": True}
 
+    # Two-level timeout: `total` caps the whole call (failover must still
+    # happen inside CHAT_TOTAL_TIMEOUT=90 s), `sock_read` caps the gap
+    # BETWEEN chunks — a dead upstream that accepted the connection then
+    # went silent is caught here, not by `total`.
+    # sock_connect=10 lets a downed OmniRoute/Hermes fail fast so the loop
+    # in stream_chat can move to the next target while the user is still
+    # waiting (no audio yet, so the failover is invisible to them).
     timeout = aiohttp.ClientTimeout(
         total=total_timeout, sock_connect=10, sock_read=first_token_timeout
     )
@@ -165,6 +175,10 @@ async def stream_sentences(
     logger.debug("chat stream done in %.2fs", asyncio.get_event_loop().time() - t_start)
 
 
+# System prompts are byte-stable PROMPT TEXT: they are sent verbatim to the
+# upstream models. The "no markdown" rules exist because a leaked «### 1.»
+# would be read aloud by TTS; sentence splitting still sanitizes whatever
+# slips through (see _speakable). Edit wording only with an E2E voice check.
 CHAT_SYSTEM = (
     "Ты голосовой ассистент умной колонки. Отвечай ГОЛОСОМ: по-русски, "
     "живо, сразу по существу, 1-3 предложения. Тебе недоступны инструменты — "

@@ -1,3 +1,11 @@
+"""Tests for camera_client.AIVoiceOutputTrack (av-based audio output track).
+
+Covers the PyAV track wrapper the camera stream uses to play TTS audio:
+initialization, packet timestamps and frame assembly. NOTE: this module
+imports `av`, which is only installed inside the Docker image — on a host
+without av the whole `pytest tests/` run fails at collection, so run the
+5-file suite (see AGENTS/README) instead of the full directory.
+"""
 import asyncio
 import time
 import pytest

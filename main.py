@@ -1,3 +1,128 @@
+# =====================================================================================
+# VOICE GATEWAY — main.py
+# =====================================================================================
+#
+# PURPOSE
+#   FastAPI gateway for the smart-home voice stack. It terminates the WebSocket of
+#   every ESP32 satellite speaker, ingests their Opus audio, runs server-side VAD +
+#   STT, forwards the recognised text into the LLM cascade and streams the spoken
+#   answer back as Opus frames. It also serves the operator web UI
+#   (templates/index.html), the REST/OTA API used by the firmware, and starts one
+#   go2rtc camera session per configured stream (openWakeWord + camera TTS live in
+#   camera_client.py).
+#
+# CASCADE PLACEMENT (this file is the gateway level below the router)
+#   ESP32 satellite (device-side wake word, Opus capture)
+#        |  WebSocket "/" : binary Opus frames + JSON control events
+#        v
+#   THIS FILE — silero VAD -> STT (WHISPER_URL) -> speaker ID -> backend dispatch
+#        |  LLM_BACKEND=cascade : backends.CascadeBackend -> jev-router (L1,
+#        |      ROUTER_URL, default :8091, SSE POST /route) -> smolagents-worker
+#        |      (L2 smolagents CodeAgent on a free LLM) -> Hermes (L3 expert)
+#        |      -> Home Assistant through MCP tools
+#        |  LLM_BACKEND=hermes : backends.HermesBackend -> Hermes (L3) HTTP API
+#        |      directly, skipping L1/L2
+#        |  LLM_BACKEND=nanobot (default) : legacy backends.NanobotBackend -> the
+#        |      Nanobot WebSocket brain (kept for compatibility)
+#        v
+#   TTS (TTS_URL, OpenAI-compatible) -> pydub resample -> Opus -> satellite speaker
+#
+# MAIN ENTRY POINTS
+#   __main__            uvicorn.run(app, host 0.0.0.0, port 18792, ws_ping disabled —
+#                       liveness is the manual ping/pong implemented in voice_ws()).
+#   app (FastAPI)       also imported directly by tests (test_ota_auth, test_main).
+#   on_startup/shutdown start/stop the go2rtc camera sessions.
+#   voice_ws()          the satellite WebSocket; owns per-device session state.
+#
+# END-TO-END REQUEST / AUDIO LIFECYCLE
+#   1. Auth + connect: voice_ws() checks ?token= or "Authorization: Bearer" against
+#      NANOBOT_TOKEN with a constant-time compare, accepts, allocates a session_id
+#      and a fresh per-session `state` dict (status IDLE), replies `hello` with the
+#      audio contract (Opus 16 kHz mono, 60 ms frames) and asks the device for its
+#      MCP tool list (tools/list, id 999).
+#   2. Wake: device-side wake word -> JSON `listen:start` -> status LISTENING,
+#      buffers cleared, VAD reset, screen 100% (ignored during the TTS cooldown so
+#      the tail of our own playback cannot re-trigger us).
+#   3. Capture: each binary WS message is one 60 ms Opus frame (v1 = raw,
+#      v2 = 16-byte header, v3 = 4-byte header); decoded to PCM16@16k and scored by
+#      VadEngine (Silero ONNX + adaptive energy floor) for the silence counter.
+#   4. Cut: device `listen:stop` or server-side VAD (>VAD_SILENCE_FRAMES quiet
+#      frames after real speech) -> status PROCESSING -> process_audio_and_send().
+#   5. Gates: echo guard (camera_client.GLOBAL_TTS_UNTIL), min 15 frames,
+#      ENERGY_THRESHOLD / MIN_SPEECH_RATIO, cross-device speaker lock — quiet or
+#      noisy bursts never reach Whisper.
+#   6. STT + identity: pack_ogg() then one round of parallel POSTs to WHISPER_URL
+#      and SPEAKER_ID_URL; is_valid_text() (audio_utils.py) filters hallucinations
+#      and mic echoes of our own TTS.
+#   7. Dispatch: _handle_successful_transcription() echoes the text to the device
+#      (`stt` event) and then either _dispatch_hermes() (cascade/hermes backends)
+#      or the legacy Nanobot WS path; a WATCHDOG_TIMEOUT timer apologises and
+#      re-opens the mic when the upstream AI stalls.
+#   8. Speak-back: sentences land on an asyncio.Queue -> _hermes_player_task()
+#      (sentence N+1 is synthesised while N plays) -> stream_tts_pcm() -> pydub ->
+#      PCM 16 kHz mono -> Opus frames paced in real time -> device, bracketed by
+#      `tts start`/`tts stop` control events plus a 1.5 s VAD cooldown afterwards.
+#   9. Turn end: _finalize_response() probes the reply for a question (the
+#      HAS_QUESTION_* regexes) and either keeps LISTENING for the follow-up window
+#      (STANDBY_TIMEOUT_QUESTION after a question, STANDBY_TIMEOUT_STATEMENT after
+#      a statement) or reset_to_standby(); activity_monitor_task() runs that timer
+#      and dims the screen while idle.
+#
+# WEB UI / REST API (HTTP Basic auth via ADMIN_USERNAME/ADMIN_PASSWORD, 5 req/min/IP)
+#   GET    /                          operator dashboard (templates/index.html)
+#   GET    /health                    liveness probe, unauthenticated
+#   GET    /api/devices               live sessions: session_id, mac, status, last_text
+#   GET    /api/devices/config        device DB (devices.json) merged with online status
+#   POST   /api/devices/config        create device; PUT/DELETE .../{mac} update/remove
+#   POST   /mcp/{session_id}          MCP JSON-RPC passthrough to a satellite
+#                                     ("latest" resolves to the most recent session)
+#   POST   /api/tts                   speak arbitrary text on a satellite session
+#   POST   /api/camera/tts            speak text through a go2rtc camera session
+#   GET    /api/firmware              current firmware metadata
+#   POST   /api/firmware/upload       upload a .bin (size-capped by MAX_FIRMWARE_SIZE)
+#   GET|POST /ota                     ESP32 OTA handshake: WS URL, access token, update URL
+#   GET    /firmware/*                static firmware files (source for the OTA URL)
+#   WS     /                          satellite audio/control channel (token-authenticated)
+#
+# CONFIG — read from the environment / .env only. The repository is PUBLIC: never
+# hardcode IPs, passwords or tokens in this file.
+#   Cascade : LLM_BACKEND, ROUTER_URL, ROUTER_ACK_DELAY, HERMES_API_URL, HERMES_API_KEY
+#   Legacy  : NANOBOT_WS_URL, NANOBOT_TOKEN, NANOBOT_SESSION_SALT
+#   Media   : WHISPER_URL, SPEAKER_ID_URL, TTS_URL, TTS_MODEL, TTS_VOICE, TTS_API_KEY
+#   Auth    : ADMIN_USERNAME, ADMIN_PASSWORD (>= 8 chars and != username — enforced
+#             at import time, the module refuses to start otherwise)
+#   Tuning  : VAD_SILENCE_FRAMES, ENERGY_THRESHOLD, MIN_SPEECH_RATIO, WATCHDOG_TIMEOUT,
+#             STANDBY_TIMEOUT_QUESTION, STANDBY_TIMEOUT_STATEMENT, CHAT_ID_TTL,
+#             LOG_TRANSCRIPTIONS, MAX_FIRMWARE_SIZE
+#   Cameras : DISABLE_CAMERAS, CAMERA_STREAMS, GO2RTC_HOST, GO2RTC_PORT,
+#             GO2RTC_SOURCE_URL[_<NAME>], GO2RTC_HEAL_STALLS, WAKE_WORD,
+#             WAKE_WORD_MODEL, WAKE_WORD_MODEL_<NAME>
+#   Unused here: THINKING_SOUND_PATH, VAD_ADAPTIVE (declared for compatibility).
+#
+# THREADS / ASYNC INTERPLAY
+#   One asyncio event loop owns the process. Blocking work is pushed off-loop:
+#   Silero ONNX inference, device-DB writes and firmware file writes go through
+#   asyncio.to_thread(), the chat_id cache save through loop.run_in_executor().
+#   Watchdogs and buffer-flush timers are loop.call_later() handles stored in the
+#   session `state`. Every background task is registered in state["tasks"] by
+#   create_tracked_task() and cancelled in the voice_ws() finally block, so a
+#   dropped satellite leaves no orphan tasks behind. The cross-session registries
+#   (active_sessions, session_states, mcp_futures, _active_speaker_lock) are plain
+#   module-level dicts mutated only from the loop — no locks are needed because
+#   there is a single writer.
+#
+# KNOWN GOTCHAS / TODOs
+#   * The import block that follows the first config section is duplicated
+#     (historical copy-paste). It is harmless — Python caches imported modules —
+#     but the redundant block should be merged some day.
+#   * During a gateway restart a single `ERROR ... Error in device websocket loop`
+#     line (old process logged it as voice_ws:1961) is a benign artifact of the
+#     satellite connection dropping mid-shutdown, not a regression.
+#   * camera_client.py (2683 lines) is a sibling module that reuses VadEngine,
+#     pack_ogg and the TTS backends for go2rtc cameras; it is edited elsewhere —
+#     this file only imports it (see start_camera_sessions()).
+# =====================================================================================
+
 import asyncio
 import json
 import os
@@ -38,14 +163,28 @@ import backends
 
 # ==========================================
 # CONFIGURATION & ENVIRONMENT VARIABLES
+# Backend selection: one env var switches the whole reply path between the
+# three-level cascade (L1 router / L2 CodeAgent / L3 Hermes), a direct Hermes
+# call and the legacy Nanobot WebSocket. Read at import time only — flipping
+# LLM_BACKEND requires a restart (the global `llm_backend` below is built once).
 LLM_BACKEND = os.getenv("LLM_BACKEND", "nanobot").lower()
+# Hermes (L3) HTTP API — used when LLM_BACKEND=hermes. Defaults are overridable
+# from .env; never hardcode credentials here (public repo).
 HERMES_API_URL = os.getenv("HERMES_API_URL", "http://192.168.22.102:8000")
 HERMES_API_KEY = os.getenv("HERMES_API_KEY", "")
 # Cascade mode (LLM_BACKEND=cascade): jev-router SSE endpoint
+# (jev-router = L1 of the cascade; it classifies the utterance and forwards to
+# the L2 smolagents worker or the L3 Hermes expert.)
 ROUTER_URL = os.getenv("ROUTER_URL", "http://localhost:8091")
+# Seconds to wait before speaking the filler ack «Секунду, занимаюсь…» on a
+# slow L1/L2 turn — cancelled as soon as the first real sentence arrives, so
+# fast paths never hear it (see backends.CascadeBackend).
 ROUTER_ACK_DELAY = float(os.getenv("ROUTER_ACK_DELAY", "3"))
 # ==========================================
 
+# NOTE: the import block below is a historical duplicate of the one above.
+# Modules are cached by Python, so re-importing is a no-op; kept as-is to avoid
+# touching executable lines (TODO: merge the two blocks).
 import asyncio
 import json
 import os
@@ -85,12 +224,19 @@ from camera_client import CameraSession, CameraConfig
 
 # ==========================================
 # CONFIGURATION & ENVIRONMENT VARIABLES (continued)
+# Nanobot WebSocket (legacy default backend) — also used as the auth token for
+# the satellite WebSocket in voice_ws() and as the OTA access_token.
 NANOBOT_WS_URL = os.getenv("NANOBOT_WS_URL", "ws://nanobot:8765/").rstrip("/")
 NANOBOT_TOKEN = os.getenv("NANOBOT_TOKEN", "")
+# Salt mixed into the deterministic per-MAC chat_id (make_chat_id) so session
+# ids cannot be guessed from a device MAC alone.
 NANOBOT_SESSION_SALT = os.getenv("NANOBOT_SESSION_SALT", "")
+# Speaker-recognition service: POST multipart (file) -> {user_id, confidence}.
 SPEAKER_ID_URL = os.getenv("SPEAKER_ID_URL", "http://192.168.22.102:8001/identify")
 
 # Global LLM backend (set at import; HermesBackend, CascadeBackend or NanobotBackend)
+# Chosen once at import: every reply path (dispatch + camera sessions) reuses this
+# object, so backend config changes need a container restart.
 llm_backend = None
 if LLM_BACKEND == "hermes":
     llm_backend = backends.HermesBackend(HERMES_API_URL, HERMES_API_KEY)
@@ -99,21 +245,30 @@ elif LLM_BACKEND == "cascade":
     llm_backend = backends.CascadeBackend(ROUTER_URL, ack_delay=ROUTER_ACK_DELAY)
     logger.info(f"🔀 Global LLM backend: Cascade @ {ROUTER_URL}")
 else:
+    # Unknown values silently fall back to Nanobot — the default keeps old
+    # deployments working when LLM_BACKEND is unset or mistyped.
     llm_backend = backends.NanobotBackend(NANOBOT_WS_URL, NANOBOT_TOKEN, NANOBOT_SESSION_SALT)
     logger.info(f"🤖 Global LLM backend: Nanobot @ {NANOBOT_WS_URL}")
 
+# OpenAI-compatible STT endpoint (speaches/whisper): multipart POST of the
+# packed Ogg file -> {"text": ...}. language/model are set in fetch_transcription().
 WHISPER_URL = os.getenv(
     "WHISPER_URL", "http://192.168.22.111:8000/v1/audio/transcriptions"
 )
 
+# OpenAI-compatible TTS endpoint (edge_tts sidecar): JSON in -> MP3 out.
 TTS_URL = os.getenv("TTS_URL", "http://edge_tts:5050/v1/audio/speech")
 TTS_MODEL = os.getenv("TTS_MODEL", "tts-1")
 TTS_VOICE = os.getenv("TTS_VOICE", "ru-RU-SvetlanaNeural")
 TTS_API_KEY = os.getenv("TTS_API_KEY", "")
 
+# Web UI / REST API credentials. Both must be set or verify_auth() rejects every
+# request with 401 "Authentication disabled".
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
 
+# Fail fast at import: a weak or identical password would otherwise only be
+# discovered on the first login attempt (and the API would happily accept it).
 if ADMIN_PASSWORD:
     if len(ADMIN_PASSWORD) < 8:
         raise ValueError(
@@ -122,25 +277,41 @@ if ADMIN_PASSWORD:
     if ADMIN_PASSWORD == ADMIN_USERNAME:
         raise ValueError("ADMIN_PASSWORD cannot be the same as ADMIN_USERNAME.")
 
+# Opt-in transcript logging: by default only redacted lengths are logged so
+# spoken content stays out of the (shared) container logs.
 LOG_TRANSCRIPTIONS = os.getenv("LOG_TRANSCRIPTIONS", "false").lower() == "true"
 
 DB_FILE = "/app/config/devices.json"
+# Server-side VAD: this many consecutive quiet frames cut the utterance.
 VAD_SILENCE_FRAMES = int(os.getenv("VAD_SILENCE_FRAMES", 8))
 MAX_FIRMWARE_SIZE = int(os.getenv("MAX_FIRMWARE_SIZE", 10 * 1024 * 1024))
+# Upstream AI silence limit: after this long without a reply, apologize + re-listen.
 WATCHDOG_TIMEOUT = int(os.getenv("WATCHDOG_TIMEOUT", 90))
+# Adaptive standby: keep the mic open longer after we asked the user a question
+# (they need time to answer) than after a plain statement.
 STANDBY_TIMEOUT_QUESTION = int(os.getenv("STANDBY_TIMEOUT_QUESTION", 30))
 STANDBY_TIMEOUT_STATEMENT = int(os.getenv("STANDBY_TIMEOUT_STATEMENT", 10))
 CHAT_ID_TTL = int(
     os.getenv("CHAT_ID_TTL", 604800)
 )  # 7-day sliding window — Nanobot context lives a week
-THINKING_SOUND_PATH = os.getenv("THINKING_SOUND_PATH", "")
+THINKING_SOUND_PATH = os.getenv("THINKING_SOUND_PATH", "")  # declared for compatibility; unused in this file
 
+# VAD gates. ENERGY_THRESHOLD = mean RMS below which Whisper is skipped entirely;
+# MIN_SPEECH_RATIO = share of frames Silero must call speech; VAD_ADAPTIVE is
+# read for compatibility but not referenced further down.
 ENERGY_THRESHOLD = float(os.getenv("ENERGY_THRESHOLD", "0.002"))
 MIN_SPEECH_RATIO = float(os.getenv("MIN_SPEECH_RATIO", "0.12"))
 VAD_ADAPTIVE = os.getenv("VAD_ADAPTIVE", "true").lower() == "true"
 
+# Shared helpers extracted to audio_utils.py (also reused by camera_client.py):
+# pack_ogg() wraps the Opus frames into an Ogg container for the Whisper API,
+# is_valid_text() rejects hallucinations and mic echoes of our own TTS.
 from audio_utils import pack_ogg, is_valid_text
 
+# Fillers the user may say while deciding what to ask ("wait a second").
+# _handle_successful_transcription() detects them in the transcript and only
+# extends the listening window, so an utterance starting with a filler is not
+# cut off mid-thought. NB: "momento" appears twice in the source (harmless).
 HOLD_PHRASES = {
     "подожди",
     "мomento",
@@ -150,8 +321,15 @@ HOLD_PHRASES = {
     "мomento",
 }
 
+# Question detection driving the adaptive standby window (see _finalize_response).
+# HAS_QUESTION_RE: does the reply end with "?" (ASCII or fullwidth "？").
 HAS_QUESTION_RE = re.compile(r"[?？]\s*$")
+# SENTENCE_END_RE: sentence boundary used by NanobotResponseHandler to cut the
+# streaming LLM output into speakable chunks ('.', '!', '…'/ellipsis or newline).
 SENTENCE_END_RE = re.compile(r"[.!?…](?:\s|$)|[\n]")
+# HAS_QUESTION_WORDS_RE: Russian interrogatives and common imperatives — a reply
+# phrased without a "?" still counts as a question so the mic stays open for the
+# follow-up (applied case-insensitively to the whole reply text).
 HAS_QUESTION_WORDS_RE = re.compile(
     r"\b(что|как|где|когда|почему|зачем|сколько|кто|какой|какая|какое|какие|чей|чья|чьё|чьи|куда|откуда|уточни|расскажи|напомни|объясни|повтори|скажи|покажи|подожди|помоги|ответь|напиши|сделай|включи|выключи|открой|закрой|дай|можешь|не знаю|не понимаю)\b",
     re.IGNORECASE,
@@ -161,6 +339,13 @@ SPEAKER_NAME_FILE = "/app/config/speaker_names.json"
 
 
 def load_speaker_names() -> dict:
+    """Load the uid -> display-name map used when labelling speaker IDs.
+
+    Returns:
+        dict: {speaker_uid: human-readable name}. Returns {} if the file is
+        missing or malformed — a missing names file must never prevent the
+        gateway from starting, so every error is swallowed into a warning.
+    """
     try:
         with open(SPEAKER_NAME_FILE) as f:
             return json.load(f)
@@ -169,14 +354,23 @@ def load_speaker_names() -> dict:
         return {}
 
 
+# Snapshot taken once at import; speaker names change rarely, so the file is
+# not re-read per utterance (edit requires a restart).
 SPEAKER_NAME_MAP = load_speaker_names()
 
+# chat_id -> {chat_id, ts} cache: keeps each satellite's Nanobot conversation
+# context across reconnects and container rebuilds (persists to JSON on disk).
 CHAT_ID_CACHE = {}
 CHAT_ID_CACHE_FILE = "/app/config/chat_id_cache.json"
 
 
 def load_chat_id_cache():
-    """Loads chat_id cache from disk (survives container rebuild)."""
+    """Loads chat_id cache from disk (survives container rebuild).
+
+    Side effects: replaces the module-level CHAT_ID_CACHE. Entries older than
+    CHAT_ID_TTL (7 days) are dropped on load; any read/parse error silently
+    resets the cache to empty rather than raising.
+    """
     global CHAT_ID_CACHE
     if os.path.exists(CHAT_ID_CACHE_FILE):
         try:
@@ -194,7 +388,17 @@ def load_chat_id_cache():
 
 
 def save_chat_id_cache(cache_data: dict = None):
-    """Persists chat_id cache to disk."""
+    """Persist the chat_id cache to disk.
+
+    Args:
+        cache_data: snapshot to write; when None the live CHAT_ID_CACHE is
+            shallow-copied first — the copy avoids "dictionary changed size
+            during iteration" if another coroutine mutates the cache while a
+            background thread serialises it.
+
+    Failure mode: IO errors are logged, never raised (the cache is a
+    performance/continuity aid, losing a write only costs a re-handshake).
+    """
     if cache_data is None:
         # Shallow copy to avoid "dictionary changed size during iteration" in bg thread
         cache_data = dict(CHAT_ID_CACHE)
@@ -206,6 +410,13 @@ def save_chat_id_cache(cache_data: dict = None):
 
 
 def get_cached_chat_id(mac: str) -> str | None:
+    """Return the still-fresh chat_id for a MAC, or None if absent/expired.
+
+    Params:
+        mac: device MAC (lower-cased before lookup).
+    Returns:
+        str | None: the deterministic chat_id or None outside CHAT_ID_TTL.
+    """
     # Adding a small comment to ensure the tests verify the function in the file
     entry = CHAT_ID_CACHE.get(mac.lower())
     if entry and time.time() - entry["ts"] < CHAT_ID_TTL:
@@ -213,13 +424,22 @@ def get_cached_chat_id(mac: str) -> str | None:
     return None
 
 
+# Timestamp of the last disk write — set_cached_chat_id() throttles persistence
+# to at most one write per 5 s (wake words would otherwise hammer the fs).
 _chat_id_last_save = 0.0
 
 
 def set_cached_chat_id(mac: str, chat_id: str):
+    """Cache chat_id for a MAC and (throttled) persist it to disk.
+
+    Side effects: mutates CHAT_ID_CACHE; schedules save_chat_id_cache() on the
+    running loop's executor at most every 5 s. Falls back to a synchronous
+    write when no event loop is running (called from tests / import time).
+    """
     global _chat_id_last_save
     CHAT_ID_CACHE[mac.lower()] = {"chat_id": chat_id, "ts": time.time()}
     now = time.time()
+    # Rate-limit disk writes: one per 5 s is plenty for a sliding TTL window.
     if now - _chat_id_last_save > 5.0:
         _chat_id_last_save = now
         cache_copy = dict(CHAT_ID_CACHE)
@@ -227,29 +447,57 @@ def set_cached_chat_id(mac: str, chat_id: str):
             loop = asyncio.get_running_loop()
             loop.run_in_executor(None, save_chat_id_cache, cache_copy)
         except RuntimeError:
+            # No running loop (plain sync call): write inline instead.
             save_chat_id_cache(cache_copy)
 
 
 def make_chat_id(mac: str) -> str:
     """Deterministic chat_id from MAC address in UUID format (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx).
-    Nanobot reuses the session across reconnects."""
+    Nanobot reuses the session across reconnects.
+
+    The MAC is salted with NANOBOT_SESSION_SALT and hashed (sha256), so the
+    conversation id cannot be forged from a physically visible MAC address.
+    """
     h = hashlib.sha256(f"{mac.lower()}{NANOBOT_SESSION_SALT}".encode()).hexdigest()
     return f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
 
 
-load_chat_id_cache()  # Load on startup
+load_chat_id_cache()  # Load on startup (drops entries older than CHAT_ID_TTL)
 
+# slowapi rate limiter keyed by client IP; wired into FastAPI app.state and used
+# directly by verify_auth() (which is a dependency, not a route, so it needs the
+# manual limiter._limiter.hit() call below).
 limiter = Limiter(key_func=get_remote_address)
 app = FastAPI()
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
+# HTTP Basic scheme with auto_error=False: missing credentials produce None
+# instead of an automatic 401, letting verify_auth() craft its own responses
+# ("auth disabled" vs "auth required").
 security = HTTPBasic(auto_error=False)
 
 
 def verify_auth(
     request: Request, credentials: HTTPBasicCredentials | None = Depends(security)
 ):
+    """FastAPI dependency: HTTP Basic auth for every UI/REST endpoint.
+
+    Args:
+        request: used for the per-IP rate limit key.
+        credentials: parsed Basic header, or None when absent.
+    Returns:
+        str: the authenticated username (callers compare it with ADMIN_USERNAME
+        for per-device ownership checks).
+    Raises:
+        HTTPException: 429 when the IP exceeds 5 attempts/minute, 401 when
+        credentials are unset/missing/wrong (with WWW-Authenticate so the
+        browser prompts).
+
+    Non-obvious behaviour: auth *disabled* (no ADMIN_* configured) still
+    raises 401 — the API is never silently left open; the message only tells
+    the operator that credentials were not configured.
+    """
     limit = limits.parse("5/minute")
     if not limiter._limiter.hit(limit, get_remote_address(request), "verify_auth"):
         raise HTTPException(status_code=429, detail="Too many requests")
@@ -266,6 +514,8 @@ def verify_auth(
             detail="Authentication required",
             headers={"WWW-Authenticate": "Basic"},
         )
+    # Constant-time comparison: prevents timing attacks that could reveal
+    # how many leading characters of the stored password match.
     is_user_ok = secrets.compare_digest(credentials.username, ADMIN_USERNAME)
     is_pass_ok = secrets.compare_digest(credentials.password, ADMIN_PASSWORD)
     if not (is_user_ok and is_pass_ok):
@@ -277,11 +527,14 @@ def verify_auth(
     return credentials.username
 
 
+# Firmware staging area for OTA updates; /firmware is mounted as a static route
+# because the /ota handshake hands the satellite a direct download URL.
 FIRMWARE_DIR = "/app/config/firmware"
-os.makedirs(FIRMWARE_DIR, exist_ok=True)
+os.makedirs(FIRMWARE_DIR, exist_ok=True)  # must exist before StaticFiles mounts
 FIRMWARE_META = "/app/config/firmware.json"
 app.mount("/firmware", StaticFiles(directory=FIRMWARE_DIR), name="firmware")
 
+# Single-page operator dashboard (device list, status badges, MCP console, OTA).
 templates = Jinja2Templates(directory="templates")
 
 
@@ -289,6 +542,24 @@ templates = Jinja2Templates(directory="templates")
 # VAD ENGINE (Voice Activity Detection)
 # ==========================================
 class VadEngine:
+    """Server-side voice activity detector: Silero VAD (ONNX) + energy fallback.
+
+    Wraps silero_vad.onnx (16 kHz, 512-sample chunks) and scores PCM16 buffers.
+    Two independent signals are combined with OR:
+      * ONNX speech probability > onnx_threshold (input pre-amplified by
+        onnx_gain to compensate quiet microphones);
+      * RMS energy above max(ENERGY_THRESHOLD, adaptive noise floor * 1.2),
+        where the floor is an exponential moving average of recent levels.
+
+    Stateful: the recurrent `state`/`context` tensors and the sample `buffer`
+    carry history between calls, so reset() MUST be called at every utterance
+    boundary (wake, standby, watchdog) — otherwise one utterance's residual
+    energy biases the next one's decision.
+
+    Failure modes: exceptions are caught and reported as (False, 0.0) — a VAD
+    error should read as "silence", never as a phantom wake.
+    """
+
     def __init__(
         self,
         energy_fallback: bool = True,
@@ -299,8 +570,26 @@ class VadEngine:
         rms_alpha: float = 0.05,
         onnx_gain: float = 20.0,
     ):
+        """Create the ONNX session and default buffers.
+
+        Args:
+            energy_fallback: enable the RMS-based second opinion.
+            energy_threshold: static RMS gate (raised to the adaptive floor
+                when the floor is higher).
+            onnx_threshold: Silero speech-probability cut-off.
+            vad_adaptive: accepted for API compatibility, unused (see module
+                header "Unused here").
+            rms_noise_floor: initial EMA of the ambient noise level.
+            rms_alpha: EMA weight for the noise floor (0 = frozen floor —
+                used by camera sessions on already-normalised audio).
+            onnx_gain: linear pre-gain applied before Silero, because quiet
+                camera/satellite mics otherwise score below the threshold.
+        """
         logger.info("Loading Silero VAD (ONNX) model...")
         opts = ort.SessionOptions()
+        # Single-threaded ONNX: inference runs off-loop via asyncio.to_thread;
+        # capping threads keeps latency predictable and avoids starving the
+        # event loop on the shared CPU.
         opts.inter_op_num_threads = 1
         opts.intra_op_num_threads = 1
         self.session = ort.InferenceSession(
@@ -320,6 +609,12 @@ class VadEngine:
         self.reset()
 
     def reset(self):
+        """Zero the recurrent state, context window and sample buffer.
+
+        Call at every utterance boundary. No I/O; safe from any coroutine.
+        """
+        # Silero's hidden state (2x1x128) and 64-sample context prefix — the
+        # shapes are fixed by the ONNX graph, do not change them.
         self._state = np.zeros((2, 1, 128), dtype=np.float32)
         self._context = np.zeros((1, self._context_size), dtype=np.float32)
         self.buffer = np.array([], dtype=np.float32)
@@ -327,6 +622,12 @@ class VadEngine:
     def _run_onnx(
         self, chunk: np.ndarray, state: np.ndarray, context: np.ndarray
     ) -> tuple:
+        """Run one 512-sample chunk through the model (blocking — call from a
+        thread). Returns (probabilities, next_state) as the graph outputs them.
+
+        The context is prepended because Silero expects a (1, 64+512) window,
+        not a bare chunk.
+        """
         full_input = np.concatenate([context, chunk[np.newaxis, :]], axis=1)  # (1, 576)
         return self.session.run(
             None,
@@ -340,6 +641,22 @@ class VadEngine:
     async def is_speech(
         self, pcm: bytes, precomputed_rms: float | None = None
     ) -> tuple[bool, float]:
+        """Score one PCM16 chunk.
+
+        Args:
+            pcm: raw int16 little-endian samples (one 60 ms frame = 960 samples).
+            precomputed_rms: RMS already computed by the caller, saved to avoid
+                a second numpy pass over the same buffer.
+
+        Returns:
+            (speech_detected, rms): True when either the ONNX probability or
+            the energy gate fires.
+
+        Side effects: consumes/extends self.buffer, advances the recurrent
+        state, and adapts the noise-floor EMA. Inference is offloaded with
+        asyncio.to_thread so the event loop is not blocked.
+        Failure mode: any exception -> (False, 0.0) plus an error log.
+        """
         try:
             audio_float32 = (
                 np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
@@ -354,6 +671,8 @@ class VadEngine:
             onnx_max = 0.0
             onnx_input = audio_float32 * self.onnx_gain
             self.buffer = np.concatenate((self.buffer, onnx_input))
+            # The model only accepts 512-sample windows: drain whole windows
+            # and keep the remainder for the next call (input may be 960 samples).
             while len(self.buffer) >= 512:
                 chunk = self.buffer[:512]
                 self.buffer = self.buffer[512:]
@@ -371,12 +690,16 @@ class VadEngine:
             # Energy-based detection with adaptive threshold
             speech_energy = False
             if self.energy_fallback:
+                # Never let the gate drop below the static threshold, and
+                # require ~20% above the learned ambient floor so a slowly
+                # rising noise level cannot keep the gate permanently open.
                 energy_thresh = max(self.energy_threshold, self.rms_noise_floor * 1.2)
                 if rms > energy_thresh:
                     speech_energy = True
 
             speech_detected = speech_onnx or speech_energy
 
+            # EMA of the ambient level: tracks fans/TV drifting over minutes.
             self.rms_noise_floor = (
                 1 - self.rms_alpha
             ) * self.rms_noise_floor + self.rms_alpha * rms
@@ -389,9 +712,23 @@ class VadEngine:
     async def is_speech_batch(
         self, pcms: list[bytes], rms_list: list[float]
     ) -> list[bool]:
-        """Process a batch of PCM chunks in a single thread to avoid N+1 async delays."""
+        """Process a batch of PCM chunks in a single thread to avoid N+1 async delays.
 
-        def process_all():
+        Params:
+            pcms: PCM16 chunks (None-safe order preserved by the caller).
+            rms_list: pre-computed RMS per chunk.
+        Returns:
+            list[bool]: per-chunk speech flags, same order as pcms.
+
+        Why batch: is_speech() pays one asyncio.to_thread hop per chunk (~1 ms
+        each), which added up to a noticeable cut latency on a 100-frame
+        utterance; running the whole batch in one thread keeps the model state
+        sequential (the ONNX session is stateful and NOT thread-safe) and pays
+        a single hop. Per-chunk errors are recorded as False instead of
+        aborting the batch.
+        """
+
+        def process_all():  # runs entirely in one worker thread (see docstring)
             results = []
             for pcm, precomputed_rms in zip(pcms, rms_list):
                 try:
@@ -446,10 +783,21 @@ class VadEngine:
 # ==========================================
 # UTILS & AUDIO PACKING
 # ==========================================
+# Module-level cache of devices.json: load_db() is called on every REST request
+# (device config, OTA, MCP auth) and save_db() invalidates it. The cache makes
+# reads lock-free; all mutation goes through save_db() so there is a single
+# writer path (still loop-serialised — no threading lock required).
 _DB_CACHE = None
 
 
 def load_db() -> dict:
+    """Return the device DB (devices.json), loading it lazily and caching it.
+
+    Returns:
+        dict: {MAC: {friendly_name, ws_url, allowed, owner}}; {} when the file
+        is missing or unparseable (a warning is logged, callers treat that as
+        an empty DB rather than an error).
+    """
     global _DB_CACHE
     if _DB_CACHE is not None:
         return _DB_CACHE
@@ -465,12 +813,26 @@ def load_db() -> dict:
 
 
 async def save_db(db: dict):
+    """Update the in-memory device DB and persist it off-loop.
+
+    Args:
+        db: the complete dict to store (callers pass load_db() after mutation).
+    Side effects: replaces _DB_CACHE immediately (readable before the write
+    finishes), then serialises to disk in a worker thread so a slow fs never
+    stalls the event loop.
+    """
     global _DB_CACHE
     _DB_CACHE = db
     await asyncio.to_thread(_save_db_sync, db)
 
 
 def _save_db_sync(db: dict):
+    """Blocking JSON write (runs in a worker thread via asyncio.to_thread).
+
+    Creates the config directory on first use; IO errors propagate to save_db's
+    caller as an unhandled exception, which REST endpoints surface as a 500 —
+    a failed device-DB write should be visible, not silent.
+    """
     os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
     with open(DB_FILE, "w") as f:
         json.dump(db, f, indent=4)
@@ -479,15 +841,29 @@ def _save_db_sync(db: dict):
 # ==========================================
 # HARDWARE CONTROL (MCP Tools)
 # ==========================================
+# Three loop-owned registries (single writer = the event loop, no locks):
+#   active_sessions : session_id -> satellite WebSocket (REST/MCP routing)
+#   session_states  : session_id -> the per-device `state` dict (status, VAD,
+#                     tasks, timings — the state machine of voice_ws())
+#   mcp_futures     : request_id -> Future, matching MCP replies to callers
 active_sessions = {}
 session_states = {}
 mcp_futures = {}
 
 # Speaker ID lock: prevents duplicate processing when two devices hear the same speaker
+# (a kitchen and a corridor satellite both hear one person; only the first
+# may run the turn — the other one drops it as a duplicate.)
 _active_speaker_lock: dict | None = None  # {"uid": str, "sid": str, "expires": float}
 
 
 def _clean_stale_futures():
+    """Drop finished or expired entries from mcp_futures.
+
+    Entries are keyed by epoch-ms ids, so anything older than 30 s is assumed
+    abandoned (its waiter already timed out) and is cancelled — otherwise a
+    chatty device would leak futures forever. Called opportunistically before
+    each new MCP exchange instead of on a timer (cheap, no extra task).
+    """
     now = time.time()
     stale = [
         rid for rid, f in mcp_futures.items() if f.done() or (rid < (now - 30) * 1000)
@@ -505,9 +881,25 @@ async def send_mcp_cmd(
     arguments: dict,
     req_id: int = None,
 ):
+    """Send a JSON-RPC tools/call to the satellite (fire-and-forget).
+
+    Args:
+        device_ws: the device's WebSocket.
+        session_id: satellite session id, echoed so the firmware can route it.
+        tool_name: MCP tool, e.g. "self.screen.set_brightness".
+        arguments: JSON-serialisable tool arguments.
+        req_id: correlation id; defaults to epoch ms. Pass an explicit id when
+            a reply is awaited (see handle_device_tool_call / execute_mcp).
+
+    Failure mode: send errors are logged as warnings, never raised — device
+    disconnection is routine and the caller (screen dimming, volume set) must
+    not crash the session over it.
+    """
     if req_id is None:
         req_id = int(time.time() * 1000)
 
+    # JSON-RPC 2.0 envelope wrapped in the gateway's own {"session_id","type"}
+    # frame — this is the wire format the ESP32 firmware understands.
     payload = {
         "jsonrpc": "2.0",
         "method": "tools/call",
@@ -523,6 +915,15 @@ async def send_mcp_cmd(
 
 
 async def request_mcp_tools(device_ws: WebSocket, session_id: str):
+    """Ask the satellite for its MCP tool catalogue once, right after `hello`.
+
+    Uses the sentinel request id 999: handle_ws_text_message() recognises it
+    and stores the returned tool list in state["available_tools"] instead of
+    matching it against a pending future (nobody waits for this reply).
+
+    Failure mode: logged, never raised — a device that speaks an older
+    protocol may simply ignore tools/list.
+    """
     logger.info("🛠 [MCP] Requesting available tools from ESP32...")
     payload = {
         "jsonrpc": "2.0",
@@ -541,6 +942,23 @@ async def request_mcp_tools(device_ws: WebSocket, session_id: str):
 async def handle_device_tool_call(
     nano_ws: aiohttp.ClientWebSocketResponse, device_ws: WebSocket, state: dict, d: dict
 ):
+    """Bridge a tool call from the LLM brain to the satellite and back.
+
+    Flow: LLM emits `device_tool_call` -> we forward it as an MCP tools/call
+    over the device WS -> await the matching reply (correlated by req_id in
+    mcp_futures) -> return the result to the brain as `device_tool_result`.
+
+    Args:
+        nano_ws: upstream WS to the brain (carries the result).
+        device_ws: the satellite WS (carries the tool call).
+        state: session state (provides sid).
+        d: the decoded `device_tool_call` event from the brain.
+
+    Failure modes: 10 s timeout -> a structured {"error": ...} result is sent
+    so the LLM can react instead of hanging; any other exception is only
+    logged (the brain then relies on its own timeout). The future is always
+    removed in `finally`.
+    """
     tc = d.get("tool_call", {})
     tool_name = tc.get("name", "")
     arguments = tc.get("arguments", {})
@@ -549,6 +967,9 @@ async def handle_device_tool_call(
     req_id = int(time.time() * 1000)
     loop = asyncio.get_running_loop()
     future = loop.create_future()
+    # Register the future BEFORE sending: a reply could otherwise arrive while
+    # we are still awaiting and find no waiter. Bound the map at 200 entries
+    # (cancel the oldest) so lost replies cannot grow it without limit.
     _clean_stale_futures()
     if len(mcp_futures) > 200:
         oldest = min(mcp_futures.keys())
@@ -558,6 +979,8 @@ async def handle_device_tool_call(
     mcp_futures[req_id] = future
     try:
         await send_mcp_cmd(device_ws, state["sid"], tool_name, arguments, req_id)
+        # 10 s cap: on-device tools (relays, sensors) answer in milliseconds;
+        # a longer wait would just stall the LLM turn on a dead satellite.
         result = await asyncio.wait_for(future, timeout=10.0)
         await nano_ws.send_json(
             {
@@ -585,6 +1008,13 @@ async def handle_device_tool_call(
 
 
 def create_tracked_task(coro, state, name=""):
+    """Spawn an asyncio task that is registered in state["tasks"] and
+    auto-unregistered when it finishes.
+
+    Why: voice_ws()'s finally block cancels every task in that set when the
+    satellite disconnects, so background work (pipeline, TTS, monitor) never
+    outlives its session or writes to a dead WebSocket.
+    """
     task = asyncio.create_task(coro, name=name)
     state["tasks"].add(task)
     task.add_done_callback(lambda _: state["tasks"].discard(task))
@@ -593,7 +1023,21 @@ def create_tracked_task(coro, state, name=""):
 
 async def activity_monitor_task(device_ws: WebSocket, state: dict):
     """Monitors idle: dims screen but does NOT close the connection.
-    Persistent mode — WS/context lives while ESP32 is on."""
+    Persistent mode — WS/context lives while ESP32 is on.
+
+    Runs for the whole session (1 Hz tick) and implements two behaviours:
+
+    * Adaptive standby: while LISTENING, if nothing arrives within
+      STANDBY_TIMEOUT_QUESTION (after an AI question) or
+      STANDBY_TIMEOUT_STATEMENT (after a statement), reset_to_standby() is
+      scheduled. A wake with no audio at all is logged as a diagnostic.
+    * Screen dimming: IDLE for >10 s -> brightness 25%; any active status
+      re-arms `dim_sent` so the next idle period dims again.
+
+    Timers are frozen while status is PROCESSING/SPEAKING (last_activity is
+    refreshed each tick) so a long TTS answer cannot expire the turn.
+    Cancellation: exits silently on CancelledError (session teardown).
+    """
     await send_mcp_cmd(
         device_ws, state["sid"], "self.audio_speaker.set_volume", {"volume": 100}
     )
@@ -651,7 +1095,13 @@ async def activity_monitor_task(device_ws: WebSocket, state: dict):
 
 async def reset_to_standby(device_ws: WebSocket, state: dict):
     """Switches the speaker to standby: dims screen, stops listening.
-    Keeps WS open — MCP tools (temperature monitoring) continue working."""
+    Keeps WS open — MCP tools (temperature monitoring) continue working.
+
+    Side effects: releases this session's claim on the global speaker lock,
+    clears buffers/silence counters, resets the VAD state, forgets the
+    "AI asked a question" flag, bumps last_activity and cancels the watchdog
+    (nothing is pending anymore). Safe to call from any task of the session.
+    """
     # Note: no has_speech guard here — last_activity timer already protects
     # against interrupting active speech. has_speech can be stuck True by
     # VAD false positives on background noise, permanently blocking standby.
@@ -678,6 +1128,18 @@ async def reset_to_standby(device_ws: WebSocket, state: dict):
 
 
 async def watchdog_timeout(device_ws: WebSocket, state: dict):
+    """Fired by the WATCHDOG_TIMEOUT timer when the upstream AI goes silent.
+
+    Apologises over TTS, then immediately re-opens the microphone so the user
+    can repeat the request without a new wake word. Sets watchdog_fired = True,
+    which makes _hermes_player_task() drop any late sentences (they would
+    contradict the apology) and makes listen_to_nanobot_task() ignore stray
+    late replies.
+
+    Side effects: status -> SPEAKING -> LISTENING, buffers cleared, VAD reset,
+    short TTS cooldown (0.3 s) so our own apology cannot re-trigger the VAD,
+    screen back to 100%. TTS failure is logged but does not stop the re-arm.
+    """
     logger.warning("⏱ [Watchdog] Upstream AI timed out.")
     state["watchdog_fired"] = True
     state["status"] = "SPEAKING"
@@ -704,6 +1166,16 @@ async def watchdog_timeout(device_ws: WebSocket, state: dict):
 # ASYNC PIPELINE (STT & SPEAKER ID)
 # ==========================================
 async def fetch_speaker_id(audio: bytes, sess: aiohttp.ClientSession) -> str:
+    """Identify the speaker by voice via the SPEAKER_ID_URL service.
+
+    Args:
+        audio: Ogg/Opus utterance (pack_ogg output).
+        sess: shared aiohttp session (30 s total timeout from voice_ws).
+    Returns:
+        str: recognised uid, or "unknown" on low confidence (<= 0.1), HTTP
+        errors or service downtime — STT must proceed without identity rather
+        than fail (speaker names are optional decoration for the transcript).
+    """
     try:
         form = aiohttp.FormData()
         form.add_field("file", audio, filename="audio.ogg", content_type="audio/ogg")
@@ -713,6 +1185,8 @@ async def fetch_speaker_id(audio: bytes, sess: aiohttp.ClientSession) -> str:
                 uid, conf = json_resp.get("user_id", "unknown"), json_resp.get(
                     "confidence", 0.0
                 )
+                # Confidence floor: below 0.1 the service is guessing, so the
+                # uid is discarded instead of attributing the utterance.
                 if uid != "unknown" and conf > 0.1:
                     logger.info(f"✅ [SpeakerID] Recognized: {uid} ({conf:.2f})")
                     return uid
@@ -724,6 +1198,16 @@ async def fetch_speaker_id(audio: bytes, sess: aiohttp.ClientSession) -> str:
 
 
 async def fetch_transcription(audio: bytes, sess: aiohttp.ClientSession) -> str:
+    """Speech-to-text: POST the Ogg utterance to the Whisper-compatible API.
+
+    Args:
+        audio: Ogg/Opus bytes from pack_ogg().
+        sess: shared aiohttp session.
+    Returns:
+        str: transcript text, or "" on HTTP errors / exceptions (callers run
+        the result through is_valid_text(), so an empty string simply becomes
+        a rejected turn). Non-200 bodies are logged for diagnosis.
+    """
     try:
         form = aiohttp.FormData()
         form.add_field("file", audio, filename="a.ogg")
@@ -746,7 +1230,12 @@ async def fetch_transcription(audio: bytes, sess: aiohttp.ClientSession) -> str:
 
 
 def calculate_rms(pcm_data: bytes) -> float:
-    """Calculate RMS energy from PCM16 audio data."""
+    """Calculate RMS energy from PCM16 audio data.
+
+    Returns:
+        float: RMS in 0..1 (int16 scaled to float); 0.0 for empty or
+        malformed buffers — a silent frame must never raise into the pipeline.
+    """
     try:
         if not pcm_data:
             return 0.0
@@ -761,13 +1250,28 @@ def calculate_rms(pcm_data: bytes) -> float:
 async def decode_opus_frames(
     frames: list, decoder: opuslib.Decoder, vad: VadEngine
 ) -> tuple[bytes, list[float], list[bool]]:
-    """Decode Opus frames to PCM and return (combined_pcm, rms_list, vad_results)."""
+    """Decode Opus frames to PCM and return (combined_pcm, rms_list, vad_results).
+
+    Args:
+        frames: 60 ms Opus packets as received from the satellite.
+        decoder: stateful opuslib decoder (16 kHz mono) — reused across calls
+            so packet-loss concealment stays continuous within a session.
+        vad: engine that scores every decoded chunk in one batch.
+    Returns:
+        (combined PCM bytes, per-frame RMS, per-frame speech flag).
+
+    Non-obvious: a frame that fails to decode contributes 0.0/False but keeps
+    its position in the result lists (index alignment with `frames` is what
+    the caller relies on); the VAD batch only sees the frames that decoded.
+    """
     all_pcm = bytearray()
     rms_list = []
     pcm_list = []
 
     for frame in frames:
         try:
+            # 960 samples = 60 ms at 16 kHz — the frame duration negotiated
+            # in the `hello` audio_params.
             pcm = decoder.decode(frame, 960)
             all_pcm.extend(pcm)
 
@@ -805,6 +1309,17 @@ async def decode_opus_frames(
 async def _process_audio_metrics_and_gates(
     frames: list, state: dict, decoder: opuslib.Decoder = None
 ) -> tuple[bool, float, float, opuslib.Decoder]:
+    """Decode the utterance and apply the cheap pre-STT gates.
+
+    Returns:
+        (passed, avg_rms, speech_ratio, decoder): `passed` is False when the
+        audio is too quiet (ENERGY_THRESHOLD) or too little of it is speech
+        (MIN_SPEECH_RATIO) — in that case Whisper is skipped entirely, saving
+        a network round trip on every background-noise burst.
+
+    The decoder is created lazily and always returned, so the caller can keep
+    reusing one decoder per session (opus state must survive between cuts).
+    """
     dec = decoder or opuslib.Decoder(16000, 1)
     _, rms_list, vad_results = await decode_opus_frames(frames, dec, state["vad"])
 
@@ -828,6 +1343,21 @@ async def _process_audio_metrics_and_gates(
 
 
 def _check_speaker_lock(uid: str, sid: str) -> bool:
+    """Claim the global speaker turn for one session (cross-device de-dup).
+
+    Two satellites often hear the same person at once; without a lock both
+    would run the pipeline and the LLM would answer twice.
+
+    Args:
+        uid: recognised speaker id ("unknown" counts as its own speaker).
+        sid: session that wants to speak.
+    Returns:
+        bool: True when this session may proceed (it also acquires/refreshes
+        the lock, 30 s TTL); False when the same uid is already active on a
+        *different* session — the duplicate is dropped.
+    Side effects: module-global _active_speaker_lock; expired locks are
+    cleared on the way in, so a crashed session cannot block the system.
+    """
     global _active_speaker_lock
     now = time.time()
     if _active_speaker_lock and _active_speaker_lock["expires"] < now:
@@ -848,9 +1378,31 @@ def _check_speaker_lock(uid: str, sid: str) -> bool:
 async def _handle_successful_transcription(
     txt: str, uid: str, state: dict, device_ws: WebSocket, _t0: float, _t_stt: float
 ):
+    """Run the accepted transcript through the LLM dispatch paths.
+
+    Args:
+        txt: validated transcript.
+        uid: speaker id from fetch_speaker_id().
+        state: session state (mutated: status, last_text, watchdog, timing).
+        device_ws: satellite WebSocket.
+        _t0: timestamp of the pipeline start (VAD trigger), for latency logs.
+        _t_stt: timestamp right after STT returned.
+
+    Behaviour by backend:
+      * LLM_BACKEND in (hermes, cascade) -> _dispatch_hermes() streams the
+        reply through the queue player.
+      * legacy Nanobot -> text pushed over nano_ws, watchdog armed; if the
+        brain is connected but has no chat_id yet, the user is told the
+        system is not ready; if it is not connected at all, the transcript
+        itself is spoken back as a fallback so the turn never ends in silence.
+    Early exit: a failed `stt` send to the device (disconnected) aborts
+    before any LLM work is done.
+    """
     state["_rejected_count"] = 0
     _t_transcribed = time.time()
     state["_stt_time"] = _t_transcribed
+    # Transcript logging is opt-in; by default only the length is logged so
+    # what the user said stays out of the shared container logs.
     if LOG_TRANSCRIPTIONS:
         logger.info(f"🗣 [User: {uid}] Transcribed: '{txt}'")
     else:
@@ -861,10 +1413,14 @@ async def _handle_successful_transcription(
     if state.get("nanobot_chat_id"):
         set_cached_chat_id(state["mac"].lower(), state["nanobot_chat_id"])
 
+    # Fillers ("подожди", "один момент"...) buy the user time instead of
+    # ending the turn — refresh the idle timer so standby does not cut them.
     if any(p in txt.lower() for p in HOLD_PHRASES):
         logger.info(f"🛑 [Hold] Detected hold phrase, extending listening")
         state["last_activity"] = time.time()
 
+    # Show the transcript on the satellite display (subtitle). If the device
+    # is gone there is nothing to answer — abort before touching the LLM.
     try:
         await device_ws.send_json(
             {"type": "stt", "text": txt, "session_id": state["sid"]}
@@ -920,6 +1476,10 @@ async def _handle_successful_transcription(
 
             if state.get("watchdog"):
                 state["watchdog"].cancel()
+            # Arm the watchdog (call_later handle lives in state so any later
+            # chunk can cancel it): if the brain stays silent for
+            # WATCHDOG_TIMEOUT seconds, watchdog_timeout() apologises and
+            # re-opens the mic instead of leaving dead air.
             state["watchdog"] = asyncio.get_event_loop().call_later(
                 WATCHDOG_TIMEOUT,
                 lambda: create_tracked_task(watchdog_timeout(device_ws, state), state),
@@ -936,7 +1496,22 @@ async def _handle_successful_transcription(
 
 
 async def _dispatch_hermes(txt, uid, state, device_ws, _t0, _t_stt):
-    """Send transcribed text to HermesBackend and stream the reply to TTS."""
+    """Send transcribed text to HermesBackend and stream the reply to TTS.
+
+    Used for LLM_BACKEND=hermes and =cascade (backends.CascadeBackend is the
+    L1-router entry point of the three-level cascade).
+
+    Steps: notify the device that speech starts, arm the watchdog, create a
+    sentence queue + player task, hand the queue to the backend (it pushes
+    sentences and finally None), wait for playback to drain (120 s hard cap),
+    then return the session to standby.
+
+    Side effects: state status/tts_started/watchdog are mutated; on completion
+    reset_to_standby() runs. Failure modes: a dead device WS is tolerated
+    (send errors swallowed), a stalled player is cancelled by the timeout.
+    """
+    # Fallback chat_id: deterministic per MAC so context survives even when
+    # the legacy Nanobot session never announced one.
     chat_id = state.get("nanobot_chat_id") or make_chat_id(state["mac"])
     speaker_name = SPEAKER_NAME_MAP.get(uid, uid)
     try:
@@ -948,6 +1523,9 @@ async def _dispatch_hermes(txt, uid, state, device_ws, _t0, _t_stt):
     state["status"] = "SPEAKING"
     state["tts_started"] = True
     state["watchdog_fired"] = False
+    # Watchdog for the whole turn; the first played sentence cancels it
+    # (see _hermes_player_task.play), so a long-but-alive reply never
+    # triggers the apology.
     if state.get("watchdog"):
         state["watchdog"].cancel()
     state["watchdog"] = asyncio.get_event_loop().call_later(
@@ -955,6 +1533,10 @@ async def _dispatch_hermes(txt, uid, state, device_ws, _t0, _t_stt):
         lambda: create_tracked_task(watchdog_timeout(device_ws, state), state),
     )
 
+    # Producer/consumer: the backend pushes sentences into q and finally None;
+    # _hermes_player_task consumes them. The player is awaited in `finally`
+    # so a backend exception still drains (or cancels) the playback task —
+    # otherwise audio could keep streaming after the turn was abandoned.
     q: asyncio.Queue = asyncio.Queue()
     player_task = asyncio.create_task(_hermes_player_task(q, device_ws, state))
     try:
@@ -965,6 +1547,8 @@ async def _dispatch_hermes(txt, uid, state, device_ws, _t0, _t_stt):
             response_queue=q,
         )
     finally:
+        # 120 s playback cap: far above any single reply, but bounded so a
+        # stuck Opus stream cannot wedge the session forever.
         try:
             await asyncio.wait_for(player_task, timeout=120.0)
         except asyncio.TimeoutError:
@@ -987,9 +1571,16 @@ async def _hermes_player_task(q: asyncio.Queue, device_ws, state):
     """
 
     def start_synth(text):
+        """Start (do not await) MP3 synthesis for one sentence, returning the task."""
         return asyncio.create_task(synthesize_tts_mp3(text, state))
 
     async def play(mp3_data):
+        """Stream one sentence to the device and disarm the watchdog.
+
+        The watchdog is cancelled only AFTER audio actually flows: proof that
+        the upstream L1/L2/L3 chain is alive, so a slow tail of the reply can
+        no longer trigger a duplicate apology.
+        """
         try:
             await stream_tts_pcm(mp3_data, device_ws, state["sid"], state)
         except Exception as e:
@@ -1006,9 +1597,12 @@ async def _hermes_player_task(q: asyncio.Queue, device_ws, state):
 
     first = await q.get()
     if first is None:
-        return
+        return  # backend produced nothing (empty reply or early error)
     synth_task = start_synth(first) if not state.get("watchdog_fired") else None
     while True:
+        # One-ahead pipeline: `synth_task` is always the NEXT sentence's
+        # synthesis. Awaiting it here overlaps with `play()` of the current
+        # one, so Edge-TTS latency is hidden instead of heard as a gap.
         nxt = await q.get()
         mp3 = await synth_task if synth_task is not None else None
         synth_task = None
@@ -1021,7 +1615,7 @@ async def _hermes_player_task(q: asyncio.Queue, device_ws, state):
         if mp3 is not None:
             await play(mp3)
         if nxt is None:
-            return
+            return  # None is the backend's end-of-stream marker
 
 
 async def _handle_rejected_transcription(
@@ -1033,6 +1627,16 @@ async def _handle_rejected_transcription(
     speech_ratio: float,
     frames_len: int,
 ):
+    """Handle a turn whose transcript failed is_valid_text() (or was empty).
+
+    Args mirror the diagnostics: avg_rms/speech_ratio/frames_len explain WHY
+    the cut was suspicious, `txt` shows what Whisper produced (empty text =
+    likely noise, gibberish = likely echo/hallucination). The rejection counter
+    (_rejected_count) makes consecutive failures visible in the logs.
+
+    Side effect: returns the device to standby — the user must wake it again,
+    which is the cheapest way to shake off a false cut.
+    """
     _rej_count = state.get("_rejected_count", 0) + 1
     state["_rejected_count"] = _rej_count
     if not txt:
@@ -1051,8 +1655,29 @@ async def _handle_rejected_transcription(
 async def process_audio_and_send(
     frames: list, state: dict, device_ws: WebSocket, decoder: opuslib.Decoder = None
 ):
+    """The STT pipeline: one cut utterance from VAD to LLM dispatch.
+
+    Args:
+        frames: Opus frames accumulated between wake and cut.
+        state: session state (status transitions PROCESSING -> LISTENING /
+        SPEAKING, timing stamps for the latency logs).
+        device_ws: satellite WebSocket.
+        decoder: reuse the session's Opus decoder (stateful).
+
+    Gate order (cheapest first, so noise costs nothing):
+      1. echo guard — skip while our own TTS is still playing (the mic would
+         hear the speaker);
+      2. min frame count (15 ≈ 0.9 s) — too short to be a command;
+      3. energy + speech-ratio thresholds (_process_audio_metrics_and_gates);
+      4. after STT: speaker-lock de-dup, then is_valid_text().
+    Side effects: spawns the emotion "thinking" animation plus parallel
+    speaker-ID and Whisper tasks; any unexpected exception returns the
+    device to standby instead of leaving it stuck in PROCESSING.
+    """
     _t0 = time.time()
     if time.time() < camera_client.GLOBAL_TTS_UNTIL:
+        # GLOBAL_TTS_UNTIL is set by stream_tts_pcm() for playback + 3 s;
+        # the guard keeps the satellite from transcribing its own voice.
         logger.info("🔇 [Pipeline] Skipping — TTS playback active (echo guard)")
         state["status"] = "LISTENING"
         return
@@ -1076,6 +1701,8 @@ async def process_audio_and_send(
         audio = pack_ogg(frames)
         _t_packed = time.time()
 
+        # Speaker ID and Whisper run concurrently: two independent HTTP calls
+        # whose combined latency dominates the turn, so overlap them.
         create_tracked_task(trigger_emotion("thinking", device_ws, state["sid"]), state)
         sess = state["http_session"]
         uid_task = create_tracked_task(fetch_speaker_id(audio, sess), state)
@@ -1110,7 +1737,19 @@ async def process_audio_and_send(
 # TTS & EMOTION
 # ==========================================
 async def synthesize_tts_mp3(text: str, state: dict) -> bytes | None:
-    """Synthesize text to MP3 via the TTS API (network-bound, no streaming)."""
+    """Synthesize text to MP3 via the TTS API (network-bound, no streaming).
+
+    Args:
+        text: sentence to speak (already stripped of emotion tags).
+        state: session state — only state["http_session"] is used.
+    Returns:
+        bytes | None: MP3 payload, or None on non-200 responses/errors.
+
+    The OpenAI-style /v1/audio/speech contract (model, voice, response_format)
+    is used so any compatible server (edge_tts sidecar here) can be swapped in
+    via TTS_URL. "Cannot call" errors are filtered from the log because they
+    are the expected noise of a device that disconnected mid-turn.
+    """
     logger.info(f"🔊 [TTS] Synthesizing: '{text}'")
     try:
         sess = state["http_session"]
@@ -1140,9 +1779,32 @@ async def stream_tts_pcm(
     state: dict,
     send_stop: bool = True,
 ) -> bool:
-    """Stream pre-synthesized MP3 to the device. Returns True on success."""
+    """Stream pre-synthesized MP3 to the device. Returns True on success.
+
+    Pipeline: pydub decodes the MP3 -> re-samples to 16 kHz mono s16 (the
+    contract negotiated in `hello`) -> Opus-encodes 60 ms frames -> sends them
+    as binary WS messages, paced against a virtual clock so the speaker plays
+    at real time instead of being flooded.
+
+    Args:
+        mp3_data: complete MP3 of one utterance.
+        session_id: satellite session id echoed in the control events.
+        state: session state; only used when truthy (a bare `None` is
+            tolerated so shared helpers can call this without a session).
+        send_stop: send the closing `tts stop` event — False when more
+            segments follow (the continuous Nanobot stream), so the device
+            keeps one open audio unit.
+
+    Side effects: sets camera_client.GLOBAL_TTS_UNTIL (echo guard for the
+    whole gateway) and state["tts_cooldown_until"] (+1.5 s) so VAD ignores
+    the loudness tail of our own playback.
+    Failure modes: returns False on send failures or decode errors; "Cannot
+    call" errors (device already closed) are suppressed from the logs.
+    """
     try:
         if not state or not state.get("tts_started"):
+            # Announce the start exactly once per utterance; without it the
+            # firmware does not open the speaker path.
             try:
                 await device_ws.send_json(
                     {"type": "tts", "state": "start", "session_id": session_id}
@@ -1156,11 +1818,17 @@ async def stream_tts_pcm(
         audio_seg = audio_seg.set_frame_rate(16000).set_channels(1).set_sample_width(2)
         pcm_data = audio_seg.raw_data
 
+        # Extend the gateway-wide echo guard by the exact playback duration
+        # (bytes / (16000 samples/s * 2 bytes/sample)) plus a 3 s margin for
+        # the room's reverb tail.
         camera_client.GLOBAL_TTS_UNTIL = time.time() + len(pcm_data) / (16000 * 2) + 3.0
 
+        # Encoder cached in the session (setdefault): creating it per call
+        # would reset internal state and cost a fresh codec instance each
+        # sentence. "voip" mode trades bitrate for low delay.
         enc = state.setdefault("tts_encoder", opuslib.Encoder(16000, 1, "voip"))
-        frame_size = 960
-        chunk_size = frame_size * 2
+        frame_size = 960          # samples per Opus packet (60 ms @ 16 kHz)
+        chunk_size = frame_size * 2  # int16 -> 2 bytes per sample
         _tts_start = time.time()
 
         start_stream = time.perf_counter()
@@ -1178,6 +1846,10 @@ async def stream_tts_pcm(
                 logger.error(f"❌ [TTS] Send failed mid-stream: {e}")
                 return False
 
+            # Real-time pacing: advance a virtual clock by the frame's
+            # duration (60 ms) and sleep the remainder, so frames leave the
+            # gateway at playback speed. Sending faster would just buffer in
+            # the firmware (and defeat the echo guard timing above).
             next_chunk_time += 0.06
             sleep_duration = next_chunk_time - time.perf_counter()
             if sleep_duration > 0:
@@ -1209,7 +1881,16 @@ async def stream_tts_pcm(
 async def generate_and_stream_tts(
     text: str, device_ws: WebSocket, session_id: str, state: dict = None
 ):
-    """Compatibility wrapper: synthesize then stream a single utterance."""
+    """Compatibility wrapper: synthesize then stream a single utterance.
+
+    Args:
+        text: sentence to speak.
+        device_ws/session_id: where to send it.
+        state: session state; must be provided (it carries the HTTP session
+        and the Opus encoder) — without it the call is a logged no-op rather
+        than a crash, e.g. during teardown of an already-closed session.
+    Silently does nothing when synthesis fails (synthesize_tts_mp3 -> None).
+    """
     if not state:
         logger.error("❌ [TTS] generate_and_stream_tts called without state")
         return
@@ -1221,6 +1902,13 @@ async def generate_and_stream_tts(
 async def trigger_emotion(
     emotion: str, device_ws: WebSocket, session_id: str, logger=logger
 ):
+    """Ask the satellite to switch its display face (`llm` + emotion event).
+
+    The `text: " "` payload is required by the firmware's message schema even
+    though no speech follows. Fire-and-forget: a device that already
+    disconnected ("Cannot call send") is ignored silently, other failures are
+    only warned — cosmetics must never break the audio turn.
+    """
     logger.info(f"💡 [Emotion] Setting display face to: '{emotion}'")
     try:
         await device_ws.send_json(
@@ -1234,17 +1922,39 @@ async def trigger_emotion(
 # ==========================================
 # NANOBOT WEBSOCKET RESPONSE HANDLER
 # ==========================================
+# Emotion tags the brain wraps around sentences ("[neutral]", "[thinking]"...)
+# are extracted and sent to the display, then stripped from the spoken text.
 EMOTION_REGEX = re.compile(r"\[([a-zA-Z0-9_]+)\]")
 
 class NanobotResponseHandler:
+    """Buffers a streaming LLM reply and turns it into speech, sentence by sentence.
+
+    One instance per device connection (stored in state["handler"]). It owns:
+      * `buffer` — text chunks not yet spoken;
+      * a flush timer (call_later) that bounds how long a partial sentence
+        may sit unspoken;
+      * a TTS audio queue + single player task, so synthesis of sentence N+1
+        overlaps playback of sentence N;
+      * `_synth_tasks` — in-flight synthesis jobs awaited before finalising.
+
+    Lifecycle: handle_chunk() per incoming text chunk -> flush() on a complete
+    sentence or timer expiry -> _handle_tts() -> after the buffer drains,
+    _finalize_response() decides follow-up listening vs standby.
+
+    Failure modes: a dead device WebSocket surfaces as send errors that are
+    swallowed per message; if playback fails, _tts_player() stops and the
+    next _ensure_tts_player() restarts it.
+    """
+
     def __init__(self, device_ws, state):
+        """Bind the handler to one device connection and its session state."""
         self.device_ws = device_ws
         self.state = state
-        self.buffer = []
-        self.full_response_text = []
-        self.timer = None
+        self.buffer = []           # pending text chunks (not yet spoken)
+        self.full_response_text = []  # everything spoken this turn (question detection)
+        self.timer = None          # call_later handle for delayed flushes
         self.emotion_regex = EMOTION_REGEX
-        self.is_flushing = False
+        self.is_flushing = False   # re-entrancy guard: flush() must not overlap
         self._first_chunk_time = None
         self._last_chunk_time = None
         self._chunk_count = 0
@@ -1254,7 +1964,13 @@ class NanobotResponseHandler:
 
     async def _tts_player(self):
         """Play pre-synthesized segments back-to-back as one continuous
-        stream (no stop/start between segments, so audio is gapless)."""
+        stream (no stop/start between segments, so audio is gapless).
+
+        Sends every segment with send_stop=False; the matching single stop is
+        emitted later by _await_tts_drained(). Exits on the None sentinel or
+        as soon as a send fails (device gone) — _ensure_tts_player() respawns
+        it for the next turn.
+        """
         while True:
             mp3_data = await self.tts_audio_queue.get()
             if mp3_data is None:
@@ -1273,6 +1989,12 @@ class NanobotResponseHandler:
             await asyncio.sleep(0.1)
 
     async def _send_tts_stop(self):
+        """Close the continuous TTS stream (single `tts stop` event).
+
+        No-op when no stream is open (tts_started False) — the firmware
+        ignores duplicate stops, but sending none at all would leave the
+        speaker path open and the next utterance would splice onto it.
+        """
         if self.state.get("tts_started"):
             self.state["tts_started"] = False
             try:
@@ -1289,12 +2011,23 @@ class NanobotResponseHandler:
             await self.tts_audio_queue.put(mp3_data)
 
     def _ensure_tts_player(self):
+        """Start the background player task if it is missing or has finished.
+
+        Lazy start (rather than one per connection) so a session that never
+        speaks pays nothing; after a failure the next sentence revives it.
+        """
         if self.tts_player_task is None or self.tts_player_task.done():
             self.tts_player_task = create_tracked_task(self._tts_player(), self.state)
 
     async def _await_tts_drained(self):
         """Wait until all background synthesis and playback has finished,
-        then close the continuous TTS stream with a single stop message."""
+        then close the continuous TTS stream with a single stop message.
+
+        Order matters: synthesis tasks first (they push into the queue), then
+        queue.join() (playback drained), then the stop event. The 30 s timeout
+        guarantees a stuck playback cannot block the end of the turn — the
+        stop is sent either way.
+        """
         while self._synth_tasks:
             await asyncio.sleep(0.05)
         try:
@@ -1304,11 +2037,21 @@ class NanobotResponseHandler:
         await self._send_tts_stop()
 
     def reset_timing(self):
+        """Clear the per-turn chunk timing stats (called when a new request is
+        dispatched so the latency logs describe this turn only)."""
         self._first_chunk_time = None
         self._last_chunk_time = None
         self._chunk_count = 0
 
     async def handle_chunk(self, chunk: str):
+        """Consume one text chunk streamed from the LLM brain.
+
+        Cancels the watchdog (the upstream is demonstrably alive), records
+        timing stats and schedules a flush: immediately when the buffer ends
+        on a sentence boundary with balanced brackets, otherwise after a
+        1.5-2.0 s quiet timer (longer when an emotion tag is still open, so a
+        chunk split inside "[neutral]" is never spoken as literal text).
+        """
         if self.state.get("watchdog"):
             self.state["watchdog"].cancel()
             self.state["watchdog"] = None
@@ -1342,6 +2085,17 @@ class NanobotResponseHandler:
             create_tracked_task(self.flush(), self.state)
 
     def _process_buffer(self) -> str | None:
+        """Take the speakable prefix out of the buffer.
+
+        Returns:
+            str | None: the text up to and including the last complete
+            sentence (trailing partial text is pushed back into the buffer so
+            phrases are never cut mid-thought), or None when an emotion tag
+            is still unbalanced — the caller then waits for more chunks.
+
+        Synchronous and deliberately side-effecting: consumes `buffer` and,
+        in the None case, re-arms a 0.5 s retry timer.
+        """
         text = "".join(self.buffer)
         self.buffer = []
 
@@ -1368,6 +2122,16 @@ class NanobotResponseHandler:
         return text
 
     async def _handle_disconnect(self, clean_text: str) -> bool:
+        """Honour a `[disconnect]` command emitted by the brain.
+
+        The tag means "the user asked to end the session": any text before it
+        is spoken first (so the acknowledgement is heard), then the device
+        WebSocket is closed.
+
+        Returns:
+            bool: True when the tag was present (the caller must stop
+            processing this flush); False means normal speech continues.
+        """
         if "[disconnect]" not in clean_text:
             return False
 
@@ -1401,6 +2165,15 @@ class NanobotResponseHandler:
         return True
 
     async def _handle_tts(self, clean_text: str):
+        """Speak one sentence chunk.
+
+        Notifies the device (`tts sentence_start` + text for the subtitle),
+        accumulates full_response_text (used later for question detection)
+        and queues background synthesis while the previous segment is still
+        playing — this pipeline is what makes the reply sound continuous.
+        Send failures are swallowed: the queue drain is what actually gates
+        the end of the turn.
+        """
         if not clean_text:
             return
 
@@ -1431,13 +2204,30 @@ class NanobotResponseHandler:
         # Pipeline TTS: synthesize in background while the previous
         # segment is still playing, so phrases flow without gaps.
         self._ensure_tts_player()
+        # _synth_tasks tracks in-flight synthesis so _await_tts_drained() can
+        # wait for it; the done-callback unregisters it (no manual cleanup).
         task = create_tracked_task(self._enqueue_tts(clean_text), self.state)
         self._synth_tasks.add(task)
         task.add_done_callback(self._synth_tasks.discard)
 
     async def _finalize_response(self):
+        """End of a turn: drain audio, then choose follow-up listening or standby.
+
+        Waits for all playback, probes the full reply for a question (trailing
+        '?', the «повторите пожалуйста» apology, or any Russian interrogative /
+        imperative from HAS_QUESTION_WORDS_RE) and stores the verdict in
+        state["last_ai_had_question"] — activity_monitor_task() reads it to
+        pick the standby timeout (30 s vs 10 s).
+
+        Both branches return the state machine to LISTENING with a short TTS
+        cooldown (0.2 s) so the mic is ready for the answer but deaf to the
+        last loud frames of playback. Finally the VAD is reset and the
+        per-turn text accumulator cleared.
+        """
         await self._await_tts_drained()
 
+        # Question detection runs on the SPOKEN text (tags already stripped),
+        # lower-cased so the Cyrillic keyword regex matches regardless of case.
         clean_for_check = "".join(self.full_response_text).strip().lower()
         has_question = (
             HAS_QUESTION_RE.search(clean_for_check) is not None
@@ -1476,9 +2266,21 @@ class NanobotResponseHandler:
         self.full_response_text = []
 
     async def flush(self):
+        """Cut the buffer into speech: emotions, disconnect, TTS, finalisation.
+
+        Re-entrancy: guarded by is_flushing, so a timer firing while a flush
+        is in progress exits immediately (the active flush re-schedules
+        itself if more text arrived meanwhile).
+
+        Steps: extract speakable text -> fire display emotions for every
+        [tag] -> handle [disconnect] -> queue TTS -> if the brain is still
+        streaming, schedule the next flush in 150 ms; only when the buffer is
+        empty does the turn finalise (question check, standby).
+        """
         if self.is_flushing or not "".join(self.buffer).strip():
             return
         self.is_flushing = True
+        # Speech means the turn is active again: unpause the idle accounting.
         self.state["status"] = "SPEAKING"
 
         text = self._process_buffer()
@@ -1486,6 +2288,8 @@ class NanobotResponseHandler:
             self.is_flushing = False
             return
 
+        # Emotion tags are shown on the display and then stripped from the
+        # text — the TTS must never read "[neutral]" aloud.
         emotions = self.emotion_regex.findall(text)
         for emotion in emotions:
             create_tracked_task(
@@ -1518,11 +2322,19 @@ class NanobotResponseHandler:
 # ==========================================
 @app.get("/health")
 async def health():
+    """Liveness probe for the container/monitoring — unauthenticated by design
+    (it exposes nothing beyond process liveness)."""
     return {"status": "ok"}
 
 
 @app.get("/", response_class=HTMLResponse)
 async def web_index(req: Request, username: str = Depends(verify_auth)):
+    """Render the operator dashboard (templates/index.html).
+
+    Requires HTTP Basic auth (401 otherwise); `username` is only used by the
+    dependency, the template itself fetches the /api/* endpoints with the
+    browser's cached credentials.
+    """
     return templates.TemplateResponse(req, "index.html")
 
 
@@ -1532,6 +2344,30 @@ async def web_index(req: Request, username: str = Depends(verify_auth)):
 async def listen_to_nanobot_task(
     device_ws: WebSocket, state: dict, nano_session: aiohttp.ClientSession
 ):
+    """Maintain the upstream Nanobot WS and dispatch every event it emits.
+
+    Started lazily on the device `hello` (legacy backend only — Hermes/
+    Cascade never use nano_ws, see handle_ws_text_message) and loops until
+    the session disappears from session_states.
+
+    Reconnect policy: connection failure -> retry after 10 s; connection lost
+    mid-read -> retry after 5 s. Each new connection gets a fresh
+    NanobotResponseHandler (buffers/queues of the old one are abandoned with
+    the socket).
+
+    Event handling:
+      * `ready`      -> cache the deterministic chat_id for this MAC;
+      * `error`      -> speak the apology and re-arm listening (except the
+                        benign "unknown type" protocol warning);
+      * `device_tool_call` -> bridge to the satellite (handle_device_tool_call);
+      * `text`       -> strip provider errors (apology path) or feed the
+                        sentence flusher; replies arriving after the watchdog
+                        apology are dropped as stale.
+    Every text event re-arms the WATCHDOG_TIMEOUT timer.
+
+    Failure modes: malformed JSON is logged and skipped; any exception in the
+    read loop is caught to schedule the reconnect instead of killing the task.
+    """
     nano_ws = state.get("nano_ws")
     handler = NanobotResponseHandler(device_ws, state)
     state["handler"] = handler
@@ -1540,6 +2376,10 @@ async def listen_to_nanobot_task(
             try:
                 mac_key = state["mac"].lower()
                 det_chat_id = make_chat_id(mac_key)
+                # Token + deterministic chat_id go in the query string — that
+                # is the auth/routing contract of the Nanobot WS endpoint, and
+                # the stable chat_id is what preserves conversation context
+                # across reconnects.
                 auth_url = (
                     f"{NANOBOT_WS_URL}?token={NANOBOT_TOKEN}&chat_id={det_chat_id}"
                 )
@@ -1559,6 +2399,9 @@ async def listen_to_nanobot_task(
         try:
             async for msg in nano_ws:
                 if msg.type == aiohttp.WSMsgType.TEXT:
+                    # Any inbound text proves the upstream chain is alive:
+                    # slide the watchdog deadline forward instead of letting
+                    # a long-but-streaming reply be interrupted.
                     if state.get("watchdog"):
                         state["watchdog"].cancel()
                         state["watchdog"] = asyncio.get_event_loop().call_later(
@@ -1578,6 +2421,9 @@ async def listen_to_nanobot_task(
 
                     if d.get("event") == "ready":
                         nano_chat_id = d.get("chat_id")
+                        # Ignore the id the brain just minted: ours is
+                        # deterministic per MAC, so context survives a gateway
+                        # or Nanobot restart (logged alongside for debugging).
                         state["nanobot_chat_id"] = make_chat_id(state["mac"])
                         mac_key = state["mac"].lower()
                         set_cached_chat_id(mac_key, state["nanobot_chat_id"])

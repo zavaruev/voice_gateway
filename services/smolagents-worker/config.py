@@ -74,4 +74,11 @@ MAX_STEPS = _i("MAX_STEPS", "15")                # CodeAgent steps ceiling
 HEARTBEAT_INTERVAL = _f("HEARTBEAT_INTERVAL", "15")  # progress SSE, <=20 s
 LLM_CALL_TIMEOUT = _f("LLM_CALL_TIMEOUT", "60")  # per-completion OpenAI timeout
 TOOL_TIMEOUT = _f("TOOL_TIMEOUT", "20")          # per-tool HTTP (ha_*)
-EXPERT_TIMEOUT = _f("EXPERT_TIMEOUT", "90")      # hermes_expert tool
+# Must stay well below the gateway's WATCHDOG_TIMEOUT (90 s): a tool that
+# blocks for longer than that guarantees the satellite has already spoken
+# the "I'm stuck, please repeat" apology before the real answer exists.
+# 2026-09-27: hermes_expert burned 92 s of a 90 s budget on a one-word
+# utterance, pushing the whole turn to 104 s and turning a clarifying
+# question into a dead turn. 25 s keeps the expert useful without letting
+# it eat the turn.
+EXPERT_TIMEOUT = _f("EXPERT_TIMEOUT", "25")      # hermes_expert tool

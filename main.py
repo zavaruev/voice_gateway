@@ -62,11 +62,16 @@
 #      (sentence N+1 is synthesised while N plays) -> stream_tts_pcm() -> pydub ->
 #      PCM 16 kHz mono -> Opus frames paced in real time -> device, bracketed by
 #      `tts start`/`tts stop` control events plus a 1.5 s VAD cooldown afterwards.
-#   9. Turn end: _finalize_response() probes the reply for a question (the
-#      HAS_QUESTION_* regexes) and either keeps LISTENING for the follow-up window
-#      (STANDBY_TIMEOUT_QUESTION after a question, STANDBY_TIMEOUT_STATEMENT after
-#      a statement) or reset_to_standby(); activity_monitor_task() runs that timer
-#      and dims the screen while idle.
+#   9. Turn end: the finaliser probes the spoken reply for a question (the
+#      HAS_QUESTION_* regexes via _reply_has_question()) and returns the state
+#      machine to LISTENING for an adaptive follow-up window —
+#      STANDBY_TIMEOUT_QUESTION after a question (screen back to 100%, dialogue
+#      mode) or STANDBY_TIMEOUT_STATEMENT after a statement. Both backends share
+#      it: NanobotResponseHandler._finalize_response() (legacy) and
+#      _finalize_turn_followup() (shared by both — the cascade/hermes path used
+#      to drop straight to standby, so a question was never followed up).
+#      activity_monitor_task()
+#      runs that window's timer and finally calls reset_to_standby().
 #
 # WEB UI / REST API (HTTP Basic auth via ADMIN_USERNAME/ADMIN_PASSWORD, 5 req/min/IP)
 #   GET    /                          operator dashboard (templates/index.html)
@@ -321,7 +326,10 @@ HOLD_PHRASES = {
     "мomento",
 }
 
-# Question detection driving the adaptive standby window (see _finalize_response).
+# Question detection driving the adaptive standby window — one implementation
+# (_reply_has_question()) behind BOTH turn finalisers: the legacy
+# NanobotResponseHandler._finalize_response() and the shared
+# _finalize_turn_followup() that the cascade/hermes path calls.
 # HAS_QUESTION_RE: does the reply end with "?" (ASCII or fullwidth "？").
 HAS_QUESTION_RE = re.compile(r"[?？]\s*$")
 # SENTENCE_END_RE: sentence boundary used by NanobotResponseHandler to cut the
@@ -334,6 +342,35 @@ HAS_QUESTION_WORDS_RE = re.compile(
     r"\b(что|как|где|когда|почему|зачем|сколько|кто|какой|какая|какое|какие|чей|чья|чьё|чьи|куда|откуда|уточни|расскажи|напомни|объясни|повтори|скажи|покажи|подожди|помоги|ответь|напиши|сделай|включи|выключи|открой|закрой|дай|можешь|не знаю|не понимаю)\b",
     re.IGNORECASE,
 )
+
+
+def _reply_has_question(reply_text: str) -> bool:
+    """Does the spoken reply ask something? Drives the follow-up window.
+
+    Single source of truth for question detection, reached from both turn
+    finalisers: the legacy NanobotResponseHandler._finalize_response() and the
+    cascade/hermes path through the shared _finalize_turn_followup(). Keeping
+    the verdict in one place is what makes the two backends behave identically
+    (they used to diverge — the cascade path never looked at the reply at all
+    and dropped straight to standby, so a question was never followed up).
+
+    Args:
+        reply_text: the FULL reply as spoken, already concatenated from the
+            per-sentence accumulator; case is normalised here so callers may
+            pass raw text.
+
+    Returns:
+        True when the reply ends with '?' (ASCII or fullwidth), contains the
+        «повторите пожалуйста» apology, or matches any Russian interrogative /
+        imperative of HAS_QUESTION_WORDS_RE — i.e. the mic should stay open
+        for the answer instead of going to standby.
+    """
+    clean = reply_text.strip().lower()
+    return (
+        HAS_QUESTION_RE.search(clean) is not None
+        or "повторите пожалуйста" in clean
+        or HAS_QUESTION_WORDS_RE.search(clean) is not None
+    )
 
 SPEAKER_NAME_FILE = "/app/config/speaker_names.json"
 
@@ -1066,7 +1103,7 @@ async def activity_monitor_task(device_ws: WebSocket, state: dict):
                 if time_idle > timeout:
                     if not state.get("_wake_audio_received"):
                         logger.warning(
-                            f"🔇 [Diag] Wake timeout — no audio received in {int(time_idle)}s after listen:start"
+                            f"🔇 [Diag] Listening window expired — no audio received in {int(time_idle)}s"
                         )
                     logger.info(
                         f"💤 [Timeout] {int(time_idle)}s idle (limit {timeout}s). Standby."
@@ -1127,6 +1164,64 @@ async def reset_to_standby(device_ws: WebSocket, state: dict):
         state["watchdog"] = None
 
 
+async def _finalize_turn_followup(
+    device_ws: WebSocket, state: dict, spoken_text: str
+) -> bool:
+    """End of a turn: judge the spoken reply and open the follow-up window.
+
+    Single implementation of the post-turn transition, shared by the legacy
+    NanobotResponseHandler._finalize_response() and the cascade/hermes
+    _dispatch_hermes(). The two paths used to diverge: the cascade one called
+    reset_to_standby() unconditionally, so the satellite went IDLE immediately
+    after the reply — including right after the gateway itself asked the
+    user a question, which is why the answer never arrived (the firmware's own
+    post-TTS `listen:start` was additionally rejected as a false wake).
+
+    Args:
+        device_ws: satellite WebSocket, used for the dialogue-mode screen cmd.
+        state: session state, mutated in place.
+        spoken_text: the FULL reply as spoken; question detection itself is
+            case-insensitive and lives in _reply_has_question().
+
+    Returns:
+        True when the reply was judged a question (the caller may want it for
+        logging; the verdict is also stored in state["last_ai_had_question"]).
+
+    Side effects: status -> LISTENING in BOTH branches, frames/silence cleared,
+    TTS cooldown trimmed to 0.2 s (mic ready for the answer, still deaf to the
+    tail of our own playback), last_ai_had_question stored for
+    activity_monitor_task()'s window choice (STANDBY_TIMEOUT_QUESTION 30 s vs
+    STANDBY_TIMEOUT_STATEMENT 10 s), VAD reset. A question additionally lights
+    the screen to 100 % (dialogue mode); a statement disarms the pending
+    watchdog. The cross-device speaker lock is deliberately NOT touched — as in
+    legacy, reset_to_standby() releases it when the window expires.
+    """
+    has_question = _reply_has_question(spoken_text)
+    state["last_ai_had_question"] = has_question
+    state.update(
+        {"status": "LISTENING", "frames": [], "silence": 0, "has_speech": False}
+    )
+    state["tts_cooldown_until"] = time.time() + 0.2
+    # A fresh listening window opened: no audio received YET. This makes the
+    # monitor's "no audio received" warning truthful instead of always-on.
+    state["_wake_audio_received"] = False
+    if has_question:
+        logger.info(f"💡 [Brightness] Dialogue mode — screen 100%")
+        await send_mcp_cmd(
+            device_ws,
+            state["sid"],
+            "self.screen.set_brightness",
+            {"brightness": 100},
+        )
+    else:
+        if state.get("watchdog"):
+            state["watchdog"].cancel()
+            state["watchdog"] = None
+    state["last_activity"] = time.time()
+    state["vad"].reset()
+    return has_question
+
+
 async def watchdog_timeout(device_ws: WebSocket, state: dict):
     """Fired by the WATCHDOG_TIMEOUT timer when the upstream AI goes silent.
 
@@ -1157,6 +1252,9 @@ async def watchdog_timeout(device_ws: WebSocket, state: dict):
     state["last_activity"] = time.time()  # Reset timer
     state["vad"].reset()
     state["tts_cooldown_until"] = time.time() + 0.3  # Short cooldown after apology
+    # New listening window: no audio received YET, otherwise the monitor's
+    # warning would be silenced by frames from the previous window.
+    state["_wake_audio_received"] = False
     await send_mcp_cmd(
         device_ws, state["sid"], "self.screen.set_brightness", {"brightness": 100}
     )
@@ -1504,11 +1602,23 @@ async def _dispatch_hermes(txt, uid, state, device_ws, _t0, _t_stt):
     Steps: notify the device that speech starts, arm the watchdog, create a
     sentence queue + player task, hand the queue to the backend (it pushes
     sentences and finally None), wait for playback to drain (120 s hard cap),
-    then return the session to standby.
+    then open the follow-up window instead of going to standby.
 
-    Side effects: state status/tts_started/watchdog are mutated; on completion
-    reset_to_standby() runs. Failure modes: a dead device WS is tolerated
-    (send errors swallowed), a stalled player is cancelled by the timeout.
+    Turn end parity: this used to end with an unconditional reset_to_standby(),
+    which put the satellite IDLE right after the reply — including after the
+    gateway itself asked a question, so the answer had nowhere to land (the
+    firmware's own post-TTS `listen:start` was in addition rejected as a false
+    wake by the 1.5 s cooldown). It now runs _finalize_turn_followup(), the
+    same finaliser the legacy Nanobot path uses: question -> 30 s of LISTENING
+    with the screen at 100 %, statement -> 10 s of LISTENING.
+
+    Side effects: state status/tts_started/watchdog/reply_sentences are
+    mutated; on completion _finalize_turn_followup() always opens a LISTENING
+    window (question -> 30 s, statement -> 10 s, post-watchdog apology ->
+    10 s), so a reply — or the watchdog's own "repeat please" — is always
+    answerable without a fresh wake word.
+    Failure modes: a dead device WS is tolerated (send errors swallowed), a
+    stalled player is cancelled by the timeout.
     """
     # Fallback chat_id: deterministic per MAC so context survives even when
     # the legacy Nanobot session never announced one.
@@ -1523,6 +1633,11 @@ async def _dispatch_hermes(txt, uid, state, device_ws, _t0, _t_stt):
     state["status"] = "SPEAKING"
     state["tts_started"] = True
     state["watchdog_fired"] = False
+    # Spoken-reply accumulator for question detection: _hermes_player_task()
+    # appends every sentence it actually plays, _finalize_turn_followup()
+    # consumes it. Initialised per turn so a leftover from a previous turn
+    # (e.g. one abandoned by a timeout) can never skew the new verdict.
+    state["reply_sentences"] = []
     # Watchdog for the whole turn; the first played sentence cancels it
     # (see _hermes_player_task.play), so a long-but-alive reply never
     # triggers the apology.
@@ -1558,7 +1673,25 @@ async def _dispatch_hermes(txt, uid, state, device_ws, _t0, _t_stt):
         f"⏱ [Timing] Hermes reply done: {_t_done-_t_stt:.2f}s after STT | "
         f"total={_t_done-_t0:.2f}s since VAD trigger"
     )
-    await reset_to_standby(device_ws, state)
+    # Turn end: open the follow-up window (question -> 30 s, statement -> 10 s)
+    # instead of dropping to standby, so the satellite can answer the reply we
+    # just produced without a fresh wake word.
+    #
+    # Runs UNCONDITIONALLY, watchdog apology included. The old code called
+    # reset_to_standby() here unconditionally as well, which cut dead the very
+    # LISTENING window watchdog_timeout() had just opened for its apology.
+    # _finalize_turn_followup() re-opens LISTENING in both of its branches, so
+    # that window survives — only the idle timer is refreshed and the question
+    # verdict re-judged (post-watchdog it is almost always a statement: play()
+    # cancels the watchdog on the FIRST sentence attempt, so the watchdog can
+    # only fire before anything was appended to reply_sentences; the apology
+    # itself goes through generate_and_stream_tts(), never through the player).
+    spoken_reply = "".join(state.pop("reply_sentences", []))
+    has_question = await _finalize_turn_followup(device_ws, state, spoken_reply)
+    logger.info(
+        f"👂 [Hermes] Follow-up window: {'question -> 30s' if has_question else 'statement -> 10s'}"
+        + (" (post-watchdog)" if state.get("watchdog_fired") else "")
+    )
 
 
 async def _hermes_player_task(q: asyncio.Queue, device_ws, state):
@@ -1568,21 +1701,30 @@ async def _hermes_player_task(q: asyncio.Queue, device_ws, state):
     latency (sequential synth-then-play left 1-4 s of silence between
     sentences — heard as stutter). Sentences that arrive after the
     watchdog apology are dropped instead of played stale.
+
+    Every sentence that actually reaches the speaker is also appended to
+    state["reply_sentences"] — _finalize_turn_followup() probes that text for
+    a question to pick the follow-up window (30 s vs 10 s), mirroring what
+    NanobotResponseHandler.full_response_text does for the legacy backend.
+    Only played sentences count: dropped/stale ones never reached the user.
     """
 
     def start_synth(text):
         """Start (do not await) MP3 synthesis for one sentence, returning the task."""
         return asyncio.create_task(synthesize_tts_mp3(text, state))
 
-    async def play(mp3_data):
+    async def play(mp3_data, text: str):
         """Stream one sentence to the device and disarm the watchdog.
 
         The watchdog is cancelled only AFTER audio actually flows: proof that
         the upstream L1/L2/L3 chain is alive, so a slow tail of the reply can
-        no longer trigger a duplicate apology.
+        no longer trigger a duplicate apology. `text` is appended to
+        state["reply_sentences"] only when the stream actually succeeded, so
+        question detection judges exactly what the user heard.
         """
+        streamed = False
         try:
-            await stream_tts_pcm(mp3_data, device_ws, state["sid"], state)
+            streamed = await stream_tts_pcm(mp3_data, device_ws, state["sid"], state)
         except Exception as e:
             logger.error(f"❌ [Hermes] TTS player error: {e}")
         # Audio is flowing — upstream proved alive, drop the guard so a
@@ -1594,26 +1736,35 @@ async def _hermes_player_task(q: asyncio.Queue, device_ws, state):
             except Exception:
                 pass
             state["watchdog"] = None
+        # Remember what the user actually heard: question detection at turn
+        # end reads exactly this, never the raw (unspoken) queue contents.
+        if streamed and text:
+            state.setdefault("reply_sentences", []).append(text + " ")
 
     first = await q.get()
     if first is None:
         return  # backend produced nothing (empty reply or early error)
     synth_task = start_synth(first) if not state.get("watchdog_fired") else None
+    # Text belonging to the in-flight synth task; travels alongside it because
+    # the queue only carries strings, not the (text, mp3) pairing.
+    synth_text = first if synth_task is not None else None
     while True:
         # One-ahead pipeline: `synth_task` is always the NEXT sentence's
         # synthesis. Awaiting it here overlaps with `play()` of the current
         # one, so Edge-TTS latency is hidden instead of heard as a gap.
         nxt = await q.get()
         mp3 = await synth_task if synth_task is not None else None
-        synth_task = None
+        synth_task, spoken_text = None, synth_text
+        synth_text = None
         if state.get("watchdog_fired"):
             if nxt is None:
                 return
             continue  # stale: apology already spoken, keep draining
         if nxt is not None:
             synth_task = start_synth(nxt)  # prefetch while mp3 plays
+            synth_text = nxt
         if mp3 is not None:
-            await play(mp3)
+            await play(mp3, spoken_text)
         if nxt is None:
             return  # None is the backend's end-of-stream marker
 
@@ -2213,56 +2364,23 @@ class NanobotResponseHandler:
     async def _finalize_response(self):
         """End of a turn: drain audio, then choose follow-up listening or standby.
 
-        Waits for all playback, probes the full reply for a question (trailing
-        '?', the «повторите пожалуйста» apology, or any Russian interrogative /
-        imperative from HAS_QUESTION_WORDS_RE) and stores the verdict in
-        state["last_ai_had_question"] — activity_monitor_task() reads it to
-        pick the standby timeout (30 s vs 10 s).
+        Waits for all playback, then delegates to the shared
+        _finalize_turn_followup(), which probes the full reply for a question
+        (trailing '?', the «повторите пожалуйста» apology, or any Russian
+        interrogative / imperative from HAS_QUESTION_WORDS_RE) and stores the
+        verdict in state["last_ai_had_question"] — activity_monitor_task()
+        reads it to pick the standby timeout (30 s vs 10 s).
 
-        Both branches return the state machine to LISTENING with a short TTS
-        cooldown (0.2 s) so the mic is ready for the answer but deaf to the
-        last loud frames of playback. Finally the VAD is reset and the
-        per-turn text accumulator cleared.
+        Delegating keeps the legacy Nanobot backend and the cascade backend on
+        one code path: they used to each carry their own copy of this
+        transition, and only this one had the follow-up window.
         """
         await self._await_tts_drained()
 
-        # Question detection runs on the SPOKEN text (tags already stripped),
-        # lower-cased so the Cyrillic keyword regex matches regardless of case.
-        clean_for_check = "".join(self.full_response_text).strip().lower()
-        has_question = (
-            HAS_QUESTION_RE.search(clean_for_check) is not None
-            or "повторите пожалуйста" in clean_for_check
-            or HAS_QUESTION_WORDS_RE.search(clean_for_check) is not None
+        # Question detection runs on the SPOKEN text (tags already stripped).
+        await _finalize_turn_followup(
+            self.device_ws, self.state, "".join(self.full_response_text)
         )
-        self.state["last_ai_had_question"] = has_question
-
-        if has_question:
-            self.state.update(
-                {
-                    "status": "LISTENING",
-                    "frames": [],
-                    "silence": 0,
-                    "has_speech": False,
-                }
-            )
-            self.state["tts_cooldown_until"] = time.time() + 0.2
-            logger.info(f"💡 [Brightness] Dialogue mode — screen 100%")
-            await send_mcp_cmd(
-                self.device_ws,
-                self.state["sid"],
-                "self.screen.set_brightness",
-                {"brightness": 100},
-            )
-        else:
-            self.state.update(
-                {"status": "LISTENING", "frames": [], "silence": 0, "has_speech": False}
-            )
-            self.state["tts_cooldown_until"] = time.time() + 0.2
-            if self.state.get("watchdog"):
-                self.state["watchdog"].cancel()
-                self.state["watchdog"] = None
-        self.state["last_activity"] = time.time()
-        self.state["vad"].reset()
         self.full_response_text = []
 
     async def flush(self):
@@ -2599,6 +2717,9 @@ async def handle_ws_text_message(ctx: WSContext):
         state["last_activity"] = time.time()
         state["vad"].reset()
         state["post_wake_cooldown_until"] = time.time() + 0.3
+        # Fresh window: the monitor's "no audio received" warning is only
+        # meaningful if the flag is cleared on every new listening session.
+        state["_wake_audio_received"] = False
         state["watchdog_fired"] = False
         state["tts_started"] = False
         try:
@@ -2650,6 +2771,10 @@ async def handle_ws_audio_message(
         else (byte_data[16:] if state["version"] == 2 else byte_data[4:])
     )
     state["frames"].append(f)
+    # The device IS streaming: silence the monitor's "no audio received"
+    # warning for this listening window (it read the flag but nothing ever
+    # set it before, so the warning fired unconditionally).
+    state["_wake_audio_received"] = True
 
     try:
         pcm = dec.decode(f, 960)

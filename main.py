@@ -1244,6 +1244,12 @@ async def watchdog_timeout(device_ws: WebSocket, state: dict):
         )
     except Exception as e:
         logger.error(f"❌ [Watchdog] TTS failed: {e}")
+    # If synthesis never produced audio the apology did not close the stream
+    # either, so close it here — "keeping mic open" is only true once the
+    # satellite has seen `tts stop`. Edge-TTS outage case (2026-09-27 15:11):
+    # every synthesis failed, no stop was sent, the device stayed in SPEAKING
+    # and the re-opened window expired with "no audio received".
+    await send_tts_stop(device_ws, state)
 
     logger.info("🎤 [Watchdog] Keeping mic open for repeat.")
     state.update(
@@ -1613,8 +1619,11 @@ async def _dispatch_hermes(txt, uid, state, device_ws, _t0, _t_stt):
     with the screen at 100 %, statement -> 10 s of LISTENING.
 
     Side effects: state status/tts_started/watchdog/reply_sentences are
-    mutated; on completion _finalize_turn_followup() always opens a LISTENING
-    window (question -> 30 s, statement -> 10 s, post-watchdog apology ->
+    mutated; the turn's single closing `tts stop` is emitted from the playback
+    `finally` below on every exit path, so the satellite always leaves
+    SPEAKING;
+    on completion _finalize_turn_followup() always opens a LISTENING window
+    (question -> 30 s, statement -> 10 s, post-watchdog apology ->
     10 s), so a reply — or the watchdog's own "repeat please" — is always
     answerable without a fresh wake word.
     Failure modes: a dead device WS is tolerated (send errors swallowed), a
@@ -1668,6 +1677,11 @@ async def _dispatch_hermes(txt, uid, state, device_ws, _t0, _t_stt):
             await asyncio.wait_for(player_task, timeout=120.0)
         except asyncio.TimeoutError:
             player_task.cancel()
+        # Always emit the ONE closing `tts stop` of this turn, on every exit
+        # path (normal end, backend exception, playback cancel). It is the
+        # signal that lets the satellite re-arm its microphone; the follow-up
+        # window opened below is unreachable for the user without it.
+        await send_tts_stop(device_ws, state)
     _t_done = time.time()
     logger.info(
         f"⏱ [Timing] Hermes reply done: {_t_done-_t_stt:.2f}s after STT | "
@@ -1724,7 +1738,22 @@ async def _hermes_player_task(q: asyncio.Queue, device_ws, state):
         """
         streamed = False
         try:
-            streamed = await stream_tts_pcm(mp3_data, device_ws, state["sid"], state)
+            # send_stop=False: the WHOLE turn is one audio unit, the closing
+            # `tts stop` is emitted once by _dispatch_hermes() (send_tts_stop).
+            # The satellite re-arms its microphone by itself on `tts stop`
+            # (it then sends `listen:start`), but only while it still counts
+            # itself as LISTENING — it drops to IDLE after ~10 s with no `stt`
+            # reply from us, and a `tts stop` from IDLE does NOT re-arm it.
+            # Stopping after every sentence therefore stranded the device in
+            # LISTENING between sentences (it timed out, then ignored the
+            # FINAL stop as well), so the follow-up window opened by
+            # _finalize_turn_followup() received zero frames — observed on
+            # 2026-09-27: 1-2-sentence replies followed up fine, the 8-sentence
+            # 104 s reply did not. One start / one stop keeps the device in
+            # SPEAKING for exactly as long as we are speaking.
+            streamed = await stream_tts_pcm(
+                mp3_data, device_ws, state["sid"], state, send_stop=False
+            )
         except Exception as e:
             logger.error(f"❌ [Hermes] TTS player error: {e}")
         # Audio is flowing — upstream proved alive, drop the guard so a
@@ -1942,9 +1971,12 @@ async def stream_tts_pcm(
         session_id: satellite session id echoed in the control events.
         state: session state; only used when truthy (a bare `None` is
             tolerated so shared helpers can call this without a session).
-        send_stop: send the closing `tts stop` event — False when more
-            segments follow (the continuous Nanobot stream), so the device
-            keeps one open audio unit.
+        send_stop: send the closing `tts stop` event — False while more
+            segments of the SAME utterance follow (the continuous legacy
+            Nanobot stream and the cascade/hermes sentence player), so the
+            device keeps one open audio unit and only sees a single `tts stop`
+            at the very end of the turn. Only that final stop makes the
+            satellite re-arm its microphone for the follow-up window.
 
     Side effects: sets camera_client.GLOBAL_TTS_UNTIL (echo guard for the
     whole gateway) and state["tts_cooldown_until"] (+1.5 s) so VAD ignores
@@ -2027,6 +2059,37 @@ async def stream_tts_pcm(
         if "Cannot call" not in str(e):
             logger.error(f"❌ [TTS] Error: {e}")
         return False
+
+
+async def send_tts_stop(device_ws, state: dict) -> None:
+    """Close the turn's open TTS stream (one `tts stop` control event).
+
+    The satellite treats `tts start` -> `tts stop` as a single audio unit: it
+    opens the speaker path on start and re-arms the microphone on stop (which
+    is what makes the follow-up window answerable without a wake word). The
+    closing stop must therefore be sent EXACTLY once per turn and always —
+    including turns where nothing reached the speaker at all (every Edge-TTS
+    call failed, the backend produced no sentence, playback was cancelled by
+    the 120 s cap). Without it the satellite stays in SPEAKING with the mic
+    shut and the LISTENING window we open next expires without a single frame,
+    as happened on 2026-09-27 15:11 ("no audio received in 10s").
+
+    No-op when no stream is open (tts_started False) — duplicate stops are
+    ignored by the firmware, but a stray one would splice the next utterance
+    onto a stream the caller believes is closed.
+
+    Failure modes: a dead device WebSocket is swallowed; only the satellite's
+    state is stale then, the gateway state is reset regardless.
+    """
+    if not state.get("tts_started"):
+        return
+    state["tts_started"] = False
+    try:
+        await device_ws.send_json(
+            {"type": "tts", "state": "stop", "session_id": state["sid"]}
+        )
+    except Exception:
+        pass
 
 
 async def generate_and_stream_tts(
@@ -2142,18 +2205,12 @@ class NanobotResponseHandler:
     async def _send_tts_stop(self):
         """Close the continuous TTS stream (single `tts stop` event).
 
-        No-op when no stream is open (tts_started False) — the firmware
-        ignores duplicate stops, but sending none at all would leave the
-        speaker path open and the next utterance would splice onto it.
+        Thin wrapper over the shared send_tts_stop() helper — the legacy
+        Nanobot path and the cascade/hermes path must agree on the wire
+        protocol: no-op when no stream is open (tts_started False), otherwise
+        one `tts stop` per audio unit.
         """
-        if self.state.get("tts_started"):
-            self.state["tts_started"] = False
-            try:
-                await self.device_ws.send_json(
-                    {"type": "tts", "state": "stop", "session_id": self.state["sid"]}
-                )
-            except Exception:
-                pass
+        await send_tts_stop(self.device_ws, self.state)
 
     async def _enqueue_tts(self, text: str):
         """Synthesize in background; player picks it up when ready."""

@@ -354,11 +354,21 @@ def find_entity(states: list[dict], hint: str, area: str | None = None) -> dict 
                 areas.update(lats)
 
     def _hay(e: dict) -> str:
+        """Lowercased `entity_id friendly_name` — the text both filters scan.
+
+        Built once per entity so hint/area matching share one haystack and
+        one casing rule instead of each caller re-deriving it.
+        """
         eid = e.get("entity_id", "")
         name = (e.get("attributes", {}).get("friendly_name") or "").lower()
         return f"{eid} {name}".lower()
 
     def _match(e: dict, use_hint: bool, use_area: bool) -> bool:
+        """True when `e` passes every enabled filter (hint and/or area).
+
+        Empty filter sets pass everything; the caller disables one flag at
+        a time to implement the hint->area fallback ladder.
+        """
         hay = _hay(e)
         if use_hint and hints and not any(h in hay for h in hints):
             return False

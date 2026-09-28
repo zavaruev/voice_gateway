@@ -102,13 +102,21 @@ logger.propagate = False
 
 
 class AIVoiceOutputTrack(MediaStreamTrack):
+    """aiortc sendonly track that plays TTS PCM to the camera speaker.
+
+    recv() pulls the next queued frame (or a pre-built silence frame when
+    the queue is dry) and paces it against the RTP clock, so go2rtc sees a
+    steady 20 ms stream instead of bursts. Writers use queue_frame(),
+    which blocks when the buffer is full rather than dropping audio.
+    """
+
     kind = "audio"
 
     def __init__(self, sample_rate: int = 8000):
         super().__init__()
         self._sample_rate = sample_rate
-        # Буфер на ~10 секунд аудио. Если очередь заполнится,
-        # писатель будет ждать (backpressure), не теряя фреймы.
+        # Buffer for ~10 seconds of audio. If the queue fills up, the
+        # writer waits (backpressure) instead of dropping frames.
         self._queue: asyncio.Queue[av.AudioFrame] = asyncio.Queue(maxsize=500)
         self._timestamp = 0
         self._start: float = 0.0
@@ -125,6 +133,7 @@ class AIVoiceOutputTrack(MediaStreamTrack):
         self._last_play_duration: float = 0.0
 
     def _pcm_to_frame(self, pcm: bytes, sample_rate: int) -> av.AudioFrame:
+        """Wrap raw s16le mono PCM into a PyAV AudioFrame for the WebRTC track."""
         samples = len(pcm) // 2
         frame = av.AudioFrame(
             format="s16",
@@ -150,7 +159,7 @@ class AIVoiceOutputTrack(MediaStreamTrack):
         if self._timestamp == 0:
             self._start = time.time()
 
-        # Строгий тайминг выдачи фреймов для WebRTC (RTP clock)
+        # Strict frame pacing for WebRTC (RTP clock)
         wait = self._start + (self._timestamp / self._sample_rate) - time.time()
         if wait > 0:
             await asyncio.sleep(wait)
@@ -161,8 +170,8 @@ class AIVoiceOutputTrack(MediaStreamTrack):
         return frame
 
     async def queue_frame(self, pcm: bytes, sample_rate: int = 8000):
-        # Используем await put, чтобы при больших TTS ответах трек не переполнялся
-        # и не дропал слова в середине предложения.
+        # We use `await put` so long TTS replies never overflow the track
+        # and drop words in the middle of a sentence.
         frame = self._pcm_to_frame(pcm, sample_rate)
         await self._queue.put(frame)
 
@@ -234,6 +243,12 @@ def _arbiter_owner_active(exclude: str, max_age: float = 45.0):
 
 
 def _arbiter_clear_owner(stream: str) -> None:
+    """Release the arbitration ownership only if `stream` currently holds it.
+
+    Called when a winner goes back to standby or resets; ownership by a
+    DIFFERENT camera is left untouched so a concurrent interaction is not
+    silently stolen by a late reset.
+    """
     o = _ARB_STATE.get("owner")
     if o and o.get("stream") == stream:
         _ARB_STATE["owner"] = None
@@ -279,6 +294,12 @@ def _arbiter_sent_recently(key: tuple, stream: str, within: float = 3.0) -> bool
 
 
 def _arb_lock() -> asyncio.Lock:
+    """Lazily create the module-level arbitration lock.
+
+    Built on first use because the lock binds to the event loop that
+    creates it; constructing at import time would tie the arbiter to a
+    loop that may not be the one uvicorn ends up running.
+    """
     global _ARB_LOCK
     if _ARB_LOCK is None:
         _ARB_LOCK = asyncio.Lock()
@@ -363,6 +384,10 @@ GLOBAL_TTS_UNTIL = 0.0
 
 @dataclass
 class CameraConfig:
+    """Everything one CameraSession needs: go2rtc endpoints, STT/TTS/Nanobot
+    URLs, wake-word tuning and the go2rtc re-register hints. Defaults match
+    the in-home services; main.start_camera_sessions() fills them from env.
+    """
     stream_name: str
     go2rtc_host: str = "192.168.22.102"
     go2rtc_port: int = 1984
@@ -391,6 +416,13 @@ class CameraConfig:
 
 
 class CameraSession:
+    """One bidirectional voice session for a single go2rtc camera stream.
+
+    Owns the full loop: RTSP mic feed -> echo guards -> VAD/wake gate ->
+    cross-camera arbiter -> Whisper STT -> LLM backend -> TTS back out over
+    the WebRTC sendonly track, plus the self-heal path that re-registers a
+    dead go2rtc stream. Lifetime: start() -> _run() reconnect loop -> stop().
+    """
 
     def __init__(self, config: CameraConfig, backend=None):
         if not re.match(r"^[a-zA-Z0-9_-]+$", config.stream_name):
@@ -464,7 +496,7 @@ class CameraSession:
         self._stall_count = 0
         self._last_heal_ts = 0.0
 
-        # Статистика и таймеры
+        # Stats and timers
         self._last_attention = 0.0
         self._last_feed_log = 0.0
         self._last_rms_log = 0.0
@@ -543,6 +575,11 @@ class CameraSession:
         return f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
 
     async def start(self):
+        """Boot the engine and spawn the WebRTC + RTSP background tasks.
+
+        Both tasks are registered in `self._tasks` with a discard callback
+        so `stop()` can cancel them and re-start does not leak the old ones.
+        """
         self._stopped.clear()
         await self._init_engine()
         task = asyncio.create_task(self._run())
@@ -610,6 +647,7 @@ class CameraSession:
             )
 
     async def stop(self):
+        """Set the stop flag, cancel every background task, close the PC."""
         self._stopped.set()
         for t in list(self._tasks):
             t.cancel()
@@ -617,6 +655,11 @@ class CameraSession:
         logger.info(f"[{self.stream_name}] CameraSession stopped")
 
     async def _cleanup(self):
+        """Close (and forget) the WebRTC peer connection, swallowing errors.
+
+        The PC reference is cleared FIRST so a concurrently running
+        _connect() cannot accidentally close a freshly created one.
+        """
         pc = self._pc
         self._pc = None
         if pc:
@@ -626,6 +669,11 @@ class CameraSession:
                 pass
 
     async def _run(self):
+        """Reconnect supervisor: keep _connect() alive until stop() is called.
+
+        Any connect failure (go2rtc down, camera rebooting, SDP mismatch)
+        is logged and retried after 5 s instead of killing the session.
+        """
         while not self._stopped.is_set():
             try:
                 await self._connect()
@@ -659,6 +707,13 @@ class CameraSession:
 
     @staticmethod
     def _parse_candidate(value) -> RTCIceCandidate | None:
+        """Parse an ICE candidate from go2rtc's dict or bare-string form.
+
+        Accepts both shapes the signalling channel may deliver
+        (`{"candidate": "candidate:...", "sdpMid": ..., ...}` and the raw
+        SDP attribute string). Returns None for malformed input instead of
+        raising — a bad candidate must not tear down the whole session.
+        """
         if isinstance(value, dict):
             raw = value.get("candidate", "")
             sdp_mid = value.get("sdpMid") or "0"
@@ -692,6 +747,11 @@ class CameraSession:
 
     @staticmethod
     async def _add_candidate(pc: RTCPeerConnection, value):
+        """Parse `value` and hand it to the PC; log-and-ignore on failure.
+
+        Late/trickle candidates regularly arrive after the PC is closed or
+        are rejected by aiortc — both are normal, never fatal.
+        """
         cand = CameraSession._parse_candidate(value)
         if cand is None:
             logger.debug(f"candidate parse failed: {str(value)[:80]}")
@@ -824,6 +884,11 @@ class CameraSession:
 
     @staticmethod
     def _resample_generic(pcm: bytes, rate: int) -> bytes:
+        """Resample s16le mono PCM from `rate` to the internal 16 kHz.
+
+        Uses scipy's polyphase resampler (band-limited, no audible aliasing
+        on speech) with the gcd-reduced up/down factors.
+        """
         from scipy.signal import resample_poly
 
         arr = np.frombuffer(pcm, dtype=np.int16).astype(np.float32)
@@ -832,6 +897,12 @@ class CameraSession:
         return resample_poly(arr, up, down).astype(np.int16).tobytes()
 
     async def _recv_audio(self, track):
+        """Pull audio frames off the go2rtc WebRTC track until stop().
+
+        A 10 s recv() timeout keeps the loop responsive when the producer
+        goes quiet, and a non-audio frame (video keyframe, application
+        data) is skipped rather than crashing the consumer.
+        """
         frame_count = 0
         while not self._stopped.is_set():
             try:
@@ -1123,6 +1194,13 @@ class CameraSession:
             self._drain_vad_buf()
 
     def _drain_vad_buf(self):
+        """Carve _vad_buf into fixed 160 ms chunks and hand them to _vad_process.
+
+        Silero VAD needs a stable frame size, so incoming (jittery) RTSP
+        data is buffered here and emitted in exact chunk_bytes units; the
+        per-3s RMS/peak log and the background-noise window are updated on
+        the chunk boundary.
+        """
         chunk_bytes = 2560
         while len(self._vad_buf) >= chunk_bytes:
             chunk = bytes(self._vad_buf[:chunk_bytes])
@@ -1756,6 +1834,11 @@ class CameraSession:
         wav = await asyncio.to_thread(self._encode_wav, buf_processed)
 
         def _save_debug_wav(wav_data, ts):
+            """Best-effort dump of every utterance to /tmp/utterances/.
+
+            Field debugging aid only: created lazily, failures swallowed —
+            a full tmpfs must never abort an STT round-trip.
+            """
             import os
 
             os.makedirs("/tmp/utterances", exist_ok=True)
@@ -1781,6 +1864,13 @@ class CameraSession:
         uid_task = asyncio.create_task(self._fetch_speaker_id(wav))
 
         def _uid_done(t: "asyncio.Task") -> None:
+            """done-callback: log the recognised speaker, never raise.
+
+            Must be exception-safe (a raise inside a callback is only
+            logged by asyncio and would look like a SpeakerID bug); the
+            result is read defensively because the task may have been
+            cancelled along with the session.
+            """
             try:
                 u = t.result()
             except BaseException:
@@ -2093,6 +2183,12 @@ class CameraSession:
         self._last_auto_greet_ts = 0.0
 
     async def _on_user_command(self, text: str):
+        """Route a transcript that arrived with the wake word present.
+
+        Text after the wake keyword: that is the command -> dispatch to the
+        backend. Nothing after it: a bare wake ("компьютер") -> extend the
+        wake window and chirp the attention cue so the user knows to speak.
+        """
         try:
             kw = self.wake_keyword.lower()
             if kw not in text.lower():
@@ -2389,6 +2485,11 @@ class CameraSession:
                 self._back_to_wake()
 
     def _encode_wav(self, pcm_16k: bytes) -> bytes:
+        """Prepend a 44-byte canonical WAV header to raw s16le 16 kHz mono PCM.
+
+        Hand-rolled (no `wave` module) because this runs in a worker thread
+        and the format is fixed — header + payload, nothing else.
+        """
         sample_rate = 16000
         bits = 16
         channels = 1
@@ -2452,6 +2553,13 @@ class CameraSession:
         return ""
 
     async def _fetch_speaker_id(self, wav: bytes) -> str:
+        """Identify the speaker: WAV -> Opus/Ogg -> SpeakerID POST.
+
+        ffmpeg re-encodes to Ogg/Opus in a pipe (the service rejects raw
+        WAV), then the multipart POST returns user_id+confidence. Returns
+        "unknown" on any failure or when confidence <= 0.1 — speaker ID
+        only annotates logs and must never gate or fail the reply.
+        """
         try:
             proc = await asyncio.create_subprocess_exec(
                 "ffmpeg",
@@ -2556,6 +2664,12 @@ class CameraSession:
             logger.warning(f"[{self.stream_name}] attention error: {exc}")
 
     async def _play_activation_sound(self):
+        """Queue the short "I'm listening" cue on the camera speaker.
+
+        The wav is normalised to 8 kHz mono s16le (the track's contract)
+        and its duration is registered so the echo guard stays closed for
+        exactly as long as the cue sounds.
+        """
         try:
             seg = AudioSegment.from_file(self._activation_wav_path)
             seg = seg.set_frame_rate(8000).set_channels(1).set_sample_width(2)
@@ -2624,6 +2738,7 @@ class CameraSession:
             return None
 
     async def _speak(self, text: str, reply: str = "") -> bool:
+        """Synthesise `text` and play it; False when TTS produced nothing."""
         pcm = await self._tts_fetch(text)
         if not pcm:
             return False
@@ -2645,7 +2760,8 @@ class CameraSession:
             # be checked for our own echo (cross-correlation in _is_echo).
             self._store_tts_echo(pcm)
 
-            # Блокируем микрофон только сейчас, когда звук реально готов пойти в канал
+            # Mute the microphone only now, when the audio is really about
+            # to enter the playback channel.
             audio_dur = len(pcm) / (sr * 2)
             self._tts_play_end = time.time() + audio_dur
             if self._out_track:
@@ -2658,7 +2774,8 @@ class CameraSession:
                 if len(c) < chunk_size:
                     c += b"\x00" * (chunk_size - len(c))
                 if self._out_track:
-                    # Теперь мы просто асинхронно пушим куски, тайминг задается внутри AIVoiceOutputTrack.recv()
+                    # We just push chunks asynchronously now; the pacing is
+                    # enforced inside AIVoiceOutputTrack.recv().
                     await self._out_track.queue_frame(c, sr)
 
             # Suppress wake detection AND inbound commands only for the direct

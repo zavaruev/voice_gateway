@@ -97,6 +97,7 @@ class AudioStreamTrack(MediaStreamTrack):
     kind = "audio"
 
     def __init__(self):
+        """Allocate the empty ONNX handle slots (session/model load in load())."""
         super().__init__()
         self._queue = asyncio.Queue()
         self._pts = 0
@@ -130,6 +131,11 @@ class LocalAudioEngine:
     asyncio callers use asyncio.to_thread to stay off the event loop)."""
 
     def __init__(self, vad_threshold: float = 0.5):
+        """Create the ONNX session and default buffers.
+
+        The actual Silero/openWakeWord weights are loaded lazily by
+        load(); construction alone must stay cheap enough to call in tests.
+        """
         self.vad_session = None
         self.oww_model = None
         self.vad_threshold = vad_threshold
@@ -328,6 +334,9 @@ class CameraProcessor:
         on_activation_cb=None,
         stt_url: str = SPEECHES_STT_URL
     ):
+        """Bind the shared engine + callbacks; start in LISTENING with a
+        1.5 s end-of-utterance silence timeout (the FSM's default).
+        """
         self.engine = engine
         self.stt_url = stt_url
         self.on_command_cb = on_command_cb
@@ -359,6 +368,7 @@ class CameraProcessor:
         "nothing recognised", never as an error to the user.
         """
         def _write_wav():
+            """PCM16 numpy -> WAV bytes (runs inside asyncio.to_thread)."""
             wav_io = io.BytesIO()
             with wave.open(wav_io, 'wb') as wf:
                 wf.setnchannels(1)

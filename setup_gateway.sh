@@ -1,9 +1,9 @@
 #!/bin/bash
 
-# 1. Структура папок
+# 1. Folder layout
 mkdir -p config/firmware
 
-# 2. Зависимости
+# 2. Dependencies
 cat <<EOF > requirements.txt
 fastapi
 uvicorn
@@ -28,7 +28,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Качаем легкую модель VAD (всего 3мб)
+# Fetch the lightweight VAD model (only 3 MB)
 RUN curl -L -o silero_vad.onnx https://github.com/snakers4/silero-vad/raw/master/files/silero_vad.onnx
 
 COPY main.py .
@@ -37,7 +37,7 @@ EXPOSE 18792 8080
 CMD ["python", "-u", "main.py"]
 EOF
 
-# 4. Основной код шлюза (согласно официальной спецификации XiaoZhi)
+# 4. Main gateway code (per the official XiaoZhi specification)
 cat <<EOF > main.py
 import asyncio, json, os, time, struct, aiohttp, numpy as np
 import onnxruntime as ort
@@ -46,7 +46,7 @@ from fastapi import FastAPI, Request, Form, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
-# --- Конфигурация ---
+# --- Configuration ---
 NANOBOT_URL = os.getenv("NANOBOT_URL", "http://nanobot_prod:18790/voice_message")
 SPEAKER_URL = os.getenv("SPEAKER_ID_URL", "http://192.168.22.102:8001/identify")
 WHISPER_URL = os.getenv("WHISPER_URL", "http://192.168.22.111:8000/v1/audio/transcriptions")
@@ -56,7 +56,7 @@ app = FastAPI()
 if os.path.exists("/app/config/firmware"):
     app.mount("/firmware", StaticFiles(directory="/app/config/firmware"), name="firmware")
 
-# Глобальный реестр активных сессий (чтобы Нанобот мог слать команды на колонку)
+# Global registry of active sessions (so Nanobot can push commands to a speaker)
 active_sessions = {}
 
 # --- VAD Engine (ONNX) ---
@@ -75,7 +75,7 @@ class SileroVAD:
 
 vad = SileroVAD()
 
-# --- База данных ---
+# --- Device database ---
 def load_db():
     if os.path.exists(DB_FILE):
         try:
@@ -86,7 +86,7 @@ def load_db():
 def save_db(db):
     with open(DB_FILE, "w") as f: json.dump(db, f, indent=4)
 
-# --- OGG упаковка ---
+# --- OGG packing ---
 def pack_ogg(frames):
     def ogg_crc(data):
         crc, table = 0, []
@@ -109,20 +109,20 @@ def pack_ogg(frames):
         res += page(2+i//50, (i+len(c))*2880, ser, False, (i+50>=len(frames)), c)
     return res
 
-# --- Пайплайн обработки (Voice -> Text -> Nanobot) ---
+# --- Processing pipeline (Voice -> Text -> Nanobot) ---
 async def process_voice(frames, sid, ws):
     audio = pack_ogg(frames)
     async with aiohttp.ClientSession() as sess:
         uid, txt = "unknown", ""
         
-        # 1. Распознавание говорящего (Speaker ID)
+        # 1. Speaker recognition (Speaker ID)
         try:
             f = aiohttp.FormData(); f.add_field('file', audio, filename='a.ogg')
             async with sess.post(SPEAKER_URL, data=f, timeout=5) as r:
                 if r.status==200: uid = (await r.json()).get("user_id", "unknown")
         except: pass
         
-        # 2. Распознавание текста (Whisper STT)
+        # 2. Speech-to-text (Whisper STT)
         try:
             f = aiohttp.FormData(); f.add_field('file', audio, filename='a.ogg')
             f.add_field('model', 'Systran/faster-whisper-large-v3')
@@ -133,19 +133,19 @@ async def process_voice(frames, sid, ws):
         if txt:
             logger.info(f"Session {sid}: {uid} -> {txt}")
             
-            # Отправляем STT статус на экран колонки (согласно доке 4.2.2)
+            # Send the STT status to the speaker's screen (per spec 4.2.2)
             await ws.send_json({"session_id": sid, "type": "stt", "text": txt})
             
-            # 3. Передача в Нанобот
+            # 3. Forward to Nanobot
             try:
                 payload = {"user_id": uid, "text": txt, "session_id": sid, "channel": "voice_gateway"}
                 async with sess.post(NANOBOT_URL, json=payload, timeout=10) as r:
-                    pass # Ответ придет через отдельный API или WS
+                    pass # The reply arrives through a separate API or WS
             except Exception as e: logger.error(f"Nanobot notify error: {e}")
         else:
             await ws.send_json({"session_id": sid, "type": "tts", "state": "stop"})
 
-# --- Эндпоинты OTA и Приема команд от Нанобота ---
+# --- OTA endpoints and inbound commands from Nanobot ---
 @app.api_route("/ota", methods=["GET", "POST"])
 @app.api_route("/xiaozhi/ota/", methods=["GET", "POST"])
 async def ota_handler(req: Request):
@@ -161,7 +161,7 @@ async def ota_handler(req: Request):
     c = db[mac]
     return {"protocol":"websocket","websocket":{"url":c["ws_url"],"access_token":c.get("access_token","")},"firmware":{"has_update":c.get("has_update",False),"version":c.get("version","2.2.5"),"url":c.get("firmware_url","")}}
 
-# Эндпоинт для Нанобота: отправить MCP или TTS в нужную колонку
+# Endpoint for Nanobot: forward MCP or TTS to the addressed speaker
 @app.post("/send/{session_id}")
 async def send_to_device(session_id: str, req: Request):
     if session_id in active_sessions:
@@ -170,14 +170,14 @@ async def send_to_device(session_id: str, req: Request):
         return {"status": "ok"}
     return {"status": "not_found", "error": "Device not connected"}
 
-# --- Основной WebSocket (Умный парсер) ---
+# --- Main WebSocket (smart parser) ---
 @app.websocket("/")
 async def voice_ws(ws: WebSocket):
     await ws.accept()
     import opuslib
     dec = opuslib.Decoder(16000, 1)
     
-    # Состояние сессии
+    # Per-session state
     state = {"listening": False, "frames": [], "silence": 0, "sid": "unknown", "version": 1}
     vad.reset()
     
@@ -189,12 +189,12 @@ async def voice_ws(ws: WebSocket):
                 msg_type = d.get("type")
                 
                 if msg_type == "hello":
-                    # Сохраняем версию протокола и фичи колонки
+                    # Remember the protocol version and the speaker's feature set
                     state["version"] = d.get("version", 1)
                     state["sid"] = d.get("session_id", "unknown")
                     active_sessions[state["sid"]] = ws
                     
-                    # Отвечаем правильным handshake (дока 4.2.1)
+                    # Reply with the correct handshake (per spec 4.2.1)
                     await ws.send_json({
                         "type": "hello",
                         "transport": "websocket",
@@ -208,16 +208,16 @@ async def voice_ws(ws: WebSocket):
                     vad.reset()
                     
                 elif msg_type == "mcp":
-                    # Прозрачный проброс MCP от ESP32 в Нанобот (дока 4.1.5)
+                    # Transparently pass MCP from ESP32 to Nanobot (per spec 4.1.5)
                     logger.info(f"Received MCP from device: {d}")
-                    # В будущем Нанобот может слушать этот эндпоинт
+                    # In the future Nanobot may listen on this endpoint
                     pass
 
             elif "bytes" in m and state["listening"]:
                 payload = m["bytes"]
                 audio_frame = b""
                 
-                # ДИНАМИЧЕСКИЙ ПАРСИНГ ЗАГОЛОВКОВ (Раздел 3 в websocket.md)
+                # DYNAMIC HEADER PARSING (section 3 in websocket.md)
                 try:
                     if state["version"] == 1:
                         audio_frame = payload
@@ -243,7 +243,7 @@ async def voice_ws(ws: WebSocket):
                 if vad.is_speech(pcm): state["silence"] = 0
                 else: state["silence"] += 1
                 
-                # 25 кадров = 1.5 секунды тишины. 500 кадров = хардлимит 30 сек.
+                # 25 frames = 1.5 s of silence. 500 frames = 30 s hard limit.
                 if state["silence"] > 25 or len(state["frames"]) > 500:
                     state["listening"] = False
                     asyncio.create_task(process_voice(state["frames"], state["sid"], ws))
@@ -254,7 +254,7 @@ async def voice_ws(ws: WebSocket):
     except Exception as e:
         logger.error(f"WS error: {e}")
 
-# --- Админка (Управление устройствами) ---
+# --- Admin UI (device management) ---
 @app.get("/", response_class=HTMLResponse)
 async def admin_page(selected_mac: str = None):
     db = load_db()
@@ -280,7 +280,7 @@ if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=18792)
 EOF
 
-# 5. Сборка
+# 5. Build
 docker build -t voice_gateway .
 
 echo "-------------------------------------------------------"

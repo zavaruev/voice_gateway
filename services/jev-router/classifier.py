@@ -147,6 +147,12 @@ RE_NO_TOOL = re.compile(
 
 @dataclass
 class RouteDecision:
+    """Outcome of L1 classification: chosen route + scoring detail.
+
+    `confidence` is the calibrated [0,1] margin-derived score; `scores`
+    keeps the per-route cosine values for debugging; `reason` non-empty
+    means the utterance was escalated (see `escalated`).
+    """
     route: str
     confidence: float
     scores: dict[str, float] = field(default_factory=dict)
@@ -169,11 +175,13 @@ class Embedder:
     """Async Ollama /api/embed client with batch warm-up support."""
 
     def __init__(self, url: str = config.OLLAMA_URL, model: str = config.EMBED_MODEL):
+        """Point the client at Ollama; the HTTP session is opened lazily."""
         self.url = url
         self.model = model
         self.session: aiohttp.ClientSession | None = None
 
     async def _sess(self) -> aiohttp.ClientSession:
+        """Return a live session, opening one on first use or after a close."""
         if self.session is None or self.session.closed:
             self.session = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=30)
@@ -181,6 +189,11 @@ class Embedder:
         return self.session
 
     async def embed(self, texts: list[str]) -> np.ndarray:
+        """Embed `texts` and L2-normalise the rows (cosine = dot product).
+
+        Raises RuntimeError on a non-200 so callers can fail the warm-up
+        loudly instead of classifying against a half-built matrix.
+        """
         sess = await self._sess()
         async with sess.post(
             f"{self.url}/api/embed",
@@ -204,6 +217,12 @@ class Classifier:
     def __init__(self, embedder: Embedder | None = None,
                  conf_threshold: float = config.CONFIDENCE_THRESHOLD,
                  margin_min: float = config.MARGIN_MIN):
+        """Wire the embedder and the two escalation gates.
+
+        conf_threshold/margin_min are the calibrated floor and the
+        top1-top2 spread below which a decision is considered ambiguous
+        and gets escalated to L2 rather than guessed.
+        """
         self.embedder = embedder or Embedder()
         self.conf_threshold = conf_threshold
         self.margin_min = margin_min

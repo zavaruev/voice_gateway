@@ -76,6 +76,7 @@ class NanobotBackend(BaseLLMBackend):
     """
 
     def __init__(self, url: str, token: str, salt: str):
+        """Store the WS endpoint and credentials; `url` keeps no trailing slash."""
         self.url = url.rstrip("/")
         self.token = token
         self.salt = salt

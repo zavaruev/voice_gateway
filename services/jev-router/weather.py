@@ -219,6 +219,7 @@ async def _ha_coords() -> tuple[float, float]:
         return _coords
 
     def _load() -> tuple[float, float]:
+        """Blocking HA /api/config read (latitude/longitude) for the thread."""
         cfg = _http_json(
             f"{config.HA_URL}/api/config",
             {"Authorization": f"Bearer {config.HA_TOKEN}"},

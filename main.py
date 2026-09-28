@@ -2697,6 +2697,12 @@ async def listen_to_nanobot_task(
 
 @dataclass
 class WSContext:
+    """Bundle of per-connection objects the WS message handlers need.
+
+    Passed as one argument so handle_ws_text_message/handle_ws_audio_message
+    stay testable and the voice_ws() locals do not multiply into a 10-arg
+    signature. All fields refer to live state owned by voice_ws().
+    """
     d: dict
     state: dict
     device_ws: WebSocket
@@ -3012,6 +3018,7 @@ async def voice_ws(device_ws: WebSocket):
 # ==========================================
 @app.get("/api/devices")
 async def api_get_devices(username: str = Depends(verify_auth)):
+    """List live WS sessions: id, device MAC, status and last transcript."""
     return [
         {
             "session_id": sid,
@@ -3081,6 +3088,13 @@ async def execute_mcp(
 
 @app.post("/api/tts")
 async def api_tts(req: Request, username: str = Depends(verify_auth)):
+    """Speak `text` on a connected device (dashboard "TTS" button).
+
+    session_id="latest" targets the most recent session. Returns a dict
+    error ({"error": ...}) instead of raising for the routine cases — the
+    web UI branches on the field. Ownership check: a non-admin user may
+    only push TTS to a device whose `owner` in devices.json is them.
+    """
     data = await req.json()
     session_id = data.get("session_id", "latest")
     text = data.get("text", "").strip()
@@ -3132,6 +3146,13 @@ _firmware_meta_cache = None
 
 
 def load_firmware_meta() -> dict:
+    """Read config/firmware.json through a process-lifetime cache.
+
+    Returns {"version": "", "filename": "", "timestamp": 0} when the file
+    or the .bin it points at is missing/unreadable, so every caller can
+    treat "no update available" as a plain empty-version answer instead of
+    catching exceptions.
+    """
     global _firmware_meta_cache
     if _firmware_meta_cache is not None:
         return _firmware_meta_cache
@@ -3150,6 +3171,10 @@ def load_firmware_meta() -> dict:
 
 
 def save_firmware_meta(version: str, filename: str):
+    """Write firmware.json (with millisecond timestamp) and refresh the cache.
+
+    Returns the meta dict so the upload handler can echo it back verbatim.
+    """
     global _firmware_meta_cache
     meta = {
         "version": version,
@@ -3168,6 +3193,13 @@ async def firmware_upload(
     version: str = Form(""),
     username: str = Depends(verify_auth),
 ):
+    """Store an uploaded ESP32 firmware .bin and update firmware.json.
+
+    Guards, in order: version charset, `.bin` extension, basename-only
+    filename (no path traversal), and a MAX_FIRMWARE_SIZE cap enforced
+    while streaming in a worker thread (a too-big file is deleted, not
+    left as a truncated artifact). Raises 400/413 on violations.
+    """
     if version and not re.match(r"^[a-zA-Z0-9.\-_]+$", version):
         raise HTTPException(400, "Invalid version format")
     if not file.filename or not file.filename.endswith(".bin"):
@@ -3179,6 +3211,13 @@ async def firmware_upload(
     fpath = os.path.join(FIRMWARE_DIR, fname)
 
     def write_sync_chunked(path, file_obj, max_size):
+        """Stream `file_obj` to `path` in 64 KB chunks, aborting over max_size.
+
+        Runs via asyncio.to_thread: UploadFile.read() blocks, and doing it
+        on the event loop would stall every other WS session. Raises
+        ValueError("Firmware file too large") after unlinking the partial
+        file so no oversized image is ever served to a device.
+        """
         size = 0
         with open(path, "wb") as f:
             while True:
@@ -3210,6 +3249,12 @@ async def firmware_info(username: str = Depends(verify_auth)):
 
 @app.api_route("/ota", methods=["GET", "POST"])
 async def ota_handler(req: Request, username: str = Depends(verify_auth)):
+    """Xiaozhi OTA handshake: advertise the WS endpoint + current firmware.
+
+    GET (with mac in query/header) or POST (mac in JSON body); an unknown
+    MAC is registered on the fly as not-yet-allowed. `has_update` is true
+    whenever a versioned .bin is present — devices compare versions.
+    """
     db = load_db()
     meta = load_firmware_meta()
     has_update = bool(meta.get("version"))
@@ -3244,6 +3289,9 @@ from pydantic import BaseModel
 
 
 class DeviceCreate(BaseModel):
+    """POST /api/devices/config body. `mac` is the only required field;
+    the rest default to permissive values so the UI can send partial forms.
+    """
     mac: str
     friendly_name: str = ""
     ws_url: str = ""
@@ -3252,6 +3300,9 @@ class DeviceCreate(BaseModel):
 
 
 class DeviceUpdate(BaseModel):
+    """PUT /api/devices/config/{mac} body: every field optional, and only
+    the non-None ones are applied (partial update semantics).
+    """
     friendly_name: str | None = None
     ws_url: str | None = None
     allowed: bool | None = None
@@ -3259,10 +3310,16 @@ class DeviceUpdate(BaseModel):
 
 
 def normalize_mac(mac: str) -> str:
+    """devices.json key form: trimmed, uppercased (lookup is case-insensitive)."""
     return mac.strip().upper()
 
 
 def device_online_status(mac: str) -> str:
+    """Live status for one MAC, or "offline" when no session carries it.
+
+    Comparison is case-insensitive because devices.json stores normalised
+    (upper) MACs while the WS `device-id` header may arrive in any case.
+    """
     if not mac:
         return "offline"
     for st in session_states.values():
@@ -3272,6 +3329,12 @@ def device_online_status(mac: str) -> str:
 
 
 def device_list_with_status() -> list[dict]:
+    """Merge devices.json with live WS status for the dashboard.
+
+    Joins config entries with session_states by lowercased MAC; sorting
+    puts online devices first, then orders by MAC, so the UI list is
+    stable and useful at a glance.
+    """
     db = load_db()
     result = []
     mac_to_status = {}
@@ -3294,6 +3357,7 @@ async def api_get_device_config(username: str = Depends(verify_auth)):
 
 @app.post("/api/devices/config")
 async def api_create_device(body: DeviceCreate, username: str = Depends(verify_auth)):
+    """Create a device config (400 empty MAC, 409 duplicate). Reports offline."""
     mac = normalize_mac(body.mac)
     if not mac:
         raise HTTPException(400, "MAC address required")
@@ -3314,6 +3378,11 @@ async def api_create_device(body: DeviceCreate, username: str = Depends(verify_a
 async def api_update_device(
     mac: str, body: DeviceUpdate, username: str = Depends(verify_auth)
 ):
+    """Partial-update one device config (404 unknown MAC).
+
+    None means "leave unchanged", so the dashboard can PATCH a single
+    field without resending the whole object.
+    """
     normalized = normalize_mac(mac)
     db = load_db()
     if normalized not in db:
@@ -3333,6 +3402,7 @@ async def api_update_device(
 
 @app.delete("/api/devices/config/{mac}")
 async def api_delete_device(mac: str, username: str = Depends(verify_auth)):
+    """Remove a device config (404 unknown MAC). Live sessions are untouched."""
     normalized = normalize_mac(mac)
     db = load_db()
     if normalized not in db:
@@ -3348,6 +3418,11 @@ _camera_sessions: list[CameraSession] = []
 
 
 async def start_camera_sessions():
+    """Create + start one CameraSession per CAMERA_STREAMS entry.
+
+    A session that fails to start is logged and skipped — one dead camera
+    must not prevent the others (or the gateway itself) from running.
+    """
     global _camera_sessions
     if os.getenv("DISABLE_CAMERAS", "").lower() in ("1", "true", "yes"):
         logger.info("📷 Cameras disabled via DISABLE_CAMERAS")
@@ -3433,7 +3508,7 @@ async def start_camera_sessions():
                     onnx_gain=8.0,
                 ),
             )
-            # Выбор LLM-бэкенда
+            # Pick the LLM backend
             if LLM_BACKEND == 'hermes':
                 llm_backend = backends.HermesBackend(HERMES_API_URL, HERMES_API_KEY)
                 logger.info('Using Hermes backend at ' + HERMES_API_URL)
@@ -3453,6 +3528,11 @@ async def start_camera_sessions():
 
 @app.post("/api/camera/tts")
 async def api_camera_tts(req: Request, username: str = Depends(verify_auth)):
+    """Speak `text` on one camera (by `name`) or on all cameras (no name).
+
+    Schedules _speak() as a fire-and-forget task per session so a slow TTS
+    never blocks the HTTP response; failures are logged, not returned.
+    """
     data = await req.json()
     text = data.get("text", "").strip()
     name = data.get("name", "")
@@ -3474,6 +3554,11 @@ async def api_camera_tts(req: Request, username: str = Depends(verify_auth)):
 
 
 async def stop_camera_sessions():
+    """Gracefully stop every camera session and clear the registry.
+
+    Called from the FastAPI shutdown hook so ffmpeg/RTSP sockets are
+    closed before the process exits (avoids zombie ffmpeg on restart).
+    """
     global _camera_sessions
     for s in _camera_sessions:
         await s.stop()
@@ -3482,11 +3567,13 @@ async def stop_camera_sessions():
 
 @app.on_event("startup")
 async def on_startup():
+    """Lifespan hook: bring up the go2rtc camera sessions with the app."""
     await start_camera_sessions()
 
 
 @app.on_event("shutdown")
 async def on_shutdown():
+    """Lifespan hook: tear the camera sessions down before exit."""
     await stop_camera_sessions()
 
 

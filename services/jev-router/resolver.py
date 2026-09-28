@@ -23,6 +23,10 @@ Contracts / key behaviours
         None  = escalate; otherwise one of the kinds "datetime" / "state" /
                 "weather", which app.py answers from HA, the registry or the
                 open-meteo chain.
+  * `unresolved_hint` -> str
+        the RU "did you mean X" L2 gets when resolve_action bailed out on an
+        unknown device word (STT corruption); "" on every other failure, so
+        the hint can never nudge an unrelated escalation.
   * Areas: the dict sends the HA *registry display name* («Kitchen», not
     «кухня») — RU aliases exist only for some areas and «гостиная» used to
     fail with MatchFailedError INVALID_AREA (E2E regression, Sep 2026).
@@ -36,6 +40,7 @@ Contracts / key behaviours
 import logging
 import re
 from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 
 import config
 
@@ -422,6 +427,133 @@ def resolve_action(text: str, stream_name: str) -> ResolvedCall | None:
         speak_ok="Включила" if turn_on else "Выключила",
         area_source=area_src,
         hint=hint,
+    )
+
+
+# --- Escalation hint: near-miss device words --------------------------------
+# Field case 28.09.2026 («Выключи кашеварку»): one corrupted word made
+# resolve_action bail out, and L2 received the bare utterance — it guessed a
+# name, HA answered MatchFailedError, the honesty veto corrected the lie and
+# the turn was lost (1 of 5 turns of that dialogue). resolve_action itself
+# must stay conservative (a fuzzy match may NOT pick a device on its own), so
+# the hint below does the opposite: it TELLS L2 what the unknown word most
+# probably means and lets the model — which sees the whole utterance plus the
+# dialogue history — decide whether to use it.
+#
+# Narrow by construction, all four guards must pass:
+#   * a command verb is present (a question/state gets no nudge to act);
+#   * _DEVICE_NOUN does not match — i.e. the exact branch that made
+#     resolve_action return None ("no recognizable device noun");
+#   * no negation («не выключи кофеварку» must never be nudged toward an
+#     action the user explicitly refused);
+#   * no candidate that the dictionary already knows (then the fast path
+#     failed for a verb/slot reason, not because the device is unknown).
+_HINT_THRESHOLD = 0.70  # difflib ratio; «кашеварк» vs «кофеварк» = 0.75
+
+# Verbs, pronouns and fillers — words that can never name a device. Matched
+# against a whole token, so «выключи» is dropped while «кашеварку» survives.
+_RE_HINT_STOP = re.compile(
+    r"^(?:включ\w*|выключ\w*|зажг\w*|зажечь|погас\w*|отключ\w*|подними|поднять|"
+    r"опусти|опустить|сдела\w*|постав\w*|убери|убрать|запусти|запустить|"
+    r"пожалуйста|давай|просто|будто|может|чтоб|"
+    r"это|эта|этот|эти|её|ее|он|она|они|оно|тот|та|те|то|"
+    r"вс[её]|весь|вся|мой|моя|мо[её]|наш|наша|сам|сама|"
+    r"такой|такая|здесь|там|сейчас|пока|потом|ну|же|бы|ли|что|как)$",
+    re.IGNORECASE,
+)
+
+# Every word the hint may match against -> the name to hand to ha_action.
+# Both spellings matter: the stem («кофеварк») catches inflected forms, the
+# exact name («кофеварка») is what makes a heavily corrupted word still line
+# up («криварка» scores 0.706 against the name but only 0.667 against the
+# stem — i.e. it would lose its hint without this).
+_HINT_VOCAB: list[tuple[str, str]] = list(
+    dict.fromkeys(
+        pair
+        for stem, (_domain, name) in THING.items()
+        for pair in ((stem, name or stem), ((name or stem), name or stem))
+    )
+)
+for _extra in ("освещени", "люстр", "насос"):
+    _HINT_VOCAB.append((_extra, _extra))
+
+
+def _hint_candidates(text: str) -> list[str]:
+    """Words of the utterance that may still be a (misheard) device name.
+
+    Filters: >= 5 chars (short words match stems too easily), stop words,
+    action verbs (RE_ON/RE_OFF) and room words (RE_AREA) — all of them were
+    already understood by the fast path, so they cannot be the unknown noun.
+    """
+    out: list[str] = []
+    for w in re.findall(r"[а-яё]+", text.lower()):
+        if len(w) < 5 or _RE_HINT_STOP.match(w):
+            continue
+        if RE_ON.match(w) or RE_OFF.match(w) or RE_AREA.match(w):
+            continue
+        out.append(w)
+    return out
+
+
+def _hint_norm(word: str) -> str:
+    """Lowercase + ё→е + ONE case ending dropped («кашеварку» -> «кашеварк»).
+
+    One character only: Russian endings can be longer («-ому», «-ями»), but
+    stripping more would turn a device into a different device — and the
+    fuzzy step only needs the noun stem to line up.
+    """
+    w = word.lower().replace("ё", "е")
+    if w.endswith("ь"):
+        return w[:-1]
+    if len(w) > 4 and w[-1] in "аяыеиоуюе":
+        return w[:-1]
+    return w
+
+
+def _hint_sim(a: str, b: str) -> float:
+    """Best difflib ratio of the raw and the de-inflected spellings."""
+    best = SequenceMatcher(None, a, b).ratio()
+    na, nb = _hint_norm(a), _hint_norm(b)
+    if (na, nb) != (a, b):
+        best = max(best, SequenceMatcher(None, na, nb).ratio())
+    return best
+
+
+def unresolved_hint(text: str) -> str:
+    """RU hint for L2 when the fast path could not name the device, else "".
+
+    Returned text is a suggestion, never an instruction: it names the
+    near-miss and says what to do ONLY IF that is what the user meant, so a
+    wrong guess costs L2 one wasted call instead of a wrong side effect.
+    Pure and offline (no registry access) — see tests/test_router_resolution.
+    """
+    t = (text or "").strip()
+    if not t:
+        return ""
+    if not (RE_ON.search(t) or RE_OFF.search(t)):
+        return ""  # not an on/off command: no device is being requested
+    if _DEVICE_NOUN.search(t):
+        return ""  # the dictionary knows a device word: failed for another reason
+    if RE_NEGATION.search(t):
+        return ""  # user refused the action: never nudge toward it
+    cands = _hint_candidates(t)
+    if not cands:
+        return ""  # pronoun/room only («выключи её») — history, not a name guess
+    for c in cands:
+        if any(needle in c for needle, _name in _HINT_VOCAB):
+            return ""  # the dictionary already knows this word
+    best_cand, best_name, best_r = "", "", _HINT_THRESHOLD
+    for c in cands:
+        for needle, name in _HINT_VOCAB:
+            r = _hint_sim(c, needle)
+            if r > best_r:
+                best_cand, best_name, best_r = c, name, r
+    if not best_cand:
+        return ""
+    return (
+        f"Слово «{best_cand}» не распознано — вероятно, STT его исказил. "
+        f"Похожее устройство: «{best_name}». Если это оно, вызывай ha_action "
+        f"с точным именем «{best_name}»."
     )
 
 

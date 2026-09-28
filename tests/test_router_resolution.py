@@ -14,7 +14,7 @@ _ROUTER = os.path.abspath(
 sys.path.insert(0, _ROUTER)
 
 import classifier as clf  # noqa: E402
-from resolver import resolve_action, resolve_query  # noqa: E402
+from resolver import resolve_action, resolve_query, unresolved_hint  # noqa: E402
 from ha_client import find_entity, describe_entity  # noqa: E402
 
 
@@ -342,3 +342,49 @@ def test_fragment_without_letters_is_dropped():
     assert not chat_proxy._has_letters("168.")
     assert not chat_proxy._has_letters("### 2.")
     assert chat_proxy._has_letters("192.168.0.1 или веб-интерфейс")
+
+
+# --- escalation hint: a corrupted device word becomes a suggestion for L2 ---
+# Field case 28.09.2026: «Выключи кашеварку» escalated with NO context, L2
+# guessed a name, HA answered MatchFailedError and the turn was lost. The
+# hint is a suggestion only — resolve_action must stay conservative.
+
+
+def test_hint_names_the_stt_corrupted_device():
+    hint = unresolved_hint("Выключи кашеварку.")
+    assert "кашеварку" in hint and "кофеварка" in hint
+    # Conditional wording: a wrong guess must cost one wasted L2 call, not a
+    # wrong side effect.
+    assert "Если это оно" in hint
+
+
+def test_hint_silent_for_pronoun():
+    """«её» has no device to guess — the dialogue history resolves it."""
+    assert unresolved_hint("Выключи её.") == ""
+
+
+def test_hint_silent_for_known_device():
+    """The dictionary knows the word: the fast path failed elsewhere."""
+    assert unresolved_hint("Выключи кофеварку.") == ""
+    assert unresolved_hint("Выключи чайник.") == ""
+
+
+def test_hint_silent_for_negation():
+    """«не выключи …» must never be nudged toward the refused action."""
+    assert unresolved_hint("Не выключи кашеварку.") == ""
+
+
+def test_hint_silent_without_command_verb():
+    """A state or question gets no push to act («кашеварка горит»)."""
+    assert unresolved_hint("кашеварка горит") == ""
+
+
+def test_hint_silent_below_threshold():
+    """An unknown device with no near match -> no suggestion at all: a wrong
+    name (посудомойку ~ подсветка = 0.44) is worse than none."""
+    assert unresolved_hint("Выключи посудомойку.") == ""
+
+
+def test_hint_never_makes_the_resolver_act():
+    """The hint rides along with the escalation, it does not resolve."""
+    assert resolve_action("Выключи кашеварку.", "kitchen") is None

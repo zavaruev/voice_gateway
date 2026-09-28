@@ -12,7 +12,7 @@ _WORKER = os.path.abspath(
 )
 sys.path.insert(0, _WORKER)
 
-from honesty import vet_answer, vet_weather  # noqa: E402
+from honesty import failure_note, vet_answer, vet_weather  # noqa: E402
 
 _FAIL_NAME = [
     {"tool": "intent__HassTurnOn", "ok": False,
@@ -151,3 +151,25 @@ def test_weather_veto_skipped_when_action_attempted():
     """Whole-answer replacement must not wipe an action report."""
     out, replaced = vet_weather(_LIE, _FORECAST, action_attempted=True)
     assert replaced is False and out == _LIE
+
+
+# --- failure_note: what the bounded retry after a veto is told --------------
+# Field case 28.09.2026: two of five turns died on a veto with no second
+# attempt — the model believed it acted, only the tool disagreed.
+
+
+def test_failure_note_carries_the_raw_error():
+    note = failure_note(_FAIL_NAME)
+    assert "MatchFailedReason.NAME" in note and "кафеварка" in note
+    # Guard rails: correct the target, do not blind-repeat, do not promise.
+    assert "иначе" in note and "не повторяй" in note and "не заявляй" in note
+
+
+def test_failure_note_is_raw_not_speakable():
+    """_truth() would hand the model a polished refusal to repeat."""
+    assert failure_note(_FAIL_NAME) != vet_answer("Кафеварка включена!", _FAIL_NAME)[0]
+
+
+def test_failure_note_empty_when_nothing_failed():
+    assert failure_note([]) == ""
+    assert failure_note(_OK) == ""

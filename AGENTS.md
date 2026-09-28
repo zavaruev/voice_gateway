@@ -12,7 +12,7 @@ WebSocket gateway connecting ESP32 smart speakers **and OpenIPC IP cameras** (co
 - `camera_client.py` (~2,800 lines) — per-camera session: RTSP audio feed, VAD, wake-word gate cascade, cross-camera arbiter, go2rtc self-healer, TTS playback pipeline
 - `engine.py` — Silero VAD wrapper + openWakeWord scoring (`check_wakeword()` stores the raw score in `.last_score`)
 - `backends.py` — `BaseLLMBackend` implementations: `NanobotBackend` (WS), `HermesBackend` (OpenAI SSE), `CascadeBackend` (jev-router SSE)
-- `tests/` — pytest suite (`pytest tests/`), 11 files / 2,308 lines / 159 tests: engine scoring, camera arbitration, wake-gate STT-confirm bands, cascade backend, honesty vetoes, router resolution, weather, TTS gate, OTA auth, RMS utils. No lint/CI.
+- `tests/` — pytest suite (`pytest tests/`), 12 files / 2,458 lines / 177 tests: engine scoring, camera arbitration, wake-gate STT-confirm bands, cascade backend, honesty vetoes + retry note, router resolution + escalation hint, short-term dialogue ring, weather, TTS gate, OTA auth, RMS utils. No lint/CI.
 
 ## External services (all env-overridable)
 
@@ -46,6 +46,7 @@ docker run -p 18792:18792 \
 - **Dialogue mode**: if the reply ends with `?` (ASCII/fullwidth), contains the «повторите пожалуйста» apology, or matches a Russian interrogative/imperative (`HAS_QUESTION_WORDS_RE`, anywhere in the text) → follow-up window opens when playback drains; otherwise returns to standby
 - **Watchdog**: `WATCHDOG_TIMEOUT` (default 90 s) → fallback TTS "Простите, я задумалась. Повторите пожалуйста." — never outlive it (the L2 `EXPERT_TIMEOUT` is 25 s for exactly this reason)
 - **Emotions**: extracted from Nanobot text via `[emotion_name]` regex
+- **Cascade L2 context** (jev-router → smolagents-worker): an escalation carries two extras — `resolver.unresolved_hint()` (difflib over the THING stems/names, threshold 0.70, guarded to fire only on a command verb whose exact word made the resolver bail) and the last 4 finished turns of that satellite from `history.py` (TTL 10 min, read before the turn is pushed). A fired honesty veto triggers exactly one retry fed with `honesty.failure_note()` (raw tool errors) plus the same history; a second veto speaks the truth instead of looping.
 
 ## REST API
 

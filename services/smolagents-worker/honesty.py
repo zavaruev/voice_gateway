@@ -40,6 +40,9 @@ CONTRACT
                          and `{"tool", "detail"}` per weather_forecast).
     Output : `(answer, replaced)` — the string to actually speak plus a
              flag for logging; `replaced=True` means the veto fired.
+             `failure_note(events)` is the sibling helper: the RAW recorded
+             errors for app._run_agent's one bounded retry after a veto (the
+             speakable `_truth()` above would teach the model nothing).
     Callers : app.py `_run_agent()` runs vet_answer() first, then
              vet_weather(); nothing else in the pipeline re-checks the text.
     Fail-open : no events / at least one confirmed success / an honest
@@ -136,6 +139,31 @@ def vet_answer(answer: str, events: list[dict]) -> tuple[str, bool]:
     if _RE_FAIL.search(answer):
         return answer, False  # already honest about the failure
     return _truth(events), True
+
+
+def failure_note(events: list[dict]) -> str:
+    """-> RU context block for the bounded retry after a veto, or "".
+
+    vet_answer swaps the claim for the user-facing `_truth()` sentence; the
+    retry needs the RAW recorded errors instead, because the model has to
+    correct its target (device name / room), not just phrase a refusal
+    better. Capped at 400 chars: a free model loses the thread in walls of
+    MCP JSON, and one failed call is all the signal there is.
+
+    Returns "" when nothing failed — then there is nothing to retry from and
+    the caller must not spend a second run (a blind repeat would only add
+    latency and another chance to act on a wrong target).
+    """
+    fails = [str(e.get("detail", "")) for e in events if not e.get("ok")]
+    if not fails:
+        return ""
+    return (
+        "Предыдущая попытка этого же запроса провалилась: "
+        + "; ".join(fails)[:400]
+        + ". Попробуй иначе — другое имя устройства или комнаты — либо прямо "
+        "скажи, что не вышло; не повторяй отклонённый вызов один в один и "
+        "не заявляй успех без подтверждённого результата тула."
+    )
 
 
 # --- Weather veto -----------------------------------------------------------

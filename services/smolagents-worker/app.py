@@ -22,11 +22,12 @@ ROLE IN THE CASCADE (three-level voice control of the smart home)
   -> jev-router (L1, :8091) -> THIS SERVICE (L2, :8092, FastAPI)
   -> Hermes (L3 expert) -> Home Assistant via MCP tools.
   L1 escalates here for complex_logic/expert routes; the `context` field of
-  the request explains which HA call failed and why.
+  the request explains which HA call failed and why, and `history` holds the
+  last finished turns of the same satellite (anaphora like «выключи её»).
 
 CONTRACT
   POST /invoke  {"text": RU utterance, "session_id", "stream_name",
-                 "context": escalation reason}
+                 "context": escalation reason, "history": recent turns}
              -> text/event-stream: one JSON object per data line, events
                 listed above, UTF-8, blank-line terminated.
   GET  /health  -> config snapshot + tool names, for compose/monitoring.
@@ -60,7 +61,7 @@ from pydantic import BaseModel
 from smolagents import CodeAgent, OpenAIModel
 
 import config
-from honesty import vet_answer, vet_weather
+from honesty import failure_note, vet_answer, vet_weather
 from tools import TOOLS, get_action_events, get_weather_events, reset_action_events
 
 logging.basicConfig(
@@ -147,12 +148,18 @@ class InvokeRequest(BaseModel):
     """POST /invoke body. `text` is the transcribed user utterance (RU);
     `session_id`/`stream_name` are passed through for logging parity with
     L1; `context` is why L1 escalated (failed HA call args + error) and is
-    injected into the task as the «Контекст эскалации» block."""
+    injected into the task as the «Контекст эскалации» block; `history` is
+    the router's ring of the last finished turns («Предыдущие реплики»).
+
+    Both context fields default to "" so an older L1 can still call this
+    service: unknown/absent fields simply stay empty.
+    """
 
     text: str
     session_id: str = ""
     stream_name: str = ""
     context: str = ""  # why L1 escalated (failed HA call args + error)
+    history: str = ""  # recent turns, one `- пользователь: … — ответ: …` line each
 
 
 def _sse(obj: dict) -> str:
@@ -248,11 +255,17 @@ def _build_model(primary: bool) -> OpenAIModel:
     )
 
 
-def _run_agent(text: str, context: str = "") -> str:
+def _run_agent(
+    text: str, context: str = "", hist: str = "", retry: bool = False
+) -> str:
     """Sync agent run (executed in a thread). OmniRoute combo -> Hermes failover.
 
     Params: `text` = transcribed utterance; `context` = why L1 escalated
-    (appended as the «Контекст эскалации» block, empty for direct calls).
+    (the «Контекст эскалации» block, empty for direct calls); `hist` =
+    router-side ring of the last finished turns (the «Предыдущие реплики»
+    block — without it an anaphora like «выключи её» has nothing to resolve
+    against and the model picks a device at random); `retry` = set by the
+    bounded self-healing pass below.
     Returns the final answer AFTER the honesty vetoes. Failure: raises the
     second attempt's exception if both models fail (surfaced as SSE error).
 
@@ -260,8 +273,24 @@ def _run_agent(text: str, context: str = "") -> str:
     (each attempt starts clean, so a failed first attempt cannot make the
     veto trust stale successes), and the vetoes run on every attempt —
     the failover model is free too and gets the same treatment.
+
+    BOUNDED RETRY: veto fired == the model believed it acted on a target and
+    only the tool disagreed, so ONE more pass is given, with the recorded
+    error text as context (it can fix the name/room instead of ending the
+    turn in a bare refusal). `retry=True` makes a second veto speak the
+    recorded truth rather than loop — this is a fix, not a search: field
+    case 28.09.2026 lost 2 of 5 turns exactly here, but an unbounded agent
+    that keeps trying would eventually act on a wrong target.
     """
-    ctx = f"\nКонтекст эскалации: {context}" if context else ""
+    blocks = []
+    if context:
+        blocks.append(f"Контекст эскалации: {context}")
+    if hist:
+        blocks.append(
+            "Предыдущие реплики этого же разговора (нужны, чтобы понимать "
+            f"местоимения вроде «её», «он», «то»):\n{hist}"
+        )
+    ctx = ("\n" + "\n".join(blocks)) if blocks else ""
     task = TASK_TEMPLATE.format(text=text, context=ctx)
     last_err: Exception | None = None
     for attempt, primary in enumerate((True, False), start=1):
@@ -295,6 +324,15 @@ def _run_agent(text: str, context: str = "") -> str:
                 "agent run done in %.1fs (attempt %d)",
                 time.monotonic() - t0, attempt,
             )
+            note = failure_note(events) if replaced else ""
+            if note and not retry:
+                logger.warning("honesty veto -> bounded retry with the recorded errors")
+                return _run_agent(
+                    text,
+                    " ".join(p for p in (context, note) if p),
+                    hist,
+                    retry=True,
+                )
             return answer
         except Exception as e:
             last_err = e
@@ -327,7 +365,7 @@ async def _handle(req: InvokeRequest):
         # Everything, vetoes included, must land in `box`: an unhandled
         # exception here would otherwise hang the poll loop until timeout.
         try:
-            box["answer"] = _run_agent(req.text, req.context)
+            box["answer"] = _run_agent(req.text, req.context, req.history)
         except Exception as e:  # noqa: BLE001 — must surface as SSE error
             box["error"] = str(e)[:300]
 

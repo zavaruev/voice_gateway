@@ -54,6 +54,7 @@ from pydantic import BaseModel
 
 import chat_proxy
 import config
+import history
 import memory
 import weather
 from classifier import Classifier
@@ -65,7 +66,7 @@ from ha_client import (
     find_action_targets,
     find_entity,
 )
-from resolver import resolve_action, resolve_query
+from resolver import resolve_action, resolve_query, unresolved_hint
 
 # stdout logging: uvicorn does not configure root logging by default, and the
 # route decisions logged here are the main debugging surface in `docker logs`.
@@ -309,13 +310,23 @@ async def _execute_action(call) -> tuple[str | None, dict | None]:
     return None, res
 
 
-async def _run_worker(text: str, session_id: str, stream_name: str, context: str = ""):
+async def _run_worker(
+    text: str,
+    session_id: str,
+    stream_name: str,
+    context: str = "",
+    hist: str = "",
+):
     """Forward smolagents-worker (L2) SSE events; yields router-level dicts.
 
     The worker speaks the same event schema, so its `sentence`/`progress`
     objects are re-emitted verbatim to the client. `context` is the decoded
-    failure reason from a fast-path attempt — that is what makes the L2 retry
-    self-healing instead of a blind repeat of the rejected call.
+    failure reason from a fast-path attempt (or the near-miss device hint)
+    — that is what makes the L2 retry self-healing instead of a blind
+    repeat of the rejected call; `hist` is the formatted ring of the last
+    finished turns of this satellite (history.block), which is what lets
+    the model resolve «выключи её» without inventing a device. The payload
+    field is named `history` — the request schema of the worker.
 
     Raises RuntimeError on a non-200 response (surfaced as an SSE `error`
     event by _handle); non-JSON `data:` lines are skipped, and `[DONE]`
@@ -328,7 +339,8 @@ async def _run_worker(text: str, session_id: str, stream_name: str, context: str
         async with sess.post(
             f"{config.WORKER_URL}/invoke",
             json={"text": text, "session_id": session_id,
-                  "stream_name": stream_name, "context": context},
+                  "stream_name": stream_name, "context": context,
+                  "history": hist},
             headers={"Accept": "text/event-stream"},
         ) as resp:
             if resp.status != 200:
@@ -383,11 +395,18 @@ async def _handle(req: RouteRequest):
     # The resolvers are pure and cheap (regex only), so they run HERE as a
     # pre-flight: a downgrade is visible in the very first route event and
     # the caller never sees an easy_* verdict it would have to roll back.
+    # `ctx` explains to L2 WHY L1 could not answer itself and `hist` holds the
+    # last finished turns of this satellite; every worker call below passes
+    # both, because a bare utterance made the model guess a device name and a
+    # pronoun a whole room (field case 28.09.2026).
+    ctx = ""
+    hist = history.block(req.stream_name or req.session_id)
     if route == "easy_action":
         call = resolve_action(text, req.stream_name)
         if call is None:
             logger.info("resolver ambiguous -> complex_logic: %r", text[:80])
             route, reason = "complex_logic", "resolver_ambiguous"
+            ctx = unresolved_hint(text)  # «кашеварку» -> «кофеварка», or ""
     elif route == "easy_query":
         q = resolve_query(text, req.stream_name)
         if q is None:
@@ -450,7 +469,7 @@ async def _handle(req: RouteRequest):
                     "попробуй иначе, либо прямо сообщи, что не получилось."
                 )
                 async for chunk in _run_worker(
-                    text, req.session_id, req.stream_name, context=ctx
+                    text, req.session_id, req.stream_name, context=ctx, hist=hist
                 ):
                     if chunk.get("type") == "sentence" and chunk.get("text"):
                         reply_parts.append(chunk["text"])
@@ -520,7 +539,7 @@ async def _handle(req: RouteRequest):
                             "reason": "query_unresolved"})
                 route = "complex_logic"
                 async for chunk in _run_worker(
-                    text, req.session_id, req.stream_name
+                    text, req.session_id, req.stream_name, context=ctx, hist=hist
                 ):
                     if chunk.get("type") == "sentence" and chunk.get("text"):
                         reply_parts.append(chunk["text"])
@@ -536,7 +555,9 @@ async def _handle(req: RouteRequest):
 
         # --- complex_logic: L2 CodeAgent ----------------------------------
         else:
-            async for chunk in _run_worker(text, req.session_id, req.stream_name):
+            async for chunk in _run_worker(
+                text, req.session_id, req.stream_name, context=ctx, hist=hist
+            ):
                 # Heartbeats are forwarded for UX but only sentences are
                 # remembered (memory stores what the user actually heard).
                 if chunk.get("type") == "sentence" and chunk.get("text"):
@@ -553,6 +574,9 @@ async def _handle(req: RouteRequest):
     # client disconnect at `done` cannot skip it) --------------------------
     reply = " ".join(reply_parts)
     if reply:
+        # Short-term ring FIRST (sync, in-process): the next turn of this
+        # satellite must see this one even if the Qdrant write below fails.
+        history.push(req.stream_name or req.session_id, text, reply)
         asyncio.create_task(
             memory.save_turn(
                 text, reply, route, confidence, req.session_id, req.stream_name

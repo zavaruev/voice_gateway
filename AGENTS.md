@@ -8,10 +8,11 @@ WebSocket gateway connecting ESP32 smart speakers **and OpenIPC IP cameras** (co
 
 ## Core modules
 
-- `main.py` (~2,200 lines) — FastAPI app, ESP32 WebSocket protocol, REST API, OTA
-- `camera_client.py` (~2,260 lines) — per-camera session: RTSP audio feed, VAD, wake-word gate cascade, cross-camera arbiter, TTS playback pipeline
+- `main.py` (~3,590 lines) — FastAPI app, ESP32 WebSocket protocol, REST API, OTA, firmware upload
+- `camera_client.py` (~2,800 lines) — per-camera session: RTSP audio feed, VAD, wake-word gate cascade, cross-camera arbiter, go2rtc self-healer, TTS playback pipeline
 - `engine.py` — Silero VAD wrapper + openWakeWord scoring (`check_wakeword()` stores the raw score in `.last_score`)
-- `tests/` — pytest suite (`pytest tests/`), ~1,160 lines: engine scoring, camera arbitration, OTA auth, RMS utils. No lint/CI.
+- `backends.py` — `BaseLLMBackend` implementations: `NanobotBackend` (WS), `HermesBackend` (OpenAI SSE), `CascadeBackend` (jev-router SSE)
+- `tests/` — pytest suite (`pytest tests/`), 10 files / 2,087 lines / 149 tests: engine scoring, camera arbitration, cascade backend, honesty vetoes, router resolution, weather, TTS gate, OTA auth, RMS utils. No lint/CI.
 
 ## External services (all env-overridable)
 
@@ -35,15 +36,15 @@ docker run -p 18792:18792 \
 
 - **ESP32 STT pipeline**: Opus frames → `pack_ogg()` → parallel POST to Whisper + Speaker ID → text sent to Nanobot via WS
 - **Camera audio**: go2rtc RTSP backchannel (raw L16 16 kHz via ffmpeg) → echo guards → Silero VAD → SpeexDSP NS rescue → adaptive normalisation → Whisper **only inside an active wake window** (ambient utterances never reach STT)
-- **Wake word**: openwakeword custom model `config/computer.onnx` (v1: trained on TTS «компьютер», end-aligned). Raw int16 required — never feed normalized floats. Per-room base thresholds: kitchen 0.47, others 0.52. Sliding-window debounce: 2 qualifying chunks out of the last 3 (~80 ms chunks); single chunk ≥0.68 fires immediately. Bidirectional AGC normalises every chunk to a per-room target peak (kitchen 6500, others 4000) before scoring.
-- **Wake gate cascade** (in order): own-playback guard → appliance hold (60 s bg median >800 ⇒ need ≥0.92) → quiet-source hold (own level <3000 ⇒ need ≥0.72) → distant-source veto (level <1600 while another room hears ≥1.4× louder ⇒ stand down) → clipping-bang gate (peak >24k & score <0.85) → crest-factor gate (dense impact: rms·2 > peak) → debounce → arbiter.
+- **Wake word**: openWakeWord. Default model is the library head `config/computer_20260706_130638.onnx` (Creator #7074 "Classic V3"; recall 55.6 %, measured positives 0.64 / clean negatives 0.001–0.05) for every room except kitchen, which keeps the custom `config/computer.onnx` (the library head scores clipped kitchen audio 0.001). Override per room with `WAKE_WORD_MODEL_<NAME>`. Raw int16 required — never feed normalized floats. Per-room base thresholds: kitchen 0.40, others 0.30 (they self-clamp back to base after a command). Sliding-window debounce: 2 qualifying chunks out of the last 3 (~80 ms chunks); single chunk ≥0.68 fires immediately. Bidirectional AGC normalises every chunk to a per-room target peak before scoring: kitchen 6500, corridor 9000, others 4000.
+- **Wake gate cascade** (in order): own-playback guard → appliance hold (60 s bg median >800 ⇒ top score must be ≥0.60) → quiet-source hold (own level <3000 ⇒ ≥0.58 below level 2000, ≥0.55 above) → distant-source veto (level <3000 while another room hears ≥1.4× louder ⇒ stand down 5 s) → clipping-bang gate (peak >24k & score <0.85) → crest-factor gate (dense impact: rms·2 > peak) → ambiguous-zone STT confirm (top <0.55 or a recent unanswered auto-greet, level <3000 ⇒ no pip, route to Whisper) → debounce → arbiter.
 - **Cross-camera arbiter** (`_arbiter_*` in camera_client.py): first detector becomes interaction owner; others stand down. Proximity steal: a room with ≥5× the owner's loudness level takes over a not-yet-dispatched wake. `_ARB_STATE["cmd_sent"]` blocks steal once the owner dispatched to Nanobot.
 - **TTS pipeline**: Nanobot text → sentence splitter → prefetch player (sentence N+1 synthesises while N plays; `_tts_fetch` + `_speak_pcm`) → pydub decode + resample → Opus to ESP32 / PCM queued to camera WebRTC track. Every played clip is registered in the echo-reference ring; confirmed mic echoes extend `_wake_suppress_until`.
 - **VAD**: Silero ONNX server-side (`silero_vad.onnx`), 10 silence frames triggers processing, 7 s max-duration cap; VAD state is reset at wake fire so the post-wake command starts clean.
 - **Binary frame versions**: v1 = raw Opus, v2 = 16-byte header, v3 = 4-byte header
 - **MCP**: Gateway requests tool list (`tools/list` id=999) on connect; forwards to Nanobot as `tools_update`
-- **Dialogue mode**: If AI response ends with `?`, follow-up window opens when playback drains; otherwise returns to standby
-- **Watchdog**: 30s timeout → fallback TTS "Простите, я задумалась. Повторите пожалуйста."
+- **Dialogue mode**: if the reply ends with `?` (ASCII/fullwidth), contains the «повторите пожалуйста» apology, or matches a Russian interrogative/imperative (`HAS_QUESTION_WORDS_RE`, anywhere in the text) → follow-up window opens when playback drains; otherwise returns to standby
+- **Watchdog**: `WATCHDOG_TIMEOUT` (default 90 s) → fallback TTS "Простите, я задумалась. Повторите пожалуйста." — never outlive it (the L2 `EXPERT_TIMEOUT` is 25 s for exactly this reason)
 - **Emotions**: extracted from Nanobot text via `[emotion_name]` regex
 
 ## REST API
@@ -55,8 +56,12 @@ docker run -p 18792:18792 \
 | `/api/devices/config` | GET/POST | Device DB from `devices.json` |
 | `/api/devices/config/{mac}` | PUT/DELETE | Update / remove device |
 | `/mcp/{session_id}` | POST | Send MCP command to device (`"latest"` for most recent session) |
+| `/api/tts` | POST | Speak `text` on a connected device (`session_id: "latest"` = most recent; ownership-checked) |
 | `/api/camera/tts` | POST | Speak a phrase on a camera session |
+| `/api/firmware/upload` | POST | Upload an ESP32 `.bin` (multipart, size-capped by `MAX_FIRMWARE_SIZE`) + update `firmware.json` |
+| `/api/firmware` | GET | Current firmware metadata |
 | `/ota` | GET/POST | ESP32 OTA handshake; returns WS URL + firmware info |
+| `/health` | GET | Liveness probe, no auth |
 
 ## Config
 
@@ -70,8 +75,11 @@ docker run -p 18792:18792 \
 | `CAMERA_STREAMS` | `""` | Comma-separated go2rtc stream names |
 | `GO2RTC_HOST` / `GO2RTC_PORT` | `192.168.22.102` / `1984` | go2rtc control API |
 | `VAD_SILENCE_FRAMES` | `8` | ESP32 path only; camera path hardcodes 10 |
-| `WATCHDOG_TIMEOUT` | `30` | Seconds before fallback TTS |
+| `WATCHDOG_TIMEOUT` | `90` | Seconds before fallback TTS |
+| `LLM_BACKEND` | `nanobot` | `nanobot` \| `hermes` \| `cascade` |
 | `TTS_VOICE` | `ru-RU-SvetlanaNeural` | |
+| `TTS_MODEL` | `tts-1` | Model field posted to the TTS endpoint |
+| `WAKE_WORD` | `компьютер` | Spoken phrase used by the command stripper |
 
 ## Gotchas
 
@@ -81,7 +89,8 @@ docker run -p 18792:18792 \
 - Confirmed mic echoes extend `_wake_suppress_until` by +20 s each; the RTSP backchannel returns played audio 3–40 s late
 - Whisper form must include `model` field (`koekaverna/faster-whisper-podlodka-turbo`)
 - Corridor mic clips at close range (peak 32k) — clipped speech mangles oww scores; bang gate ignores peak >24k unless score ≥0.85
-- Robot vacuum / hood noise keeps bg median high → appliance hold requires score ≥0.92 in that room
+- Robot vacuum / hood noise keeps bg median high → appliance hold suppresses wakes below score 0.60 in that room (and the log line still prints the old "needs >=0.95" wording)
+- Two of the three `_open_stt_confirm()` call sites in the gate cascade are currently unreachable: the appliance guard requires `max < 0.60` but its inner branch tests `top >= 0.85`, and the quiet-source guard requires `max < 0.55/0.58` but its inner branch tests `>= 0.60` after `_ww_recent.clear()`. Only the ambiguous-zone path (top < 0.55) actually opens a confirm window.
 - go2rtc 1.9.2 leaks zombie RTSP sessions under slow links; cameras run `/etc/watchdog_majestic.sh` via crond (restart majestic when :554 dead or send-queues pile up)
 - Wake-word retrain attempts v2–v4 all degraded discrimination — keep `model_stream.npz` and `export_onnx.py`; v1 backups: `computer.onnx.bak_v1` (current), `.bak_v4` (failed)
 - Dockerfile exposes 8080 but nothing listens on it

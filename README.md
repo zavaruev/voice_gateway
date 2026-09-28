@@ -1,6 +1,6 @@
 # Voice Gateway
 
-> **Version 2.31** — Dialogue continuity fixes + expert timeout: the cascade now ends every turn in the follow-up window (a question stays answerable), one `tts stop` per turn so the satellite re-arms the mic after long replies, `EXPERT_TIMEOUT` 90→25 s (never outlive the watchdog), and a full English-comment audit across the codebase. See Changelog below.
+> **Version 2.32** — Documentation audit: README and AGENTS.md re-synced against the actual code — correct wake thresholds (kitchen 0.40 / others 0.30), wake models (library `computer_20260706` head, kitchen keeps `computer.onnx`), AGC targets (kitchen 6500 / corridor 9000 / others 4000), recalibrated gate cascade (0.60 / 0.58 / 0.55 / <3000), `WATCHDOG_TIMEOUT` 90 s, activity-monitor timings, the 15 s wake window, end-anchored `?` detection and the camera-only Whisper retry. Added the three missing REST endpoints, six missing env vars and five undocumented features (go2rtc self-healer, STT-confirm window, auto-greeting «Да?», cross-device speaker lock, firmware upload). See Changelog below.
 
 WebSocket gateway bridging [Xiaozhi ESP32](https://github.com/78/xiaozhi-esp32) smart speakers **and WebRTC/IP cameras** to an AI backend (**Cascade** 3-level router, **[Nanobot](https://github.com/HKUDS/nanobot)** or **Hermes**) with real-time speech processing.
 
@@ -21,8 +21,8 @@ Camera (RTSP/L16) ─┘          │                        │
 
 1. **ESP32** sends Opus audio frames over WebSocket; **cameras** stream raw L16 PCM over RTSP (via go2rtc)
 2. **Silero VAD** detects speech, energy gates reject noise/artifacts
-3. **openWakeWord** listens for the wake word «компьютер» (custom-trained model) on camera streams
-4. **Whisper STT** transcribes audio to text (Russian, retries at temperature 0.0/0.5)
+3. **openWakeWord** listens for the wake word «компьютер» on camera streams (library head `computer_20260706_130638.onnx`, custom `computer.onnx` in the kitchen)
+4. **Whisper STT** transcribes audio to text (Russian; the camera path retries at temperature 0.0 → 0.5, the ESP32 path sends a single 0.0 attempt)
 5. **Speaker ID** identifies the speaker (parallel with STT)
 6. **LLM backend** (Cascade *or* Nanobot *or* Hermes) processes text, returns response with optional emotions `[emotion_name]`
 7. **Edge TTS** synthesizes speech; Opus streamed to ESP32, PCM queued to camera speakers
@@ -30,19 +30,23 @@ Camera (RTSP/L16) ─┘          │                        │
 ## Features
 
 - **ESP32 + camera support** — both device classes in one gateway; cameras use WebRTC (go2rtc) with the mic feed taken from the RTSP audio backchannel (`ffmpeg`, raw L16, no μ-law quantisation)
-- **Wake word «компьютер»** — custom-trained openWakeWord model (`config/computer.onnx` + `config/embedding_model.onnx` backbone), detected on the live 16 kHz camera feed with per-room thresholds (kitchen 0.47, other rooms 0.52), sliding-window debounce (2 qualifying chunks out of the last 3), single-chunk bypass at score ≥0.68, attention beep
-- **Bidirectional AGC** — every oww chunk is normalised to a per-room target peak (kitchen 6500, others 4000) in *both* directions; quiet far-room copies are boosted while loud close-range speech is scaled down, so all rooms feed the model equally loud audio
+- **go2rtc self-healer** — after a camera reboot go2rtc can serve video-only SDP and ffmpeg stalls; 3 consecutive stalls (`GO2RTC_HEAL_STALLS`) trigger a stream re-register using `GO2RTC_SOURCE_URL[_<NAME>]`, rate-limited to once per minute
+- **Wake word «компьютер»** — openWakeWord on the live 16 kHz camera feed: library head `config/computer_20260706_130638.onnx` (Creator #7074, Classic V3) everywhere except the kitchen, which keeps the custom `config/computer.onnx` (the library head scores its clipped audio at 0.001); per-room base thresholds **kitchen 0.40, others 0.30**, sliding-window debounce (2 qualifying chunks out of the last 3), single-chunk bypass at score ≥0.68, attention pip
+- **Bidirectional AGC** — every oww chunk is normalised to a per-room target peak (**kitchen 6500, corridor 9000, others 4000**) in *both* directions; quiet far-room copies are boosted while loud close-range speech is scaled down, so all rooms feed the model equally loud audio
 - **Wake arbitration** — strict first-detector ownership across rooms; a loud room can steal a not-yet-dispatched wake from a far room (proximity steal); muffled through-wall copies are vetoed when another room hears the same sound ≥1.4× louder
-- **Noise-rejection gates** — quiet-source hold (faint audio needs a confident score), appliance hold (continuous background like a robot vacuum requires an overwhelming score), crest-factor gate (dense impacts), clipping-bang gate, own-TTS playback guard
-- **Whisper on demand only** — STT runs solely inside an active wake window; ambient utterances never reach Whisper
+- **Noise-rejection gates** — quiet-source hold (faint audio needs a confident score), appliance hold (continuous background like a robot vacuum requires a top score ≥0.60), crest-factor gate (dense impacts), clipping-bang gate, own-TTS playback guard, ambiguous-zone STT confirm
+- **STT confirm window** — when a gate holds a plausible score instead of a pip, the next VAD utterance inside the 10 s window goes to Whisper; «компьютер» in the transcript fires the real wake, garbage expires silently
+- **Auto-greeting** — a bare wake with no command within 5 s (11.5 s from an STT-confirm window) speaks a local «Да?» instead of polling the LLM; a repeat inside 60 s with no transcript is forced through STT confirmation
+- **Whisper on demand only** — STT runs solely inside an active wake window or an opened STT-confirm window; ambient utterances never reach Whisper
 - **Server-side VAD** — Silero ONNX + energy fallback; adaptive background floor
 - **Distant-speech tuned** — corridor/lobby coverage: lowered RMS gates, SpeexDSP noise suppression with "NS rescue" (utterance salvaged from the noise floor), adaptive peak normalisation (up to 20x)
 - **Echo guards** — global `GLOBAL_TTS_UNTIL` gate (no STT while any TTS plays — kills ESP32↔camera echo cascade) + duration-proportional mic hold (0.3 s beep → ~0.6 s hold, 20 s TTS → capped 15 s)
-- **Dialogue mode** — mic stays open after questions (`?` anywhere in the reply, question words, imperative verbs); returns to standby after statements
+- **Dialogue mode** — mic stays open when the reply *ends* with `?` (ASCII or fullwidth), contains the «повторите пожалуйста» apology, or matches a Russian interrogative/imperative anywhere in the text; returns to standby after plain statements
 - **MCP hardware control** — ESP32/camera tools (screen, volume, LEDs) are requested via `tools/list`; in Nanobot mode device events are forwarded to Nanobot, in Hermes/Cascade mode the tool list is kept for future use (neither Hermes nor the router sends a `tools` payload)
-- **Watchdog** — 30 s timeout → fallback TTS «Простите, я задумалась. Повторите пожалуйста.»
-- **Activity monitor** — dims screen to 25% after 30 s idle, closes abandoned sessions after 45 s in LISTENING
-- **OTA** — ESP32 firmware handshake returning WS URL + `access_token` + firmware info
+- **Cross-device speaker lock** — two satellites hearing the same person at once: a 30 s per-`uid` lock lets one session run the pipeline, the duplicate is dropped (no double LLM answer)
+- **Watchdog** — `WATCHDOG_TIMEOUT`, default **90 s** → fallback TTS «Простите, я задумалась. Повторите пожалуйста.»
+- **Activity monitor** — dims screen to 25 % after **10 s** idle (any active status re-arms `dim_sent`); **never closes the connection** — MCP tools keep working while the ESP32 is on. Adaptive standby opens separately: `STANDBY_TIMEOUT_QUESTION` 30 s after a question, `STANDBY_TIMEOUT_STATEMENT` 10 s after a statement
+- **OTA** — ESP32 firmware handshake returning WS URL + `access_token` + firmware info; `POST /api/firmware/upload` stores a `.bin` (capped by `MAX_FIRMWARE_SIZE`, default 10 MB, path-traversal-safe) and refreshes `firmware.json`, `GET /api/firmware` reads it back
 - **Emotions** — extracted from LLM text via `[emotion_name]` regex (Nanobot/Hermes strip them before TTS; router output in cascade mode carries none)
 - **Pluggable LLM backend** — switch the AI brain between **Nanobot** (`nanobot`, WebSocket, streaming), **Hermes** (`hermes`, OpenAI-compatible `/v1/chat/completions`) and **Cascade** (`cascade`, 3-level router) with a single env var. All paths feed the same VAD → STT → TTS pipeline; replies are sentence-split and streamed through the prefetch TTS player exactly like Nanobot delta text.
 - **Cascade AI (3 levels)** — `LLM_BACKEND=cascade` routes every utterance through **jev-router** (semantic classifier on local Ollama embeddings, 5 routes: `easy_action`/`easy_query`/`general_qa`/`expert`/`complex_logic`). Easy routes resolve slots offline and call Home Assistant MCP directly; general chat streams from the OmniRoute combo; expert goes to Hermes; complex logic escalates to the **smolagents-worker** (CodeAgent with HA/memory/expert tools, 120 s cap + progress heartbeats). Every failure or ambiguity escalates to L2 — never a wrong side-effect. Qdrant `voice_turns`/`voice_facts` store dialogue memory (written by the router, read by the L2 tool).
@@ -111,7 +115,8 @@ Do **not** start the container manually with `docker run` on the default bridge 
 | Variable | Default | Description |
 |---|---|---|
 | `NANOBOT_WS_URL` | `ws://nanobot:8765/` | Nanobot AI agent WebSocket URL |
-| `NANOBOT_TOKEN` | `token` | Token appended to Nanobot WS URL |
+| `NANOBOT_TOKEN` | `""` | WS auth token; appended as `?token=`. **Must be non-empty or every socket is rejected** (deployments set it to `token`) |
+| `NANOBOT_SESSION_SALT` | `""` | Salt mixed into the deterministic per-MAC `chat_id` so session ids can't be guessed from a MAC |
 | `LLM_BACKEND` | `nanobot` | AI brain: `nanobot` (default), `hermes` or `cascade` |
 | `HERMES_API_URL` | `http://192.168.22.102:8000` | Hermes OpenAI-compatible base URL (used when `LLM_BACKEND=hermes`) |
 | `HERMES_API_KEY` | `""` | Bearer token sent to Hermes if set |
@@ -120,21 +125,27 @@ Do **not** start the container manually with `docker run` on the default bridge 
 | `WHISPER_URL` | `http://192.168.22.111:8000/v1/audio/transcriptions` | OpenAI-compatible STT endpoint |
 | `TTS_URL` | `http://edge_tts:5050/v1/audio/speech` | OpenAI-compatible TTS endpoint |
 | `TTS_VOICE` | `ru-RU-SvetlanaNeural` | TTS voice identifier |
+| `TTS_MODEL` | `tts-1` | `model` field posted to the TTS endpoint |
 | `TTS_API_KEY` | `""` | Sends `Authorization: Bearer` if set |
 | `SPEAKER_ID_URL` | `http://192.168.22.102:8001/identify` | Speaker recognition ([speaker-id](https://github.com/zavaruev/speaker-id) container) |
 | `CAMERA_STREAMS` | `""` | Comma-separated go2rtc stream names to attach to |
 | `DISABLE_CAMERAS` | `""` | Set to `true`/`1`/`yes` to disable all camera sessions entirely (takes precedence over `CAMERA_STREAMS`) |
 | `GO2RTC_HOST` / `GO2RTC_PORT` | `192.168.22.102` / `1984` | go2rtc control host |
-| `VAD_SILENCE_FRAMES` | `8` | Silence frames before processing (~60 ms each) |
-| `WATCHDOG_TIMEOUT` | `30` | AI response timeout before fallback TTS |
+| `GO2RTC_SOURCE_URL` | `""` | RTSP source URL the self-healer re-registers with (`GO2RTC_SOURCE_URL_<NAME>` per stream). Without it the healer falls back to whatever URL go2rtc still lists |
+| `GO2RTC_HEAL_STALLS` | `3` | Consecutive ffmpeg stalls (~20 s read timeout each) before a stream re-register |
+| `WAKE_WORD` | `компьютер` | Spoken phrase stripped from the transcript to expose the command |
+| `WAKE_WORD_MODEL` | `config/computer_20260706_130638.onnx` | openWakeWord head; bare package names resolve inside the package. `WAKE_WORD_MODEL_<NAME>` overrides per stream (kitchen defaults to `config/computer.onnx`) |
+| `VAD_SILENCE_FRAMES` | `8` | Silence frames before processing (~60 ms each; ESP32 path only — the camera path hardcodes 10) |
+| `WATCHDOG_TIMEOUT` | `90` | AI response timeout before fallback TTS |
 | `STANDBY_TIMEOUT_QUESTION` | `30` | Seconds before standby after a question |
 | `STANDBY_TIMEOUT_STATEMENT` | `10` | Seconds before standby after a statement |
 | `CHAT_ID_TTL` | `604800` | Chat context lifetime in seconds (7 days) |
 | `ENERGY_THRESHOLD` | `0.002` | Energy gate threshold for noise reduction |
 | `MIN_SPEECH_RATIO` | `0.12` | Minimum speech ratio to trigger processing |
-| `VAD_ADAPTIVE` | `true` | Enable adaptive VAD threshold |
-| `THINKING_SOUND_PATH` | `""` | Path to thinking indicator sound |
-| `ADMIN_USERNAME` / `ADMIN_PASSWORD` | `""` | HTTP basic auth for the API |
+| `VAD_ADAPTIVE` | `true` | **Declared for compatibility — read but unused** |
+| `THINKING_SOUND_PATH` | `""` | **Declared for compatibility — unused in `main.py`** |
+| `MAX_FIRMWARE_SIZE` | `10485760` | Byte cap for `/api/firmware/upload` (10 MB) |
+| `ADMIN_USERNAME` / `ADMIN_PASSWORD` | `""` | HTTP basic auth for the API (empty = auth disabled) |
 | `LOG_TRANSCRIPTIONS` | `false` | Log transcriptions |
 
 ## REST API
@@ -148,7 +159,10 @@ Do **not** start the container manually with `docker run` on the default bridge 
 | `/api/devices/config` | GET/POST | Registered device list / register |
 | `/api/devices/config/{mac}` | PUT/DELETE | Update / remove device |
 | `/mcp/{session_id}` | POST | Send MCP command to device (`"latest"` = most recent session) |
+| `/api/tts` | POST | Speak `text` on a connected device (`session_id: "latest"` = most recent; non-admin may only target devices they own) |
 | `/api/camera/tts` | POST | Speak a phrase on a camera session |
+| `/api/firmware/upload` | POST | Upload an ESP32 `.bin` (multipart `file` + `version`, capped by `MAX_FIRMWARE_SIZE`) and refresh `firmware.json` |
+| `/api/firmware` | GET | Current firmware metadata (`firmware.json`) |
 | `/ota` | GET/POST | ESP32 OTA handshake; returns WS URL + firmware info |
 
 ## Architecture
@@ -160,20 +174,21 @@ Opus frames → VAD (Silero) → energy gate → noise reduction → Ogg → Whi
 RTSP (raw L16 16 kHz) → echo guard (waveform + `_is_echo` cross-correlation vs played-audio ring, delays 2–45 s) → VAD + RMS gates → SpeexDSP NS rescue → adaptive normalisation → **(only after an acoustic wake)** Whisper (+ Speaker ID via Ogg) → LLM backend
 
 ### Wake-word detector feed
-RTSP 16 kHz → own-echo drop → per-room bidirectional AGC (target peak: kitchen 6500, others 4000) → openWakeWord scoring → gate cascade (see *Wake word & arbitration*)
+RTSP 16 kHz → own-echo drop → per-room bidirectional AGC (target peak: kitchen 6500, corridor 9000, others 4000) → openWakeWord scoring → gate cascade (see *Wake word & arbitration*)
 
 ### Wake word & arbitration
-openWakeWord `kompyuter` model (custom-trained, ONNX) on the live 16 kHz feed of every camera. Each chunk is AGC-normalised to the room's target peak, scored, and pushed through a gate cascade before a wake fires:
+openWakeWord on the live 16 kHz feed of every camera — library head `computer_20260706_130638.onnx` except the kitchen, which keeps the custom `computer.onnx`. Each chunk is AGC-normalised to the room's target peak, scored, and pushed through a gate cascade before a wake fires:
 
 1. **Own-playback guard** — no fire while this camera's speaker is playing (any wake-shaped sound then is our own echo)
-2. **Appliance hold** — 60 s background median rms >800 (robot vacuum, hood…) requires a single-chunk score ≥0.92
-3. **Quiet-source hold** — own signal level <3000 requires score ≥0.72 (faint TV/muffled speech scores deceptively high on the TTS-trained model)
-4. **Distant-source veto** — level <1600 while another camera hears the same sound ≥1.4× louder → the wake belongs to that room
-5. **Clipping bang / crest-factor gates** — door slams and dense impacts (peak >24k or rms·2 > peak) are ignored unless overwhelming
+2. **Appliance hold** — 60 s background median rms >800 (robot vacuum, hood…) holds the wake unless the top score reaches **0.60** (a held score ≥0.85 is meant to go to STT confirm, but that branch is currently unreachable — see *Known Issues*)
+3. **Quiet-source hold** — own signal level <3000 requires **0.58 below level 2000 / 0.55 above** (faint TV/muffled speech scores deceptively high on the TTS-trained model)
+4. **Distant-source veto** — level <3000 while another camera hears the same sound ≥1.4× louder → the wake belongs to that room; the veto sticks for 5 s
+5. **Clipping bang / crest-factor gates** — door slams and dense impacts (peak >24k, or rms·2 > peak above peak 4000) are ignored unless the score reaches 0.85
 6. **Debounce** — 2 qualifying chunks out of the last 3 (~240 ms), or one confident chunk ≥0.68
-7. **Cross-camera arbiter** — first detector becomes interaction owner; others stand down. A room ≥5× louder than the owner steals a not-yet-dispatched wake so the answer sounds where the user actually is
+7. **Ambiguous zone** — top score <0.55 (or a repeat within 60 s of an ignored auto-greet) with level <3000 → no pip; the next utterance goes to Whisper for confirmation
+8. **Cross-camera arbiter** — first detector becomes interaction owner; others stand down. A room ≥5× louder than the owner steals a not-yet-dispatched wake so the answer sounds where the user actually is
 
-After a fire: attention pip, VAD state reset, Whisper listens until the command is dispatched (or the ~60 s window expires).
+After a fire: attention pip, VAD state reset, Whisper listens until the command is dispatched (or the **15 s** wake window expires — a bare wake with no command within 5 s speaks a local «Да?» instead of polling the LLM).
 
 ### TTS Pipeline
 Backend text → sentence splitter → **prefetch pipeline** (sentence N+1 is synthesised while N plays, hiding Edge-TTS latency) → Edge TTS (MP3) → decode → resample (16/24 kHz) → Opus for ESP32 / PCM for cameras → paced 60 ms chunks. Every played clip is registered in the echo-reference ring and extends wake suppression past the delayed-echo window.
@@ -183,15 +198,16 @@ Backend text → sentence splitter → **prefetch pipeline** (sentence N+1 is sy
 The AI brain is selected by `LLM_BACKEND` and implemented as a `BaseLLMBackend` (`backends.py`):
 
 - **`NanobotBackend`** (default) — opens a WebSocket to `NANOBOT_WS_URL?token=…&chat_id=…`, streams `text` deltas, handles `[thinking]` blocks, and pushes sentence-split replies into the response queue.
-- **`HermesBackend`** — streams the user message to `${HERMES_API_URL}/v1/chat/completions` (OpenAI-compatible SSE, `stream: true`); each `choices[].delta.content` chunk is accumulated and flushed sentence-by-sentence on `. ! ? …` into the response queue. `[thinking]` reasoning blocks and `[emotion_name]` tags are stripped before TTS, identical to `NanobotBackend`. Streaming keeps first-token latency low so the prefetch TTS player starts before the full reply arrives (avoiding the 30 s watchdog fallback).
+- **`HermesBackend`** — streams the user message to `${HERMES_API_URL}/v1/chat/completions` (OpenAI-compatible SSE, `stream: true`); each `choices[].delta.content` chunk is accumulated and flushed sentence-by-sentence on `. ! ? …` into the response queue. `[thinking]` reasoning blocks and `[emotion_name]` tags are stripped before TTS, identical to `NanobotBackend`. Streaming keeps first-token latency low so the prefetch TTS player starts before the full reply arrives (avoiding the 90 s watchdog fallback).
 - **`CascadeBackend`** — POSTs the text to `${ROUTER_URL}/route` (SSE) and replays router events into the same queue: `sentence`/`progress` are spoken (emotion tags stripped, no monologue gate — the router output is already curated), `route` events drive the ack timer (immediate «Секунду, занимаюсь…» for `complex_logic`/`expert`, `ROUTER_ACK_DELAY`-second fallback for chat/easy), `error`/empty streams produce an immediate apology so the user is never left in silence. The first played audio (usually the ack) cancels the watchdog downstream, which is what makes 48–120 s L2 turns possible.
 
 Both backends expose the same `generate_response(text, session_id, stream_name, response_queue)` contract. The ESP32 path dispatches via `_dispatch_hermes`/`_hermes_player_task`; camera sessions receive the backend instance at construction and call `_call_backend` → `_nanobot_player_task` (the player is backend-agnostic). Either way replies reach the prefetch TTS player, so sentence-level latency hiding works identically for both brains.
 
 ### Dialogue Mode
-- AI response contains `?` (or Russian question patterns) → mic stays open
-- AI response is a statement → returns to standby
-- Hold phrases extend listening
+- Reply **ends with `?`** (ASCII or fullwidth), or contains the «повторите пожалуйста» apology → mic stays open when playback drains
+- Reply matches a Russian interrogative/imperative anywhere in the text (`HAS_QUESTION_WORDS_RE`: что, как, где, включи, выключи, расскажи, повтори…) → same follow-up window
+- Reply is a plain statement → returns to standby (`STANDBY_TIMEOUT_STATEMENT`, 10 s)
+- Hold phrases («подожди»…) extend listening without dispatching to the LLM
 
 ### Binary Frame Formats
 | Version | Format |
@@ -221,8 +237,10 @@ Device identifies itself via `device-id` header (fallback: `mac` header). MAC ke
 - **Camera WiFi links** — the kitchen camera's link quality fluctuates (21–34/100 vs 80+ elsewhere); its video stream was reduced to fps 10 / bitrate 1024 to keep the audio backchannel stable.
 - **Echo cascade ESP32 ↔ camera is only partially solved** — `GLOBAL_TTS_UNTIL` + duration-proportional mic hold are band-aids. Camera-speaker echo returns via WebRTC with 8–15 s delay; `_is_echo` cross-correlates mic chunks against a reference ring of recently played audio (delays 2–45 s) and confirmed echoes extend wake suppression.
 - **TTS-trained wake model prefers muffled audio** — through-wall copies of «компьютер» can out-score close live speech; the distant-source veto and quiet-source hold compensate, but retraining on real in-room recordings (v2–v4 attempts degraded discrimination — keep v1) remains the proper fix.
-- **Gates are room-calibrated** — thresholds (wake 0.47/0.52, hold/veto levels, bg-median 800) were tuned against measured score distributions in three specific rooms. They will not generalise to other rooms without recalibration.
-- **Whisper retry at temperature 0.5** — empty/`unknown` transcripts trigger a noisier re-transcription; on some engines this doubles STT latency in the worst case.
+- **Two of the three STT-confirm branches are unreachable** — the appliance guard admits only `max < 0.60` but its inner branch tests `top >= 0.85`; the quiet-source guard admits only `max < 0.55/0.58` yet tests `>= 0.60` *after* `_ww_recent.clear()`. Neither can ever fire, so only the ambiguous-zone path (top <0.55) actually opens a confirm window — and `_open_stt_confirm()`'s docstring, which advertises the appliance/quiet-source use case, describes dead code.
+- **Stale log wording** — the appliance-hold log line still prints `needs >=0.95` while the guard it belongs to enforces 0.60.
+- **Gates are room-calibrated** — thresholds (wake 0.40 kitchen / 0.30 elsewhere, hold/veto levels, bg-median 800) were tuned against measured score distributions in three specific rooms. They will not generalise to other rooms without recalibration.
+- **Whisper retry at temperature 0.5 is camera-only** — the camera path (`_fetch_transcription`) retries 0.0 → 0.5 on an empty transcript, doubling STT latency in the worst case; the ESP32 path (`fetch_transcription`) sends a single attempt at 0.0 and never retries.
 - **`Dockerfile` exposes 8080 but nothing listens on it** (18792 is the only real port).
 - **`setup_gateway.sh` is an outdated snapshot** — not authoritative.
 - **Vosk models downloaded but unused** — `config/vosk-model-ru-0.42/` (3.5 GB) candidate for a local low-latency STT fallback; not wired into the pipeline.
@@ -238,19 +256,25 @@ docker exec voice_gateway python3 -m pytest /tmp/vg_tests -q
 docker exec voice_gateway rm -rf /tmp/vg_tests
 ```
 
-Covers engine wake scoring/gates, camera arbitration helpers, OTA auth, and RMS utilities (~1,160 lines).
+Covers 149 tests across 10 files (2,087 lines): engine wake scoring/gates, camera arbitration + gate-cascade helpers, the ESP32 `main.py` protocol, cascade backend streaming, honesty vetoes, router slot resolution, weather, TTS gate, OTA auth and RMS utilities.
 
 ## Dependencies
 
 - Python 3.12+
 - FFmpeg (RTSP capture, WAV/OGG conversion)
 - Silero VAD ONNX model (downloaded at build time)
-- openWakeWord + custom `computer.onnx` / `embedding_model.onnx` (baked into the image)
+- openWakeWord + the library head `computer_20260706_130638.onnx` and the custom `computer.onnx` / `embedding_model.onnx` (baked into the image)
 - SpeexDSP noise suppression (`speexdsp-ns`)
 - External services: Whisper STT, Edge TTS, Speaker ID, go2rtc (for cameras), plus one of the backends — Nanobot; Hermes; or (cascade) Ollama embeddings + Qdrant + OmniRoute + Home Assistant MCP
 
 ## Changelog
 
+- **2.32** — Documentation audit: README and AGENTS.md re-synced with the code; no code changes.
+  - **Corrected stale values (both files)** — wake thresholds `0.47/0.52` → **kitchen 0.40 / others 0.30** (`camera_client.py:570`, clamped back to base in `_call_backend`/`_call_nanobot`); wake model "custom `computer.onnx`" → default is the **library head `computer_20260706_130638.onnx`** with the custom head kept only for kitchen; AGC targets `kitchen 6500, others 4000` → **corridor 9000 added** (`camera_client.py:1377`); gate cascade appliance `≥0.92` → **0.60** (`f38d73e`), quiet-source `≥0.72` → **0.58/0.55** (`bfc328f`), distant-veto `<1600` → **`<3000`** (`03371ea`); `WATCHDOG_TIMEOUT` `30` → **90** (since v2.25); wake window `~60 s` → **15 s** (`CameraConfig.wake_timeout`); activity monitor "dim after 30 s, close sessions after 45 s" → **dim after 10 s, connections are never closed**; dialogue mode "`?` anywhere" → **trailing `?` only** (plus apology/interrogative words anywhere); Whisper retry → **camera path only** (the ESP32 path is a single attempt); tests `~1,160 lines` → **10 files / 2,087 lines / 149 tests**; `NANOBOT_TOKEN` default `token` → `""` (deployments set it).
+  - **Added missing REST endpoints** — `/api/tts` (POST, ownership-checked device TTS), `/api/firmware/upload` (POST, `MAX_FIRMWARE_SIZE`-capped), `/api/firmware` (GET), plus `/health` in AGENTS.md.
+  - **Added missing env vars** — `TTS_MODEL`, `MAX_FIRMWARE_SIZE`, `NANOBOT_SESSION_SALT`, `WAKE_WORD`, `WAKE_WORD_MODEL[_<NAME>]`, `GO2RTC_SOURCE_URL[_<NAME>]`, `GO2RTC_HEAL_STALLS`; flagged `VAD_ADAPTIVE` and `THINKING_SOUND_PATH` as declared-but-unused instead of functional.
+  - **Documented five previously undocumented features** — go2rtc self-healer (`_heal_go2rtc_stream`, stall-triggered stream re-register), the STT-confirm window (`_open_stt_confirm`: a held score routes the next utterance to Whisper instead of pipping), auto-greeting «Да?» on a bare wake, the cross-device speaker lock (`_check_speaker_lock`, 30 s per-uid TTL), and firmware upload.
+  - **Recorded two known bugs found during the audit** — two of the three `_open_stt_confirm()` call sites are unreachable (appliance branch tests `≥0.85` behind a `<0.60` guard; quiet-source branch tests `≥0.60` after `_ww_recent.clear()` behind a `<0.55/0.58` guard), and the appliance-hold log still prints `needs >=0.95`. Both are documented as Known Issues; the stale *code* comments (`camera_client.py` lines 556, 1511, 1562, 2169) and the dead branches were deliberately left for a separate code change.
 - **2.31** — The assistant keeps the mic open, keeps its own audio protocol consistent, and the code is fully documented in English.
   - **Follow-up window (`main.py`)** — the cascade/hermes path used to end every turn with an unconditional `reset_to_standby()`, so a reply that ENDED in a question went IDLE: the ESP32's post-TTS `listen:start` was rejected by the 1.5 s TTS cooldown or found the session IDLE, and every frame was dropped — the user had to repeat the wake word to answer the assistant's own question. `_reply_has_question()` is now the single source of truth (trailing `?`/`？`, the «повторите пожалуйста» apology, interrogative words) and `_finalize_turn_followup()` is the one post-turn transition shared by both backends: a question opens the 30 s dialogue window (screen 100 %), a statement opens the 10 s window and disarms the pending watchdog. `_wake_audio_received` is finally written (it was read but never set, so the "no audio received" warning fired unconditionally).
   - **One `tts stop` per turn (`main.py`)** — the cascade played every sentence with `send_stop=True`, so the device saw `tts start`/`tts stop` between sentences; each stop re-arms the mic only while the firmware still considers itself LISTENING (it falls back to IDLE after ~10 s without an `stt` reply), and Edge-TTS gaps of 11–16 s meant long replies timed out into IDLE and ignored the FINAL stop too — no mic, follow-up window expired. Now the turn streams as ONE audio unit (`send_stop=False`) and a new idempotent `send_tts_stop()` closes it exactly once from `_dispatch_hermes()`'s `finally` and from the watchdog — covering normal end, backend exception, playback cancel and a failed synthesis (Edge-TTS DNS outage left the satellite stuck in SPEAKING).

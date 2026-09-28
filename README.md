@@ -1,6 +1,6 @@
 # Voice Gateway
 
-> **Version 2.32** — Documentation audit: README and AGENTS.md re-synced against the actual code — correct wake thresholds (kitchen 0.40 / others 0.30), wake models (library `computer_20260706` head, kitchen keeps `computer.onnx`), AGC targets (kitchen 6500 / corridor 9000 / others 4000), recalibrated gate cascade (0.60 / 0.58 / 0.55 / <3000), `WATCHDOG_TIMEOUT` 90 s, activity-monitor timings, the 15 s wake window, end-anchored `?` detection and the camera-only Whisper retry. Added the three missing REST endpoints, six missing env vars and five undocumented features (go2rtc self-healer, STT-confirm window, auto-greeting «Да?», cross-device speaker lock, firmware upload). See Changelog below.
+> **Version 2.33** — Wake-gate fix: the two STT-confirm rescue bands that the threshold recalibration had left unreachable are live again — appliance hold **[0.55, 0.60)**, quiet-source hold **[tier−0.05, tier)** — so a near-miss «компьютер» goes to Whisper instead of being dropped silently. `_open_stt_confirm()` no longer stacks a second window over an open one, and the appliance-hold log prints the bar it actually enforces (0.60, previously the leftover `needs >=0.95`). Pinned by the new `tests/test_wake_gates.py` — 159 tests across 11 files.
 
 WebSocket gateway bridging [Xiaozhi ESP32](https://github.com/78/xiaozhi-esp32) smart speakers **and WebRTC/IP cameras** to an AI backend (**Cascade** 3-level router, **[Nanobot](https://github.com/HKUDS/nanobot)** or **Hermes**) with real-time speech processing.
 
@@ -180,8 +180,8 @@ RTSP 16 kHz → own-echo drop → per-room bidirectional AGC (target peak: kitch
 openWakeWord on the live 16 kHz feed of every camera — library head `computer_20260706_130638.onnx` except the kitchen, which keeps the custom `computer.onnx`. Each chunk is AGC-normalised to the room's target peak, scored, and pushed through a gate cascade before a wake fires:
 
 1. **Own-playback guard** — no fire while this camera's speaker is playing (any wake-shaped sound then is our own echo)
-2. **Appliance hold** — 60 s background median rms >800 (robot vacuum, hood…) holds the wake unless the top score reaches **0.60** (a held score ≥0.85 is meant to go to STT confirm, but that branch is currently unreachable — see *Known Issues*)
-3. **Quiet-source hold** — own signal level <3000 requires **0.58 below level 2000 / 0.55 above** (faint TV/muffled speech scores deceptively high on the TTS-trained model)
+2. **Appliance hold** — 60 s background median rms >800 (robot vacuum, hood…) holds the wake unless the top score reaches **0.60**; a held score in **[0.55, 0.60)** opens an STT-confirm window rather than being dropped
+3. **Quiet-source hold** — own signal level <3000 requires **0.58 below level 2000 / 0.55 above** (faint TV/muffled speech scores deceptively high on the TTS-trained model); a held score in **[tier−0.05, tier)** opens an STT-confirm window
 4. **Distant-source veto** — level <3000 while another camera hears the same sound ≥1.4× louder → the wake belongs to that room; the veto sticks for 5 s
 5. **Clipping bang / crest-factor gates** — door slams and dense impacts (peak >24k, or rms·2 > peak above peak 4000) are ignored unless the score reaches 0.85
 6. **Debounce** — 2 qualifying chunks out of the last 3 (~240 ms), or one confident chunk ≥0.68
@@ -237,8 +237,6 @@ Device identifies itself via `device-id` header (fallback: `mac` header). MAC ke
 - **Camera WiFi links** — the kitchen camera's link quality fluctuates (21–34/100 vs 80+ elsewhere); its video stream was reduced to fps 10 / bitrate 1024 to keep the audio backchannel stable.
 - **Echo cascade ESP32 ↔ camera is only partially solved** — `GLOBAL_TTS_UNTIL` + duration-proportional mic hold are band-aids. Camera-speaker echo returns via WebRTC with 8–15 s delay; `_is_echo` cross-correlates mic chunks against a reference ring of recently played audio (delays 2–45 s) and confirmed echoes extend wake suppression.
 - **TTS-trained wake model prefers muffled audio** — through-wall copies of «компьютер» can out-score close live speech; the distant-source veto and quiet-source hold compensate, but retraining on real in-room recordings (v2–v4 attempts degraded discrimination — keep v1) remains the proper fix.
-- **Two of the three STT-confirm branches are unreachable** — the appliance guard admits only `max < 0.60` but its inner branch tests `top >= 0.85`; the quiet-source guard admits only `max < 0.55/0.58` yet tests `>= 0.60` *after* `_ww_recent.clear()`. Neither can ever fire, so only the ambiguous-zone path (top <0.55) actually opens a confirm window — and `_open_stt_confirm()`'s docstring, which advertises the appliance/quiet-source use case, describes dead code.
-- **Stale log wording** — the appliance-hold log line still prints `needs >=0.95` while the guard it belongs to enforces 0.60.
 - **Gates are room-calibrated** — thresholds (wake 0.40 kitchen / 0.30 elsewhere, hold/veto levels, bg-median 800) were tuned against measured score distributions in three specific rooms. They will not generalise to other rooms without recalibration.
 - **Whisper retry at temperature 0.5 is camera-only** — the camera path (`_fetch_transcription`) retries 0.0 → 0.5 on an empty transcript, doubling STT latency in the worst case; the ESP32 path (`fetch_transcription`) sends a single attempt at 0.0 and never retries.
 - **`Dockerfile` exposes 8080 but nothing listens on it** (18792 is the only real port).
@@ -251,12 +249,18 @@ Host Python usually lacks the runtime deps (`opuslib`, `onnxruntime`, …), and 
 
 ```sh
 docker exec voice_gateway pip install -q pytest httpx pytest-asyncio
-docker cp tests voice_gateway:/tmp/vg_tests
-docker exec voice_gateway python3 -m pytest /tmp/vg_tests -q
-docker exec voice_gateway rm -rf /tmp/vg_tests
+docker exec voice_gateway rm -rf /tmp/vg_src && docker exec voice_gateway mkdir -p /tmp/vg_src
+for f in audio_utils.py backends.py camera_client.py engine.py main.py; do docker cp "$f" voice_gateway:/tmp/vg_src/"$f"; done
+docker cp services voice_gateway:/tmp/vg_src/services
+docker cp templates voice_gateway:/tmp/vg_src/templates
+docker cp tests voice_gateway:/tmp/vg_src/tests
+docker exec -w /tmp/vg_src voice_gateway python3 -m pytest tests -q
+docker exec voice_gateway rm -rf /tmp/vg_src
 ```
 
-Covers 149 tests across 10 files (2,087 lines): engine wake scoring/gates, camera arbitration + gate-cascade helpers, the ESP32 `main.py` protocol, cascade backend streaming, honesty vetoes, router slot resolution, weather, TTS gate, OTA auth and RMS utilities.
+Tests must run against a copy of the sources, not the live `/app` mounts: the three router tests import `honesty`/`classifier`/`weather` from `services/jev-router`, which is not part of the image (it runs as its own container), so the sources, `services/` and `tests/` have to travel together.
+
+Covers 159 tests across 11 files (2,308 lines): engine wake scoring/gates, camera arbitration, the wake-gate cascade's STT-confirm bands, the ESP32 `main.py` protocol, cascade backend streaming, honesty vetoes, router slot resolution, weather, TTS gate, OTA auth and RMS utilities.
 
 ## Dependencies
 
@@ -268,6 +272,14 @@ Covers 149 tests across 10 files (2,087 lines): engine wake scoring/gates, camer
 - External services: Whisper STT, Edge TTS, Speaker ID, go2rtc (for cameras), plus one of the backends — Nanobot; Hermes; or (cascade) Ollama embeddings + Qdrant + OmniRoute + Home Assistant MCP
 
 ## Changelog
+
+- **2.33** — Wake-gate fix: the two STT-confirm rescue bands that the threshold recalibration had left unreachable are live again; no other behaviour changed.
+  - **Appliance hold** — the guard admits `max < 0.60` under bg median >800, but its rescue branch still tested `top >= 0.85`, a leftover of the pre-recalibration 0.92 bar, so a held 0.55–0.59 «компьютер» was dropped silently. The band is now **[0.55, 0.60)** — everything this guard can hold that is still worth a Whisper arbitration (0.55 is the same bar the ambiguous zone uses; at or above 0.60 the wake already fires).
+  - **Quiet-source hold** — the guard admits `max < 0.58/0.55` while its rescue tested `>= 0.60` *after* `_ww_recent.clear()`, dead since `bfc328f` moved the tier down from 0.72/0.85. The band is now **[tier−0.05, tier)**, i.e. `[0.53, 0.58)` below level 2000 and `[0.50, 0.55)` above it; the tier is computed once (`q_tier`) so guard, log line and band cannot drift apart again.
+  - **`_open_stt_confirm()` is idempotent** — the appliance hold clears the score ring, so on a quiet-room chunk at bg >800 both gates hit their bands; the second call now returns instead of refreshing the 10 s deadline and stacking a second 11.5 s expiry watcher over the first.
+  - **Stale log fixed** — the appliance-hold line printed `needs >=0.95` while the guard it belongs to enforces 0.60.
+  - **New `tests/test_wake_gates.py`** — 10 end-to-end tests driving `_vad_process` with the engine, utterance VAD and arbiter stubbed: both rescue bands, the pass-through above each guard, the drop below each band, and the single-window guarantee. Suite 149 → **159 tests across 11 files (2,308 lines)**; the five band tests fail against the pre-fix code, which is what holds the regression.
+  - **Docs** — the two Known Issues (unreachable branches, stale log wording) and the AGENTS gotchas derived from them are gone; README's own test recipe was also wrong (`docker cp tests … pytest /tmp/vg_tests` failed with `ModuleNotFoundError` on `honesty`/`classifier`/`weather`) and now copies the sources and `services/` together.
 
 - **2.32** — Documentation audit: README and AGENTS.md re-synced with the code; no code changes.
   - **Corrected stale values (both files)** — wake thresholds `0.47/0.52` → **kitchen 0.40 / others 0.30** (`camera_client.py:570`, clamped back to base in `_call_backend`/`_call_nanobot`); wake model "custom `computer.onnx`" → default is the **library head `computer_20260706_130638.onnx`** with the custom head kept only for kitchen; AGC targets `kitchen 6500, others 4000` → **corridor 9000 added** (`camera_client.py:1377`); gate cascade appliance `≥0.92` → **0.60** (`f38d73e`), quiet-source `≥0.72` → **0.58/0.55** (`bfc328f`), distant-veto `<1600` → **`<3000`** (`03371ea`); `WATCHDOG_TIMEOUT` `30` → **90** (since v2.25); wake window `~60 s` → **15 s** (`CameraConfig.wake_timeout`); activity monitor "dim after 30 s, close sessions after 45 s" → **dim after 10 s, connections are never closed**; dialogue mode "`?` anywhere" → **trailing `?` only** (plus apology/interrogative words anywhere); Whisper retry → **camera path only** (the ESP32 path is a single attempt); tests `~1,160 lines` → **10 files / 2,087 lines / 149 tests**; `NANOBOT_TOKEN` default `token` → `""` (deployments set it).

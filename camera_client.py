@@ -1494,6 +1494,11 @@ class CameraSession:
                             or time.time() < self._speaking_until
                         )
                         my_lvl = self._proximity_level()
+                        # Quiet-source fire bar: 0.58 below 2000 raw peak,
+                        # 0.55 above it. Computed once so the guard, its log
+                        # line and the STT rescue band below cannot drift
+                        # apart from each other.
+                        q_tier = 0.58 if my_lvl < 2000 else 0.55
                         vetoed = False
                         # Appliance gate: a continuously running appliance
                         # (robot vacuum, hood, AC) keeps the 60s background
@@ -1510,16 +1515,23 @@ class CameraSession:
                         if bg_med > 800 and max(sc, max(self._ww_recent or [0])) < 0.60:
                             logger.info(
                                 f"[{self.stream_name}] 🧹 appliance hold — bg {bg_med:.0f} "
-                                f"sc {sc:.2f} needs >=0.95"
+                                f"sc {sc:.2f} needs >=0.60"
                             )
                             self._ww_consec = 0
                             top = max(sc, max(self._ww_recent or [0]))
                             self._ww_recent.clear()
-                            if top >= 0.85:
-                                # Real speech over appliance noise reaches
-                                # 0.85-0.99; the motor whine itself tops out
-                                # ~0.90 but never produces a wake-word
-                                # transcript — let STT arbitrate.
+                            if top >= 0.55:
+                                # Gray zone just under the bar. The bar used to
+                                # be 0.92 and the rescue band 0.85-0.92: real
+                                # speech over appliance noise reached 0.85-0.99
+                                # while the whine topped out ~0.90, so only STT
+                                # could tell them apart. When Silero VAD started
+                                # gating non-speech the bar dropped to 0.60, and
+                                # the same near-miss attempts now land at
+                                # 0.55-0.59 — the band the rescue forgot to
+                                # follow it into. Anything at or above 0.60
+                                # already fires; anything below 0.55 is too weak
+                                # to be worth a Whisper call.
                                 self._open_stt_confirm(top)
                             vetoed = True
                         if speaker_active:
@@ -1528,9 +1540,7 @@ class CameraSession:
                             # through the mic. Never fire on it.
                             self._ww_consec = 0
                             self._ww_recent.clear()
-                        elif my_lvl < 3000 and max(sc, max(self._ww_recent or [0])) < (
-                            0.58 if my_lvl < 2000 else 0.55
-                        ):
+                        elif my_lvl < 3000 and max(sc, max(self._ww_recent or [0])) < q_tier:
                             # Quiet-source confirmation gate: a real user even
                             # at mid-distance produces peaks >3k HERE; faint
                             # through-wall copies stay under it while still
@@ -1541,17 +1551,24 @@ class CameraSession:
                             # muffled copy fire in the livingroom).
                             logger.info(
                                 f"[{self.stream_name}] 🔈 quiet-source hold — "
-                                f"lvl {my_lvl:.0f} sc {sc:.2f} needs >="
-                                f"{0.58 if my_lvl < 2000 else 0.55}"
+                                f"lvl {my_lvl:.0f} sc {sc:.2f} needs >={q_tier}"
                             )
                             self._ww_consec = 0
+                            top = max(sc, max(self._ww_recent or [0]))
                             self._ww_recent.clear()
-                            # NOTE: this branch already implies
-                            # max(sc,recent) < tier threshold, so any held
-                            # score >=0.60 is worth STT arbitration — real
-                            # mid-distance attempts land 0.65-0.75 here.
-                            if max(sc, max(self._ww_recent or [0])) >= 0.60:
-                                self._open_stt_confirm(sc)
+                            if top >= q_tier - 0.05:
+                                # Rescue band [tier-0.05, tier): the only scores
+                                # this gate can hold that are still plausibly
+                                # the user — a genuine attempt landing just under
+                                # the bar is exactly what a threshold cannot
+                                # separate from a muffled copy. Attempts at or
+                                # above the tier already pass and fire; well
+                                # below the band they are too faint to be worth
+                                # a Whisper call. This band used to sit at
+                                # 0.60-0.72/0.85 back when the tier did; the
+                                # recalibration to 0.55/0.58 left the rescue
+                                # threshold behind, so the branch was dead.
+                                self._open_stt_confirm(top)
                             vetoed = True
                         elif my_lvl < 3000:
                             # Ceiling matches the quiet-source hold ceiling;
@@ -1703,6 +1720,14 @@ class CameraSession:
         wake; garbage transcripts just expire silently. This rescues strong
         attempts that threshold gates cannot separate from noise (kitchen
         trace: real 0.91 vs vacuum 0.90 — only STT tells them apart)."""
+        if time.time() < self._stt_confirm_until:
+            # A window is already open. Two gates in the same cascade can hit
+            # their rescue bands on one chunk (appliance holds first and clears
+            # the score ring, the quiet-source gate then re-reads the bare
+            # chunk score) — stacking a second expiry watcher would greet the
+            # same silent room twice, and the refreshed deadline would keep
+            # Whisper listening longer than a single window should.
+            return
         self._stt_confirm_until = time.time() + 10.0
         self._confirm_saw_text = False
         asyncio.create_task(self._confirm_expiry_watch())

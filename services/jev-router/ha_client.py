@@ -336,12 +336,15 @@ def find_entity(
     return None (escalate) instead of falling back to an area-only match,
     which would answer a completely different question.
 
-    `domain` (optional) is a PREFERENCE, never a filter: candidates whose
-    own domain is listed are ranked first. Needed because «пылесос» matches
-    both `vacuum.valetudo_…` and `update.vacuum_card_update`, and the
-    registry is ordered so the helper entity comes first — a filter would
-    be wrong in the other direction (the household lamp is a `switch.*`
-    while the resolver asks for domain ["light"]).
+    `domain` (optional) is a PREFERENCE, never a filter: it wins whenever a
+    candidate with that domain exists, and does nothing otherwise. Needed
+    because «пылесос» matches `vacuum.valetudo_…`, `update.vacuum_card_update`
+    AND `sensor.…_map_segments` (all contain "valetudo"/"vacuum"), and both
+    the registry order and the numeric-sensor rule below would answer with
+    something that is not the vacuum — observed live as «Пылесос: 8».
+    Filtering outright would be wrong in the other direction: the household
+    lamp is a `switch.*` while the resolver asks for domain ["light"], so
+    with no `light.*` candidate the search has to fall back to all matches.
     """
     hint_l = (hint or "").lower().strip()
     area_l = (area or "").lower().strip()
@@ -396,22 +399,24 @@ def find_entity(
         candidates = [e for e in states if _match(e, False, True)]
     if not candidates:
         return None
+    # The requested domain narrows the POOL when it can: if the resolver asked
+    # for domain ["vacuum"] and a `vacuum.*` candidate exists, only that group
+    # competes — otherwise the numeric-sensor rule below returns
+    # sensor.…_map_segments (state "8") for «Пылесос» (live case 29.09.2026).
+    # No candidate with that domain -> the pool stays untouched: a
+    # preference, never a filter (the household lamp is a switch.* asked as
+    # domain ["light"]).
+    pool = candidates
+    if domain:
+        want = {d.lower() for d in domain}
+        in_dom = [e for e in candidates if e["entity_id"].split(".", 1)[0] in want]
+        if in_dom:
+            pool = in_dom
     # Prefer a numeric sensor (temperature/battery readings) over helpers
     # like number.*_calibration or select.*_display_mode.
     ordered = sorted(
-        candidates, key=lambda e: 0 if e["entity_id"].startswith("sensor.") else 1
+        pool, key=lambda e: 0 if e["entity_id"].startswith("sensor.") else 1
     )
-    if domain:
-        # Domain PREFERENCE (see docstring): a `vacuum.*` entity beats the
-        # `update.vacuum_card_update` helper that matches the same hint and
-        # sorts earlier in the registry. Stable sort keeps the order inside
-        # each group, so the sensor rule above still decides between two
-        # same-domain candidates.
-        want = {d.lower() for d in domain}
-        in_dom = [e for e in ordered if e["entity_id"].split(".", 1)[0] in want]
-        if in_dom:
-            ids = {e["entity_id"] for e in in_dom}
-            ordered = in_dom + [e for e in ordered if e["entity_id"] not in ids]
     for e in ordered:
         if e["entity_id"].startswith("sensor."):
             try:

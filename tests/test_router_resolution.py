@@ -465,6 +465,23 @@ def test_domain_preference_is_a_preference_not_a_filter():
     assert e is not None and e["entity_id"] == "switch.kitchen_coffee_machine"
 
 
+def test_domain_beats_a_numeric_sensor_with_the_same_hint():
+    """Live check 29.09.2026: the router answered «Пылесос: 8» —
+    sensor.…_map_segments contains "valetudo" (hint match) AND is a numeric
+    sensor, so it outranked the vacuum itself."""
+    states = _VAC_STATES + [
+        {"entity_id": "sensor.valetudo_zealouseverlastinggaur_map_segments",
+         "state": "8",
+         "attributes": {"friendly_name": "Roborock Map segments"}},
+    ]
+    e = find_entity(states, "пылесос", None, domain=["vacuum"])
+    assert e is not None and e["entity_id"].startswith("vacuum.")
+    assert describe_entity(e, None, label="пылесос") == "Пылесос: на базе"
+    # Without a domain the numeric-sensor rule is unchanged — that is exactly
+    # what the domain argument is for.
+    assert find_entity(states, "пылесос", None)["entity_id"].startswith("sensor.")
+
+
 def test_describe_vacuum_status_is_spoken_russian():
     vac = _VAC_STATES[1]
     # Without a label the latin friendly name is read out as-is...

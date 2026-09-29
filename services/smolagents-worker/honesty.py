@@ -41,13 +41,23 @@ CONTRACT
                          and `{"tool", "detail"}` per weather_forecast);
              `read_events` — the same shape for ha_read calls (a READ has
                          no side effect, so it lives in its own buffer and
-                         proves DATA claims only, never actions).
+                         proves DATA claims only, never actions);
+             `weather_events` — optional, for GROUNDING only: a degree or
+                         percentage may legitimately come from the forecast
+                         instead of a sensor read.
     Output : `(answer, replaced)` — the string to actually speak plus a
              flag for logging; `replaced=True` means the veto fired.
              `failure_note(events + read_events)` is the sibling helper:
              the RAW recorded errors for app._run_agent's one bounded retry
              after a veto (the speakable `_truth()` above would teach the
              model nothing).
+    Siblings: `same_block_check()` is the structural guard smolagents calls
+             through `final_answer_checks` BEFORE accepting an answer: it
+             refuses an answer written in the same code block as a tool
+             call, so the text can only come from the tool output that is
+             already in the model's context. `mark_tool_call()` /
+             `reset_tool_call()` / `reset_run_state()` keep its flag in step
+             with tools.py and app.py.
     Callers : app.py `_run_agent()` runs vet_answer() first, then
              vet_weather(); nothing else in the pipeline re-checks the text.
     Fail-open : no events / a confirmed result of the claim's own kind / an
@@ -65,6 +75,73 @@ CONTRACT
 from __future__ import annotations
 
 import re
+
+# --- Same-block guard (structural, via smolagents `final_answer_checks`) -----
+# The empirical fact this whole module exists: the free model writes
+# `final_answer` in the SAME code block as its tool call, i.e. it announces
+# its answer while the tool output does not exist yet — the text can then
+# only come from imagination or from the dialogue history. Field cases:
+# 25.09 (forecast written before the fetch), 29.09 11:39 («заряд 45 %» after
+# a failed read) and 29.09 14:17 («робот убирает в гостиной, заряд батареи
+# шестьдесят пять процентов» — the read was on screen and carried NEITHER
+# state nor battery). The prompt forbids it in words and was ignored every
+# single time, so it is refused here: smolagents runs `final_answer_checks`
+# before accepting an answer, and raising inside one turns into an
+# AgentError that is recorded ON the step while the run CONTINUES — next
+# step, the tool output is in the model's context, which is where the answer
+# must come from.
+#
+# `mark_tool_call()` is called by every tool in tools.py; `reset_tool_call()`
+# by app.py's step callback at the end of each step; `reset_run_state()` by
+# app._run_agent at the start of every attempt (next to the event buffers).
+
+_TOOL_IN_STEP = False  # a real tool ran inside the code block being executed
+_BLOCK_GUARD_USED = False  # fire once per run (see module logic above)
+
+
+def mark_tool_call() -> None:
+    """A tool started executing inside the current code block."""
+    global _TOOL_IN_STEP
+    _TOOL_IN_STEP = True
+
+
+def reset_tool_call() -> None:
+    """End of step: the next code block starts with a clean flag."""
+    global _TOOL_IN_STEP
+    _TOOL_IN_STEP = False
+
+
+def reset_run_state() -> None:
+    """Per attempt: no tool called yet, guard re-armed."""
+    global _TOOL_IN_STEP, _BLOCK_GUARD_USED
+    _TOOL_IN_STEP = False
+    _BLOCK_GUARD_USED = False
+
+
+def same_block_check(final_answer, memory, agent=None) -> bool:
+    """`final_answer_checks` hook for CodeAgent — refuse an answer written in
+    the same code block as a tool call.
+
+    Returns True when the answer may be spoken. Otherwise it raises, and
+    smolagents wraps that into an AgentError: the step is recorded as an
+    error and the loop goes on, so the run does not die. The message IS what
+    the model reads on the next step, hence an instruction, not a log line.
+    Signature is smolagents' contract: `check(final_answer, memory, agent)`.
+
+    Fires once per run (`_BLOCK_GUARD_USED`): a model that repeats itself
+    would otherwise spend MAX_STEPS on refusals — the vetoes below still
+    cover the second attempt, so nothing is lost by letting it through.
+    """
+    global _BLOCK_GUARD_USED
+    if not _TOOL_IN_STEP or _BLOCK_GUARD_USED:
+        return True
+    _BLOCK_GUARD_USED = True
+    raise AssertionError(
+        "Ответ написан в том же блоке кода, что и вызов тула, — то есть до "
+        "чтения его вывода. Вывод тула уже есть в журнале шага выше: "
+        "прочитай его и вызови final_answer отдельно, на следующем шаге, "
+        "строго по этим данным, без предположений."
+    )
 
 # Success claims about an action (what must not be said without a result).
 # Field regression 25.09.2026: «Хорошо, отправляю робота-пылесоса на кухню!»
@@ -151,28 +228,144 @@ def _truth(events: list[dict]) -> str:
     return "Не получилось: Home Assistant отклонил команду."
 
 
+# --- Data GROUNDING (field case 29.09.2026, 14:17) ---------------------------
+# The gates in vet_answer() only prove a claim wrong when the read FAILED.
+# This turn had a SUCCESSFUL read — ha_read("пылесос") returned ten entity
+# lines — and the model still dictated «Робот сейчас убирает в гостиной,
+# заряд батареи шестьдесят пять процентов»: the payload carried neither the
+# cleaning state nor a battery entity (HA exposes none for that vacuum), and
+# the vacuum's own `docked` line had been cut off by match_states' cap.
+# A successful read of SOME entities proves nothing about ANY entity, so a
+# data claim has to be GROUNDED: its subject must occur in a recorded
+# payload, otherwise the claim is as good as invented.
+#
+# Each rule is (claim pattern, evidence the payload must carry, RU sentence
+# to speak instead). Evidence is matched LENIENTLY (latin stems by prefix
+# with a non-alnum lookbehind — «charge» must also match «charging», but
+# «on» must not be satisfied by «person»; Russian stems as plain
+# substrings): a missed match here would replace a TRUE answer, which is
+# worse than letting a doubtful one through.
+_GROUND: tuple[tuple[re.Pattern[str], tuple[str, ...], str], ...] = (
+    (re.compile(r"заряд|заряжен|батаре|процент", re.I),
+     ("battery", "заряд", "charge", "%"),
+     "Данных о заряде батареи в Home Assistant нет."),
+    (re.compile(r"на\s+базе|в\s+доке|пристан\w*", re.I),
+     ("docked", "док", "на базе", "в доке"),
+     "В Home Assistant нет сведений, что робот на базе."),
+    (re.compile(r"убирает|убирается|уборк\w*|чистит|моет", re.I),
+     ("cleaning", "возвращается", "в работе", "запущен"),
+     "В Home Assistant нет сведений, что робот сейчас убирается."),
+    (re.compile(r"температур\w*|градус", re.I),
+     ("temperature", "temp", "температур", "°", "градус"),
+     "В Home Assistant нет данных о температуре."),
+    (re.compile(r"влажност", re.I), ("humidity", "влажн"),
+     "В Home Assistant нет данных о влажности."),
+    (re.compile(r"громкост", re.I), ("volume", "громкост"),
+     "В Home Assistant нет данных о громкости."),
+    (re.compile(r"яркост", re.I), ("brightness", "яркост"),
+     "В Home Assistant нет данных о яркости."),
+    (re.compile(r"включено|горит|работает", re.I),
+     ("on", "включ", "playing", "active", "cleaning", "open", "открыт"),
+     "В Home Assistant не видно, чтобы это было включено."),
+    (re.compile(r"выключено|погашен", re.I),
+     ("off", "выключ", "standby"),
+     "В Home Assistant не видно, чтобы это было выключено."),
+)
+
+_NUMBER_TRUTH = "В Home Assistant нет таких данных."
+
+
+def _has_evidence(key: str, pool: str) -> bool:
+    """Is `key` present in the (already lowercased) payload pool?"""
+    if not key.isascii():
+        return key in pool
+    return re.search(rf"(?<![a-z0-9_]){re.escape(key)}", pool) is not None
+
+
+def _payload_pool(
+    reads: list[dict], weather_events: list[dict] | None
+) -> str:
+    """Lowercased concatenation of every payload this run may quote: the
+    successful ha_read details plus the recorded weather_forecast output
+    («15 градусов» may legitimately come from the forecast, not from a
+    sensor read, and must never be vetoed as ungrounded)."""
+    parts = [str(e.get("detail", "")) for e in reads if e.get("ok")]
+    parts += [str(e.get("detail", "")) for e in (weather_events or [])]
+    return "\n".join(parts).lower().replace("ё", "е")
+
+
+def _grounding_truth(answer: str, pool: str) -> str | None:
+    """-> the RU sentence to speak instead of `answer`, or None when every
+    data claim in it is carried by a recorded payload.
+
+    When several claims fail, the one appearing EARLIEST in the answer picks
+    the sentence — the user hears about the first thing that was made up.
+    Digit percentages are checked against the payload numbers too (a 65 %
+    claim cannot stand on a payload that says 82); word numbers («шестьдесят
+    пять») are covered by the subject rules instead, since the model spells
+    them out.
+    """
+    if not _RE_DATA_CLAIM.search(answer):
+        return None
+    failures: list[tuple[int, str]] = []
+    for pattern, evidence, sentence in _GROUND:
+        m = pattern.search(answer)
+        if m and not any(_has_evidence(k, pool) for k in evidence):
+            failures.append((m.start(), sentence))
+    for m in re.finditer(r"(\d+(?:[.,]\d+)?)\s*(?:%|процент)", answer, re.I):
+        val = float(m.group(1).replace(",", "."))
+        if not any(abs(val - n) <= 0.5 for n in _payload_numbers(pool)):
+            failures.append((m.start(), _NUMBER_TRUTH))
+            break
+    if not failures:
+        return None
+    return min(failures, key=lambda f: f[0])[1]
+
+
+def _payload_numbers(pool: str) -> list[float]:
+    """All numbers readable in the payload pool (comma and dot spellings)."""
+    out: list[float] = []
+    for tok in re.findall(r"\d+(?:[.,]\d+)?", pool):
+        try:
+            out.append(float(tok.replace(",", ".")))
+        except ValueError:  # pragma: no cover — \d+ always parses
+            continue
+    return out
+
+
 def vet_answer(
-    answer: str, events: list[dict], read_events: list[dict] | None = None
+    answer: str,
+    events: list[dict],
+    read_events: list[dict] | None = None,
+    weather_events: list[dict] | None = None,
 ) -> tuple[str, bool]:
     """-> (answer, replaced). Replaces an unsupported claim with the truth.
 
-    TWO PROOFS, each with its own log (the buffers are kept apart in
+    THREE PROOFS, each with its own log (the buffers are kept apart in
     tools.py on purpose — a read must never pass for a side effect):
       * action claim («включил/отправляю/сделал», _RE_CLAIM) -> ha_action log;
-      * data claim («заряд сорок пять процентов», «сейчас работает»,
-        _RE_DATA_CLAIM) -> ha_read log. Added 29.09.2026 for the vacuum
-        turn: the read failed with `success: false` and the model still
-        dictated a state and a battery percentage — vet_answer only looked
-        at ha_action events, saw an empty log and passed the fabrication.
-    Gates for either claim, in order (ALL must pass to fire):
+      * data claim after a FAILED read («заряд сорок пять процентов»,
+        «сейчас работает», _RE_DATA_CLAIM) -> ha_read log. Added 29.09.2026
+        for the vacuum turn: the read failed with `success: false` and the
+        model still dictated a state and a battery percentage — vet_answer
+        only looked at ha_action events, saw an empty log and passed it;
+      * data claim after a SUCCESSFUL read -> GROUNDING (see _GROUND): the
+        claim's subject must occur in a recorded payload. Added 29.09.2026
+        14:17, the second occurrence: ten entities read, «робот убирает,
+        заряд 65 %» spoken — neither was in those entities.
+    Gates for the first two proofs, in order (ALL must pass to fire):
       1. >=1 recorded event of the relevant kind (nothing to prove against
          otherwise -> fail open);
       2. zero events with ok=True of that kind (one confirmed result =
          trust the model's report);
       3. the claim is present;
       4. no admission of failure (honest refusals pass).
-    On fire the whole answer is swapped for `_truth()` — a short, factual,
-    speakable sentence; returns replaced=True for logging.
+    Grounding needs its own gates: a successful read, NO confirmed action
+    (a confirmed side effect backs a state claim — «включил» -> «включено»
+    is true without a fresh read), and the claim present.
+    On fire the whole answer is swapped for a short, factual, speakable
+    sentence (`_truth()` for failures, the rule's sentence for ungrounded
+    claims); returns replaced=True for logging.
     """
     reads = list(read_events or [])
     if not events and not reads:
@@ -187,6 +380,12 @@ def vet_answer(
         return _truth(reads + list(events)), True
     if reads and not reads_ok and _RE_DATA_CLAIM.search(answer):
         return _truth(reads + list(events)), True
+    if reads_ok and not acts_ok:
+        truth = _grounding_truth(
+            answer, _payload_pool(reads, weather_events)
+        )
+        if truth:
+            return truth, True
     return answer, False
 
 

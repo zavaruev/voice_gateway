@@ -12,7 +12,15 @@ _WORKER = os.path.abspath(
 )
 sys.path.insert(0, _WORKER)
 
-from honesty import failure_note, vet_answer, vet_weather  # noqa: E402
+from honesty import (  # noqa: E402
+    failure_note,
+    mark_tool_call,
+    reset_run_state,
+    reset_tool_call,
+    same_block_check,
+    vet_answer,
+    vet_weather,
+)
 
 _FAIL_NAME = [
     {"tool": "intent__HassTurnOn", "ok": False,
@@ -260,3 +268,125 @@ def test_failure_note_carries_a_failed_read():
     """The bounded retry must see the raw read error, not the speakable truth."""
     note = failure_note(_READ_FAIL)
     assert "No exposed entities" in note and "пылесос" in note
+
+
+# --- GROUNDING: a SUCCESSFUL read still has to carry the claim ---------------
+# Second occurrence of the same lie, 29.09.2026 14:17 — «Что у нас с
+# роботом?»: ha_read succeeded (ten entity lines), so gate 2 ("one confirmed
+# result of that kind") disarmed the data veto completely, and the model
+# dictated «Робот сейчас убирает в гостиной, заряд батареи шестьдесят пять
+# процентов». Neither was in those ten lines: no battery entity exists for
+# that vacuum, and the vacuum's own `docked` had been cut off by match_states'
+# cap (fixed in ha_match). A successful read of SOME entities proves nothing
+# about ANY entity — the claim's subject must be IN the payload.
+
+_READ_1417 = [
+    {"tool": "ha_read", "ok": True,
+     "detail": "update.vacuum_card_update: off (Vacuum Card Update)\n"
+               "sensor.valetudo_zealouseverlastinggaur_map_segments: 8 "
+               "(Roborock Map segments)"},
+]
+_LIE_1417 = (
+    "Робот сейчас убирает в гостиной, заряд батареи шестьдесят пять процентов."
+)
+
+
+def test_ungrounded_state_and_battery_after_a_successful_read_is_vetoed():
+    """The exact 14:17 transcript. The EARLIEST fabricated claim picks the
+    replacement sentence — the user hears about the first lie."""
+    out, replaced = vet_answer(_LIE_1417, [], _READ_1417)
+    assert replaced is True
+    assert "убирается" in out  # «убирает» стоит в ответе раньше «заряда»
+
+
+def test_battery_only_claim_is_vetoed():
+    out, replaced = vet_answer("Заряд батареи шестьдесят пять процентов.", [],
+                               _READ_1417)
+    assert replaced is True
+    assert "заряд" in out.lower()
+
+
+def test_grounded_state_passes():
+    """`docked` in the payload + «на базе» in the answer: honest, untouched."""
+    out, replaced = vet_answer("Робот на базе.", [], _READ_OK)
+    assert replaced is False and out == "Робот на базе."
+
+
+def test_percentage_number_must_appear_in_the_payload():
+    """Battery present but the number is not: the digits are invented too."""
+    reads = [{"tool": "ha_read", "ok": True,
+              "detail": "sensor.valetudo_battery: 82 (%)"}]
+    assert vet_answer("Заряд батареи 65 процентов.", [], reads)[1] is True
+    # The real number passes (comma/dot and rounding tolerance are handled).
+    assert vet_answer("Заряд батареи 82 процента.", [], reads)[1] is False
+
+
+def test_grounding_is_skipped_after_a_confirmed_action():
+    """«включил» -> «включено» is true without a fresh read: a confirmed
+    side effect backs the state claim, so the read taken BEFORE the action
+    must not veto it."""
+    out, replaced = vet_answer("Свет включён.", _OK, _READ_1417)
+    assert replaced is False and out == "Свет включён."
+
+
+def test_weather_numbers_are_not_vetoed_as_ungrounded():
+    """«15 градусов» may come from weather_forecast instead of a sensor
+    read — the forecast is passed in as evidence for exactly that."""
+    weather = [{"tool": "weather_forecast", "detail": "На улице 15 градусов, пасмурно."}]
+    assert vet_answer("На улице 15 градусов, пасмурно.", [], _READ_1417, weather)[1] is False
+    # Same answer, forecast not recorded -> the read carries no temperature.
+    assert vet_answer("На улице 15 градусов.", [], _READ_1417)[1] is True
+
+
+def test_non_data_answers_are_never_grounded():
+    out, replaced = vet_answer("Расскажу анекдот: заходит кактус...", [], _READ_1417)
+    assert replaced is False
+
+
+# --- Same-block guard: the answer must come AFTER the tool output ------------
+# smolagents runs `final_answer_checks` before accepting an answer; raising
+# there records an error on the step and the run continues, so the model
+# gets a fresh step where the tool output is already in its context.
+
+
+def _refused() -> bool:
+    try:
+        same_block_check("ответ", None, None)
+    except AssertionError:
+        return True
+    return False
+
+
+def test_guard_refuses_an_answer_written_with_the_tool():
+    reset_run_state()
+    mark_tool_call()          # tools.py does this the moment a tool starts
+    try:
+        same_block_check("ответ", None, None)
+        raise AssertionError("the guard must refuse an answer written with a tool")
+    except AssertionError as e:
+        # …and the message is an instruction for the NEXT step, not a log line.
+        assert "прочитай" in str(e) and "final_answer отдельно" in str(e)
+
+
+def test_guard_lets_a_clean_answer_through():
+    reset_run_state()
+    assert same_block_check("ответ", None, None) is True
+
+
+def test_guard_ignores_a_tool_from_a_previous_step():
+    """app._end_step clears the flag after every step: a tool in step 1 and
+    a lone final_answer in step 2 is the CORRECT flow and must pass."""
+    reset_run_state()
+    mark_tool_call()
+    reset_tool_call()         # step_callbacks does exactly this
+    assert same_block_check("ответ", None, None) is True
+
+
+def test_guard_fires_once_and_rearms_per_run():
+    reset_run_state()
+    mark_tool_call()
+    refusals = sum(1 for _ in range(3) if _refused())
+    assert refusals == 1  # a model that repeats itself must not burn MAX_STEPS
+    reset_run_state()     # …but the next attempt starts armed again
+    mark_tool_call()
+    assert _refused() is True

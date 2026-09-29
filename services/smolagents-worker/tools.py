@@ -53,6 +53,10 @@ from smolagents import tool
 
 import config
 from ha_match import has_data, match_states
+# The same-block guard lives in honesty (pure stdlib, so tests import it
+# without smolagents): every tool announces itself there the moment it runs,
+# and app.py clears the flag at the end of each agent step.
+from honesty import mark_tool_call, reset_run_state
 
 logger = logging.getLogger("worker.tools")
 
@@ -80,15 +84,26 @@ _READ_EVENTS: list[dict] = []
 _WEATHER_EVENTS: list[dict] = []
 _EVENTS_LOCK = threading.Lock()
 
+# Read payloads are kept far longer than action details: honesty's
+# GROUNDING greps them for the subject of a claim (battery / state /
+# reading) and for the number of a percentage, so truncating at the
+# error-marker size would make a TRUE claim look ungrounded. Weather keeps
+# the 300-char default — vet_weather compares its numbers verbatim and a
+# longer forecast would start flagging honest paraphrases.
+_READ_DETAIL_LIMIT = 4000
+
 
 def reset_action_events() -> None:
-    """Clear ALL THREE buffers; called by app._run_agent at the start of
-    every attempt so events never leak between runs (a stale success from
-    the previous turn would silence the veto on a fresh failure)."""
+    """Clear ALL THREE buffers AND the same-block guard; called by
+    app._run_agent at the start of every attempt so events never leak
+    between runs (a stale success from the previous turn would silence the
+    veto on a fresh failure, a stale guard flag would refuse the first
+    honest answer)."""
     with _EVENTS_LOCK:
         _ACTION_EVENTS.clear()
         _READ_EVENTS.clear()
         _WEATHER_EVENTS.clear()
+    reset_run_state()
 
 
 def get_action_events() -> list[dict]:
@@ -114,19 +129,23 @@ def get_weather_events() -> list[dict]:
         return list(_WEATHER_EVENTS)
 
 
-def _record(tool: str, bucket: list[dict], result: str, ok: bool | None) -> None:
+def _record(
+    tool: str, bucket: list[dict], result: str, ok: bool | None, limit: int = 300
+) -> None:
     """Append one outcome to `bucket` (lock-protected).
 
     `ok=None` means "decide here" via ha_match.has_data — the same
     definition the REST fallback uses, so a miss can never be recorded as a
     success (a wrongly-flagged success disarms the honesty veto).
-    `detail` is truncated to 300 chars — enough for the error markers the
-    veto greps for, small enough to keep the log tidy.
+    `detail` is truncated to `limit` — 300 chars is enough for the error
+    markers the veto greps for, small enough to keep the log tidy; reads
+    pass a much larger limit because the grounding check reads them (see
+    _READ_DETAIL_LIMIT).
     """
     if ok is None:
         ok = has_data(result)
     with _EVENTS_LOCK:
-        bucket.append({"tool": tool, "ok": ok, "detail": result[:300]})
+        bucket.append({"tool": tool, "ok": ok, "detail": result[:limit]})
 
 
 def _record_action(tool_name: str, result: str) -> None:
@@ -148,7 +167,7 @@ def _record_read(tool_name: str, result: str, ok: bool) -> None:
     a read that came back with no entity («Ничего не найдено…») is a miss,
     not data — recording it as a success would let a fabricated status claim
     through the veto (field case 29.09.2026)."""
-    _record(tool_name, _READ_EVENTS, result, ok)
+    _record(tool_name, _READ_EVENTS, result, ok, limit=_READ_DETAIL_LIMIT)
 
 
 def _http_json(
@@ -244,6 +263,7 @@ def ha_action(tool_name: str, arguments_json: str) -> str:
             vacuum__HassVacuumCleanArea с {"area": "кухня"}; у HassVacuumStart
             area означает ГДЕ стоит пылесос (комната-фильтр), а не цель уборки.
     """
+    mark_tool_call()  # honesty.same_block_check: this block now HAS a tool
     # A malformed/absent JSON object never reaches HA, but it is still a
     # failed call: record it so the veto can refuse honestly instead of
     # letting the model claim success for a command that was never sent.
@@ -297,6 +317,7 @@ def ha_read(query: str, area: str = "") -> str:
             домен (light, switch, sensor, media_player) или показатель (температура, влажность, заряд).
         area: Комната по-русски или по-английски (кухня, спальня, kitchen); можно пусто.
     """
+    mark_tool_call()  # honesty.same_block_check: this block now HAS a tool
     # Primary: HA MCP GetLiveContext (understands name+area and answers
     # with a curated context blob). A transport/tool error ("Ошибка…"), an
     # EMPTY result and a `{"success": false …}` payload all mean "miss" ->
@@ -344,6 +365,7 @@ def qdrant_search(query: str, limit: int = 5) -> str:
         query: Текстовый запрос по-русски (например, о чём пользователь говорил ранее).
         limit: Максимум результатов (по умолчанию 5).
     """
+    mark_tool_call()  # honesty.same_block_check: this block now HAS a tool
     # Embed the query with Ollama first (30 s: cold model load happens
     # here). Any failure is returned as text — the model must read
     # "память недоступна" instead of getting a tool exception.
@@ -395,6 +417,7 @@ def hermes_expert(question: str) -> str:
     Args:
         question: Вопрос по-русски с контекстом проблемы (что не работает, что уже проверено).
     """
+    mark_tool_call()  # honesty.same_block_check: this block now HAS a tool
     # Plain non-streaming chat completion against L3 Hermes — no MCP, no
     # tools: the expert only READS infrastructure and advises. The system
     # message below is PROMPT TEXT (byte-identical, see header).
@@ -430,6 +453,7 @@ def hermes_expert(question: str) -> str:
 @tool
 def get_datetime() -> str:
     """Текущие дата и время (часовой пояс дома, Европа/Москва)."""
+    mark_tool_call()  # honesty.same_block_check: this block now HAS a tool
     # strftime has no Russian locale in the slim container, so the string
     # is built in English and the weekday / month names are swapped for
     # their Russian forms via str.replace (the weekday is looked up once,
@@ -478,6 +502,7 @@ def weather_forecast(text: str) -> str:
         text: Полный вопрос пользователя про погоду («какая завтра погода»,
             «сколько градусов на улице», «нужен ли зонт в пятницу»).
     """
+    mark_tool_call()  # honesty.same_block_check: this block now HAS a tool
     # Deterministic path: L1 router /weather (open-meteo) — the model never
     # computes weather itself, it only relays this text. The question is
     # URL-encoded (RU sentences contain «?», «&», quotes). 15 s timeout;

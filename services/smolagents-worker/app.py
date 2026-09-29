@@ -38,11 +38,16 @@ CONTRACT
 WHY THIS SERVICE IS SHAPED THE WAY IT IS — the single most important fact
   about it: the CodeAgent runs on a FREE LLM that routinely writes
   `final_answer` in the SAME code block as its tool call, i.e. it announces
-  success before the tool ever ran. Prompt rules alone were ignored in 3/3
-  field cases, so honesty is enforced PROGRAMMATICALLY after agent.run():
-  vet_answer() cross-checks the draft against the recorded ha_action
-  outcomes and, for state/number claims, the recorded ha_read outcomes,
-  vet_weather() against the recorded forecast (honesty.py), and
+  success before the tool ever ran. Prompt rules alone were ignored in 4/4
+  field cases, so honesty is enforced PROGRAMMATICALLY, twice over:
+  BEFORE the answer is accepted, honesty.same_block_check (a smolagents
+  `final_answer_checks` hook) refuses an answer written in the same code
+  block as a tool call and gives the model a fresh step where the tool
+  output is in its context; AFTER agent.run(), vet_answer() cross-checks
+  the draft against the recorded ha_action outcomes, against the recorded
+  ha_read outcomes (a failed read) and against the payload itself
+  (GROUNDING: a claim whose subject is not in any recorded payload is
+  invented), vet_weather() against the recorded forecast (honesty.py), and
   tools.ha_action() carries a deterministic vacuum-retry fallback. The
   TASK_TEMPLATE rules below are only a supporting layer — treat them as
   prompt text, never as the enforcement mechanism (they must stay
@@ -62,7 +67,7 @@ from pydantic import BaseModel
 from smolagents import CodeAgent, OpenAIModel
 
 import config
-from honesty import failure_note, vet_answer, vet_weather
+from honesty import failure_note, reset_tool_call, same_block_check, vet_answer, vet_weather
 from tools import (
     TOOLS,
     get_action_events,
@@ -262,6 +267,18 @@ def _build_model(primary: bool) -> OpenAIModel:
     )
 
 
+def _end_step(step) -> None:
+    """smolagents `step_callbacks` hook: every code block starts with a clean
+    same-block flag (the tools set it while they run, honesty.
+    same_block_check reads it when the model tries to answer).
+
+    Signature is deliberately `(step)` only — smolagents passes the extra
+    kwargs (agent=…) solely to multi-parameter callbacks, and it inspects
+    the signature to decide.
+    """
+    reset_tool_call()
+
+
 def _run_agent(
     text: str, context: str = "", hist: str = "", retry: bool = False
 ) -> str:
@@ -307,6 +324,14 @@ def _run_agent(
                 tools=TOOLS,
                 model=_build_model(primary),
                 max_steps=config.MAX_STEPS,
+                # Honesty is enforced by smolagents' own hooks, not by the
+                # prompt: `final_answer_checks` refuses an answer written in
+                # the same code block as a tool call (the model then gets a
+                # fresh step where the tool output IS in its context), and
+                # the step callback clears that flag at the end of every
+                # step. See honesty.same_block_check.
+                final_answer_checks=[same_block_check],
+                step_callbacks=[_end_step],
             )
             logger.info("agent run start (attempt %d, primary=%s)", attempt, primary)
             t0 = time.monotonic()
@@ -318,7 +343,11 @@ def _run_agent(
             # replaced by the truth.
             events = get_action_events()
             reads = get_read_events()
-            answer, replaced = vet_answer(answer, events, reads)
+            w_events = get_weather_events()
+            # Third argument is the read log (data claims), fourth the
+            # weather output — a degree or a percentage may legitimately
+            # come from the forecast, and grounding must not veto it.
+            answer, replaced = vet_answer(answer, events, reads, w_events)
             if replaced:
                 logger.warning("honesty veto: claim replaced with recorded truth")
             # Same pattern for weather: the model wrote final_answer before
@@ -326,7 +355,6 @@ def _run_agent(
             # recorded forecast decides instead. Skipped whenever a ha_action
             # was attempted this run: the full-answer replacement must never
             # wipe an action report (true success or honest refusal).
-            w_events = get_weather_events()
             answer, w_replaced = vet_weather(answer, w_events, bool(events))
             if w_replaced:
                 logger.warning("weather veto: answer replaced with recorded forecast")

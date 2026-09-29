@@ -321,7 +321,12 @@ class HAClient:
             await self._session.close()
 
 
-def find_entity(states: list[dict], hint: str, area: str | None = None) -> dict | None:
+def find_entity(
+    states: list[dict],
+    hint: str,
+    area: str | None = None,
+    domain: list[str] | None = None,
+) -> dict | None:
     """Fuzzy entity lookup for easy_query.
 
     HA entity_ids/friendly_names are mostly latin (bedroom_thermometer
@@ -330,6 +335,13 @@ def find_entity(states: list[dict], hint: str, area: str | None = None) -> dict 
     hint that matches NOTHING globally means the entity does not exist:
     return None (escalate) instead of falling back to an area-only match,
     which would answer a completely different question.
+
+    `domain` (optional) is a PREFERENCE, never a filter: candidates whose
+    own domain is listed are ranked first. Needed because «пылесос» matches
+    both `vacuum.valetudo_…` and `update.vacuum_card_update`, and the
+    registry is ordered so the helper entity comes first — a filter would
+    be wrong in the other direction (the household lamp is a `switch.*`
+    while the resolver asks for domain ["light"]).
     """
     hint_l = (hint or "").lower().strip()
     area_l = (area or "").lower().strip()
@@ -389,6 +401,17 @@ def find_entity(states: list[dict], hint: str, area: str | None = None) -> dict 
     ordered = sorted(
         candidates, key=lambda e: 0 if e["entity_id"].startswith("sensor.") else 1
     )
+    if domain:
+        # Domain PREFERENCE (see docstring): a `vacuum.*` entity beats the
+        # `update.vacuum_card_update` helper that matches the same hint and
+        # sorts earlier in the registry. Stable sort keeps the order inside
+        # each group, so the sensor rule above still decides between two
+        # same-domain candidates.
+        want = {d.lower() for d in domain}
+        in_dom = [e for e in ordered if e["entity_id"].split(".", 1)[0] in want]
+        if in_dom:
+            ids = {e["entity_id"] for e in in_dom}
+            ordered = in_dom + [e for e in ordered if e["entity_id"] not in ids]
     for e in ordered:
         if e["entity_id"].startswith("sensor."):
             try:
@@ -484,12 +507,19 @@ def dedupe_device_facets(targets: list[dict]) -> list[dict]:
     return out
 
 
-def describe_entity(e: dict, area: str | None = None) -> str:
+def describe_entity(e: dict, area: str | None = None, label: str = "") -> str:
     """Human phrase for TTS from an HA state object.
 
     Latin technical names (bedroom_thermometer Temperature) read terribly
     aloud, so when the spoken area is known the phrase leads with it
     («В спальне: 22,9 градусов»); otherwise underscores are flattened.
+
+    `label` is a RU device word the resolver already extracted («пылесос»):
+    when the friendly name is latin, the spoken word beats both the latin
+    name («Roborock Robot: на базе») and the room prefix, because the user
+    asked about the DEVICE. Ignored when the friendly name is already
+    Russian — there it wins — and never used by the sensor families, which
+    pass stems like «температур» that would read worse than the real name.
     """
     name = e.get("attributes", {}).get("friendly_name") or e.get("entity_id", "")
     state = str(e.get("state", ""))
@@ -519,6 +549,14 @@ def describe_entity(e: dict, area: str | None = None) -> str:
         "idle": "в ожидании",
         "playing": "воспроизводится",
         "paused": "на паузе",
+        # vacuum.* states — without them «docked» was read out in English
+        # (field case 29.09.2026, «что там с пылесосом?»).
+        "docked": "на базе",
+        "cleaning": "убирается",
+        "spot_cleaning": "убирается",
+        "returning": "возвращается на базе",
+        "stuck": "застрял",
+        "error": "ошибка",
     }
     state_ru = state_map.get(state.lower(), state)
     # Numeric states: '22.94' -> '22,9' (Russian decimal comma) and '22.0'
@@ -531,10 +569,14 @@ def describe_entity(e: dict, area: str | None = None) -> str:
             state_ru = f"{f:.1f}".replace(".", ",")
     except (ValueError, TypeError):
         pass
-    # Latin technical names read terribly aloud: lead with the room when it
-    # is known, otherwise flatten underscores; RU names are spoken as-is.
+    # Latin technical names read terribly aloud: lead with the spoken device
+    # word when one was given, else with the room when it is known, otherwise
+    # flatten underscores; RU names are spoken as-is (a label never overrides
+    # a Russian friendly name — it is only a fallback for latin ones).
     if not re.search(r"[А-Яа-я]", name):
-        if area:
+        if label:
+            head = label[:1].upper() + label[1:]
+        elif area:
             head = _area_phrase(area)
         else:
             head = name.replace("_", " ")

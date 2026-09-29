@@ -515,9 +515,14 @@ async def _handle(req: RouteRequest):
                 # Area is binding: never answer with another room's sensor.
                 # (area=None -> unconstrained global match; a room that was
                 # named — explicitly or via the satellite default — narrows it.)
-                ent = find_entity(states, hint, area) if area else find_entity(states, hint, None)
+                # `domain` ranks a real device above a same-hint helper entity
+                # (vacuum.* over update.vacuum_card_update); `label` is the RU
+                # device word spoken instead of the latin friendly name.
+                ent = find_entity(states, hint, area, domain=q.args.get("domain"))
                 if ent is not None:
-                    sentence = describe_entity(ent, area)
+                    sentence = describe_entity(
+                        ent, area, label=q.args.get("label", "")
+                    )
                 elif states and hint:
                     # The registry is loaded but the hint matches nothing in
                     # RU or EN: deterministic truth from the source of record.

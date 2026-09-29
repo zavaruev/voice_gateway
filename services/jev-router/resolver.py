@@ -103,6 +103,7 @@ THING: dict[str, tuple[list[str] | None, str | None]] = {
     "жалюзи": (["cover"], None),
     "пылесос": (["vacuum"], None),
     "пылесоса": (["vacuum"], None),
+    "робот": (["vacuum"], None),  # «робот/робота» = the same Valetudo vacuum
     "кофеварк": (["switch"], "кофеварка"),
     "кафеварк": (["switch"], "кофеварка"),  # STT hears «кафеварку» (dropped «о»)
     "кофемашин": (["switch"], "кофемашина"),
@@ -575,6 +576,16 @@ RE_STATE_Q = re.compile(
     r"|^\s*(?:а\s+)?что\s+(?:с\s+)?(?:сейчас\s+)?(?:играет|включено|идёт|идет)",
     re.IGNORECASE,
 )
+# Status phrasing about a NAMED device: «что там с нашим пылесосом?»,
+# «что с чайником», «чего с роботом?», «как пылесос?». The second branch
+# requires the question mark: STT keeps it, and without it «как включить
+# свет» would read as a status question. Only ever consulted together with a
+# THING match (see resolve_query), so «как дела?»/«привет» still escalate.
+RE_STATUS_Q = re.compile(
+    r"\b(?:что|чего)\s+(?:там\s+|нового\s+)?(?:с|со)\b"
+    r"|\bкак\s+(?:наш\w*|мой\w*|он|она|оно|сейчас)?\s*[\wа-яё-]+\s*\?",
+    re.IGNORECASE,
+)
 RE_TIME_Q = re.compile(
     r"\b(который час|какое (?:сейчас )?время|какое (?:сегодня )?число|какая дата|дата сегодня)\b",
     re.IGNORECASE,
@@ -589,7 +600,9 @@ class ResolvedQuery:
     kind       -> "datetime" (HA llm__GetDateTime), "weather" (open-meteo
                   hybrid chain) or "state" (live registry lookup).
     args       -> optional matcher slots for the state read: domain/name/
-                  area, with `area` again the HA registry display name.
+                  area, with `area` again the HA registry display name, plus
+                  `label` — a RU device word («пылесос») that describe_entity
+                  speaks instead of the latin friendly name.
     entity_hint-> RU stem handed to ha_client.find_entity() for the
                   bilingual (RU stem -> latin entity) match.
     """
@@ -623,7 +636,7 @@ def resolve_query(text: str, stream_name: str) -> ResolvedQuery | None:
 
     # The area *source* is irrelevant for queries (nothing is toggled).
     area, _src = _find_area(t, stream_name)
-    thing_domain, thing_name, *_ = _find_thing(t)
+    thing_domain, thing_name, _low, thing_stem = _find_thing(t)
 
     # Sensor reads: domain=sensor (+ room when known); the RU stem travels
     # in entity_hint and ha_client.find_entity() does the bilingual lookup.
@@ -642,6 +655,27 @@ def resolve_query(text: str, stream_name: str) -> ResolvedQuery | None:
         if area:
             args["area"] = area
         return ResolvedQuery("state", args, entity_hint="заряд")
+
+    # Status question about a NAMED device («что там с нашим пылесосом?»):
+    # THING already resolved the noun to a domain, so this is a registry
+    # state read in ~1 s instead of an L2 escalation. Field case 29.09.2026:
+    # the phrasing fell through to None, the free model was asked instead
+    # and invented «работает, заряда 45 %» while HA reported `docked` (and
+    # has no battery attribute for that vacuum at all) — 20 s of latency for
+    # a lookup this branch does deterministically.
+    if thing_domain and RE_STATUS_Q.search(t):
+        args = {"domain": thing_domain}
+        if thing_name:
+            args["name"] = thing_name
+        if area:
+            args["area"] = area
+        # RU stem («пылесос») rather than the domain: ha_client._HINT_LAT
+        # expands it to vacuum/roborock/robot, and describe_entity() speaks
+        # it back instead of the latin «Roborock Robot».
+        args["label"] = thing_name or thing_stem
+        return ResolvedQuery(
+            "state", args, entity_hint=thing_stem or thing_name or thing_domain[0]
+        )
 
     if RE_STATE_Q.search(t):
         args = {}

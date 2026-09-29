@@ -388,3 +388,92 @@ def test_hint_silent_below_threshold():
 def test_hint_never_makes_the_resolver_act():
     """The hint rides along with the escalation, it does not resolve."""
     assert resolve_action("Выключи кашеварку.", "kitchen") is None
+
+
+# --- status question about a NAMED device (field case 29.09.2026) -----------
+# «Что там с нашим пылесосом?» resolved to None, escalated to L2 and the free
+# model dictated «сейчас работает, заряда 45 %» while HA reports `docked`.
+# The THING dictionary already knows the noun — the answer is one state read.
+
+
+def test_device_status_query_resolves_to_state():
+    q = resolve_query("Что там с нашим пылесосом?", "device")
+    assert q is not None and q.kind == "state"
+    assert q.args["domain"] == ["vacuum"]
+    # RU stem, not the domain: _HINT_LAT expands it to vacuum/roborock/robot
+    # and describe_entity() speaks it instead of «Roborock Robot».
+    assert q.entity_hint == "пылесос"
+    assert q.args["label"] == "пылесос"
+
+
+def test_device_status_query_short_forms():
+    for text in ("что с чайником", "чего с роботом?", "а как пылесос?"):
+        q = resolve_query(text, "device")
+        assert q is not None and q.kind == "state", text
+
+
+def test_device_status_query_keeps_a_named_room():
+    q = resolve_query("что там с пылесосом на кухне", "device")
+    assert q is not None and q.args["area"] == "Kitchen"
+
+
+def test_status_question_without_a_device_still_escalates():
+    """No THING match -> nothing to read: «как дела?» must not become a
+    state query, and the bare greeting stays an escalation."""
+    assert resolve_query("привет", "device") is None
+    assert resolve_query("как дела?", "device") is None
+    assert resolve_query("что нового в мире?", "device") is None
+
+
+def test_status_question_does_not_shadow_the_earlier_families():
+    """Temperature/humidity/battery are decided BEFORE the status rung —
+    «что там с температурой?» is a sensor read with a sensor hint."""
+    q = resolve_query("что там с температурой в спальне", "device")
+    assert q is not None and q.kind == "state"
+    assert "температур" in q.entity_hint
+    assert q.args.get("label") is None  # sensor stems are never spoken labels
+
+
+def test_classifier_routes_the_field_phrase_as_easy_query():
+    """L1 must even see the question: route=easy_query conf=0.90 was logged
+    for exactly this text on 29.09.2026."""
+    assert clf.RE_QUERY.match("что там с нашим пылесосом?")
+
+
+# --- find_entity domain preference / describe_entity vacuum wording ----------
+
+
+_VAC_STATES = [
+    {"entity_id": "update.vacuum_card_update", "state": "off",
+     "attributes": {"friendly_name": "Vacuum Card Update"}},
+    {"entity_id": "vacuum.valetudo_zealouseverlastinggaur", "state": "docked",
+     "attributes": {"friendly_name": "Roborock Robot"}},
+]
+
+
+def test_find_entity_prefers_the_real_domain():
+    """`update.vacuum_card_update` sorts before `vacuum.…` and matches the
+    same hint — without a preference the model would read the card helper."""
+    e = find_entity(_VAC_STATES, "пылесос", None, domain=["vacuum"])
+    assert e is not None and e["entity_id"].startswith("vacuum.")
+
+
+def test_domain_preference_is_a_preference_not_a_filter():
+    """The household lamp is a `switch.*` while the resolver asks for
+    domain ['light'] — a filter would answer "device not found"."""
+    e = find_entity(_STATES, "кофемашин", None, domain=["light"])
+    assert e is not None and e["entity_id"] == "switch.kitchen_coffee_machine"
+
+
+def test_describe_vacuum_status_is_spoken_russian():
+    vac = _VAC_STATES[1]
+    # Without a label the latin friendly name is read out as-is...
+    assert describe_entity(vac, None) == "Roborock Robot: на базе"
+    # ...with the resolver's RU device word it says what the user asked about.
+    assert describe_entity(vac, None, label="пылесос") == "Пылесос: на базе"
+
+
+def test_describe_label_never_beats_a_russian_name():
+    e = {"entity_id": "switch.kettle", "state": "on",
+         "attributes": {"friendly_name": "Чайник кухня"}}
+    assert describe_entity(e, None, label="чайник").startswith("Чайник кухня")

@@ -149,3 +149,23 @@ voice_gateway/
 
 - **Configuration, REST API, environment variables, known issues and the full changelog:** [`docs/REFERENCE.md`](docs/REFERENCE.md)
 - **Tests:** 177 tests across 12 files covering engine scoring and wake gates, camera arbitration, the ESP32 protocol, cascade streaming, honesty vetoes, router resolution and dialogue memory. Run them inside the container — see [`docs/REFERENCE.md`](docs/REFERENCE.md#tests), the host Python usually lacks `opuslib` / `onnxruntime`.
+
+---
+
+## License
+
+Dual-licensed — pick one:
+
+| | License | Price | Applies when |
+|---|---|---|---|
+| **A** | **[GNU AGPL v3 or later](LICENSE)** | free | you accept copyleft: derivative works and network services must stay open source |
+| **B** | **[Commercial License](COMMERCIAL-LICENSE.md)** | **paid** | you want it in a **commercial product** — bundled with hardware, shipped closed-source, offered as SaaS, or licensed away from the AGPL |
+
+```python
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Commercial licensing: alexander.zavaruev@gmail.com
+```
+
+Third-party components (openWakeWord model files, Silero VAD, Vosk models)
+keep their own licenses — see [`NOTICE`](NOTICE).
+

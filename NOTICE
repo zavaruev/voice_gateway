@@ -1,0 +1,38 @@
+voice_gateway
+Copyright (c) 2026 Alexander Zavaruev
+
+This repository is dual-licensed under the GNU AGPL v3 or later and a paid
+Commercial License (see LICENSE and COMMERCIAL-LICENSE.md).
+
+THIRD-PARTY COMPONENTS
+======================
+
+The following components are NOT covered by the above license. They remain
+under their own licenses, which are reproduced or referenced below.
+
+1. openWakeWord
+   Project:  https://github.com/dscripka/openWakeWord
+   License:  Apache License 2.0
+   Files:    config/computer_20260706_130638.onnx  (wake-word model, model zoo)
+             config/embedding_model.onnx
+   Copyright (c) David Scripka and openWakeWord contributors.
+
+2. Silero VAD
+   Project:  https://github.com/snakers4/silero-vad
+   License:  MIT License
+   File:     silero_vad.onnx (fetched at build/runtime, not tracked in git)
+
+3. Vosk models (optional, downloaded separately)
+   Project:  https://github.com/alphacep/vosk-api
+   License:  Apache License 2.0 (model files carry their own terms)
+   Files:    config/vosk-model-small-ru-0.22/, config/vosk-model-ru-0.42/
+
+4. Project-owned model: config/computer.onnx — custom wake-word head trained
+   in this project with the openWakeWord toolchain. Not a third-party model
+   file; covered by this repository's license.
+
+Python dependencies (requirements.txt) are installed from PyPI at build time
+and are not redistributed in this repository; each keeps its own license.
+
+Apache License 2.0 text: https://www.apache.org/licenses/LICENSE-2.0
+MIT License text:        https://opensource.org/licenses/MIT

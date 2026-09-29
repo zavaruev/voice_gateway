@@ -1,0 +1,115 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1020 560" width="1020" height="560" font-family="Inter, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arw2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#8b949e"/>
+    </marker>
+    <marker id="arwb2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#58a6ff"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="1020" height="560" rx="10" fill="#0d1117"/>
+
+  <text x="30" y="38" fill="#e6edf3" font-size="17" font-weight="700">What you need to run it</text>
+  <text x="30" y="58" fill="#8b949e" font-size="12.5">No new hardware required — every microphone you already own becomes a satellite.</text>
+
+  <text x="30" y="92" fill="#8b949e" font-size="11.5" font-weight="700" letter-spacing="1.6">YOUR ROOMS</text>
+  <text x="330" y="92" fill="#8b949e" font-size="11.5" font-weight="700" letter-spacing="1.6">LAN</text>
+  <text x="520" y="92" fill="#8b949e" font-size="11.5" font-weight="700" letter-spacing="1.6">ONE HOME SERVER</text>
+
+  <!-- rooms -->
+  <g>
+    <rect x="30" y="104" width="250" height="78" rx="7" fill="#161b22" stroke="#30363d"/>
+    <text x="46" y="130" fill="#e6edf3" font-size="13.5" font-weight="700">Corridor</text>
+    <text x="46" y="151" fill="#8b949e" font-size="12">ESP32 satellite (display, OTA)</text>
+    <text x="46" y="169" fill="#8b949e" font-size="12">OpenIPC camera — mic clips up close</text>
+
+    <rect x="30" y="196" width="250" height="78" rx="7" fill="#161b22" stroke="#30363d"/>
+    <text x="46" y="222" fill="#e6edf3" font-size="13.5" font-weight="700">Kitchen</text>
+    <text x="46" y="243" fill="#8b949e" font-size="12">OpenIPC camera</text>
+    <text x="46" y="261" fill="#8b949e" font-size="12">hood / vacuum noise → higher wake bar</text>
+
+    <rect x="30" y="288" width="250" height="78" rx="7" fill="#161b22" stroke="#30363d"/>
+    <text x="46" y="314" fill="#e6edf3" font-size="13.5" font-weight="700">Living room</text>
+    <text x="46" y="335" fill="#8b949e" font-size="12">ESP32 satellite + camera</text>
+    <text x="46" y="353" fill="#8b949e" font-size="12">two mics, one arbitration owner</text>
+
+    <rect x="30" y="384" width="250" height="70" rx="7" fill="#161b22" stroke="#30363d"/>
+    <text x="46" y="410" fill="#e6edf3" font-size="13.5" font-weight="700">Anywhere else</text>
+    <text x="46" y="431" fill="#8b949e" font-size="12">any WS client speaking the v1/v2/v3</text>
+    <text x="46" y="447" fill="#8b949e" font-size="12">Opus frame protocol</text>
+  </g>
+
+  <!-- LAN -->
+  <g>
+    <rect x="330" y="196" width="140" height="110" rx="7" fill="#161b22" stroke="#30363d"/>
+    <text x="400" y="230" fill="#e6edf3" font-size="13" font-weight="700" text-anchor="middle">home LAN</text>
+    <text x="400" y="252" fill="#8b949e" font-size="11.5" text-anchor="middle">Wi-Fi / Ethernet</text>
+    <text x="400" y="274" fill="#58a6ff" font-size="11.5" text-anchor="middle">network_mode: host</text>
+    <text x="400" y="293" fill="#8b949e" font-size="11.5" text-anchor="middle">(bridge = blackout)</text>
+  </g>
+
+  <!-- server -->
+  <g>
+    <rect x="520" y="104" width="470" height="380" rx="9" fill="#161b22" stroke="#58a6ff" stroke-opacity="0.55"/>
+    <text x="538" y="130" fill="#58a6ff" font-size="13.5" font-weight="700">docker compose project</text>
+
+    <rect x="538" y="142" width="145" height="64" rx="6" fill="#0d1117" stroke="#58a6ff"/>
+    <text x="552" y="165" fill="#58a6ff" font-size="12.5" font-weight="700">voice_gateway</text>
+    <text x="552" y="185" fill="#8b949e" font-size="11">:18792 · the only entry</text>
+
+    <rect x="693" y="142" width="145" height="64" rx="6" fill="#0d1117" stroke="#30363d"/>
+    <text x="707" y="165" fill="#3fb950" font-size="12.5" font-weight="700">jev-router</text>
+    <text x="707" y="185" fill="#8b949e" font-size="11">:8091 · cascade L1</text>
+
+    <rect x="848" y="142" width="126" height="64" rx="6" fill="#0d1117" stroke="#30363d"/>
+    <text x="862" y="165" fill="#d29922" font-size="12.5" font-weight="700">smolagents</text>
+    <text x="862" y="185" fill="#8b949e" font-size="11">:8092 · cascade L2</text>
+
+    <rect x="538" y="216" width="145" height="64" rx="6" fill="#0d1117" stroke="#30363d"/>
+    <text x="552" y="239" fill="#e6edf3" font-size="12.5" font-weight="700">Whisper (STT)</text>
+    <text x="552" y="259" fill="#8b949e" font-size="11">OpenAI-compatible</text>
+
+    <rect x="693" y="216" width="145" height="64" rx="6" fill="#0d1117" stroke="#30363d"/>
+    <text x="707" y="239" fill="#e6edf3" font-size="12.5" font-weight="700">Edge TTS</text>
+    <text x="707" y="259" fill="#8b949e" font-size="11">:5050 · prefetch</text>
+
+    <rect x="848" y="216" width="126" height="64" rx="6" fill="#0d1117" stroke="#30363d"/>
+    <text x="862" y="239" fill="#e6edf3" font-size="12.5" font-weight="700">speaker-id</text>
+    <text x="862" y="259" fill="#8b949e" font-size="11">:8001 · CAMP++</text>
+
+    <rect x="538" y="290" width="145" height="64" rx="6" fill="#0d1117" stroke="#30363d"/>
+    <text x="552" y="313" fill="#e6edf3" font-size="12.5" font-weight="700">go2rtc</text>
+    <text x="552" y="333" fill="#8b949e" font-size="11">:1984 · RTSP registry</text>
+
+    <rect x="693" y="290" width="145" height="64" rx="6" fill="#0d1117" stroke="#30363d"/>
+    <text x="707" y="313" fill="#e6edf3" font-size="12.5" font-weight="700">Ollama + Qdrant</text>
+    <text x="707" y="333" fill="#8b949e" font-size="11">embeddings · memory</text>
+
+    <rect x="848" y="290" width="126" height="64" rx="6" fill="#0d1117" stroke="#30363d"/>
+    <text x="862" y="313" fill="#e6edf3" font-size="12.5" font-weight="700">Home Assistant</text>
+    <text x="862" y="333" fill="#8b949e" font-size="11">entities · intents</text>
+
+    <text x="538" y="383" fill="#8b949e" font-size="12">· Any N100 or an old laptop with 4 GB is enough; a GPU</text>
+    <text x="538" y="403" fill="#8b949e" font-size="12">  only speeds up speaker-id and local STT</text>
+    <text x="538" y="427" fill="#8b949e" font-size="12">· STT / TTS / LLM endpoints are env-overridable — point</text>
+    <text x="538" y="447" fill="#8b949e" font-size="12">  them at whatever you already run</text>
+    <text x="538" y="471" fill="#3fb950" font-size="12">· Works offline except the LLM (and open-meteo for weather)</text>
+  </g>
+
+  <!-- arrows -->
+  <g stroke="#8b949e" stroke-width="1.6" fill="none">
+    <line x1="280" y1="143" x2="336" y2="205" marker-end="url(#arw2)"/>
+    <line x1="280" y1="235" x2="326" y2="235" marker-end="url(#arw2)"/>
+    <line x1="280" y1="327" x2="336" y2="275" marker-end="url(#arw2)"/>
+    <line x1="280" y1="419" x2="336" y2="300" marker-end="url(#arw2)"/>
+  </g>
+  <g stroke="#8b949e" stroke-width="1.6" fill="none">
+    <line x1="470" y1="245" x2="516" y2="245" marker-end="url(#arwb2)"/>
+    <line x1="516" y1="275" x2="470" y2="275" marker-end="url(#arw2)"/>
+  </g>
+  <text x="493" y="232" fill="#58a6ff" font-size="11.5" text-anchor="middle">audio in</text>
+  <text x="493" y="300" fill="#8b949e" font-size="11.5" text-anchor="middle">speech out</text>
+
+  <text x="30" y="530" fill="#8b949e" font-size="11.5">Devices authenticate with a shared token handed out over /ota. The camera path is implemented and tested but can be switched off with DISABLE_CAMERAS=true.</text>
+</svg>

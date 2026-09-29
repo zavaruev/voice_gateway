@@ -1,0 +1,107 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1020 560" width="1020" height="560" font-family="Inter, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arw" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#8b949e"/>
+    </marker>
+    <marker id="arwb" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#58a6ff"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="1020" height="560" rx="10" fill="#0d1117"/>
+
+  <text x="30" y="38" fill="#e6edf3" font-size="17" font-weight="700">voice_gateway — one process, every microphone in the house</text>
+  <text x="30" y="58" fill="#8b949e" font-size="12.5">FastAPI · port 18792 · Docker · AGPL-3.0-or-later + commercial</text>
+
+  <!-- column headers -->
+  <text x="30" y="92" fill="#8b949e" font-size="11.5" font-weight="700" letter-spacing="1.6">DEVICES</text>
+  <text x="310" y="92" fill="#8b949e" font-size="11.5" font-weight="700" letter-spacing="1.6">GATEWAY</text>
+  <text x="770" y="92" fill="#8b949e" font-size="11.5" font-weight="700" letter-spacing="1.6">BRAIN (swappable)</text>
+
+  <!-- ============ DEVICES ============ -->
+  <g>
+    <rect x="30" y="104" width="235" height="92" rx="7" fill="#161b22" stroke="#30363d"/>
+    <text x="46" y="130" fill="#e6edf3" font-size="13.5" font-weight="700">ESP32 satellites</text>
+    <text x="46" y="151" fill="#8b949e" font-size="12">Opus frames over WebSocket</text>
+    <text x="46" y="169" fill="#8b949e" font-size="12">v3 4-byte header · screen + OTA</text>
+
+    <rect x="30" y="220" width="235" height="104" rx="7" fill="#161b22" stroke="#30363d"/>
+    <text x="46" y="246" fill="#e6edf3" font-size="13.5" font-weight="700">OpenIPC cameras</text>
+    <text x="46" y="267" fill="#8b949e" font-size="12">raw L16 16 kHz over RTSP</text>
+    <text x="46" y="285" fill="#8b949e" font-size="12">backchannel echo 2–45 s late</text>
+    <text x="46" y="303" fill="#8b949e" font-size="12">corridor · kitchen · livingroom</text>
+
+    <rect x="30" y="348" width="235" height="76" rx="7" fill="#161b22" stroke="#30363d"/>
+    <text x="46" y="374" fill="#e6edf3" font-size="13.5" font-weight="700">Home Assistant</text>
+    <text x="46" y="395" fill="#8b949e" font-size="12">entity registry, intents, MCP</text>
+    <text x="46" y="413" fill="#8b949e" font-size="12">the hands of the house</text>
+  </g>
+
+  <!-- ============ GATEWAY ============ -->
+  <g>
+    <rect x="310" y="104" width="400" height="410" rx="9" fill="#161b22" stroke="#58a6ff" stroke-opacity="0.55"/>
+
+    <text x="330" y="130" fill="#58a6ff" font-size="13.5" font-weight="700">transport</text>
+    <rect x="330" y="140" width="175" height="34" rx="6" fill="#0d1117" stroke="#30363d"/>
+    <text x="417" y="162" fill="#e6edf3" font-size="12" text-anchor="middle">WS · Opus · auth token</text>
+    <rect x="515" y="140" width="175" height="34" rx="6" fill="#0d1117" stroke="#30363d"/>
+    <text x="602" y="162" fill="#e6edf3" font-size="12" text-anchor="middle">RTSP in · WebRTC out</text>
+
+    <text x="330" y="200" fill="#3fb950" font-size="12.5" font-weight="700">audio front half — no STT without passing this</text>
+    <rect x="330" y="210" width="360" height="120" rx="6" fill="#0d1117" stroke="#30363d"/>
+    <text x="346" y="233" fill="#e6edf3" font-size="12.5">1 · echo reference ring + cross-correlation</text>
+    <text x="346" y="255" fill="#e6edf3" font-size="12.5">2 · Silero VAD → cut, 10 silence frames / 7 s cap</text>
+    <text x="346" y="277" fill="#e6edf3" font-size="12.5">3 · openWakeWord + 7 wake gates + debounce</text>
+    <text x="346" y="299" fill="#e6edf3" font-size="12.5">4 · cross-room arbitration → one owner</text>
+    <text x="346" y="321" fill="#e6edf3" font-size="12.5">5 · Whisper STT + speaker ID, inside the wake only</text>
+
+    <text x="330" y="360" fill="#d29922" font-size="13.5" font-weight="700">turn orchestration</text>
+    <rect x="330" y="370" width="360" height="126" rx="6" fill="#0d1117" stroke="#30363d"/>
+    <text x="346" y="393" fill="#e6edf3" font-size="12.5">sentence splitter → prefetch TTS player</text>
+    <text x="346" y="415" fill="#e6edf3" font-size="12.5">    (sentence N+1 synthesises while N plays)</text>
+    <text x="346" y="437" fill="#e6edf3" font-size="12.5">pydub → resample → Opus / PCM, 60 ms chunks</text>
+    <text x="346" y="459" fill="#e6edf3" font-size="12.5">watchdog 90 s · follow-up window · emotions</text>
+    <text x="346" y="481" fill="#e6edf3" font-size="12.5">177 tests pin every band of this pipeline</text>
+  </g>
+
+  <!-- ============ BRAIN ============ -->
+  <g>
+    <rect x="770" y="104" width="220" height="64" rx="7" fill="#161b22" stroke="#3fb950"/>
+    <text x="786" y="127" fill="#3fb950" font-size="13.5" font-weight="700">L1 · jev-router</text>
+    <text x="786" y="147" fill="#8b949e" font-size="11.5">classifier + offline slots → HA</text>
+
+    <rect x="770" y="180" width="220" height="64" rx="7" fill="#161b22" stroke="#d29922"/>
+    <text x="786" y="203" fill="#d29922" font-size="13.5" font-weight="700">L2 · smolagents CodeAgent</text>
+    <text x="786" y="223" fill="#8b949e" font-size="11.5">tools + honesty vetoes</text>
+
+    <rect x="770" y="256" width="220" height="64" rx="7" fill="#161b22" stroke="#bc8cff"/>
+    <text x="786" y="279" fill="#bc8cff" font-size="13" font-weight="700">L3 · Hermes / OpenAI</text>
+    <text x="786" y="299" fill="#8b949e" font-size="11.5">any OpenAI-compatible SSE</text>
+
+    <rect x="770" y="344" width="220" height="80" rx="7" fill="#161b22" stroke="#30363d"/>
+    <text x="786" y="368" fill="#e6edf3" font-size="13" font-weight="700">memory &amp; tools</text>
+    <text x="786" y="388" fill="#8b949e" font-size="11.5">Qdrant turns/facts · weather</text>
+    <text x="786" y="406" fill="#8b949e" font-size="11.5">HA MCP · registry resolver</text>
+  </g>
+
+  <!-- ============ forward arrows ============ -->
+  <g stroke="#8b949e" stroke-width="1.6" fill="none">
+    <line x1="265" y1="150" x2="306" y2="150" marker-end="url(#arw)"/>
+    <line x1="265" y1="272" x2="306" y2="272" marker-end="url(#arw)"/>
+    <line x1="265" y1="386" x2="306" y2="386" marker-end="url(#arw)"/>
+    <line x1="710" y1="200" x2="766" y2="150" marker-end="url(#arw)"/>
+    <line x1="710" y1="240" x2="766" y2="212" marker-end="url(#arw)"/>
+    <line x1="710" y1="300" x2="766" y2="288" marker-end="url(#arw)"/>
+    <line x1="766" y1="384" x2="714" y2="400" marker-end="url(#arw)"/>
+  </g>
+
+  <!-- ============ return path: gateway -> devices, routed through the left gutter ============ -->
+  <g stroke="#58a6ff" stroke-width="1.6" fill="none">
+    <path d="M310 470 H 18 V 272 H 30" marker-end="url(#arwb)"/>
+    <path d="M18 272 V 150 H 30" marker-end="url(#arwb)"/>
+  </g>
+  <text x="34" y="458" fill="#58a6ff" font-size="11.5" font-weight="600">spoken answer → back to the room</text>
+  <text x="34" y="440" fill="#8b949e" font-size="11.5">intent / action → HA (MCP)</text>
+
+  <text x="30" y="540" fill="#8b949e" font-size="11.5">Wake suppression is global: while ANY device speaks, every microphone is held — that is what kills the ESP32 ↔ camera echo cascade.</text>
+</svg>

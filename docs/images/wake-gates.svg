@@ -1,0 +1,109 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1020 620" width="1020" height="620" font-family="Inter, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arw3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#8b949e"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="1020" height="620" rx="10" fill="#0d1117"/>
+
+  <text x="30" y="38" fill="#e6edf3" font-size="17" font-weight="700">The wake gate cascade — why a robot vacuum or a TV ad does not reach the LLM</text>
+  <text x="30" y="58" fill="#8b949e" font-size="12.5">Every 80 ms chunk must survive all eight. A held score is not thrown away — it is routed to Whisper instead of being pipped.</text>
+
+  <!-- input -->
+  <rect x="60" y="72" width="640" height="34" rx="6" fill="#161b22" stroke="#58a6ff"/>
+  <text x="76" y="94" fill="#58a6ff" font-size="12.5" font-weight="700">in: one raw int16 chunk (80 ms) → bidirectional AGC → openWakeWord score</text>
+
+  <g stroke="#8b949e" stroke-width="1.5" fill="none">
+    <line x1="380" y1="106" x2="380" y2="114" marker-end="url(#arw3)"/>
+  </g>
+
+  <!-- rows -->
+  <g>
+    <!-- 1 -->
+    <rect x="60" y="116" width="640" height="48" rx="6" fill="#161b22" stroke="#30363d"/>
+    <rect x="60" y="116" width="5" height="48" rx="2.5" fill="#f85149"/>
+    <text x="80" y="137" fill="#e6edf3" font-size="13" font-weight="700">1 · own-playback guard</text>
+    <text x="80" y="155" fill="#8b949e" font-size="11.5">is this chunk the echo of something we are speaking right now?</text>
+    <text x="684" y="145" fill="#f85149" font-size="12" font-weight="700" text-anchor="end">DROP</text>
+
+    <!-- 2 -->
+    <rect x="60" y="172" width="640" height="48" rx="6" fill="#161b22" stroke="#30363d"/>
+    <rect x="60" y="172" width="5" height="48" rx="2.5" fill="#d29922"/>
+    <text x="80" y="193" fill="#e6edf3" font-size="13" font-weight="700">2 · appliance hold</text>
+    <text x="80" y="211" fill="#8b949e" font-size="11.5">60 s background median &gt; 800 (hood, vacuum) → top score must be ≥ 0.60</text>
+    <text x="684" y="201" fill="#d29922" font-size="12" font-weight="700" text-anchor="end">0.55–0.60 → STT</text>
+
+    <!-- 3 -->
+    <rect x="60" y="228" width="640" height="48" rx="6" fill="#161b22" stroke="#30363d"/>
+    <rect x="60" y="228" width="5" height="48" rx="2.5" fill="#d29922"/>
+    <text x="80" y="249" fill="#e6edf3" font-size="13" font-weight="700">3 · quiet-source hold</text>
+    <text x="80" y="267" fill="#8b949e" font-size="11.5">own level &lt; 3000 → ≥ 0.58 (soft) / ≥ 0.55 (loud) before we believe it</text>
+    <text x="684" y="257" fill="#d29922" font-size="12" font-weight="700" text-anchor="end">band → STT</text>
+
+    <!-- 4 -->
+    <rect x="60" y="284" width="640" height="48" rx="6" fill="#161b22" stroke="#30363d"/>
+    <rect x="60" y="284" width="5" height="48" rx="2.5" fill="#f85149"/>
+    <text x="80" y="305" fill="#e6edf3" font-size="13" font-weight="700">4 · distant-source veto</text>
+    <text x="80" y="323" fill="#8b949e" font-size="11.5">level &lt; 3000 while another room hears it ≥ 1.4× louder → not our room</text>
+    <text x="684" y="313" fill="#f85149" font-size="12" font-weight="700" text-anchor="end">STAND DOWN 5 s</text>
+
+    <!-- 5 -->
+    <rect x="60" y="340" width="640" height="48" rx="6" fill="#161b22" stroke="#30363d"/>
+    <rect x="60" y="340" width="5" height="48" rx="2.5" fill="#f85149"/>
+    <text x="80" y="361" fill="#e6edf3" font-size="13" font-weight="700">5 · clipping-bang gate</text>
+    <text x="80" y="379" fill="#8b949e" font-size="11.5">peak &gt; 24k and score &lt; 0.85 → a bang, not «компьютер»</text>
+    <text x="684" y="369" fill="#f85149" font-size="12" font-weight="700" text-anchor="end">DROP</text>
+
+    <!-- 6 -->
+    <rect x="60" y="396" width="640" height="48" rx="6" fill="#161b22" stroke="#30363d"/>
+    <rect x="60" y="396" width="5" height="48" rx="2.5" fill="#f85149"/>
+    <text x="80" y="417" fill="#e6edf3" font-size="13" font-weight="700">6 · crest-factor gate</text>
+    <text x="80" y="435" fill="#8b949e" font-size="11.5">rms · 2 &gt; peak → dense mechanical impact (door, plate, keys)</text>
+    <text x="684" y="425" fill="#f85149" font-size="12" font-weight="700" text-anchor="end">DROP</text>
+
+    <!-- 7 -->
+    <rect x="60" y="452" width="640" height="48" rx="6" fill="#161b22" stroke="#30363d"/>
+    <rect x="60" y="452" width="5" height="48" rx="2.5" fill="#d29922"/>
+    <text x="80" y="473" fill="#e6edf3" font-size="13" font-weight="700">7 · ambiguous zone</text>
+    <text x="80" y="491" fill="#8b949e" font-size="11.5">top &lt; 0.55 at level &lt; 3000, or a repeat after an ignored auto-greet</text>
+    <text x="684" y="481" fill="#d29922" font-size="12" font-weight="700" text-anchor="end">NO PIP → STT</text>
+
+    <!-- 8 -->
+    <rect x="60" y="508" width="640" height="48" rx="6" fill="#161b22" stroke="#30363d"/>
+    <rect x="60" y="508" width="5" height="48" rx="2.5" fill="#3fb950"/>
+    <text x="80" y="529" fill="#e6edf3" font-size="13" font-weight="700">8 · debounce → cross-camera arbiter</text>
+    <text x="80" y="547" fill="#8b949e" font-size="11.5">2 of the last 3 chunks (~240 ms), or one ≥ 0.68 → first detector owns the turn</text>
+    <text x="684" y="537" fill="#3fb950" font-size="12" font-weight="700" text-anchor="end">WAKE</text>
+  </g>
+
+  <!-- right panel -->
+  <g>
+    <rect x="730" y="116" width="262" height="440" rx="8" fill="#161b22" stroke="#30363d"/>
+    <text x="748" y="144" fill="#e6edf3" font-size="13.5" font-weight="700">A held score is never lost</text>
+    <text x="748" y="170" fill="#8b949e" font-size="12">Gates 2, 3 and 7 open a 10 s</text>
+    <text x="748" y="188" fill="#8b949e" font-size="12">STT-confirm window instead of</text>
+    <text x="748" y="206" fill="#8b949e" font-size="12">silencing the room:</text>
+
+    <rect x="748" y="222" width="226" height="88" rx="6" fill="#0d1117" stroke="#30363d"/>
+    <text x="762" y="244" fill="#e6edf3" font-size="11.5">next utterance → Whisper</text>
+    <text x="762" y="264" fill="#3fb950" font-size="11.5">«… компьютер …» in transcript</text>
+    <text x="762" y="284" fill="#8b949e" font-size="11.5">→ real wake fires</text>
+    <text x="762" y="302" fill="#8b949e" font-size="11.5">garbage → expires silently</text>
+
+    <text x="748" y="344" fill="#e6edf3" font-size="13.5" font-weight="700">Why it matters</text>
+    <text x="748" y="370" fill="#8b949e" font-size="12">· thresholds are per room, not</text>
+    <text x="748" y="388" fill="#8b949e" font-size="12">  global (kitchen 0.40 vs 0.30)</text>
+    <text x="748" y="410" fill="#8b949e" font-size="12">· proximity steal: the room 5×</text>
+    <text x="748" y="428" fill="#8b949e" font-size="12">  louder takes over the wake</text>
+    <text x="748" y="450" fill="#8b949e" font-size="12">· echo suppress extends +20 s</text>
+    <text x="748" y="468" fill="#8b949e" font-size="12">  per confirmed mic echo</text>
+    <text x="748" y="490" fill="#8b949e" font-size="12">· all bands pinned by tests</text>
+    <text x="748" y="508" fill="#8b949e" font-size="12">  (177 / 12 files)</text>
+    <text x="748" y="534" fill="#58a6ff" font-size="11.5">docs/REFERENCE.md → “Wake</text>
+    <text x="748" y="550" fill="#58a6ff" font-size="11.5">word &amp; arbitration”</text>
+  </g>
+
+  <text x="30" y="592" fill="#8b949e" font-size="11.5">Fallbacks stay local: a bare wake with no command in 5 s speaks a local «Да?» — the LLM is only polled when a real sentence follows.</text>
+  <text x="30" y="610" fill="#8b949e" font-size="11.5">VAD resets at wake fire, the 15 s wake window expires silently, and a 90 s watchdog always beats a stuck backend to the speaker.</text>
+</svg>

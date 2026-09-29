@@ -4,23 +4,48 @@
 [![tests](https://github.com/zavaruev/voice_gateway/actions/workflows/tests.yml/badge.svg)](https://github.com/zavaruev/voice_gateway/actions/workflows/tests.yml)
 ![python](https://img.shields.io/badge/python-3.12%2B-3776AB?logo=python&logoColor=white)
 ![backend](https://img.shields.io/badge/AI%20backend-Cascade-orange)
+[![license](https://img.shields.io/badge/license-AGPL--3.0--or--later%20%2B%20commercial-blue)](LICENSE)
+[![stars](https://img.shields.io/github/stars/zavaruev/voice_gateway?style=flat&logo=github&color=yellow)](https://github.com/zavaruev/voice_gateway/stargazers)
+[![issues](https://img.shields.io/github/issues/zavaruev/voice_gateway)](https://github.com/zavaruev/voice_gateway/issues)
 
 > One process that turns every microphone in the house (ESP32 satellites and OpenIPC cameras) into a single employee, and every AI answer back into sound out of the right speaker.
 
-```
- DEVICE SIDE              GATEWAY (main.py)             BRAIN
-──────────────────   ─────────────────────────   ────────────────────
- ESP32 satellites ──WS──▶  VAD → STT → speaker ID ─▶ jev-router   (L1)
- OpenIPC cameras ──RTSP─▶  wake word + arbitration → smolagents   (L2)
-                                               ◀──                → Hermes   (L3)
-                                          TTS (sentence queue)
-```
+![architecture](docs/images/architecture.svg)
 
 FastAPI service on port **18792** that terminates the WebSocket of every ESP32 satellite speaker and the RTSP/WebRTC session of every configured camera, runs the audio front half (VAD, wake word, STT, speaker ID), hands the transcript to a pluggable LLM backend, and streams the spoken answer back to the device that asked.
 
 ---
 
+## Why this and not something else
+
+Home Assistant's own voice stack (Wyoming + ESPHome satellites) is the right answer if everything you own already lives inside HA. This project exists for the three things it does not cover:
+
+| | HA + ESPHome / Wyoming satellites | **voice_gateway** |
+|---|---|---|
+| Microphone hardware | a purpose-built satellite board | **every ESP32 you already have, plus the mics inside your OpenIPC cameras** (RTSP backchannel, no firmware change) |
+| Who answers | one conversation agent | a 3-level cascade: offline intent router → code agent with honesty vetoes → any OpenAI-compatible LLM |
+| Several rooms hearing one utterance | preferred-satellite selection | per-chunk arbitration with a proximity steal (the room 5× louder takes the wake) and per-room wake thresholds |
+| Who is speaking | — | CAMP++ speaker embeddings, cross-device speaker lock |
+| False-wake protection | per-device threshold | an 8-gate cascade (echo ring, appliance noise, distance, clipping, crest factor, …) with a Whisper confirm-rescue band instead of silence |
+
+Honest limits, so nobody is surprised later: the camera subsystem is implemented and tested but currently **disabled in production** (`DISABLE_CAMERAS=true`) — the ESP32 path is what runs live. See [`docs/REFERENCE.md`](docs/REFERENCE.md) → *Known Issues & Current Problems*.
+
+### Numbers from the production log
+
+| What | Measured |
+|---|---|
+| Simple command, L1 fast path (after STT) | **0.08–0.23 s** («выключи свет в гостиной» → 0.08–0.11 s) |
+| Weather on the deterministic L1 route | **0.38 s** |
+| L2 turn with a verified side effect | **3.2–4.0 s** |
+| Wake debounce | ~240 ms (2 of 3 chunks); a single chunk ≥ 0.68 fires immediately |
+| Wake window / watchdog | 15 s / 90 s |
+| Test suite | 177 tests, 12 files, ~2,500 lines |
+
+---
+
 ## Quick Start
+
+![what you need to run it](docs/images/topology.svg)
 
 The gateway needs three things to speak: an LLM backend, an STT endpoint and a TTS endpoint. All of them are env-overridable and default to the in-house services, so a minimal run is just:
 
@@ -85,6 +110,8 @@ A turn that produces no answer inside `WATCHDOG_TIMEOUT` (90 s) is cut short wit
 ## Cameras: always-on microphones
 
 Everything here exists to avoid listening to garbage.
+
+![the wake gate cascade](docs/images/wake-gates.svg)
 
 - **Transport** — `ffmpeg` pulls `rtsp://go2rtc:8554/<stream>?audio=copy` → raw L16 @ 16 kHz (no μ-law, which would degrade recognition).
 - **Two echo guards** — a hard one (while TTS frames are queued, the mic is not fed at all) and a correlational one, `_is_echo()`, which cross-checks the incoming mic chunk against a ring buffer of recently played audio: the RTSP backchannel returns our own speech **3–40 s after playback**, so fixed suppression windows never work.

@@ -7,9 +7,10 @@ own ha_action returned MatchFailedError — prompt prohibitions were ignored
 project rule, so the spoken answer is checked against the *recorded* tool
 outcomes and a success claim is replaced with the recorded truth.
 
-Veto fires only on proof: >=1 recorded ha_action failure, zero successes, a
-success claim in the answer, and no admission of failure. Pure stdlib —
-unit-testable on the host without smolagents/FastAPI.
+Veto fires only on proof: >=1 recorded failure of the claim's own kind
+(ha_action for a promise, ha_read for a state/number), zero successes of
+that kind, the claim in the answer, and no admission of failure. Pure
+stdlib — unit-testable on the host without smolagents/FastAPI.
 
 Weather veto (field regression 25.09.2026): the free model called
 weather_forecast AND final_answer in the SAME code block — i.e. it wrote
@@ -37,19 +38,24 @@ CONTRACT
     Inputs : `answer` — the raw draft string returned by agent.run();
              `events`  — the side-effect log recorded by tools.py
                          (`{"tool", "ok", "detail"}` per ha_action call,
-                         and `{"tool", "detail"}` per weather_forecast).
+                         and `{"tool", "detail"}` per weather_forecast);
+             `read_events` — the same shape for ha_read calls (a READ has
+                         no side effect, so it lives in its own buffer and
+                         proves DATA claims only, never actions).
     Output : `(answer, replaced)` — the string to actually speak plus a
              flag for logging; `replaced=True` means the veto fired.
-             `failure_note(events)` is the sibling helper: the RAW recorded
-             errors for app._run_agent's one bounded retry after a veto (the
-             speakable `_truth()` above would teach the model nothing).
+             `failure_note(events + read_events)` is the sibling helper:
+             the RAW recorded errors for app._run_agent's one bounded retry
+             after a veto (the speakable `_truth()` above would teach the
+             model nothing).
     Callers : app.py `_run_agent()` runs vet_answer() first, then
              vet_weather(); nothing else in the pipeline re-checks the text.
-    Fail-open : no events / at least one confirmed success / an honest
-             admission of failure => the answer passes untouched. The veto
-             only fires on PROOF (>=1 recorded failure, zero successes, a
-             success claim, no admission). It must never turn a real
-             success or an honest refusal into a different sentence.
+    Fail-open : no events / a confirmed result of the claim's own kind / an
+             honest admission of failure => the answer passes untouched.
+             The veto only fires on PROOF (>=1 recorded failure of that
+             kind, zero successes, a claim, no admission). It must never
+             turn a real success or an honest refusal into a different
+             sentence.
     Pure stdlib (re only) — unit-testable on the host without
     smolagents/FastAPI (tests/test_honesty.py); the regexes below are
     behaviour-critical, their pattern strings are matched against real
@@ -82,6 +88,25 @@ _RE_FAIL = re.compile(
     re.IGNORECASE,
 )
 
+# State/DATA claims: device states and readings the model can only know
+# from a ha_read. Field regression 29.09.2026: «Что там с нашим пылесосом?»
+# came back as «Пылесос сейчас работает, уровень заряда сорок пять
+# процентов» while ha_read returned
+# `{"success": false, "error": "No exposed entities matched name 'пылесос'"}`
+# — HA reports `docked` and has no battery attribute for that vacuum at all,
+# so both halves were invented. The claim is spelled out as WORDS because
+# this model writes numbers in words («сорок пять», not «45»); the digit
+# branch only covers readings with an explicit unit. Same (?<!не ) guard as
+# _RE_CLAIM: «не работает» is a status report, not a claim.
+_RE_DATA_CLAIM = re.compile(
+    r"(?<!не )\b(?:работает|работал\w*|убирается|убирал\w*|заряжен\w*|заряд\w*|"
+    r"батаре\w*|процент\w*|готов\w*|включено|выключено|приставлен\w*)\b"
+    r"|\bна\s+базе\b|\bв\s+доке\b"
+    r"|\b(?:температур\w*|влажност\w*|громкост\w*|яркост\w*)"
+    r"|\b\d{1,3}\s*(?:%|°|градус\w*)",
+    re.IGNORECASE,
+)
+
 
 def _truth(events: list[dict]) -> str:
     """Plain-Russian refusal built from the last recorded failure.
@@ -91,11 +116,19 @@ def _truth(events: list[dict]) -> str:
     Russian phrase (TTS-ready, 1 short sentence). Unknown markers fall
     through to the generic refusal — never invent a success here.
     """
-    detail = ""
+    fail: dict = {}
     for e in reversed(events):
         if not e.get("ok"):
-            detail = str(e.get("detail", ""))
+            fail = e
             break
+    detail = str(fail.get("detail", ""))
+    if str(fail.get("tool", "")) == "ha_read":
+        # A READ produced nothing: there is no state to report, and the
+        # action-shaped refusals below («команда отклонена») would describe a
+        # command the user never gave.
+        if detail.startswith("Не удалось"):
+            return "Не получилось: Home Assistant не отвечает на запросы."
+        return "Не нашла такого устройства в Home Assistant."
     if "ASSISTANT" in detail:
         # Entity exists but is not exposed to the voice assistant: no
         # wording about rooms/names would help, tell the real blocker.
@@ -118,27 +151,43 @@ def _truth(events: list[dict]) -> str:
     return "Не получилось: Home Assistant отклонил команду."
 
 
-def vet_answer(answer: str, events: list[dict]) -> tuple[str, bool]:
-    """-> (answer, replaced). Replaces a success claim made after only
-    failed ha_action calls with the recorded truth.
+def vet_answer(
+    answer: str, events: list[dict], read_events: list[dict] | None = None
+) -> tuple[str, bool]:
+    """-> (answer, replaced). Replaces an unsupported claim with the truth.
 
-    Gates, in order (ALL must pass for the veto to fire):
-      1. >=1 recorded ha_action event (otherwise nothing to prove against);
-      2. zero events with ok=True (one confirmed side effect = trust it);
-      3. _RE_CLAIM finds a success claim in the answer;
-      4. _RE_FAIL finds NO admission of failure (honest refusals pass).
-    On fire the whole answer is swapped for `_truth(events)` — a short,
-    factual, speakable sentence; returns replaced=True for logging.
+    TWO PROOFS, each with its own log (the buffers are kept apart in
+    tools.py on purpose — a read must never pass for a side effect):
+      * action claim («включил/отправляю/сделал», _RE_CLAIM) -> ha_action log;
+      * data claim («заряд сорок пять процентов», «сейчас работает»,
+        _RE_DATA_CLAIM) -> ha_read log. Added 29.09.2026 for the vacuum
+        turn: the read failed with `success: false` and the model still
+        dictated a state and a battery percentage — vet_answer only looked
+        at ha_action events, saw an empty log and passed the fabrication.
+    Gates for either claim, in order (ALL must pass to fire):
+      1. >=1 recorded event of the relevant kind (nothing to prove against
+         otherwise -> fail open);
+      2. zero events with ok=True of that kind (one confirmed result =
+         trust the model's report);
+      3. the claim is present;
+      4. no admission of failure (honest refusals pass).
+    On fire the whole answer is swapped for `_truth()` — a short, factual,
+    speakable sentence; returns replaced=True for logging.
     """
-    if not events:
-        return answer, False  # nothing recorded (no action attempted): fail open
-    if any(e.get("ok") for e in events):
-        return answer, False  # at least one confirmed side effect
-    if not _RE_CLAIM.search(answer):
-        return answer, False  # no success claim to veto
+    reads = list(read_events or [])
+    if not events and not reads:
+        return answer, False  # nothing recorded: fail open
     if _RE_FAIL.search(answer):
         return answer, False  # already honest about the failure
-    return _truth(events), True
+    acts_ok = any(e.get("ok") for e in events)
+    reads_ok = any(e.get("ok") for e in reads)
+    if events and not acts_ok and _RE_CLAIM.search(answer):
+        # Reads first: _truth() walks newest-first, and an action error
+        # (NAME/AREA/ASSISTANT) is the more specific of the two failures.
+        return _truth(reads + list(events)), True
+    if reads and not reads_ok and _RE_DATA_CLAIM.search(answer):
+        return _truth(reads + list(events)), True
+    return answer, False
 
 
 def failure_note(events: list[dict]) -> str:

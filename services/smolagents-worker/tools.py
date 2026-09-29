@@ -52,6 +52,7 @@ from datetime import datetime, timedelta, timezone
 from smolagents import tool
 
 import config
+from ha_match import has_data, match_states
 
 logger = logging.getLogger("worker.tools")
 
@@ -67,6 +68,12 @@ _MSK = timezone(timedelta(hours=3))  # Moscow fixed UTC+3 (no DST since 2014)
 # THIS IS THE CORE OF THE DESIGN: the veto never re-parses MCP payloads or
 # trusts the model's narration — it only looks at these recorded outcomes.
 _ACTION_EVENTS: list[dict] = []
+# READ outcomes live in their own buffer: ha_read has no side effect, so it
+# must never count as a "confirmed side effect" (that would disarm the action
+# veto in a compound turn), while a failed read IS proof for the data-claim
+# veto — field case 29.09.2026, «Пылесос сейчас работает, заряд 45%» was
+# spoken with the read sitting right there as `success: false`.
+_READ_EVENTS: list[dict] = []
 # Weather outcomes are recorded separately from side effects: a successful
 # weather_forecast must never count as "confirmed side effect" and suppress
 # the action veto in a compound query («включи кофеварку и какая погода»).
@@ -75,11 +82,12 @@ _EVENTS_LOCK = threading.Lock()
 
 
 def reset_action_events() -> None:
-    """Clear BOTH buffers; called by app._run_agent at the start of every
-    attempt so events never leak between runs (a stale success from the
-    previous turn would silence the veto on a fresh failure)."""
+    """Clear ALL THREE buffers; called by app._run_agent at the start of
+    every attempt so events never leak between runs (a stale success from
+    the previous turn would silence the veto on a fresh failure)."""
     with _EVENTS_LOCK:
         _ACTION_EVENTS.clear()
+        _READ_EVENTS.clear()
         _WEATHER_EVENTS.clear()
 
 
@@ -91,6 +99,14 @@ def get_action_events() -> list[dict]:
         return list(_ACTION_EVENTS)
 
 
+def get_read_events() -> list[dict]:
+    """Snapshot copy of this run's ha_read outcomes
+    [{"tool": "ha_read", "ok", "detail"}, ...]; consumed by vet_answer's
+    data-claim branch (app._run_agent)."""
+    with _EVENTS_LOCK:
+        return list(_READ_EVENTS)
+
+
 def get_weather_events() -> list[dict]:
     """Snapshot copy of this run's weather_forecast outputs
     [{"tool", "detail"}, ...]; consumed by vet_weather (app._run_agent)."""
@@ -98,34 +114,41 @@ def get_weather_events() -> list[dict]:
         return list(_WEATHER_EVENTS)
 
 
+def _record(tool: str, bucket: list[dict], result: str, ok: bool | None) -> None:
+    """Append one outcome to `bucket` (lock-protected).
+
+    `ok=None` means "decide here" via ha_match.has_data — the same
+    definition the REST fallback uses, so a miss can never be recorded as a
+    success (a wrongly-flagged success disarms the honesty veto).
+    `detail` is truncated to 300 chars — enough for the error markers the
+    veto greps for, small enough to keep the log tidy.
+    """
+    if ok is None:
+        ok = has_data(result)
+    with _EVENTS_LOCK:
+        bucket.append({"tool": tool, "ok": ok, "detail": result[:300]})
+
+
 def _record_action(tool_name: str, result: str) -> None:
     """Append the outcome of one ha_action call (ok is decided here so the
     veto in honesty.py never has to re-parse MCP payloads).
 
-    `ok` is False when the result starts with one of the transport/parse
-    error prefixes returned by mcp_call/ha_action, or when a parsed JSON
-    body carries "success": false. Anything else counts as success —
+    `ok` follows ha_match.has_data(): False on the transport/parse prefixes
+    returned by mcp_call/ha_action, on `"success": false`, on an `error`
+    payload and on a plain-text miss; anything else counts as success —
     deliberately conservative in the OTHER direction: a false "ok" would
     disable the veto, but only genuinely successful calls reach here
     unflagged (the vacuum fallback has already retried by then).
-    `detail` is truncated to 300 chars — enough for the error markers the
-    veto greps for, small enough to keep the log tidy.
     """
-    head = result.lstrip()
-    ok = not head.startswith(
-        ("Ошибка", "Тул вернул ошибку", "Некорректный", "Неожиданный")
-    )
-    if ok:
-        try:
-            data = json.loads(head)
-        except json.JSONDecodeError:
-            data = None
-        if isinstance(data, dict) and data.get("success") is False:
-            ok = False
-    with _EVENTS_LOCK:
-        _ACTION_EVENTS.append(
-            {"tool": tool_name, "ok": ok, "detail": result[:300]}
-        )
+    _record(tool_name, _ACTION_EVENTS, result, None)
+
+
+def _record_read(tool_name: str, result: str, ok: bool) -> None:
+    """Append the outcome of one ha_read call. `ok` is decided by the CALLER:
+    a read that came back with no entity («Ничего не найдено…») is a miss,
+    not data — recording it as a success would let a fabricated status claim
+    through the veto (field case 29.09.2026)."""
+    _record(tool_name, _READ_EVENTS, result, ok)
 
 
 def _http_json(
@@ -275,38 +298,42 @@ def ha_read(query: str, area: str = "") -> str:
         area: Комната по-русски или по-английски (кухня, спальня, kitchen); можно пусто.
     """
     # Primary: HA MCP GetLiveContext (understands name+area and answers
-    # with a curated context blob). Any transport/tool error ("Ошибка…")
-    # or an EMPTY result means "miss" -> fall through to raw REST states.
+    # with a curated context blob). A transport/tool error ("Ошибка…"), an
+    # EMPTY result and a `{"success": false …}` payload all mean "miss" ->
+    # fall through to raw REST states. The old check only looked for the
+    # «Ошибка» prefix, so the miss this branch actually produces —
+    # `{"success": false, "error": "No exposed entities matched name 'пылесос'"}`
+    # (29.09.2026) — was returned verbatim and the fallback never ran.
     args: dict = {"name": query}
     if area:
         args["area"] = area
     text = mcp_call("homeassistant__GetLiveContext", args)
-    if "Ошибка" not in text and text.strip():
+    if has_data(text):
+        _record_read("ha_read", text, ok=True)
         return text
 
-    # Fallback: raw REST states, substring match (MCP context miss)
+    # Fallback: raw REST states, bilingual substring match (MCP context miss).
+    # match_states() expands «пылесос» -> vacuum/roborock/robot and «кухня»
+    # -> kitchen, because the registry is latin while the user speaks RU.
     try:
         states = _http_json(
             f"{config.HA_URL}/api/states",
             headers={"Authorization": f"Bearer {config.HA_TOKEN}"},
         )
     except Exception as e:
-        return f"Не удалось прочитать состояния: {e}"
-    # OR-match on every token of "query area" against entity_id +
-    # friendly_name: the user speaks Russian while entity ids are English,
-    # so a single overlapping word must be enough to surface a candidate.
-    q_tokens = [t for t in f"{query} {area}".lower().split() if t]
-    hits = []
-    for e in states if isinstance(states, list) else []:
-        eid = e.get("entity_id", "")
-        name = e.get("attributes", {}).get("friendly_name") or ""
-        hay = f"{eid} {name}".lower()
-        if any(t in hay for t in q_tokens):
-            hits.append(f"{eid}: {e.get('state')} ({name})")
-        # cap: the result goes into the model's context
-        if len(hits) >= 10:
-            break
-    return "\n".join(hits) if hits else "Ничего не найдено в Home Assistant."
+        err = f"Не удалось прочитать состояния: {e}"
+        _record_read("ha_read", err, ok=False)
+        return err
+    hits = match_states(states, query, area)
+    if hits:
+        out = "\n".join(hits)
+        _record_read("ha_read", out, ok=True)
+        return out
+    out = "Ничего не найдено в Home Assistant."
+    # A miss, not data: recorded as such so a fabricated status answer built
+    # on top of it is vetoed instead of spoken (honesty.py, data claim).
+    _record_read("ha_read", out, ok=False)
+    return out
 
 
 @tool

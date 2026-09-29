@@ -173,3 +173,90 @@ def test_failure_note_is_raw_not_speakable():
 def test_failure_note_empty_when_nothing_failed():
     assert failure_note([]) == ""
     assert failure_note(_OK) == ""
+
+
+# --- Data-claim veto (field case 29.09.2026) --------------------------------
+# «Что там с нашим пылесосом?» -> ha_read returned
+# `{"success": false, "error": "No exposed entities matched name 'пылесос'"}`
+# and the model still dictated «сейчас работает, уровень заряда сорок пять
+# процентов». HA in fact reports `docked` — and that vacuum has no battery
+# attribute at all, so BOTH halves were invented. vet_answer() only looked at
+# ha_action events, saw an empty log and passed it.
+
+_READ_FAIL = [
+    {"tool": "ha_read", "ok": False,
+     "detail": '{"success": false, "error": "No exposed entities matched '
+               "name 'пылесос'\"}"}
+]
+_READ_OK = [
+    {"tool": "ha_read", "ok": True,
+     "detail": "vacuum.valetudo_x: docked (Roborock Robot)"}
+]
+_READ_MISS = [{"tool": "ha_read", "ok": False,
+               "detail": "Ничего не найдено в Home Assistant."}]
+_FIELD_LIE = "Пылесос сейчас работает, уровень заряда сорок пять процентов."
+
+
+def test_data_claim_after_failed_read_is_vetoed():
+    """The literal field case: state AND percentage, no successful read."""
+    out, replaced = vet_answer(_FIELD_LIE, [], _READ_FAIL)
+    assert replaced is True
+    assert "не нашла" in out.lower()
+
+
+def test_data_claim_after_a_miss_is_vetoed():
+    """A miss recorded as success would disarm the veto — guard the recorder
+    as well as the veto."""
+    out, replaced = vet_answer("Пылесос сейчас работает.", [], _READ_MISS)
+    assert replaced is True
+
+
+def test_word_numbers_count_as_claims():
+    """This model writes numbers in words («сорок пять», not «45»), so the
+    claim is a word list, not a digit regex."""
+    assert "сорок пять" in _FIELD_LIE
+    assert vet_answer("Пылесос заряжен на сорок пять процентов.", [], _READ_FAIL)[1]
+
+
+def test_honest_state_passes_when_read_succeeded():
+    out, replaced = vet_answer("Пылесос стоит на базе.", [], _READ_OK)
+    assert replaced is False and out == "Пылесос стоит на базе."
+
+
+def test_admission_passes_after_failed_read():
+    honest = "Не нашла пылесос — устройства нет в Home Assistant."
+    out, replaced = vet_answer(honest, [], _READ_FAIL)
+    assert replaced is False and out == honest
+
+
+def test_no_recorded_events_stays_fail_open():
+    out, replaced = vet_answer(_FIELD_LIE, [], [])
+    assert replaced is False and out == _FIELD_LIE
+
+
+def test_failed_read_does_not_veto_non_data_answers():
+    out, replaced = vet_answer("Расскажу анекдот: заходит кактус...", [], _READ_FAIL)
+    assert replaced is False
+
+
+def test_negated_state_is_a_report_not_a_claim():
+    out, replaced = vet_answer("Пылесос не работает.", [], _READ_FAIL)
+    assert replaced is False
+
+
+def test_successful_read_does_not_disarm_the_action_veto():
+    """The two proofs are separate: a state read cannot vouch for a promise."""
+    out, replaced = vet_answer("Кафеварка включена!", _FAIL_NAME, _READ_OK)
+    assert replaced is True
+    assert "не нашла" in out.lower()
+
+
+def test_failed_read_leaves_the_action_veto_untouched():
+    out, replaced = vet_answer("Кафеварка включена!", _FAIL_NAME, _READ_FAIL)
+    assert replaced is True
+
+
+def test_failure_note_carries_a_failed_read():
+    """The bounded retry must see the raw read error, not the speakable truth."""
+    note = failure_note(_READ_FAIL)
+    assert "No exposed entities" in note and "пылесос" in note

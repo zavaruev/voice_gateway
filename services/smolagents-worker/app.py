@@ -41,7 +41,8 @@ WHY THIS SERVICE IS SHAPED THE WAY IT IS — the single most important fact
   success before the tool ever ran. Prompt rules alone were ignored in 3/3
   field cases, so honesty is enforced PROGRAMMATICALLY after agent.run():
   vet_answer() cross-checks the draft against the recorded ha_action
-  outcomes, vet_weather() against the recorded forecast (honesty.py), and
+  outcomes and, for state/number claims, the recorded ha_read outcomes,
+  vet_weather() against the recorded forecast (honesty.py), and
   tools.ha_action() carries a deterministic vacuum-retry fallback. The
   TASK_TEMPLATE rules below are only a supporting layer — treat them as
   prompt text, never as the enforcement mechanism (they must stay
@@ -62,7 +63,13 @@ from smolagents import CodeAgent, OpenAIModel
 
 import config
 from honesty import failure_note, vet_answer, vet_weather
-from tools import TOOLS, get_action_events, get_weather_events, reset_action_events
+from tools import (
+    TOOLS,
+    get_action_events,
+    get_read_events,
+    get_weather_events,
+    reset_action_events,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -295,7 +302,7 @@ def _run_agent(
     last_err: Exception | None = None
     for attempt, primary in enumerate((True, False), start=1):
         try:
-            reset_action_events()  # per-run side-effect log for the honesty veto
+            reset_action_events()  # per-run outcome log for the honesty veto
             agent = CodeAgent(
                 tools=TOOLS,
                 model=_build_model(primary),
@@ -305,10 +312,13 @@ def _run_agent(
             t0 = time.monotonic()
             answer = str(agent.run(task, stream=False))
             # Free models claimed «включено» right after a failed ha_action
-            # (3 field regressions) — the recorded outcomes decide, not the
-            # prompt: a success claim without one confirmed call is replaced.
+            # (3 field regressions) and «заряд 45 %» right after a failed
+            # ha_read (29.09.2026) — the recorded outcomes decide, not the
+            # prompt: a claim without one confirmed call of its own kind is
+            # replaced by the truth.
             events = get_action_events()
-            answer, replaced = vet_answer(answer, events)
+            reads = get_read_events()
+            answer, replaced = vet_answer(answer, events, reads)
             if replaced:
                 logger.warning("honesty veto: claim replaced with recorded truth")
             # Same pattern for weather: the model wrote final_answer before
@@ -324,7 +334,7 @@ def _run_agent(
                 "agent run done in %.1fs (attempt %d)",
                 time.monotonic() - t0, attempt,
             )
-            note = failure_note(events) if replaced else ""
+            note = failure_note(events + reads) if replaced else ""
             if note and not retry:
                 logger.warning("honesty veto -> bounded retry with the recorded errors")
                 return _run_agent(

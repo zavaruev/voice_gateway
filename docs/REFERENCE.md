@@ -1,4 +1,6 @@
-# Voice Gateway
+# Voice Gateway — Reference
+
+> Back to the project overview: [`../README.md`](../README.md). This file is the detailed reference: configuration tables, REST API, architecture notes, known issues and the changelog.
 
 > **Version 2.34** — L2 escalation context: both turns lost in the 28.09 ESP32 dialogue were answered blind (the router sent L2 the bare utterance). The router now hands over the near-miss device hint («кашеварку» → «кофеварка», `resolver.unresolved_hint`) and the satellite's last finished turns (`services/jev-router/history.py`), so a pronoun resolves instead of inventing a device; the agent also gets one bounded retry carrying the recorded tool error whenever the honesty veto fires. Pinned by `tests/test_history.py` plus hint and retry-note cases — 177 tests across 12 files.
 

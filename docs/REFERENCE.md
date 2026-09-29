@@ -243,7 +243,7 @@ Device identifies itself via `device-id` header (fallback: `mac` header). MAC ke
 - **Whisper retry at temperature 0.5 is camera-only** — the camera path (`_fetch_transcription`) retries 0.0 → 0.5 on an empty transcript, doubling STT latency in the worst case; the ESP32 path (`fetch_transcription`) sends a single attempt at 0.0 and never retries.
 - **`Dockerfile` exposes 8080 but nothing listens on it** (18792 is the only real port).
 - **`setup_gateway.sh` is an outdated snapshot** — not authoritative.
-- **Vosk models downloaded but unused** — `config/vosk-model-ru-0.42/` (3.5 GB) candidate for a local low-latency STT fallback; not wired into the pipeline.
+- **Vosk is installed but unused** — the `vosk` wheel is in `requirements.txt` and `models/vosk_decode.py` is the only importer. The big `config/vosk-model-ru-0.42/` (3.5 GB) was deleted on 2026-09-29; only `config/vosk-model-small-ru-0.22/` (88 MB) is kept as the candidate for a local low-latency STT fallback, never wired into the pipeline.
 
 ## Tests
 

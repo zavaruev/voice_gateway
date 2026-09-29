@@ -1,6 +1,6 @@
 # Keep the build context small and free of runtime-only state. Without this
-# a local `docker build` ships ~3.6 GB of unused Vosk models plus every
-# wake-word backup (and the gitignored runtime caches) into the image.
+# a local `docker build` ships the Vosk models plus every wake-word backup
+# (and the gitignored runtime caches) into the image.
 
 .git
 .github

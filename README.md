@@ -1,5 +1,10 @@
 # Voice Gateway
 
+![version](https://img.shields.io/badge/version-v2.34-blue)
+![tests](https://img.shields.io/badge/tests-177%20passed-brightgreen)
+![python](https://img.shields.io/badge/python-3.12%2B-3776AB?logo=python&logoColor=white)
+![backend](https://img.shields.io/badge/AI%20backend-Cascade-orange)
+
 > One process that turns every microphone in the house (ESP32 satellites and OpenIPC cameras) into a single employee, and every AI answer back into sound out of the right speaker.
 
 ```
@@ -12,6 +17,27 @@
 ```
 
 FastAPI service on port **18792** that terminates the WebSocket of every ESP32 satellite speaker and the RTSP/WebRTC session of every configured camera, runs the audio front half (VAD, wake word, STT, speaker ID), hands the transcript to a pluggable LLM backend, and streams the spoken answer back to the device that asked.
+
+---
+
+## Quick Start
+
+The gateway needs three things to speak: an LLM backend, an STT endpoint and a TTS endpoint. All of them are env-overridable and default to the in-house services, so a minimal run is just:
+
+```sh
+docker build -t voice_gateway .
+docker run --network host -e NANOBOT_TOKEN=token voice_gateway
+```
+
+- **`NANOBOT_TOKEN` must be non-empty** — every satellite WebSocket is authenticated against it with a constant-time compare; an empty token means every socket is rejected. `/ota` hands the same token to the firmware.
+- **`--network host` is not optional** — ESP32 satellites reach the gateway at `<host>:18792` from the LAN, and an unpublished bridge container is unreachable. This exact misconfiguration once caused a total satellite outage; host networking also keeps the `req.url.hostname` in `/ota` responses correct.
+- **`LLM_BACKEND`** picks the brain: `nanobot` (default), `hermes` or `cascade`. Production runs `cascade` alongside the two companion services, which live in the parent `ai-prod` compose project (not part of this repo):
+
+```sh
+docker compose up -d --no-deps --build jev-router smolagents-worker voice_gateway
+```
+
+Full environment table, backend variants, REST API and OTA: [`docs/REFERENCE.md`](docs/REFERENCE.md).
 
 ---
 

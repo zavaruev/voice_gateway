@@ -1,0 +1,52 @@
+name: tests
+
+# The suite has to run inside the built image: the host Python on a runner
+# has none of the runtime deps (opuslib, onnxruntime, aiortc, openwakeword),
+# and the image itself ships without pytest. Sources are docker-cp'ed into a
+# throwaway copy (/tmp/vg_src) because the live /app would shadow the router
+# tests' sys.path imports of services/jev-router, which is not part of the
+# image (it runs as its own container).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          tags: voice_gateway:ci
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run pytest inside the container
+        run: |
+          set -euo pipefail
+          docker run --name vg-ci -d voice_gateway:ci sleep infinity
+          trap 'docker rm -f vg-ci >/dev/null 2>&1 || true' EXIT
+          docker exec vg-ci pip install -q pytest httpx pytest-asyncio
+          docker exec vg-ci rm -rf /tmp/vg_src
+          docker exec vg-ci mkdir -p /tmp/vg_src
+          for f in audio_utils.py backends.py camera_client.py engine.py main.py; do
+            docker cp "$f" vg-ci:/tmp/vg_src/"$f"
+          done
+          docker cp services vg-ci:/tmp/vg_src/services
+          docker cp templates vg-ci:/tmp/vg_src/templates
+          docker cp tests vg-ci:/tmp/vg_src/tests
+          docker exec -w /tmp/vg_src vg-ci python3 -m pytest tests -q --tb=short

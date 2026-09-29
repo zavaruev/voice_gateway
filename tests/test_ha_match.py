@@ -112,6 +112,31 @@ def test_hits_are_capped_at_ten():
     assert len(match_states(states, "пылесос")) == 10
 
 
+def test_the_device_survives_the_cap():
+    """Field case 29.09.2026, 14:17: ten helper entities matching the same
+    hint sat EARLIER in the HA registry and the cap was applied before the
+    rank sort, so `vacuum.valetudo_…: docked` was the line that got dropped.
+    The model was shown a pile of consumable-reset buttons and never the
+    device it was asked about — half of why it invented the state and the
+    battery. Rank first, cap second."""
+    helpers = [
+        {"entity_id": f"button.valetudo_reset_{i}", "state": "unknown",
+         "attributes": {"friendly_name": f"Roborock Reset {i}"}}
+        for i in range(9)
+    ]
+    states = [
+        {"entity_id": "update.vacuum_card_update", "state": "off",
+         "attributes": {"friendly_name": "Vacuum Card Update"}},
+        *helpers,
+        {"entity_id": "vacuum.valetudo_zealouseverlastinggaur", "state": "docked",
+         "attributes": {"friendly_name": "Roborock Robot"}},
+    ]
+    hits = match_states(states, "пылесос")
+    assert len(hits) == 10  # 11 candidates -> still capped
+    assert hits[0].startswith("vacuum.")  # but the device is IN, and first
+    assert "docked" in hits[0]
+
+
 def test_non_list_states_are_safe():
     assert match_states(None, "пылесос") == []
     assert matchers("") == []

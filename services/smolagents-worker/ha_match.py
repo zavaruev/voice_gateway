@@ -152,6 +152,13 @@ def match_states(states: list, query: str, area: str = "") -> list[str]:
     `update.vacuum_card_update` (both match on "vacuum", but only the first
     is a vacuum), which is what stops the model from reading state off a
     card-update helper entity.
+
+    The sort runs BEFORE the 10-line cap, never after. Observed 29.09.2026
+    14:17: ten helper entities (update/button/camera/number/select/sensor)
+    matched the same hint and sat earlier in the registry, so the cap cut
+    `vacuum.valetudo_…: docked` out of the payload — the model was shown a
+    pile of consumable-reset buttons and never the device itself, which is
+    half of why it invented «робот убирает, заряд 65 %».
     """
     m = matchers(query, area)
     if not m:
@@ -163,8 +170,7 @@ def match_states(states: list, query: str, area: str = "") -> list[str]:
         hay = f"{eid} {name}".lower()
         if any(x in hay for x in m):
             hits.append((eid, f"{eid}: {e.get('state')} ({name})"))
-        # cap: the result goes into the model's context
-        if len(hits) >= 10:
-            break
     hits.sort(key=lambda h: 0 if h[0].split(".", 1)[0] in m else 1)
-    return [line for _, line in hits]
+    # cap: the result goes into the model's context — applied to the RANKED
+    # list so the device itself is never the line that gets dropped.
+    return [line for _, line in hits[:10]]

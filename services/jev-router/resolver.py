@@ -659,6 +659,26 @@ def resolve_query(text: str, stream_name: str) -> ResolvedQuery | None:
         args = {"domain": ["sensor"]}
         if area:
             args["area"] = area
+        # «сколько заряда у робота» (29.09.2026): the METRIC alone matches
+        # every battery in the house and find_entity returns the first one
+        # in registry order — the phone («SM-A546E Battery level: 33
+        # процентов» answered for the robot). The device word travels in
+        # `device`, and find_entity() then competes only inside it.
+        # `label` says WHAT is being read: without it the head of the
+        # phrase falls back to the latin friendly name.
+        if thing_stem or thing_name:
+            args["device"] = thing_name or thing_stem
+        args["label"] = thing_name or thing_stem or "заряд"
+        # find_entity() returns None when the named device has no such
+        # reading (it refuses to borrow another device's number — «Чайник:
+        # 33 процентов» would be that borrowing). The generic «не нашла
+        # такого устройства» would be wrong too: the device is known, the
+        # READING is what does not exist, so say exactly that.
+        args["missing"] = (
+            "Данных о заряде этого устройства в Home Assistant нет."
+            if (thing_stem or thing_name)
+            else "Данных о заряде в Home Assistant нет."
+        )
         return ResolvedQuery("state", args, entity_hint="заряд")
 
     # Status question about a NAMED device («что там с нашим пылесосом?»):

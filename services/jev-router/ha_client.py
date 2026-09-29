@@ -345,6 +345,7 @@ def find_entity(
     hint: str,
     area: str | None = None,
     domain: list[str] | None = None,
+    device: str | None = None,
 ) -> dict | None:
     """Fuzzy entity lookup for easy_query.
 
@@ -364,6 +365,17 @@ def find_entity(
     Filtering outright would be wrong in the other direction: the household
     lamp is a `switch.*` while the resolver asks for domain ["light"], so
     with no `light.*` candidate the search has to fall back to all matches.
+
+    `device` (optional) names the device whose READING is being asked for:
+    «сколько заряда у робота» arrives as hint «заряд» plus device «робот»,
+    and the metric alone matches every battery in the house — observed live
+    as «SM-A546E Battery level: 33 процентов» (the phone; the robot's own
+    `sensor.…_battery_level` sits ~40th) for a question about the robot.
+    Unlike `domain`, an empty result is a NO rather than a fallback: the
+    metric exists, the device exists as a word, but THIS device has no such
+    reading — returning a stranger's entity would attribute it to the asked
+    device («Чайник: 33 процентов»), so None goes back to the caller, which
+    speaks the resolver's `missing` sentence instead.
     """
     hint_l = (hint or "").lower().strip()
     area_l = (area or "").lower().strip()
@@ -418,6 +430,21 @@ def find_entity(
         candidates = [e for e in states if _match(e, False, True)]
     if not candidates:
         return None
+    # The named device owns the reading («заряд у робота»): expand its RU
+    # stem through the same table the hint uses, then keep only its own
+    # entities. Empty here is a NO, not a preference (see the docstring) —
+    # falling through would hand the user another device's number under
+    # this device's label.
+    device_l = (device or "").lower().strip()
+    if device_l:
+        dev_hints = {device_l}
+        for stem, lats in _HINT_LAT.items():
+            if stem in device_l or device_l in stem:
+                dev_hints.update(lats)
+        in_dev = [e for e in candidates if any(d in _hay(e) for d in dev_hints)]
+        if not in_dev:
+            return None
+        candidates = in_dev
     # The requested domain narrows the POOL when it can: if the resolver asked
     # for domain ["vacuum"] and a `vacuum.*` candidate exists, only that group
     # competes — otherwise the numeric-sensor rule below returns

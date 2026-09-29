@@ -140,3 +140,100 @@ def test_the_device_survives_the_cap():
 def test_non_list_states_are_safe():
     assert match_states(None, "пылесос") == []
     assert matchers("") == []
+
+
+# --- The device's READINGS ride along with the device ------------------------
+# Field case 29.09.2026, 14:58: «Проверь робот и его заряд батареи» -> L2
+# read «пылесос» and honestly answered «узнать уровень заряда не удалось»
+# while HA reported 97 %. Valetudo puts `battery_level` in a separate
+# sensor that the integration creates LAST — after four consumable-reset
+# buttons, the map camera, statistics and wi-fi — so it was the ~19th of
+# 26 matches and the 10-line cap cut it out of the payload.
+
+_ROBOT_STATES = [
+    {"entity_id": "update.vacuum_card_update", "state": "off",
+     "attributes": {"friendly_name": "Vacuum Card Update"}},
+    {"entity_id": "button.valetudo_x_reset_main_brush_consumable",
+     "state": "unknown",
+     "attributes": {"friendly_name": "Roborock Reset Main Brush Consumable"}},
+    {"entity_id": "button.valetudo_x_reset_right_brush_consumable",
+     "state": "unknown",
+     "attributes": {"friendly_name": "Roborock Reset Right Brush Consumable"}},
+    {"entity_id": "camera.valetudo_x_map_data", "state": "idle",
+     "attributes": {"friendly_name": "Roborock Map data"}},
+    {"entity_id": "number.valetudo_x_speaker_volume", "state": "100",
+     "attributes": {"friendly_name": "Roborock Speaker volume"}},
+    {"entity_id": "select.valetudo_x_fan", "state": "medium",
+     "attributes": {"friendly_name": "Roborock Fan"}},
+    {"entity_id": "sensor.valetudo_x_map_segments", "state": "8",
+     "attributes": {"friendly_name": "Roborock Map segments"}},
+    {"entity_id": "sensor.valetudo_x_main_brush", "state": "665",
+     "attributes": {"friendly_name": "Roborock Main Brush",
+                    "unit_of_measurement": "min"}},
+    {"entity_id": "sensor.valetudo_x_total_statistics_time", "state": "2006294",
+     "attributes": {"friendly_name": "Roborock Total statistics time",
+                    "unit_of_measurement": "s"}},
+    {"entity_id": "sensor.valetudo_x_wi_fi_configuration", "state": "-55",
+     "attributes": {"friendly_name": "Roborock Wi-Fi configuration",
+                    "unit_of_measurement": "dBm"}},
+    {"entity_id": "sensor.valetudo_x_battery_level", "state": "97",
+     "attributes": {"friendly_name": "Roborock Battery level",
+                    "unit_of_measurement": "%"}},
+    {"entity_id": "switch.valetudo_x_carpet_mode", "state": "off",
+     "attributes": {"friendly_name": "Roborock Carpet mode"}},
+    {"entity_id": "vacuum.valetudo_x", "state": "docked",
+     "attributes": {"friendly_name": "Roborock Robot"}},
+]
+
+
+def test_the_devices_battery_rides_along_with_the_device():
+    """Device first, its own charge SECOND — ahead of every helper."""
+    hits = match_states(_ROBOT_STATES, "пылесос")
+    assert hits[0].startswith("vacuum.")
+    assert hits[1].startswith("sensor.valetudo_x_battery_level")
+    assert hits[1].split(": ", 1)[1].startswith("97")
+    assert len(hits) == 10  # the cap still applies — to the right list now
+
+
+def test_the_rule_works_for_every_device_spelling():
+    for query in ("робот", "заряд робота", "что с роботом на кухне"):
+        hits = match_states(_ROBOT_STATES, query, "кухня")
+        assert "battery_level" in hits[1], query
+
+
+def test_a_metric_only_query_keeps_the_registry_order():
+    """No device on top («заряд» alone) has nothing to hang a reading off:
+    the promotion must not reorder a plain metric lookup."""
+    states = [
+        {"entity_id": "sensor.phone_battery_level", "state": "33",
+         "attributes": {"friendly_name": "Phone Battery level",
+                        "unit_of_measurement": "%"}},
+        {"entity_id": "sensor.valetudo_x_battery_level", "state": "97",
+         "attributes": {"friendly_name": "Roborock Battery level",
+                        "unit_of_measurement": "%"}},
+    ]
+    hits = match_states(states, "заряд")
+    assert hits[0].startswith("sensor.phone_")  # registry order, untouched
+
+
+def test_readings_of_another_device_stay_where_they_are():
+    """Only the matched device's OWN instance may promote readings — the
+    shared household battery must not jump in front of someone else's list."""
+    # Another vacuum's battery — matches the same hint (roborock/vacuum in
+    # the hay) but has a different instance prefix, so it must NOT ride along.
+    states = [
+        {"entity_id": "vacuum.valetudo_x", "state": "docked",
+         "attributes": {"friendly_name": "Roborock Robot"}},
+        {"entity_id": "sensor.other_vacuum_battery_level", "state": "12",
+         "attributes": {"friendly_name": "Spare Roborock Battery level",
+                        "unit_of_measurement": "%"}},
+        {"entity_id": "sensor.valetudo_x_battery_level", "state": "97",
+         "attributes": {"friendly_name": "Roborock Battery level",
+                        "unit_of_measurement": "%"}},
+    ]
+    hits = match_states(states, "пылесос")
+    idx_own = next(i for i, h in enumerate(hits)
+                   if "valetudo_x_battery_level" in h)
+    idx_other = next(i for i, h in enumerate(hits)
+                     if "other_vacuum" in h)
+    assert idx_own == 1 and idx_own < idx_other

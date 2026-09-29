@@ -159,6 +159,11 @@ def match_states(states: list, query: str, area: str = "") -> list[str]:
     `vacuum.valetudo_…: docked` out of the payload — the model was shown a
     pile of consumable-reset buttons and never the device itself, which is
     half of why it invented «робот убирает, заряд 65 %».
+
+    After the sort the device's own readings are promoted under it
+    (_promote_device_readings): see the comment there for the battery case
+    of 29.09.2026 14:58 («узнать уровень заряда не удалось» while HA
+    reported 97 %).
     """
     m = matchers(query, area)
     if not m:
@@ -171,6 +176,50 @@ def match_states(states: list, query: str, area: str = "") -> list[str]:
         if any(x in hay for x in m):
             hits.append((eid, f"{eid}: {e.get('state')} ({name})"))
     hits.sort(key=lambda h: 0 if h[0].split(".", 1)[0] in m else 1)
-    # cap: the result goes into the model's context — applied to the RANKED
-    # list so the device itself is never the line that gets dropped.
+    hits = _promote_device_readings(hits, m)
+    # cap: the result goes into the model's context — applied AFTER both
+    # orderings so neither the device nor its readings are what gets dropped.
     return [line for _, line in hits[:10]]
+
+
+# A device's READINGS live in separate `sensor.*` entities that the
+# integration creates AFTER its whole army of helpers: for «пылесос» the
+# robot's battery is the ~19th match (4 reset buttons, the map camera,
+# statistics and wi-fi sit in front of it), so the 10-line cap dropped it
+# and the model answered «узнать уровень заряда не удалось» (29.09.2026
+# 14:58) while HA reported 97 %. Latin fragments only — the entity ids are
+# latin no matter which language the user spoke.
+_READING_HINTS = ("battery", "charge", "temperature", "temp", "humidity")
+_READING_LEAD = ("battery", "charge")  # asked next almost every time
+
+
+def _promote_device_readings(
+    hits: list[tuple[str, str]], m: list[str]
+) -> list[tuple[str, str]]:
+    """Put the top device's own `sensor.*` readings directly under it.
+
+    Applies only when the first hit IS a device (its domain is one of the
+    matchers): a metric-only query («заряд» with no device named) has no
+    device to hang a reading off and keeps the registry order. Battery and
+    charge readings sort ahead of the other readings, so the cap sees them
+    first; everything the rule does not recognise keeps its position.
+    """
+    if not hits:
+        return hits
+    head_eid = hits[0][0]
+    if head_eid.split(".", 1)[0] not in m:
+        return hits
+    device = head_eid.split(".", 1)[1]  # «valetudo_zealouseverlastinggaur»
+    ride: list[tuple[str, str]] = []
+    rest: list[tuple[str, str]] = []
+    for eid, line in hits[1:]:
+        bare = eid.split(".", 1)[1] if "." in eid else eid
+        reads = eid.startswith("sensor.") and any(h in eid for h in _READING_HINTS)
+        if reads and bare.startswith(device):
+            ride.append((eid, line))
+        else:
+            rest.append((eid, line))
+    if not ride:
+        return hits
+    ride.sort(key=lambda p: 0 if any(x in p[0] for x in _READING_LEAD) else 1)
+    return [hits[0]] + ride + rest

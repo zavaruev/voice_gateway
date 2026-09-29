@@ -512,3 +512,69 @@ def test_describe_label_never_beats_a_russian_name():
     e = {"entity_id": "switch.kettle", "state": "on",
          "attributes": {"friendly_name": "Чайник кухня"}}
     assert describe_entity(e, None, label="чайник").startswith("Чайник кухня")
+
+
+# --- The battery metric keeps the DEVICE it belongs to -----------------------
+# Field case 29.09.2026 (two episodes): the RE_BATT branch dropped the device
+# word entirely, so «Сколько заряда у робота?» searched the registry for
+# «заряд» globally and answered with the FIRST battery in it — the phone
+# («SM-A546E Battery level: 33 процентов») for a question about the robot.
+
+_BAT_STATES = [
+    {"entity_id": "sensor.sm_a546e_battery_level", "state": "33",
+     "attributes": {"friendly_name": "SM-A546E Battery level",
+                    "unit_of_measurement": "%"}},
+    {"entity_id": "sensor.valetudo_x_battery_level", "state": "97",
+     "attributes": {"friendly_name": "Roborock Battery level",
+                    "unit_of_measurement": "%"}},
+    {"entity_id": "vacuum.valetudo_x", "state": "docked",
+     "attributes": {"friendly_name": "Roborock Robot"}},
+]
+
+
+def test_battery_query_carries_device_label_and_missing_sentence():
+    q = resolve_query("Сколько заряда у робота?", "device")
+    assert q is not None and q.kind == "state"
+    assert q.entity_hint == "заряд"
+    assert q.args["device"] == "робот"
+    assert q.args["label"] == "робот"
+    # Spoken when the named device has no such reading at all («заряд
+    # чайника») — the generic «не нашла такого устройства» would deny a
+    # device that sits right there in the registry.
+    assert "заряде" in q.args["missing"]
+
+
+def test_battery_query_finds_the_devices_own_sensor():
+    q = resolve_query("Сколько заряда у робота?", "device")
+    e = find_entity(_BAT_STATES, q.entity_hint, None,
+                    domain=q.args.get("domain"), device=q.args.get("device"))
+    assert e is not None and e["entity_id"] == "sensor.valetudo_x_battery_level"
+    assert describe_entity(e, None, label=q.args["label"]) == "Робот: 97 процентов"
+    # The metric arrives through the whole family of spellings the STT
+    # produces — «пылесос» stems are the ones the user actually says.
+    q2 = resolve_query("Заряд батареи пылесоса", "device")
+    e2 = find_entity(_BAT_STATES, q2.entity_hint, None,
+                     domain=q2.args.get("domain"), device=q2.args.get("device"))
+    assert e2 is not None and e2["entity_id"] == "sensor.valetudo_x_battery_level"
+    assert describe_entity(e2, None, label=q2.args["label"]) == "Пылесос: 97 процентов"
+
+
+def test_battery_query_without_a_device_reads_the_metric_pool():
+    """«Сколько заряда в доме?» names no device: unchanged global metric
+    lookup (registry order), and the latin name gets a speakable label."""
+    q = resolve_query("Сколько заряда в доме?", "device")
+    assert q is not None and "device" not in q.args
+    e = find_entity(_BAT_STATES, "заряд", None, domain=["sensor"])
+    assert e is not None and e["entity_id"] == "sensor.sm_a546e_battery_level"
+    assert describe_entity(e, None, label=q.args["label"]) == "Заряд: 33 процентов"
+
+
+def test_battery_query_never_borrows_another_devices_reading():
+    """«Заряд чайника»: the kettle has no battery sensor. Handing over the
+    phone's number under the label «Чайник» would be exactly the confident
+    fabrication this project keeps fixing — the lookup refuses instead."""
+    q = resolve_query("Заряд чайника", "device")
+    assert q is not None and q.args.get("device") == "чайник"
+    assert find_entity(_BAT_STATES, q.entity_hint, None,
+                       domain=q.args.get("domain"),
+                       device=q.args.get("device")) is None

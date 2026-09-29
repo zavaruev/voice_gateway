@@ -518,7 +518,11 @@ async def _handle(req: RouteRequest):
                 # `domain` ranks a real device above a same-hint helper entity
                 # (vacuum.* over update.vacuum_card_update); `label` is the RU
                 # device word spoken instead of the latin friendly name.
-                ent = find_entity(states, hint, area, domain=q.args.get("domain"))
+                ent = find_entity(
+                    states, hint, area,
+                    domain=q.args.get("domain"),
+                    device=q.args.get("device"),
+                )
                 if ent is not None:
                     sentence = describe_entity(
                         ent, area, label=q.args.get("label", "")
@@ -527,8 +531,15 @@ async def _handle(req: RouteRequest):
                     # The registry is loaded but the hint matches nothing in
                     # RU or EN: deterministic truth from the source of record.
                     # (Escalating here lets free models hallucinate a confident
-                    # «да» — verified twice during E2E.)
-                    sentence = "Не нашла такого устройства. Может, уточните название?"
+                    # «да» — verified twice during E2E.) `missing` is the
+                    # resolver's wording for the case where the DEVICE is known
+                    # and it is the reading that does not exist («заряд
+                    # чайника»): the generic sentence would deny a device that
+                    # sits right there in the registry.
+                    sentence = (
+                        q.args.get("missing")
+                        or "Не нашла такого устройства. Может, уточните название?"
+                    )
             if emitted:
                 pass  # already streamed above
             elif sentence:

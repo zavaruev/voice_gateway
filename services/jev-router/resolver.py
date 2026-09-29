@@ -577,12 +577,17 @@ RE_STATE_Q = re.compile(
     re.IGNORECASE,
 )
 # Status phrasing about a NAMED device: «что там с нашим пылесосом?»,
-# «что с чайником», «чего с роботом?», «как пылесос?». The second branch
-# requires the question mark: STT keeps it, and without it «как включить
-# свет» would read as a status question. Only ever consulted together with a
-# THING match (see resolve_query), so «как дела?»/«привет» still escalate.
+# «что у нас с роботом?», «что с чайником», «чего с роботом?», «как пылесос?».
+# The optional fillers (там/у нас/у тебя/вообще/в целом) are a chain, not a
+# single slot: «что у нас с роботом?» (29.09.2026, 14:17) matched NONE of the
+# earlier spellings, escalated to L2 and got a fabricated answer — 0.3 s of
+# deterministic registry lookup instead. The second branch requires the
+# question mark: STT keeps it, and without it «как включить свет» would read
+# as a status question. Only ever consulted together with a THING match (see
+# resolve_query), so «как дела?»/«привет» still escalate.
 RE_STATUS_Q = re.compile(
-    r"\b(?:что|чего)\s+(?:там\s+|нового\s+)?(?:с|со)\b"
+    r"\b(?:что|чего)\s+(?:там\s+|нового\s+|у\s+нас\s+|у\s+тебя\s+|"
+    r"вообще\s+|в\s+целом\s+)*(?:с|со)\b"
     r"|\bкак\s+(?:наш\w*|мой\w*|он|она|оно|сейчас)?\s*[\wа-яё-]+\s*\?",
     re.IGNORECASE,
 )

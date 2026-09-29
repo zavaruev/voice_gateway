@@ -412,6 +412,22 @@ def test_device_status_query_short_forms():
         assert q is not None and q.kind == "state", text
 
 
+def test_device_status_query_tolerates_fillers():
+    """«Что у нас с роботом?» (29.09.2026, 14:17) — the filler «у нас» was
+    not part of the phrasing, resolve_query returned None and the turn went
+    to L2, where the free model invented both the state («убирает в
+    гостиной») and the battery («шестьдесят пять процентов»). The branch
+    only opens on a THING match, so fillers cost nothing elsewhere."""
+    for text in ("что у нас с роботом?", "что у нас с пылесосом?",
+                 "что вообще с чайником?", "что у нас с роботом на кухне?"):
+        q = resolve_query(text, "device")
+        assert q is not None and q.kind == "state", text
+    q = resolve_query("что у нас с роботом?", "device")
+    assert q.args["domain"] == ["vacuum"]
+    assert q.args["label"] == "робот"
+    assert q.entity_hint == "робот"
+
+
 def test_device_status_query_keeps_a_named_room():
     q = resolve_query("что там с пылесосом на кухне", "device")
     assert q is not None and q.args["area"] == "Kitchen"
@@ -436,8 +452,10 @@ def test_status_question_does_not_shadow_the_earlier_families():
 
 def test_classifier_routes_the_field_phrase_as_easy_query():
     """L1 must even see the question: route=easy_query conf=0.90 was logged
-    for exactly this text on 29.09.2026."""
+    for exactly this text on 29.09.2026 — and for the 14:17 one too, where
+    the resolver (not the classifier) was the part that gave up."""
     assert clf.RE_QUERY.match("что там с нашим пылесосом?")
+    assert clf.RE_QUERY.match("что у нас с роботом?")
 
 
 # --- find_entity domain preference / describe_entity vacuum wording ----------

@@ -1770,6 +1770,26 @@ async def _hermes_player_task(q: asyncio.Queue, device_ws, state):
         if streamed and text:
             state.setdefault("reply_sentences", []).append(text + " ")
 
+    async def prefetch_next():
+        """Take the NEXT queue item and start its synthesis right away.
+
+        Runs CONCURRENTLY with the playback of the current sentence. The old
+        shape awaited this item BEFORE play(), i.e. it gated sentence N on
+        sentence N+1: the ack «Секунду, занимаюсь…» (11:39:26) stayed unsaid
+        for 12 s — until L2 produced its first sentence at 11:39:38 — which
+        is exactly the silence the ack exists to cover. Waiting here while
+        the current sentence streams keeps the one-ahead property (N+1's
+        Edge-TTS latency is hidden under N's playback) without holding N
+        hostage to N+1.
+
+        Returns (text, synth_task); a None item or an already-fired watchdog
+        yields no task — nothing to synthesise, nothing to play.
+        """
+        item = await q.get()
+        if item is None or state.get("watchdog_fired"):
+            return item, None
+        return item, start_synth(item)
+
     first = await q.get()
     if first is None:
         return  # backend produced nothing (empty reply or early error)
@@ -1777,25 +1797,40 @@ async def _hermes_player_task(q: asyncio.Queue, device_ws, state):
     # Text belonging to the in-flight synth task; travels alongside it because
     # the queue only carries strings, not the (text, mp3) pairing.
     synth_text = first if synth_task is not None else None
-    while True:
-        # One-ahead pipeline: `synth_task` is always the NEXT sentence's
-        # synthesis. Awaiting it here overlaps with `play()` of the current
-        # one, so Edge-TTS latency is hidden instead of heard as a gap.
-        nxt = await q.get()
-        mp3 = await synth_task if synth_task is not None else None
-        synth_task, spoken_text = None, synth_text
-        synth_text = None
-        if state.get("watchdog_fired"):
+    nxt_get: asyncio.Task | None = None
+    try:
+        while True:
+            # Started BEFORE the current sentence is awaited: while we wait
+            # for (and then play) sentence N, sentence N+1's text arrives
+            # here and its synthesis begins — the overlap the pipeline wants,
+            # now without delaying this sentence's playback.
+            nxt_get = asyncio.create_task(prefetch_next())
+            mp3 = await synth_task if synth_task is not None else None
+            synth_task, spoken_text = None, synth_text
+            synth_text = None
+            if state.get("watchdog_fired"):
+                nxt, nxt_task = await nxt_get
+                if nxt_task is not None:
+                    nxt_task.cancel()
+                if nxt is None:
+                    return
+                continue  # stale: apology already spoken, keep draining
+            # Play THIS sentence as soon as it is ready; the next queue item
+            # is awaited afterwards (see prefetch_next).
+            if mp3 is not None:
+                await play(mp3, spoken_text)
+            nxt, synth_task = await nxt_get
+            synth_text = nxt if synth_task is not None else None
+            if state.get("watchdog_fired") and synth_task is not None:
+                synth_task.cancel()  # stale: apology already spoken
+                synth_task, synth_text = None, None
             if nxt is None:
-                return
-            continue  # stale: apology already spoken, keep draining
-        if nxt is not None:
-            synth_task = start_synth(nxt)  # prefetch while mp3 plays
-            synth_text = nxt
-        if mp3 is not None:
-            await play(mp3, spoken_text)
-        if nxt is None:
-            return  # None is the backend's end-of-stream marker
+                return  # None is the backend's end-of-stream marker
+    finally:
+        # A timeout/cancel from _dispatch_hermes must not strand a pending
+        # q.get() task (child tasks are not cancelled with their parent).
+        if nxt_get is not None and not nxt_get.done():
+            nxt_get.cancel()
 
 
 async def _handle_rejected_transcription(
@@ -3565,15 +3600,48 @@ async def stop_camera_sessions():
     _camera_sessions.clear()
 
 
+# --- Event-loop stall monitor ------------------------------------------------
+# Turn of 29.09.2026, 11:39:26–11:39:38: the L2 worker logged `done` at
+# 28.148 but this process logged it at 38.126, while every hop measured
+# <0.4 s in isolation right afterwards — i.e. ~10 s vanished somewhere this
+# code cannot see from the outside (the log write itself is synchronous, so
+# a blocked loop shows exactly this shape). The monitor is the only witness:
+# it measures how late its own 1 s deadline was rescheduled.
+_LOOP_STALL_THRESHOLD = 2.0
+_loop_monitor_task: asyncio.Task | None = None
+
+
+async def loop_stall_monitor() -> None:
+    """Log when the event loop stops scheduling tasks for more than 2 s.
+
+    A stall freezes everything at once — SSE reads, queue puts, TTS
+    synthesis, WS sends — which is what the 12 s of dead air in that turn
+    looked like. One coroutine, one sleep per second: cheap enough to run
+    permanently, and the blocked code can never log about itself.
+    """
+    while True:
+        t0 = time.monotonic()
+        await asyncio.sleep(1.0)
+        lag = time.monotonic() - t0 - 1.0
+        if lag >= _LOOP_STALL_THRESHOLD:
+            logger.warning(f"🐌 [Loop] event loop stalled for {lag:.1f}s")
+
+
 @app.on_event("startup")
 async def on_startup():
     """Lifespan hook: bring up the go2rtc camera sessions with the app."""
     await start_camera_sessions()
+    # Diagnostics stay on in every mode (prod, CI image, local): a stalled
+    # loop is invisible to the code running inside it.
+    global _loop_monitor_task
+    _loop_monitor_task = asyncio.create_task(loop_stall_monitor())
 
 
 @app.on_event("shutdown")
 async def on_shutdown():
     """Lifespan hook: tear the camera sessions down before exit."""
+    if _loop_monitor_task is not None:
+        _loop_monitor_task.cancel()
     await stop_camera_sessions()
 
 

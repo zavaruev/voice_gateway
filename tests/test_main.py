@@ -710,3 +710,74 @@ async def test_voice_ws_auth_bypass():
         with pytest.raises(Exception):
             with client.websocket_connect("/?token=") as websocket:
                 pass
+
+
+# --- _hermes_player_task: the ack must not wait for sentence #2 ---------------
+# Field case 29.09.2026, 11:39:26 -> 11:39:38: the backend enqueued the ack
+# «Секунду, занимаюсь…» immediately, but the player awaited the NEXT queue
+# item BEFORE playing the current one — so the ack stayed unsaid until L2's
+# first sentence arrived. 12 s of dead air, i.e. exactly the silence the ack
+# exists to cover (and it would be worse: an L2 run without an early sentence
+# would sit unsaid for the whole turn).
+
+
+@pytest.mark.asyncio
+async def test_player_speaks_the_ack_without_the_next_sentence():
+    q: asyncio.Queue = asyncio.Queue()
+    played, synth = [], []
+
+    async def fake_synth(text, state):
+        synth.append(text)
+        await asyncio.sleep(0.01)
+        return text.encode()
+
+    async def fake_stream(mp3, ws, sid, state, send_stop=True):
+        played.append(mp3.decode())
+        return True
+
+    state = {"sid": "s1", "watchdog_fired": False}
+    with patch.object(main, "synthesize_tts_mp3", fake_synth), patch.object(
+        main, "stream_tts_pcm", fake_stream
+    ):
+        task = asyncio.create_task(main._hermes_player_task(q, None, state))
+        await q.put("Секунду, занимаюсь…")
+        # L2 is still working: the queue is EMPTY, yet the ack must play.
+        await asyncio.sleep(0.2)
+        assert played == ["Секунду, занимаюсь…"], (
+            "the ack waited for the next queue item instead of playing"
+        )
+        await q.put("Пылесос сейчас на базе.")
+        await q.put(None)  # backend end-of-stream marker
+        await asyncio.wait_for(task, 2.0)
+
+    # One-ahead pipeline preserved: every sentence synthesised exactly once,
+    # in order, and the queue contents are what actually got spoken.
+    assert synth == ["Секунду, занимаюсь…", "Пылесос сейчас на базе."]
+    assert played == synth
+    assert state["reply_sentences"] == [s + " " for s in synth]
+
+
+@pytest.mark.asyncio
+async def test_player_watchdog_fired_drains_the_queue_silently():
+    """A fired watchdog means the apology already went out: the rest of the
+    reply is drained, never spoken, and the prefetch task is not stranded."""
+    q: asyncio.Queue = asyncio.Queue()
+    played = []
+
+    async def fake_synth(text, state):  # pragma: no cover - must not run
+        raise AssertionError("no synthesis after the watchdog fired")
+
+    async def fake_stream(mp3, ws, sid, state, send_stop=True):  # pragma: no cover
+        played.append(mp3)
+        return True
+
+    state = {"sid": "s1", "watchdog_fired": True}
+    with patch.object(main, "synthesize_tts_mp3", fake_synth), patch.object(
+        main, "stream_tts_pcm", fake_stream
+    ):
+        await q.put("фраза из реплики")
+        await q.put(None)
+        await asyncio.wait_for(main._hermes_player_task(q, None, state), 2.0)
+
+    assert played == []
+    assert "reply_sentences" not in state

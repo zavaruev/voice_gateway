@@ -56,6 +56,25 @@ _HINT_LAT: dict[str, list[str]] = {
     "ламп": ["light"],
     "телевизор": ["tv", "television"],
     "пылесос": ["vacuum", "roborock", "robot"],
+    # «робот» was missing here while THING already resolved it (29.09.2026,
+    # 14:17): the resolver handed hint="робот" over, nothing in the latin
+    # registry contains the RU word, and find_entity returned None —
+    # «Не нашла такого устройства» for a vacuum that was right there. Every
+    # key of the worker's ha_match.HINTS must exist in this table too (the
+    # two copies live in different images, so tests/test_hint_sync.py reads
+    # them out of the source and fails if they drift apart).
+    "робот": ["vacuum", "roborock", "robot"],
+    "батаре": ["battery"],
+    "громкост": ["volume"],
+    "яркост": ["brightness"],
+    "жалюзи": ["blind"],
+    "кафевар": ["coffee"],
+    "климат": ["climate"],
+    "кондиционер": ["climate", "thermostat"],
+    "люстр": ["light"],
+    "освещени": ["light"],
+    "розетк": ["switch", "socket"],
+    "торшер": ["light"],
     "штор": ["cover", "curtain", "blind"],
     "музык": ["media_player", "speaker", "receiver"],
 }

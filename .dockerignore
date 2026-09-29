@@ -1,0 +1,35 @@
+# Keep the build context small and free of runtime-only state. Without this
+# a local `docker build` ships ~3.6 GB of unused Vosk models plus every
+# wake-word backup (and the gitignored runtime caches) into the image.
+
+.git
+.github
+.pytest_cache
+__pycache__
+*.pyc
+
+# Not part of the image (router/worker run as their own containers)
+services
+tests
+docs
+
+# Local-only leftovers and backups
+*.bak-*
+*.bak
+*.log
+*.swp
+*.tmp
+.idea
+.vscode
+models
+AGENTS.md
+DESIGN.md
+setup_gateway.sh
+opencode.json
+silero_vad.onnx
+
+# Downloaded at build time by the Dockerfile itself
+config/vosk-model-ru-0.42
+config/vosk-model-small-ru-0.22
+config/*.onnx.bak*
+config/firmware/

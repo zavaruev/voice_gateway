@@ -365,8 +365,21 @@ async def _execute_action(call) -> tuple[str | None, dict | None]:
     """
     if call.tool.startswith("media__"):
         return await _execute_media(call)
+    states: list[dict] | None = None
     if call.tool in _ONOFF_TOOLS:
         states = await ha.get_states(force=True)
+        if not states:
+            # `get_states` returns its previous snapshot on failure, and that
+            # snapshot is [] on a cold cache — so an empty list means "HA did
+            # not answer", NOT "no such device". Falling through to the blind
+            # intent here is what produced the worst lie of 04.10.2026:
+            # «выключи свет» -> «Выключила» with the lamp still on, because
+            # `domain: ["light"]` cannot match a `switch.*_relay` and HA
+            # answered success for the AREA plus an `unavailable` WLED.
+            logger.error(
+                "HA registry unavailable (%s) — refusing to act blind", call.tool
+            )
+            return None, {"ok": False, "error": "ha_registry_unavailable"}
         if states:
             # Deterministic refusal: a device absent from the whole registry
             # must never reach L2 — a free model happily «включает» ghost
@@ -385,6 +398,14 @@ async def _execute_action(call) -> tuple[str | None, dict | None]:
                 return None, {
                     "ok": False,
                     "error": f"ambiguous_no_area: {len(targets)} targets, команда без комнаты",
+                }
+            if not targets:
+                # The registry answered and holds nothing for this device.
+                # Blinding the intent is what turns that into a false
+                # «Выключила»: HA matches the AREA and answers success.
+                return None, {
+                    "ok": False,
+                    "error": f"no_target:{call.hint or call.tool}: в реестре HA нет такого устройства",
                 }
             want_on = call.tool.endswith("HassTurnOn")
             opposite = "off" if want_on else "on"
@@ -468,12 +489,62 @@ async def _execute_action(call) -> tuple[str | None, dict | None]:
                     # deny them ("never promise" is about unproven actions).
                     errd["done"] = ", ".join(ok)
                 return None, errd
-    # Blind path: non-on/off intents (timers/vacuum/broadcast/light-set) or
-    # on/off when the registry gave no target — the HA matcher decides.
+    # Blind path: non-on/off intents (timers/vacuum/broadcast/light-set) — the HA
+    # matcher decides. On/off never lands here any more: an unreachable registry
+    # and an empty target set both refuse above.
     res = await ha.call_tool(call.tool, call.args)
     if res.get("ok"):
-        return call.speak_ok, None
+        if states is None:
+            states = await ha.get_states(force=True)
+        if _touched_a_usable_entity(res, states):
+            return call.speak_ok, None
+        # `ok` is HA saying the CALL was accepted, not that a device moved.
+        # A domain that cannot match the real device still yields success for
+        # the AREA alone. Claiming the side effect here is how «включи свет»
+        # answers «Сделала» with the lamp untouched — measured 04.10.2026.
+        logger.error(
+            "HA reported success but touched no usable entity: tool=%s claimed=%s",
+            call.tool, res.get("claimed"),
+        )
+        return None, {
+            "ok": False,
+            "error": "unverified_side_effect: HA принял вызов, но ни одно доступное устройство не изменилось",
+            "raw": res.get("claimed"),
+        }
     return None, res
+
+
+def _touched_a_usable_entity(res: dict, states: list[dict] | None) -> bool:
+    """True only if HA named at least one real, available entity as done.
+
+    `{"type": "area"}` in HA's success list means the intent matched a ROOM,
+    not a device — with no `entity` entry nothing was addressed at all. An
+    entity that is `unavailable` cannot have changed either.
+    """
+    claimed = res.get("claimed") or []
+    ids = {
+        row.get("id")
+        for row in claimed
+        if isinstance(row, dict) and row.get("type") == "entity" and row.get("id")
+    }
+    if not ids:
+        return False
+    if not states:
+        # No live registry to check against: refuse rather than assume.
+        return False
+    live = {
+        str(e.get("entity_id")): str(e.get("state", "")).lower()
+        for e in states
+        if isinstance(e, dict)
+    }
+    return any(
+        # Absent from the live registry is NOT evidence of availability: HA
+        # happily names entities that are filtered out of /api/states or that
+        # live in an integration we cannot read. Absent => unverified.
+        live.get(eid) is not None
+        and live.get(eid) not in ("unavailable", "unknown", "none", "")
+        for eid in ids
+    )
 
 
 async def _run_worker(
@@ -610,6 +681,12 @@ async def _handle(req: RouteRequest):
             call = resolve_action(text, area_hint)
             sentence, err = await _execute_action(call)
             if sentence:
+                # Log what the user will actually hear. A side effect that was
+                # claimed but never performed is otherwise invisible: on
+                # 04.10.2026 that is exactly how «Выключила» went out with the
+                # lamp still on, and the router log showed a clean easy_action
+                # with no error anywhere.
+                logger.info("speaking: %r", sentence)
                 reply_parts.append(sentence)
                 yield _sse({"type": "sentence", "text": sentence})
             else:

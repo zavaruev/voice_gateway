@@ -986,3 +986,139 @@ def test_a_box_without_a_volume_level_is_not_polled_at_all():
     # because that is where the change lands late.
     assert sum(confirm_delays("volume_up")) > sum(confirm_delays("media_pause"))
     assert sum(confirm_delays("volume_set")) == sum(confirm_delays("volume_mute"))
+
+
+# --- honesty: `ok` is not "the device moved" ---------------------------
+# Field case 04.10.2026, living room: «выключи свет» -> the gateway said
+# «Выключила» and the lamp stayed on. Three separate holes let that through,
+# all reachable from one ordinary utterance, and NONE of them was covered —
+# nothing in the suite imported this module.
+
+
+def _router_app():
+    """Load jev-router/app.py under a private name.
+
+    It cannot be imported as `app` (that name belongs to the FastAPI app in
+    test_main.py) and it was never imported at all before this, which is why a
+    false «Выключила» shipped with a clean log.
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "jev_router_app", os.path.join(_ROUTER, "app.py")
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class _DeadHA:
+    """HA that answers, but has no state to reason about."""
+
+    def __init__(self, states=None, result=None):
+        self._states = states if states is not None else []
+        self._result = result or {"ok": True, "result": {}}
+        self.calls = []
+
+    async def get_states(self, force=False):
+        return self._states
+
+    async def get_entity_areas(self):
+        return {}
+
+    async def call_tool(self, name, args, rpc_id=1):
+        self.calls.append((name, args))
+        return self._result
+
+
+def _off_call():
+    return resolve_action("выключи свет", "livingroom")
+
+
+def test_unavailable_registry_refuses_instead_of_acting_blind():
+    """An empty state list means "HA did not answer", not "no such device".
+
+    `get_states` returns its previous snapshot on failure and that snapshot is
+    `[]` on a cold cache. The old code fell straight through to the blind
+    intent, which cannot match a `switch.*_relay` with `domain: ["light"]` and
+    so reported success for the AREA alone.
+    """
+    import asyncio
+
+    mod = _router_app()
+    ha = _DeadHA()
+    mod.ha = ha
+    sentence, err = asyncio.run(mod._execute_action(_off_call()))
+    assert sentence is None, "claiming success on an unreadable registry is a lie"
+    assert err and "registry_unavailable" in str(err.get("error"))
+    assert ha.calls == [], "HA must not be called at all in this state"
+
+
+def test_blind_success_naming_only_an_area_is_refused():
+    """The exact 04.10.2026 answer: success for the ROOM, nothing switched."""
+    import asyncio
+
+    mod = _router_app()
+    # A NON-on/off intent, which is what the blind path is for now: on/off
+    # refuses earlier (unreadable registry / empty target set).
+    from resolver import ResolvedCall
+
+    call = ResolvedCall(
+        tool="intent__HassBroadcast",
+        hint="свет",
+        args={"domain": ["light"], "area": "Living Room"},
+        speak_ok="Включила",
+    )
+    ha = _DeadHA(
+        states=[{"entity_id": "switch.living_room_light_swith_relay", "state": "off"}],
+        result={
+            "ok": True,
+            "result": {"speech": {}, "response_type": "action_done"},
+            "claimed": [
+                {"name": "Living Room", "type": "area", "id": "living_room"},
+                {"name": "WLED_living_room", "type": "entity",
+                 "id": "light.wled_living_room"},
+            ],
+        },
+    )
+    mod.ha = ha
+    sentence, err = asyncio.run(mod._execute_action(call))
+    assert sentence is None, "an area is not a device — this is the false «Выключила»"
+    assert err and "unverified_side_effect" in str(err.get("error"))
+
+
+def test_a_real_available_entity_is_a_side_effect():
+    mod = _router_app()
+    res = {"ok": True, "claimed": [{"name": "living_room_light_swith Relay",
+                                    "type": "entity",
+                                    "id": "switch.living_room_light_swith_relay"}]}
+    states = [{"entity_id": "switch.living_room_light_swith_relay", "state": "off"}]
+    assert mod._touched_a_usable_entity(res, states) is True
+
+
+def test_naming_nothing_is_not_a_side_effect():
+    mod = _router_app()
+    live = [{"entity_id": "x", "state": "on"}]
+    assert mod._touched_a_usable_entity({"ok": True, "claimed": []}, live) is False
+    # HA's other payload shape carries a bare bool and names nothing
+    assert mod._touched_a_usable_entity({"ok": True}, live) is False
+
+
+def test_unavailable_entity_is_not_a_side_effect():
+    mod = _router_app()
+    res = {"ok": True, "claimed": [{"name": "WLED", "type": "entity",
+                                    "id": "light.wled_living_room"}]}
+    states = [{"entity_id": "light.wled_living_room", "state": "unavailable"}]
+    assert mod._touched_a_usable_entity(res, states) is False
+
+
+def test_claimed_is_parsed_out_of_the_intent_envelope():
+    """`call_tool` must surface HA's own account of what it touched."""
+    from ha_client import _claimed
+
+    assert _claimed({"data": {"success": [{"id": "a", "type": "entity"}],
+                             "failed": [{"id": "b", "type": "entity"}]}}) == {
+        "claimed": [{"id": "a", "type": "entity"}],
+        "claimed_failed": [{"id": "b", "type": "entity"}],
+    }
+    assert _claimed({"success": True}) == {"claimed": [], "claimed_failed": []}

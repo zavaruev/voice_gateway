@@ -10,6 +10,7 @@ import asyncio
 import os
 import time
 import pytest
+import inspect
 import av
 import fractions
 
@@ -692,3 +693,93 @@ async def test_vosk_branch_is_gated_exactly_like_the_acoustic_one():
     assert src.count("not self._wake_detected") >= 2, (
         "expected both the vosk and the openWakeWord branch to check it"
     )
+
+
+# --- the greeting must not talk over the command it is waiting for ------
+# Field case 04.10.2026: «компьютер, включи свет» -> the camera answered «Да?».
+# `_vad_has_speech` was False for the whole window (the onset requires
+# `not _processing_utterance`, and a previous turn was still in flight), so
+# `_wake_greeting` read the room as silent — while the VAD reported
+# `speech=True consec=54` and the command never reached Whisper at all.
+
+
+async def _raise_cancelled(_delay):
+    """Stand-in for asyncio.sleep that ends the greeting immediately."""
+    raise asyncio.CancelledError
+
+
+async def _no_sleep(_delay):
+    return None
+
+
+def _greet_session():
+    s = CameraSession.__new__(CameraSession)
+    s.stream_name = "cam"
+    s._wake_detected = True
+    s._vad_has_speech = False      # an in-flight utterance blocks the onset
+    s._vad_speech_consecutive = 54  # ...yet speech frames keep arriving
+    s._wake_greeting_delay = 5.0
+    s._wake_greeting_task = None
+    s._auto_greeting = False
+    s._last_auto_greet_ts = 0.0
+    s._veto_until = 0.0
+    s.spoken = []
+
+    async def _tts_fetch(text):
+        return b"pcm"
+
+    async def _speak(pcm, text):
+        s.spoken.append(text)
+
+    s._tts_fetch = _tts_fetch
+    s._speak_pcm = _speak
+    return s
+
+
+@pytest.mark.asyncio
+async def test_no_greeting_while_speech_frames_are_still_arriving():
+    """`_last_speech_at` is the honest "is the user talking" signal.
+
+    With it fresh (speech just arrived), `_wake_greeting` must wait instead of
+    saying «Да?» over a command that has not been transcribed yet.
+    """
+    s = _greet_session()
+    s._last_speech_at = time.time()      # speech arriving RIGHT NOW
+    with patch("camera_client.asyncio.sleep", new=_raise_cancelled):
+        await s._wake_greeting()
+    assert s.spoken == [], (
+        "greeting interrupted live speech — this is how «включи свет» was lost"
+    )
+
+
+@pytest.mark.asyncio
+async def test_greeting_still_happens_in_a_quiet_room():
+    """The fix must not silence the greeting altogether — a bare «компьютер»
+    with nobody following it should still be answered."""
+    s = _greet_session()
+    s._last_speech_at = time.time() - 600.0
+    with patch("camera_client.asyncio.sleep", new=_no_sleep):
+        await s._wake_greeting()
+    assert s.spoken == ["Да?"]
+
+
+@pytest.mark.asyncio
+async def test_vosk_is_fed_even_while_a_wake_window_is_open():
+    """The wake word must stay detectable at all times.
+
+    Gating the FEED on `_wake_detected` (added 04.10.2026) made the room deaf
+    for the whole 60 s dialogue window: the user said «компьютер» again and
+    nothing happened, which is indistinguishable from a broken detector. The
+    guard belongs on the FIRING.
+    """
+    src = inspect.getsource(CameraSession._vad_process)
+    feed_at = src.index("self._vosk_wake.feed")
+    guard_at = src.index("self._vosk_suppressed += 1")
+    between = src[feed_at:guard_at]
+    assert "self._vosk_wake is not None" not in between, (
+        "the vosk feed must be unconditional"
+    )
+    assert "_wake_detected" in between, (
+        "the FIRING must still be guarded, or _fire_wake runs twice per utterance"
+    )
+    assert "_wake_suppress_until" in between

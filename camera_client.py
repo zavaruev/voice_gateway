@@ -540,6 +540,7 @@ class CameraSession:
         # diagnostic counters for the "why did the live room stay silent"
         # question; see the vosk diag log line in _vad_process
         self._vosk_chunks = 0
+        self._vosk_suppressed = 0
         self._vosk_last_peak = 0
         self._vosk_last_log = 0.0
         # Audio-rate watchdog. The stall handlers only catch total timeouts; a
@@ -591,6 +592,10 @@ class CameraSession:
         self._last_auto_greet_ts = 0.0
         self._last_tts_reply = ""  # normalized text we last spoke (echo guard)
         self._wake_greeting_delay = 5.0
+        # Wall clock of the most recent VAD "speech" frame. The greeting
+        # asks "is the user talking?", and `_vad_has_speech` answers that
+        # wrongly while an utterance is in flight (see _wake_greeting).
+        self._last_speech_at = 0.0
         self._audio_epoch = 0.0
 
         self._pc: RTCPeerConnection | None = None
@@ -1520,6 +1525,7 @@ class CameraSession:
 
             if speech:
                 self._vad_speech_consecutive += 1
+                self._last_speech_at = now
                 if not self._vad_has_speech:
                     if win_speech >= 3 and not self._processing_utterance:
                         logger.info(
@@ -1576,17 +1582,14 @@ class CameraSession:
             # when fed continuously. The VAD exists to delimit utterances for
             # STT; it has no business discarding audio a streaming decoder needs.
             #
-            # Guarded exactly like the openWakeWord branch below. Without it the
-            # decoder restarts right after a fire, re-hears the same word ~0.6 s
-            # later and calls _fire_wake() again — and a second call clears
-            # `_vad_speech_buf`, destroying the command that was being
-            # collected. The acoustic path never had this problem because its
-            # 2-of-3 debounce plus `_wake_detected` covered it.
-            if (
-                self._vosk_wake is not None
-                and not self._wake_detected
-                and time.time() >= self._wake_suppress_until
-            ):
+            # ALWAYS fed — the wake word must stay detectable at all times and
+            # the decoder costs ~1.8 ms per 200 ms. Gating the FEED on
+            # `_wake_detected` (added 04.10.2026) made the room deaf for the
+            # whole 60 s post-wake dialogue window: the user said «компьютер»
+            # again and nothing happened, which is indistinguishable from a
+            # broken detector — the exact confusion `vosk diag` exists to
+            # prevent. The guard belongs on the FIRING, not on the feed.
+            if self._vosk_wake is not None:
                 if not self._vosk_wake.active:
                     self._vosk_wake.begin()
                 self._vosk_chunks += 1
@@ -1594,6 +1597,22 @@ class CameraSession:
                     self._vosk_last_peak, int(np.abs(s16).max())
                 )
                 got_wake = await asyncio.to_thread(self._vosk_wake.feed, chunk)
+                if got_wake and not (
+                    not self._wake_detected
+                    and time.time() >= self._wake_suppress_until
+                ):
+                    # Heard inside an open window (dialogue, or the echo of our
+                    # own reply). Fire anyway and a second `_fire_wake()` clears
+                    # `_vad_speech_buf`, destroying the command being collected
+                    # — so count it, roll the decoder over, and stay silent.
+                    self._vosk_wake.reset()
+                    self._vosk_suppressed += 1
+                    logger.info(
+                        f"[{self.stream_name}] VOSK wake heard while a window "
+                        f"was open — not fired (suppressed="
+                        f"{self._vosk_suppressed})"
+                    )
+                    got_wake = False
                 if now - self._vosk_last_log > 300.0:
                     # Deliberately rare: this is a debug aid for "the room is
                     # mute again", not a health line. It reports chunks fed,
@@ -1603,7 +1622,7 @@ class CameraSession:
                     self._vosk_last_log = now
                     logger.info(
                         f"[{self.stream_name}] vosk diag: "
-                        f"chunks={self._vosk_chunks} "
+                        f"chunks={self._vosk_chunks} suppressed={self._vosk_suppressed} "
                         f"peak_max={self._vosk_last_peak} "
                         f"triggers={self._vosk_wake.triggers} "
                         f"decodes={self._vosk_wake.decodes} "
@@ -2484,9 +2503,15 @@ class CameraSession:
             return
         if not self._wake_detected:
             return
-        if self._vad_has_speech:
-            # User is mid-sentence (slow command) — do NOT talk over them;
-            # give one extra quiet period before greeting.
+        # «Is anyone talking?» must mean "has any speech frame arrived lately",
+        # NOT "has an utterance been committed". The two differ exactly when it
+        # hurts: `_vad_has_speech` stays False while `_processing_utterance` is
+        # in flight (the onset requires `not _processing_utterance`), so a
+        # command spoken right after the previous turn is dropped before it
+        # ever reaches Whisper — measured 04.10.2026: VAD reported
+        # `speech=True consec=54` with no SPEECH START at all, and the camera
+        # answered «Да?» to «включи свет» because the room looked silent.
+        if time.time() - self._last_speech_at < self._wake_greeting_delay:
             try:
                 await asyncio.sleep(4.0)
             except asyncio.CancelledError:

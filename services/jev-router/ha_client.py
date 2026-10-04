@@ -130,6 +130,34 @@ _AREA_LAT: dict[str, list[str]] = {
 }
 
 
+
+
+def _claimed(result: dict) -> dict:
+    """Pull HA's own account of what it touched out of an intent response.
+
+    HA's MCP intent answers `{"success": bool}` or, for action intents,
+    `{"data": {"success": [...], "failed": [...]}}` where each entry is
+    `{name, type, id}` and `type` is "entity" or "area". `ok` alone is NOT
+    evidence that anything moved: an intent whose domain cannot match the real
+    device still returns success for the AREA it matched plus whatever
+    `unavailable` entities share the name — measured 04.10.2026 on
+    «выключи свет» in the living room: `success: [area "Living Room",
+    light.wled_living_room]`, `failed: []`, and the lamp (a `switch.*_relay`,
+    invisible to `domain: ["light"]`) stayed on while the gateway said
+    «Выключила». Callers must verify against live state before claiming a
+    side effect.
+    """
+    data = result.get("data")
+    if not isinstance(data, dict):
+        return {"claimed": [], "claimed_failed": []}
+
+    def _ids(key: str) -> list[dict]:
+        rows = data.get(key)
+        return [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+
+    return {"claimed": _ids("success"), "claimed_failed": _ids("failed")}
+
+
 class HAClient:
     """Async Home Assistant gateway with TTL caches (module-level singleton).
 
@@ -241,8 +269,14 @@ class HAClient:
         if isinstance(inner, dict) and inner.get("success") is False:
             return {"ok": False, "error": inner.get("error", "tool_failed"), "raw": inner}
         if isinstance(inner, dict) and "result" in inner:
-            return {"ok": True, "result": inner["result"]}
-        return {"ok": True, "result": inner}
+            out = {"ok": True, "result": inner["result"]}
+            if isinstance(out["result"], dict):
+                out.update(_claimed(out["result"]))
+            return out
+        out = {"ok": True, "result": inner}
+        if isinstance(inner, dict):
+            out.update(_claimed(inner))
+        return out
 
     async def get_states(self, force: bool = False) -> list[dict]:
         """Cached /api/states for topology + easy_query entity lookup.

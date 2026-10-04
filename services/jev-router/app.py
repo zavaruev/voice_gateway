@@ -78,6 +78,7 @@ from ha_client import (
 )
 from resolver import (
     area_of as resolver_area_of,
+    RE_MEDIA_NOUN,
     resolve_action,
     resolve_query,
     unresolved_hint,
@@ -348,7 +349,7 @@ async def _execute_media(call) -> tuple[str | None, dict | None]:
     return call.speak_ok, None
 
 
-async def _execute_action(call) -> tuple[str | None, dict | None]:
+async def _execute_action(call, text_hint: str = "") -> tuple[str | None, dict | None]:
     """Run one easy_action MCP call. Returns (sentence, None) on success or
     an «already in state» answer, (None, error) otherwise — it never claims
     a side-effect that was not confirmed.
@@ -385,6 +386,24 @@ async def _execute_action(call) -> tuple[str | None, dict | None]:
             # must never reach L2 — a free model happily «включает» ghost
             # devices (field case: «Включи кафеварку», STT typo + wrong name).
             if call.hint and find_entity(states, call.hint, None) is None:
+                # A media CONTENT word is not a device name. «включи следующую
+                # серию черного зеркала» reaches here with hint «серию» — the
+                # noun matches `RE_MEDIA_NOUN`, but `resolve_action` only takes
+                # the media branch when the thing resolves to a `media_player`,
+                # which a title never does, so it falls through to
+                # `HassTurnOn`. Field case 04.10.2026 19:22: the answer was
+                # «Не нашла такого устройства» for a request the L2 tools
+                # (`media_search` / `media_play`) exist to serve. Refusing here
+                # also blocks escalation, so route it to L2 instead.
+                if RE_MEDIA_NOUN.search(text_hint):
+                    return None, {
+                        "ok": False,
+                        "error": (
+                            f"media_content_word:{call.hint}: это название "
+                            "контента, а не устройство; поиск и запуск — в L2 "
+                            "(media_search / media_play)"
+                        ),
+                    }
                 return "Не нашла такого устройства. Может, уточните название?", None
             area_map = await ha.get_entity_areas()
             targets = dedupe_device_facets(
@@ -679,7 +698,7 @@ async def _handle(req: RouteRequest):
             # Resolved a second time (pure regex, no I/O): the pre-flight
             # already turned this branch off if the resolver said None.
             call = resolve_action(text, area_hint)
-            sentence, err = await _execute_action(call)
+            sentence, err = await _execute_action(call, text)
             if sentence:
                 # Log what the user will actually hear. A side effect that was
                 # claimed but never performed is otherwise invisible: on

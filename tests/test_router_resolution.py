@@ -1122,3 +1122,65 @@ def test_claimed_is_parsed_out_of_the_intent_envelope():
         "claimed_failed": [{"id": "b", "type": "entity"}],
     }
     assert _claimed({"success": True}) == {"claimed": [], "claimed_failed": []}
+
+
+def test_a_media_title_is_not_a_missing_device():
+    """«включи следующую серию черного зеркала» is not a request for a device.
+
+    Field case 04.10.2026 19:22: `RE_MEDIA_NOUN` matches «серию», but
+    `resolve_action` only takes the media branch when the thing resolves to a
+    `media_player` — which a title never does — so it fell through to
+    `HassTurnOn` with hint «серию», the deterministic refusal fired, and the
+    user was told «Не нашла такого устройства» about a request that L2's
+    `media_search`/`media_play` exist to serve. Refusing also BLOCKS escalation,
+    so the fix is to fail in a way that lets L2 answer.
+    """
+    import asyncio
+
+    mod = _router_app()
+    from resolver import resolve_action
+
+    call = resolve_action("включи следующую серию черного зеркала", "livingroom")
+    assert call.hint == "серию", "the noun is carried as a device hint"
+
+    class HA:
+        async def get_states(self, force=False):
+            return [{"entity_id": "switch.living_room_light_swith_relay",
+                     "state": "off", "attributes": {"friendly_name": "Relay"}}]
+
+        async def call_tool(self, *a, **k):
+            raise AssertionError("a media title must not reach the intent")
+
+    mod.ha = HA()
+    sentence, err = asyncio.run(
+        mod._execute_action(call, "включи следующую серию черного зеркала")
+    )
+    assert sentence is None, "must not answer about devices"
+    assert err and "media_content_word" in str(err.get("error")), (
+        "the refusal has to name the real reason, or L2 is told nothing useful"
+    )
+
+
+def test_a_genuinely_absent_device_still_refuses_without_escalating():
+    """The device case must keep its deterministic, spoken refusal."""
+    import asyncio
+
+    mod = _router_app()
+    from resolver import resolve_action
+
+    call = resolve_action("включи кафеварку", "livingroom")
+
+    class HA:
+        async def get_states(self, force=False):
+            return [{"entity_id": "switch.living_room_light_swith_relay",
+                     "state": "off", "attributes": {"friendly_name": "Relay"}}]
+
+        async def call_tool(self, *a, **k):
+            raise AssertionError("an absent device must not reach the intent")
+
+    mod.ha = HA()
+    sentence, err = asyncio.run(
+        mod._execute_action(call, "включи кафеварку")
+    )
+    assert sentence == "Не нашла такого устройства. Может, уточните название?"
+    assert err is None

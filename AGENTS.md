@@ -171,6 +171,39 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
 - **Emotions**: extracted from Nanobot text via `[emotion_name]` regex
 - **L2 HA action fallbacks** (`tools.ha_action`): a blind intent whose `area`/`domain` filter was rejected (`MatchFailedReason.AREA`/`.ASSISTANT`) re-resolves the target from raw `/api/states` + one `area_name` template render — the rule L1 already has — and retries with `name`+`domain` pinned, dropping the slot that failed. `find_action_targets()`/`resolve_onoff_targets()`/`match_states()` also honour ORDINALS — `resolve_action` appends the digit to the hint («свет 1», a digit is not an HA matcher slot) so «первый коридор» reaches only `corridor1_…_relay`; `ordinal_digit()` + `ORDINAL_STEMS`/`ORDINAL_ENDINGS` live in both services and `test_hint_sync.py` holds them together, and a numbered instance that does not exist yields `[]` (escalate / original error), never a both-relays toggle. The lamps here are `switch.*_relay`, so `domain: ["light"]` can never match them; guards: a device word required, several devices need a named room, ≤5 targets, state must be `on`/`off`, facets (status/network LED) dropped, exact room name beats a containing one, zero successes keep the ORIGINAL error. The vacuum pair (`CleanArea`) has the same shape.
 - **Cascade L2 context** (jev-router → smolagents-worker): an escalation carries two extras — `resolver.unresolved_hint()` (difflib over the THING stems/names, threshold 0.70, guarded to fire only on a command verb whose exact word made the resolver bail) and the last 4 finished turns of that satellite from `history.py` (TTL 10 min, read before the turn is pushed). A fired honesty veto triggers exactly one retry fed with `honesty.failure_note()` (raw tool errors) plus the same history; a second veto speaks the truth instead of looping.
+- **A wake word must get attention the moment it is HEARD.** Three separate
+  mechanisms were swallowing it, all found by reading three field dialogues
+  (04.10.2026, 19:20 / 19:22 / 19:37). The log shape is unambiguous:
+  `VOSK WAKE` … `router: speaking: '…'` … `VOSK wake heard but not fired
+  (suppressed=N)` twice … `VOSK WAKE` 28 s later.
+  * **The echo tail after playback was 15 s (16 s for the pip).** A reply ending
+    at T blocked every «компьютер» until T+18 — the +8 s and +11 s attempts in the
+    log. It was standing in for a mechanism that already works: `_feed_audio`
+    drops our own audio by CROSS-CORRELATION (`_is_echo`, which extends
+    suppression by up to 20 s when and only when a correlation matches), and it
+    does so BEFORE the chunk reaches the decoder. Now `_ECHO_TAIL_S = 3.0`, used
+    by both the pip and the reply.
+  * **`_wake_detected` is NOT a firing guard.** It stays True for the whole
+    `_wake_timeout` (60 s), so repeating the word during the dialogue window did
+    nothing — while the decoder had HEARD it. What remains is
+    `_WAKE_REARM_DEBOUNCE_S = 1.5` for the same breath saying it twice, because a
+    second `_fire_wake()` clears `_vad_speech_buf`. The openWakeWord branch
+    legitimately keeps its own `_wake_detected` guard (it has a 2-of-3 debounce);
+    it is the decoder's guard that was wrong, and the two must not be "aligned".
+  * The gate is a method, `_wake_gate_open(now)`, with `_wake_gate_reason(now)`
+    for the log line. **Test it by calling it.** Three earlier versions of these
+    tests grepped the module source for strings — the wrong instrument, because
+    each rule is written IN ITS COMMENT as the mistake that was made, so the
+    search finds the very counter-example it is trying to prove absent.
+- **A media TITLE is not a missing DEVICE, and refusing blocks escalation.**
+  `RE_MEDIA_NOUN` matches «серию»/«эпизод»/«передачу», but `resolve_action` only
+  takes the media branch when the thing resolves to a `media_player` — which a
+  title never does, so «включи следующую серию черного зеркала» fell through to
+  `HassTurnOn` with hint «серию» and the user was told «Не нашла такого
+  устройства» (field case 04.10.2026 19:22). L2 has `media_search`/`media_play`
+  for exactly this, and the deterministic refusal is what kept it from getting
+  there. The refusal is now noun-aware and returns an error L2 can act on.
+
 - **AN HONEST `ok` IS NOT A DEVICE THAT MOVED.** The MCP intent answers `{"data":{"success":[...],"failed":[...]}}`, and `success` is full of things that are not a working device. Measured 04.10.2026 on «выключи свет» in the living room: the blind call (`domain:["light"]`, `area:"Living Room"`, **no `name`**) returned `success: [{type:area, id:living_room}, {type:entity, id:light.wled_living_room}]`, `failed: []` — HA matched the ROOM plus a WLED strip that has been `unavailable` since 28.09 — so `ok=True`, the gateway said **«Выключила»**, and the lamp (`switch.*_relay`, which `domain:["light"]` cannot match at all) never changed. Three rules now, each with a test:
   1. `get_states()` returns its **previous snapshot** on failure, and that snapshot is `[]` on a cold cache — so an empty list means "HA did not answer", NOT "no such device". An empty registry and an empty target set both **refuse**; on/off never falls through to the blind intent any more.
   2. `_touched_a_usable_entity()` is required before any `speak_ok`: HA must name at least one entity of `type: "entity"` that is **present in the live registry** and not `unavailable`. An `area` entry means a room matched, not a device. (An id ABSENT from `/api/states` counts as unverified — that mistake was in the first version of this check and its own test caught it.)

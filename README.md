@@ -86,9 +86,30 @@ Full environment table, backend variants, REST API and OTA: [`docs/REFERENCE.md`
 | **`audio_utils.py`** (~220 lines) | `pack_ogg()` (Opus → Ogg for Whisper) and `is_valid_text()` (drops hallucinations and mic echoes of our own TTS) | Shared by both device paths |
 | **`services/jev-router/`** | **L1** — intent classifier, offline slot resolver, direct Home Assistant calls, weather, chat/expert proxy | ~0.1 s for a simple command, no LLM in the loop |
 | **`services/smolagents-worker/`** | **L2** — smolagents `CodeAgent` with HA / Qdrant / Hermes / weather tools, plus honesty vetoes | Multi-step tasks that must not lie about side effects |
-| **`tests/`** | 299 tests across 15 files | Pins the wake-gate bands, the protocol, the cascade contract and the Telegram source |
+| **`tests/`** | 437 tests across 18 files | Pins the wake-gate bands, the protocol, the cascade contract, the Telegram source and the utterance endpointing |
 
 > Production (`docker-compose.yml`) runs `LLM_BACKEND=cascade` with **one camera enabled** (`CAMERA_STREAMS=livingroom`, `DISABLE_CAMERAS=false`) — cameras entered test operation on 04.10.2026; the ESP32 path remains the main one.
+
+### Utterance endpointing (off by default)
+
+The living-room VAD never reports silence — Silero said `speech=True` for a whole
+capture (0 `speech=False` in 15 live minutes) — so every command used to wait out
+the full 7 s duration cap before reaching Whisper. `_PauseEndpoint` ends an
+utterance on a dip in the **level** envelope instead, which happens between words
+whatever the VAD thinks. Lowering the cap is not the fix: it is load-bearing for
+long commands.
+
+    CAMERA_PAUSE_ENDPOINT[_<NAME>]=true      # off by default, per room
+    CAMERA_PAUSE_RATIO[_<NAME>]              # dip depth, default 0.55
+    CAMERA_PAUSE_RUN_FRAMES[_<NAME>]         # dip run before the end, default 6 (0.96 s)
+    CAMERA_PAUSE_MIN_SPEECH_FRAMES[_<NAME>]  # speech before a pause may end, default 5
+
+Every end logs `via <reason>` with the `rms/ref/floor/run/speech` numbers behind
+it and tallies per boot — `since boot: {'pause': N, 'cap': M}` answers whether the
+endpoint is doing anything without an argument. `0` means "unset, use the default",
+so a half-filled override cannot silently disable a threshold. Enable it per room
+only after reading that room's `UTTERANCE END` lines on real audio;
+`bash scripts/verify_endpoint.sh` runs the whole check in one command.
 
 ---
 

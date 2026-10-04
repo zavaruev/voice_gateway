@@ -171,6 +171,81 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
 - **Emotions**: extracted from Nanobot text via `[emotion_name]` regex
 - **L2 HA action fallbacks** (`tools.ha_action`): a blind intent whose `area`/`domain` filter was rejected (`MatchFailedReason.AREA`/`.ASSISTANT`) re-resolves the target from raw `/api/states` + one `area_name` template render — the rule L1 already has — and retries with `name`+`domain` pinned, dropping the slot that failed. `find_action_targets()`/`resolve_onoff_targets()`/`match_states()` also honour ORDINALS — `resolve_action` appends the digit to the hint («свет 1», a digit is not an HA matcher slot) so «первый коридор» reaches only `corridor1_…_relay`; `ordinal_digit()` + `ORDINAL_STEMS`/`ORDINAL_ENDINGS` live in both services and `test_hint_sync.py` holds them together, and a numbered instance that does not exist yields `[]` (escalate / original error), never a both-relays toggle. The lamps here are `switch.*_relay`, so `domain: ["light"]` can never match them; guards: a device word required, several devices need a named room, ≤5 targets, state must be `on`/`off`, facets (status/network LED) dropped, exact room name beats a containing one, zero successes keep the ORIGINAL error. The vacuum pair (`CleanArea`) has the same shape.
 - **Cascade L2 context** (jev-router → smolagents-worker): an escalation carries two extras — `resolver.unresolved_hint()` (difflib over the THING stems/names, threshold 0.70, guarded to fire only on a command verb whose exact word made the resolver bail) and the last 4 finished turns of that satellite from `history.py` (TTL 10 min, read before the turn is pushed). A fired honesty veto triggers exactly one retry fed with `honesty.failure_note()` (raw tool errors) plus the same history; a second veto speaks the truth instead of looping.
+- **THE 7 s DEAD WAIT EXISTS BECAUSE THE VAD NEVER REPORTS SILENCE — and the cap
+  cannot simply be lowered.** Measured 04.10.2026: wake 19:20:10.1, Whisper
+  19:20:17.3 — 7.2 s for «выключи свет», of which the command was the first 1.5.
+  An utterance ends on 10 VAD-silent frames (1.6 s) or on the 7 s cap, and in
+  this room Silero never said `speech=False` (0 in 15 live minutes; every
+  `VAD rms=... speech=True` line sits above `consec=250`), so **every** command
+  ran to the cap. Lowering the cap is NOT the fix — it is load-bearing:
+  «я просил включить следующую серию черного зеркала» transcribes correctly at
+  7.04 s and is chopped at 3.5 s.
+  * `_PauseEndpoint` (`camera_client.py`) ends an utterance on a dip in the
+    **LEVEL** envelope, which happens between words whatever the VAD thinks.
+    Reference = 80th percentile of a trailing 12-frame window: not the max (one
+    door slam must not redefine it) and not the min (sustained noise would pull
+    it down until everything reads as a pause). No reference => no pause => the
+    cap still fires. **Slower is recoverable; a chopped command is a wrong
+    command.**
+  * It requires `min_speech_frames` of real speech FIRST, so the gap right after
+    «компьютер» does not dispatch a bare wake word — the failure behind «Да?». **Two
+    different levels, on purpose:** the PAUSE test uses the trailing percentile
+    (a responsive question — has the speaker stopped?), while the SPEECH floor is
+    **utterance-scoped**: the median of the first 4 frames, then frozen. A windowed
+    speech floor collapses to the room floor after ~2 s of silence, the pause test
+    stops matching, and every remaining quiet frame is then counted as speech —
+    measured on the buggy version: a bare «компьютер» plus a 30-frame pause drove
+    the counter to 50 on silence alone, so the guard guarded nothing. Frozen because
+    a single door slam must not redefine «speech» for the rest of the sentence; a
+    user who starts very quietly is then under-counted, which degrades to the cap.
+  * **Off by default**, per room: `CAMERA_PAUSE_ENDPOINT[_<NAME>]=true`. It
+    changes WHEN a command is dispatched in a live audio path, so it is enabled
+    only after its own log lines have been read on real audio from that room.
+  * Tuning is ENV (`CAMERA_PAUSE_RATIO` / `_RUN_FRAMES` / `_MIN_SPEECH_FRAMES`,
+    per room), not constants: the logged numbers exist to be tuned from, and a
+    rebuild per iteration is not tuning. `0` means "unset" — the detector
+    substitutes its default, because a half-filled override that zeroed
+    `ratio` would make every pause test `rms < ref * 0` fail and fall back to the
+    cap, which is indistinguishable from "the endpoint does not work".
+  * Every end now logs `via <reason>` plus the rms/ref numbers, and tallies per
+    boot, so «is the endpoint working or is everything still hitting the cap?»
+    is one `grep UTTERANCE END` away instead of an argument.
+  * All three terminators (silence, pause, cap) go through ONE method,
+    `_end_utterance()`. They used to inline three copies of the same reset
+    block and had already drifted: the cap copy reset `_vad_start_time` and
+    the silence copy did not. That variable turned out to be **written three
+    times and read nowhere** — dead state, so it was removed instead of
+    propagated. A write-only field written from several places is a trap for
+    whoever reads it next.
+- **A WATCHDOG THAT ONLY RUNS ON SUCCESS CANNOT SEE TOTAL FAILURE.** The
+  living room went mute on 04.10.2026 20:18 and the log said only
+  `RTSP audio reconnecting in 3s...` — 25+ times, every 3.2 s, and not one
+  line said why. Four separate holes, each visible only in that log:
+  * **`stderr=PIPE` and nobody ever read it.** Every real cause
+    (`Connection refused`, `404 Not Found`, `Invalid data found`) was
+    discarded while the loop said "reconnecting". `_read_ffmpeg_stderr()`
+    now reads it; the failure line is useless without it.
+  * **`_stall_count` needs audio BEFORE it can stall** (20 s of silence
+    AFTER bytes flowed). With go2rtc having no producer, ffmpeg delivered
+    zero bytes, so `_stall_count` stayed 0 forever and
+    `_heal_go2rtc_stream()` was **never called**. `_audio_cycle_done()` counts
+    zero-byte connections separately — the case that is a failed connect,
+    not a stream that ended.
+  * **The rate watchdog lived inside the success path**, so "20 s of wall
+    clock, zero bytes" was invisible to it — the exact condition it exists
+    to catch. It is now fed on the failure path too (`_account_audio_rate(0)`).
+  * **No backoff and no escalation**: 3 s forever. It now declares the room
+    dead after the heal budget, names the likely cause, and drops to 30 s.
+  **Diagnostic rule worth keeping:** `feed rms=` absent from a log while
+  reconnects repeat means NOTHING EVER ARRIVED, and the heal paths are all
+  keyed on bytes having flowed. Absence of the watchdog lines was the tell.
+- **go2rtc IS REACHABLE WITHOUT AUTH FROM MOST HOSTS** (`/api/streams`,
+  `/api/frame.jpeg`), as is `jev-router` on 8091 — so when shell access is
+  unavailable, `fetch` can still drive the stack. That is how this was
+  diagnosed. What that showed: `livingroom` had a producer entry carrying
+  only `url` — no `type`/`sdp`/`medias`/`recv` — and **zero consumers**, while
+  all five other streams had a live producer plus one ffmpeg consumer. That
+  shape means configured-but-not-connected.
 - **A wake word must get attention the moment it is HEARD.** Three separate
   mechanisms were swallowing it, all found by reading three field dialogues
   (04.10.2026, 19:20 / 19:22 / 19:37). The log shape is unambiguous:
@@ -264,6 +339,8 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
 | `TELEGRAM_ALLOWED_CHAT_IDS` | `""` | Comma-separated chat ids; **empty = nobody is served** (fail-closed) |
 | `TELEGRAM_REPLY_VOICE` | `true` | Also reply as a voice note (TTS → ffmpeg ogg/opus) |
 | `TELEGRAM_MAX_VOICE_S` / `TELEGRAM_TURN_TIMEOUT` / `TELEGRAM_COOLDOWN_S` | `60` / `120` / `1.5` | Voice length cap, per-turn cap, spacing between turn starts in one chat |
+| `WAKE_VOSK_MODEL_<NAME>` | `""` | Per-room vosk model dir. Set => that room DECODES the wake word and the acoustic head is skipped. Empty => openWakeWord (corridor/kitchen) |
+| `CAMERA_PAUSE_ENDPOINT[_<NAME>]` | `false` | Per-room level-based utterance endpointing (removes the 7 s wait). **Off by default** — it changes WHEN a command is dispatched; enable only after reading that room's `UTTERANCE END` lines on real audio |
 
 ## Gotchas
 

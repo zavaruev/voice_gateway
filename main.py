@@ -3602,6 +3602,39 @@ async def start_camera_sessions():
                 wake_vosk_model=os.getenv(
                     f"WAKE_VOSK_MODEL_{name.upper()}"
                 ) or os.getenv("WAKE_VOSK_MODEL", ""),
+                # Level-based utterance endpointing for this room. OFF unless
+                # asked for: it changes WHEN a command is dispatched in a live
+                # audio path, so it is enabled per room only after its
+                # "VAD UTTERANCE END ... via pause" lines have been read on real
+                # audio from that room. In a room whose VAD never reports
+                # silence (measured: the living room, 0 speech=False in 15 min)
+                # every command otherwise waits out the full 7 s cap.
+                pause_endpoint=os.getenv(
+                    f"CAMERA_PAUSE_ENDPOINT_{name.upper()}",
+                    os.getenv("CAMERA_PAUSE_ENDPOINT", "false"),
+                ).lower() == "true",
+                # Endpoint tuning, per room. 0 => the built-in default, so a
+                # partially filled override can never zero a threshold. These
+                # exist because tuning this on real room audio must not cost a
+                # rebuild per iteration: read the logged rms/ref/floor, adjust
+                # here, restart.
+                pause_ratio=float(
+                    os.getenv(f"CAMERA_PAUSE_RATIO_{name.upper()}")
+                    or os.getenv("CAMERA_PAUSE_RATIO")
+                    or 0.0
+                ),
+                pause_run_frames=int(
+                    os.getenv(f"CAMERA_PAUSE_RUN_FRAMES_{name.upper()}")
+                    or os.getenv("CAMERA_PAUSE_RUN_FRAMES")
+                    or 0
+                ),
+                pause_min_speech_frames=int(
+                    os.getenv(
+                        f"CAMERA_PAUSE_MIN_SPEECH_FRAMES_{name.upper()}"
+                    )
+                    or os.getenv("CAMERA_PAUSE_MIN_SPEECH_FRAMES")
+                    or 0
+                ),
                 http_session=http,
                 nanobot_url=NANOBOT_WS_URL,
                 nanobot_token=NANOBOT_TOKEN,

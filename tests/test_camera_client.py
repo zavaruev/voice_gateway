@@ -620,6 +620,160 @@ async def test_accounting_is_a_noop_inside_the_window():
     assert s._rate_check == 100.0, "window must not be reset early"
 
 
+# --- a connection that never starts -------------------------------------
+# Field case 04.10.2026 20:18: 25+ reconnects every 3.2 s, no AUDIO STARVED,
+# no heal, no reason logged. Four holes, and this block is the regression test
+# for the two that decide whether anything gets HEALED.
+
+
+class _FakeStderr:
+    def __init__(self, data: bytes = b""):
+        self._data = data
+
+    async def read(self):
+        return self._data
+
+
+class _FakeProc:
+    def __init__(self, data: bytes = b""):
+        self.stderr = _FakeStderr(data)
+
+
+def _cycle_session(heal_stalls: int = 3):
+    s = CameraSession.__new__(CameraSession)
+    s.stream_name = "cam"
+    s._heal_stalls = heal_stalls
+    s._dead_cycles = 0
+    s._dead_total = 0
+    s._audio_sleep = 3.0
+    s._rate_bytes = 0
+    s._rate_start = 1.0
+    s._rate_check = 1.0
+    s._rate_ratio = 1.0
+    s._rate_starved = 0
+    s._min_audio_rate = 0.5
+    s._starve_restarts = 3
+    s.heals = 0
+
+    async def _heal():
+        s.heals += 1
+
+    s._heal_go2rtc_stream = _heal
+    return s
+
+
+@pytest.mark.asyncio
+async def test_audio_flowing_resets_the_dead_counters_and_the_backoff():
+    s = _cycle_session()
+    s._dead_cycles = 2
+    s._dead_total = 7
+    s._audio_sleep = 30.0
+    await s._audio_cycle_done(_FakeProc(), 2560)
+    assert s._dead_cycles == 0 and s._dead_total == 0
+    assert s._audio_sleep == 3.0, "a recovered room must retry fast again"
+    assert s.heals == 0
+
+
+@pytest.mark.asyncio
+async def test_a_zero_byte_connection_is_counted_as_a_failed_connect():
+    """One dead connection is counted, and does NOT yet trigger the
+    dead-cycle heal — that needs `_heal_stalls` of them in a row.
+
+    `heals` is deliberately NOT asserted to be 0. Feeding the rate watchdog on
+    this path also heals, because zero bytes IS starvation, and that is
+    correct: `_heal_go2rtc_stream()` rate-limits itself to once a minute in
+    production, so the duplicate call costs nothing. What this test pins is that
+    the counter went UP and was not reset, which is what proves the dead-cycle
+    branch stayed out of it.
+    """
+    s = _cycle_session()
+    await s._audio_cycle_done(_FakeProc(b""), 0)
+    assert s._dead_cycles == 1, "the dead connection was not counted"
+    assert s._dead_total == 1, "the un-reset total was not counted"
+    assert s._dead_cycles < s._heal_stalls, (
+        "the dead-cycle heal fired long before its budget"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_rate_watchdog_is_fed_on_the_failure_path():
+    """The bug that hid the outage.
+
+    `_account_audio_rate` lived only inside the SUCCESSFUL read, so "20 s of
+    wall clock, zero bytes" was invisible to it — the exact condition it
+    exists to catch. With zero bytes delivered the watchdog never ran, so it
+    never said AUDIO STARVED, and the log looked like a harmless reconnect
+    loop instead of a dead room.
+    """
+    s = _cycle_session()
+    await s._audio_cycle_done(None, 0)
+    assert s._rate_starved == 1, (
+        "zero-byte connection did not feed the watchdog"
+    )
+
+
+@pytest.mark.asyncio
+async def test_repeated_zero_byte_connections_trigger_the_go2rtc_heal():
+    """`_stall_count` cannot do this job: a stall needs 20 s of silence AFTER
+    audio has flowed, so with no audio ever arriving it stays 0 forever and the
+    healer is never called. That is precisely the 04.10.2026 failure."""
+    s = _cycle_session(heal_stalls=3)
+    for _ in range(3):
+        await s._audio_cycle_done(None, 0)
+    # ">= 1", not "== 1": the rate watchdog ALSO heals on the zero-byte path and
+    # this fake has no 60 s rate limit, so the exact count is an artefact. What
+    # matters is that the healer is reached at all.
+    assert s.heals >= 1, "the healer never ran"
+    assert s._dead_cycles == 0, "the heal counter must reset after healing"
+
+
+@pytest.mark.asyncio
+async def test_a_dead_room_is_declared_and_the_retry_slows_down():
+    """Regression: escalation keyed on `_dead_cycles` was UNREACHABLE.
+
+    The heal branch resets `_dead_cycles` to 0, so it can never climb to
+    `_heal_stalls * 4`. The room was therefore never declared dead and the
+    loop retried every 3 s forever, burying everything else in the log.
+    """
+    s = _cycle_session(heal_stalls=3)
+    for _ in range(12):
+        await s._audio_cycle_done(None, 0)
+    assert s._dead_total == 12, (
+        "the total counter must survive healing, or escalation never fires"
+    )
+    assert s._audio_sleep == 30.0, "a dead room must stop hammering"
+
+
+@pytest.mark.asyncio
+async def test_healing_continues_after_the_room_is_declared_dead():
+    """`if`, not `elif`: a cycle that heals must still be able to declare the
+    room dead, and the next cycles must keep trying rather than giving up."""
+    s = _cycle_session(heal_stalls=3)
+    for _ in range(12):
+        await s._audio_cycle_done(None, 0)
+    assert s.heals >= 4, "heal stopped running while the room stayed dead"
+
+
+@pytest.mark.asyncio
+async def test_ffmpeg_stderr_is_actually_read():
+    """stderr was piped and read NOWHERE, so the only clue to the cause was
+    discarded. The failure line is worthless without it."""
+    s = _cycle_session()
+    got = await s._read_ffmpeg_stderr(
+        _FakeProc("192.168.22.241:554: Connection refused".encode())
+    )
+    assert "Connection refused" in got
+
+
+@pytest.mark.asyncio
+async def test_ffmpeg_stderr_handles_there_being_nothing_to_read():
+    s = _cycle_session()
+    assert await s._read_ffmpeg_stderr(None) == ""
+    assert await s._read_ffmpeg_stderr(_FakeProc(b"")) == ""
+
+
+
+
 # --- the greeting must not talk over the command it is waiting for ------
 # Field case 04.10.2026: «компьютер, включи свет» -> the camera answered «Да?».
 # `_vad_has_speech` was False for the whole window (the onset requires

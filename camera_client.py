@@ -93,6 +93,13 @@ _ECHO_TAIL_S = 3.0
 # which is the entire point of having one.
 _WAKE_REARM_DEBOUNCE_S = 1.5
 
+# How loud a frame must be, relative to the utterance anchor, to count as
+# SPEECH rather than as background. The pause test uses the windowed percentile
+# above (a responsive question: has the speaker stopped?); this one is about
+# whether the utterance contains speech at all, and it must survive a long
+# silence — hence the utterance-scoped anchor in _PauseEndpoint.
+_ANCHOR_FRAC = 0.5
+
 # How we get audio ONTO the camera speaker. Two paths, and the difference is
 # not cosmetic:
 #
@@ -445,6 +452,126 @@ async def _arbiter_submit(
 GLOBAL_TTS_UNTIL = 0.0
 
 
+class _PauseEndpoint:
+    """Level-based utterance endpointing, independent of the Silero verdict.
+
+    WHY THIS EXISTS
+    An utterance is supposed to end when the speaker stops: Silero reports
+    speech=False for a few frames and _vad_silence_limit (10 x 160 ms) commits
+    it. In the living room that NEVER HAPPENS — Silero reported speech=True for
+    the whole capture (0 speech=False in 15 live minutes, and every
+    "VAD rms=... speech=True" line sits above consec=250), so every command ran
+    to the 7 s duration cap instead. Measured 04.10.2026: wake at 19:20:10.1,
+    Whisper at 19:20:17.3 — 7.2 s, of which the user's «выключи свет» was the
+    first 1.5.
+
+    Lowering the cap is NOT the fix: the cap is load-bearing for long commands.
+    «я просил включить следующую серию черного зеркала» transcribes correctly at
+    7.04 s and is chopped at 3.5 s.
+
+    WHAT IT DOES
+    The gap between words is a DROP IN LEVEL, whatever the VAD thinks. So the
+    endpoint watches the level envelope against a trailing reference and ends
+    the utterance after a run of dip frames — but only once enough speech has
+    been seen, so the gap right after «компьютер» does not dispatch a bare
+    wake word.
+
+    WHY A TRAILING REFERENCE AND NOT A FLOOR
+    With the television on there is no quiet room to measure a floor against,
+    and an absolute floor is unreachable there. The reference is a high
+    percentile of the trailing window (NOT the max: one door slam must not
+    redefine it, and NOT the min: sustained noise would pull it down until
+    everything reads as a pause). If the reference cannot be established —
+    speech quieter than the background — no pause is ever reported and the
+    utterance falls back to the duration cap. That is the safe direction:
+    slower, never chopped.
+    """
+
+    def __init__(
+        self,
+        ratio: float = 0.55,
+        run_frames: int = 6,
+        min_speech_frames: int = 5,
+        ref_frames: int = 12,
+        anchor_frames: int = 4,
+    ):
+        # 0 from a config field means "unset" — the env is optional and a
+        # half-filled override must not silently zero a threshold.
+        self.ratio = ratio if ratio > 0 else 0.55
+        self.run_frames = run_frames if run_frames > 0 else 6
+        self.min_speech_frames = (
+            min_speech_frames if min_speech_frames > 0 else 5
+        )
+        self.ref_frames = ref_frames if ref_frames > 0 else 12
+        self.anchor_frames = anchor_frames if anchor_frames > 0 else 4
+        self.reset()
+
+    def reset(self) -> None:
+        self._ref: list[float] = []
+        self._utt: list[float] = []
+        self._anchor = 0.0
+        self._run = 0
+        self._speech_frames = 0
+
+    def feed(self, rms: float) -> tuple[str, str]:
+        """Classify one 160 ms frame.
+
+        Returns ("speech"|"pause"|"end", detail). The detail carries the numbers
+        that produced the verdict — they are the only way to tune this from
+        field logs instead of from a guess.
+        """
+        rms = float(rms)
+        self._ref.append(rms)
+        if len(self._ref) > self.ref_frames:
+            self._ref.pop(0)
+        # 80th percentile of the trailing window: high enough that ordinary
+        # speech sets it, low enough that a single transient cannot. This decides
+        # whether the speaker PAUSED — a responsive, windowed question.
+        ref = float(np.percentile(self._ref, 80))
+
+        # The speech floor is a SEPARATE, utterance-scoped number: the median of
+        # the first few frames, then frozen.
+        #
+        # It has to be utterance-scoped. A windowed reference collapses to the
+        # room floor after ~2 s of silence, the pause test stops matching, and
+        # from then on every quiet frame looks like speech — which is the one
+        # thing min_speech_frames exists to exclude. Measured failure of the
+        # windowed version: a bare «компьютер» (3 speech frames) followed by a
+        # pause drove _speech_frames to 50 on silence alone.
+        #
+        # Frozen after the first few frames so a single transient — a door slam
+        # — cannot redefine "speech" for the rest of the sentence. The cost is
+        # that a user who starts very quietly and gets louder is under-counted,
+        # which degrades to the duration cap: the safe direction.
+        if self._anchor == 0.0 and len(self._utt) < self.anchor_frames:
+            self._utt.append(rms)
+            if len(self._utt) >= self.anchor_frames:
+                self._anchor = float(np.median(self._utt))
+        floor = self._anchor * _ANCHOR_FRAC
+
+        is_pause = ref > 0.0 and rms < ref * self.ratio
+        if is_pause:
+            self._run += 1
+        else:
+            self._run = 0
+            if floor > 0.0 and rms >= floor:
+                self._speech_frames += 1
+
+        detail = (
+            f"rms={rms:.4f} ref={ref:.4f} floor={floor:.4f} "
+            f"run={self._run} speech={self._speech_frames}"
+        )
+        # Enough speech FIRST: the gap right after the wake word is a gap
+        # between words, not the end of a sentence.
+        if (
+            self._run >= self.run_frames
+            and self._speech_frames >= self.min_speech_frames
+        ):
+            self.reset()
+            return "end", detail
+        return ("pause" if is_pause else "speech"), detail
+
+
 @dataclass
 class CameraConfig:
     """Everything one CameraSession needs: go2rtc endpoints, STT/TTS/Nanobot
@@ -498,6 +625,19 @@ class CameraConfig:
     play_audio_password: str = ""
     # Consecutive ffmpeg stalls before triggering a go2rtc stream re-register.
     heal_stalls: int = 3
+    # Level-based utterance endpointing for this room. Off by default because
+    # it replaces a measured behaviour in a live pipeline; enable per room once
+    # its end-of-utterance log lines have been read on real audio. When off, an
+    # utterance ends only on VAD silence or the duration cap — see
+    # _PauseEndpoint for why that costs 7 s in a room with the TV on.
+    pause_endpoint: bool = False
+    # Endpoint tuning, per room, as ENV rather than constants: the whole point
+    # of logging rms/ref/floor/run/speech is to tune from what the room actually
+    # does, and tuning must not cost a rebuild + redeploy per iteration. 0 => the
+    # _PauseEndpoint default.
+    pause_ratio: float = 0.0
+    pause_run_frames: int = 0
+    pause_min_speech_frames: int = 0
 
 
 class CameraSession:
@@ -550,6 +690,12 @@ class CameraSession:
         # vosk wake-word config, read in __init__ because _init_audio_processing()
         # builds the matcher and has no access to the CameraConfig object.
         self._wake_vosk_model = config.wake_vosk_model
+        # Level-based utterance endpointing for this room (see _PauseEndpoint).
+        # Read here because _init_audio_processing() has no CameraConfig.
+        self._pause_endpoint_on = config.pause_endpoint
+        self._pause_ratio = config.pause_ratio
+        self._pause_run_frames = config.pause_run_frames
+        self._pause_min_speech_frames = config.pause_min_speech_frames
         # Always defined so _vad_process() can test it without a hasattr guard,
         # and so tests that build a session via __new__ cannot trip over it.
         self._vosk_wake = None
@@ -627,6 +773,21 @@ class CameraSession:
         self._wake_suppress_until = 0.0
         self._stall_count = 0
         self._last_heal_ts = 0.0
+        # Consecutive ffmpeg connections that delivered ZERO audio. This is a
+        # different failure from a stall: a stall needs 20 s of silence AFTER
+        # bytes have flowed, so when go2rtc has no producer for the stream the
+        # stall counter never moves and the healer never runs. Measured
+        # 04.10.2026 20:18-20:19: 25+ reconnects every 3.2 s, no AUDIO STARVED,
+        # no heal, no reason logged anywhere.
+        self._dead_cycles = 0
+        # Same thing but NOT reset by healing: how many zero-byte connections
+        # have happened in a row in total. Escalation needs this — resetting
+        # `_dead_cycles` after each heal made the "declared dead" branch
+        # unreachable, because it can never climb past `_heal_stalls`.
+        self._dead_total = 0
+        # Reconnect backoff. 3 s normally; raised once the room is declared dead
+        # so a hopeless loop does not bury everything else in the log.
+        self._audio_sleep = 3.0
 
         # Stats and timers
         self._last_attention = 0.0
@@ -639,7 +800,11 @@ class CameraSession:
         self._last_fire_ts = 0.0
         self._last_decay_ts = 0.0
         self._vad_max_duration = 7.0
-        self._vad_start_time = 0.0
+        # How each utterance was terminated since boot, so one log line answers
+        # "is the endpoint working or is everything still hitting the cap?".
+        # Lives here rather than in _init_audio_processing because it is state,
+        # not wiring.
+        self._end_reason: dict[str, int] = {}
         self._vad_lock = asyncio.Lock()
         self._processing_utterance = False
 
@@ -677,6 +842,18 @@ class CameraSession:
         self._vad_speech_consecutive = 0
         self._vad_window: list[int] = []
         self._vad_silence_limit = 10
+        # None unless this room enabled pause endpointing. Every use is a
+        # cheap None test, and with it off the utterance is ended by exactly
+        # the two terminators that existed before (VAD silence, duration cap).
+        self._endpoint = (
+            _PauseEndpoint(
+                ratio=self._pause_ratio,
+                run_frames=self._pause_run_frames,
+                min_speech_frames=self._pause_min_speech_frames,
+            )
+            if self._pause_endpoint_on
+            else None
+        )
         self._ww_ring: list[bytes] = []
         # Raw (pre-AGC) chunk peaks, proximity proxy for cross-camera arbitration.
         self._recent_peaks: list[int] = []
@@ -1263,32 +1440,43 @@ class CameraSession:
                 )
                 self._audio_epoch = time.time()
                 frame_bytes = 1280 * 2
-                while not self._stopped.is_set():
-                    chunk = await asyncio.wait_for(
-                        proc.stdout.readexactly(frame_bytes), timeout=20.0
-                    )
-                    if not chunk:
-                        break
-                    self._stall_count = 0
-                    # Rate accounting: the stall handlers above only fire on
-                    # TIMEOUTS, i.e. when ffmpeg stops delivering altogether.
-                    # They cannot see a stream that keeps delivering but at a
-                    # fraction of real time — which is exactly what happened on
-                    # 04.10.2026 and it went unnoticed for over an hour, with
-                    # the wake word simply never firing.
-                    #
-                    # `break` (not an exception) is the recovery signal: it
-                    # leaves the inner read loop, the `finally` reaps ffmpeg and
-                    # control falls through to the reconnect below. Raising
-                    # asyncio.CancelledError here would be caught by the
-                    # `except asyncio.CancelledError: break` of THIS task's
-                    # own handler and terminate the whole loop for good — the
-                    # session would never take audio again even after the
-                    # camera recovered, while still looking healthy (WebRTC
-                    # connected, keepalive ticking, /health ok).
-                    if await self._account_audio_rate(len(chunk)):
-                        break
-                    await self._feed_audio(chunk)
+                delivered = 0
+                try:
+                    while not self._stopped.is_set():
+                        chunk = await asyncio.wait_for(
+                            proc.stdout.readexactly(frame_bytes), timeout=20.0
+                        )
+                        if not chunk:
+                            break
+                        self._stall_count = 0
+                        delivered += len(chunk)
+                        # Rate accounting: the stall handlers above only fire on
+                        # TIMEOUTS, i.e. when ffmpeg stops delivering altogether.
+                        # They cannot see a stream that keeps delivering but at a
+                        # fraction of real time — which is exactly what happened
+                        # on 04.10.2026 and it went unnoticed for over an hour,
+                        # with the wake word simply never firing.
+                        #
+                        # `break` (not an exception) is the recovery signal: it
+                        # leaves the inner read loop, the `finally` reaps ffmpeg
+                        # and control falls through to the reconnect below.
+                        # Raising asyncio.CancelledError here would be caught by
+                        # the `except asyncio.CancelledError: break` of THIS
+                        # task's own handler and terminate the whole loop for
+                        # good — the session would never take audio again even
+                        # after the camera recovered, while still looking
+                        # healthy (WebRTC connected, keepalive ticking,
+                        # /health ok).
+                        if await self._account_audio_rate(len(chunk)):
+                            break
+                        await self._feed_audio(chunk)
+                finally:
+                    # Runs on EVERY exit from the read loop, including the
+                    # IncompleteReadError raised by the very first read — which
+                    # is the case that matters. A connection that delivered
+                    # nothing never started streaming at all.
+                    if not self._stopped.is_set():
+                        await self._audio_cycle_done(proc, delivered)
             except asyncio.IncompleteReadError:
                 logger.info(f"[{self.stream_name}] RTSP ffmpeg stream ended")
             except asyncio.TimeoutError:
@@ -1325,8 +1513,87 @@ class CameraSession:
                     except Exception:
                         pass
             if not self._stopped.is_set():
-                logger.info(f"[{self.stream_name}] RTSP audio reconnecting in 3s...")
-                await asyncio.sleep(3)
+                # Backoff, not a fixed 3 s: once the room is declared dead a
+                # 3 s retry loop only buries every other line in the log.
+                logger.info(
+                    f"[{self.stream_name}] RTSP audio reconnecting in "
+                    f"{self._audio_sleep:.0f}s..."
+                )
+                await asyncio.sleep(self._audio_sleep)
+
+    async def _audio_cycle_done(self, proc, delivered: int) -> None:
+        """Judge one ffmpeg connection now that it has ended.
+
+        Two cases, and only the first one existed before:
+
+        * bytes flowed -> a normal end or a stream restart; nothing to do.
+        * zero bytes   -> the connection never started streaming. go2rtc had
+          no producer for this stream, so ffmpeg was handed nothing and
+          exited. Counted SEPARATELY because the stall counter cannot see
+          it: a stall needs 20 s of silence AFTER audio has been flowing,
+          so with no audio ever arriving _stall_count stays 0 forever and
+          _heal_go2rtc_stream() is never called. Measured 04.10.2026 20:18:
+          exactly that — 25+ reconnects, no AUDIO STARVED, no heal, no
+          explanation anywhere.
+        """
+        if delivered > 0:
+            self._dead_cycles = 0
+            self._dead_total = 0
+            self._audio_sleep = 3.0
+            return
+
+        self._dead_cycles += 1
+        self._dead_total += 1
+        err = await self._read_ffmpeg_stderr(proc) or "(пусто)"
+        logger.warning(
+            f"[{self.stream_name}] RTSP audio: 0 байт за соединение "
+            f"({self._dead_cycles}) — ffmpeg: {err}"
+        )
+
+        # Feed the rate watchdog on the failure path too. It only ever ran
+        # inside the success path, so "20 s of wall clock, zero bytes" was
+        # invisible to it — the exact condition it exists to catch.
+        await self._account_audio_rate(0)
+
+        if self._dead_cycles >= self._heal_stalls:
+            self._dead_cycles = 0
+            logger.warning(
+                f"[{self.stream_name}] нет аудио {self._heal_stalls} "
+                f"попыток подряд -> перерегистрирую поток в go2rtc"
+            )
+            try:
+                await self._heal_go2rtc_stream()
+            except Exception as e:
+                logger.warning(f"[{self.stream_name}] heal error: {e}")
+
+        # `if`, not `elif`: the same cycle can heal AND declare the room dead.
+        # Keyed on _dead_total because _dead_cycles was just reset above.
+        if self._dead_total >= self._heal_stalls * 4:
+            self._audio_sleep = 30.0
+            logger.error(
+                f"[{self.stream_name}] КАМЕРА БЕЗ АУДИО — соединение "
+                f"устанавливается, но не приходит ни байта. Почти всегда "
+                f"у go2rtc нет producer для этого потока. "
+                f"ffmpeg: {err}. Продолжаю раз в 30 с."
+            )
+
+    async def _read_ffmpeg_stderr(self, proc) -> str:
+        """Whatever ffmpeg said on its way out.
+
+        stderr is piped and was NEVER read, so every real cause was thrown
+        away while the loop logged only "reconnecting in 3s". Measured
+        04.10.2026 20:18: 25 consecutive reconnects and not one line in the
+        whole log said why.
+        """
+        if proc is None or getattr(proc, "stderr", None) is None:
+            return ""
+        try:
+            data = await asyncio.wait_for(proc.stderr.read(), timeout=0.5)
+        except Exception:
+            return ""
+        if not data:
+            return ""
+        return data.decode("utf-8", "replace").strip()[-300:]
 
     def _store_tts_echo(self, pcm: bytes, rate: int = TTS_PLAY_RATE) -> None:
         """Record played TTS audio into the echo reference ring buffer,
@@ -1550,7 +1817,10 @@ class CameraSession:
                         )
                         self._vad_has_speech = True
                         self._vad_silence_frames = 0
-                        self._vad_start_time = now
+                        if getattr(self, "_endpoint", None) is not None:
+                            # A new utterance must not inherit the previous
+                            # one's dip run, or it can end before it begins.
+                            self._endpoint.reset()
                         self._vad_speech_buf.extend(chunk)
                 else:
                     self._vad_speech_buf.extend(chunk)
@@ -1562,17 +1832,7 @@ class CameraSession:
                 if self._vad_has_speech:
                     self._vad_silence_frames += 1
                     if self._vad_silence_frames >= self._vad_silence_limit:
-                        dur = len(self._vad_speech_buf) / 32
-                        logger.info(
-                            f"[{self.stream_name}] VAD UTTERANCE END dur={dur:.0f}ms"
-                        )
-                        buf = bytes(self._vad_speech_buf)
-                        self._vad_speech_buf.clear()
-                        self._vad_has_speech = False
-                        self._vad_speech_consecutive = 0
-                        self._vad_silence_frames = 0
-                        self._vad_window.clear()
-                        asyncio.create_task(self._process_utterance(buf))
+                        self._end_utterance("silence")
                     else:
                         self._vad_speech_buf.extend(chunk)
 
@@ -1581,14 +1841,17 @@ class CameraSession:
             if self._vad_has_speech and len(self._vad_speech_buf) >= int(
                 self._vad_max_duration * 32000
             ):
-                buf = bytes(self._vad_speech_buf)
-                self._vad_speech_buf.clear()
-                self._vad_has_speech = False
-                self._vad_speech_consecutive = 0
-                self._vad_silence_frames = 0
-                self._vad_window.clear()
-                self._vad_start_time = now
-                asyncio.create_task(self._process_utterance(buf))
+                self._end_utterance(f"cap {self._vad_max_duration:.0f}s")
+
+            # Level-based endpoint: a pause in the LEVEL, not in Silero's
+            # verdict. Consulted only while an utterance is open, and only when
+            # the room enabled it. `speech` is deliberately NOT required to be
+            # False — in this room it never is, which is the whole reason this
+            # block exists.
+            if getattr(self, "_endpoint", None) is not None and self._vad_has_speech:
+                verdict, detail = self._endpoint.feed(orig_rms)
+                if verdict == "end":
+                    self._end_utterance(f"pause ({detail})")
 
             # vosk wake word (rooms configured with WAKE_VOSK_MODEL_<NAME>).
             # Fed EVERY chunk, with NO VAD gate: the Silero VAD rejects 95 % of
@@ -2065,6 +2328,8 @@ class CameraSession:
         self._vad_has_speech = False
         self._vad_speech_buf.clear()
         self._vad_speech_consecutive = 0
+        if getattr(self, "_endpoint", None) is not None:
+            self._endpoint.reset()
         self._vad_silence_frames = 0
         asyncio.create_task(self._play_attention(reason))
         # Bare 'компьютер' with no follow-up used to end in eternal silence (pip
@@ -2423,6 +2688,35 @@ class CameraSession:
         if uid and uid != "unknown":
             logger.info(f"[{self.stream_name}] 👤 Speaker: {uid} | '{txt[:60]}'")
         await self._handle_wake_or_command(txt, uid or "camera")
+
+    def _end_utterance(self, reason: str) -> None:
+        """Close the current utterance and hand its audio to Whisper.
+
+        ONE path for all three terminators — VAD silence, a level-based pause
+        and the duration cap. Each used to inline its own copy of this block,
+        which is exactly how a third terminator could be added with a subtly
+        different reset set and quietly break the wake path.
+
+        The reason is logged with the numbers that produced it, and tallied per
+        boot, so "is the endpoint working or is everything still hitting the
+        7 s cap?" is one `grep UTTERANCE END` away.
+        """
+        buf = bytes(self._vad_speech_buf)
+        dur = len(buf) / 32.0
+        self._vad_speech_buf.clear()
+        self._vad_has_speech = False
+        self._vad_speech_consecutive = 0
+        self._vad_silence_frames = 0
+        self._vad_window.clear()
+        if getattr(self, "_endpoint", None) is not None:
+            self._endpoint.reset()
+        key = reason.split(" ", 1)[0].split("(", 1)[0]
+        self._end_reason[key] = self._end_reason.get(key, 0) + 1
+        logger.info(
+            f"[{self.stream_name}] VAD UTTERANCE END dur={dur:.0f}ms "
+            f"via {reason} (since boot: {self._end_reason})"
+        )
+        asyncio.create_task(self._process_utterance(buf))
 
     async def _process_utterance(self, buf: bytes):
         if self._processing_utterance:

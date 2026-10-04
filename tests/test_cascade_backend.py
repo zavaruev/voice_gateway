@@ -166,3 +166,49 @@ def test_escalation_second_route_event_acks_immediately():
 def test_empty_stream_apologizes():
     out = _drain(asyncio.run(_run([])))
     assert out == [CascadeBackend.SORRY]
+
+
+# --- room hint (Telegram /room binding) ------------------------------------
+
+
+def _run_captured(events, **kwargs):
+    """Like _run, but returns (queue_items, the JSON payload POSTed)."""
+    q = asyncio.Queue()
+    be = CascadeBackend(router_url="http://x")
+    fake = _FakeSess(events)
+    captured = {}
+    orig_post = fake.post
+
+    def post(*a, **k):
+        captured.update(k.get("json") or {})
+        return orig_post(*a, **k)
+
+    fake.post = post
+    with mock.patch("backends.aiohttp.ClientSession", return_value=fake):
+        asyncio.run(be.generate_response("тест", "sess", "test", q, **kwargs))
+    out = []
+    while not q.empty():
+        out.append(q.get_nowait())
+    return out, captured
+
+
+def test_room_hint_forwarded_to_router():
+    events = [
+        {"type": "route", "route": "easy_action", "confidence": 0.9},
+        {"type": "sentence", "text": "Свет выключен."},
+        {"type": "done", "route": "easy_action", "elapsed": 0.2},
+    ]
+    _out, payload = _run_captured(events, room="kitchen")
+    assert payload["room"] == "kitchen"
+    # The history key stays the unique stream_name — room must never
+    # overwrite it (that would merge a chat's turns into a camera's ring).
+    assert payload["stream_name"] == "test"
+
+
+def test_room_omitted_when_empty():
+    events = [{"type": "route", "route": "easy_action", "confidence": 0.9},
+              {"type": "done", "route": "easy_action", "elapsed": 0.2}]
+    _out, payload = _run_captured(events)
+    # Devices/cameras send no room -> the payload is byte-identical to the
+    # pre-Telegram contract.
+    assert "room" not in payload

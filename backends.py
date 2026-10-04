@@ -18,7 +18,12 @@ ROLE IN THE CASCADE (three-level voice control of the smart home)
     default production path is CascadeBackend.
 
 CONTRACT (identical for all three backends)
-    generate_response(text, session_id, stream_name, response_queue):
+    generate_response(text, session_id, stream_name, response_queue, room=""):
+      * `room` is an OPTIONAL default-area hint (the Telegram source's
+        /room binding); only CascadeBackend forwards it — as the router's
+        RouteRequest.room, used solely by the resolver for a bare «включи
+        свет». It is deliberately NOT folded into stream_name, which keys
+        the dialogue history;
       * async; returns when the reply is fully produced (main.py awaits it
         inside a try/finally that also waits for the player);
       * pushes str sentences — already TTS-safe (no markdown/tags/lists) —
@@ -58,10 +63,13 @@ class BaseLLMBackend(ABC):
     (sentences into the queue, exactly one None sentinel, never raise)."""
 
     @abstractmethod
-    async def generate_response(self, text: str, session_id: str, stream_name: str, response_queue: asyncio.Queue):
+    async def generate_response(self, text: str, session_id: str, stream_name: str,
+                                response_queue: asyncio.Queue, room: str = ""):
         """
         Generates a response for the given text and pushes sentences into response_queue.
         Should put None into response_queue when finished.
+        `room` = default-area hint for the cascade router ("" = none); the
+        legacy backends accept and ignore it.
         """
         pass
 
@@ -81,7 +89,8 @@ class NanobotBackend(BaseLLMBackend):
         self.token = token
         self.salt = salt
 
-    async def generate_response(self, text: str, session_id: str, stream_name: str, response_queue: asyncio.Queue):
+    async def generate_response(self, text: str, session_id: str, stream_name: str,
+                                response_queue: asyncio.Queue, room: str = ""):
         """Connect, send the utterance as one message event, then stream
         reply sentences into `response_queue`.
 
@@ -273,7 +282,8 @@ class HermesBackend(BaseLLMBackend):
         s = re.sub(r"\[[a-z]{2,30}\]", "", s)
         return re.sub(r"\s+", " ", s).strip()
 
-    async def generate_response(self, text: str, session_id: str, stream_name: str, response_queue: asyncio.Queue):
+    async def generate_response(self, text: str, session_id: str, stream_name: str,
+                                response_queue: asyncio.Queue, room: str = ""):
         """POST the utterance, parse the SSE delta stream, push sentences.
 
         Buffering rules: [thinking] blocks and unclosed tags are held back,
@@ -463,7 +473,8 @@ class CascadeBackend(BaseLLMBackend):
         self.total_timeout = total_timeout
         self.sock_read_timeout = sock_read_timeout
 
-    async def generate_response(self, text: str, session_id: str, stream_name: str, response_queue: asyncio.Queue):
+    async def generate_response(self, text: str, session_id: str, stream_name: str,
+                                response_queue: asyncio.Queue, room: str = ""):
         """POST /route to jev-router and translate its SSE event stream
         into queue sentences.
 
@@ -508,6 +519,12 @@ class CascadeBackend(BaseLLMBackend):
                 "session_id": session_id,
                 "stream_name": stream_name,
             }
+            if room:
+                # Default-area hint (Telegram /room): the resolver uses it
+                # only when the utterance names no room itself. Omitted when
+                # empty so the router's default behaviour is untouched for
+                # devices and cameras.
+                payload["room"] = room
             # total=200 s covers a full L2 turn (worker WORKER_TIMEOUT 120 s
             # plus L1 routing and stream overhead); sock_read=60 s treats a
             # dead socket as an error instead of hanging the turn.

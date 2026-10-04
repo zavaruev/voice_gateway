@@ -9,6 +9,7 @@ __pycache__/
 # Project-specific
 silero_vad.onnx
 config/chat_id_cache.json
+config/telegram_chats.json
 config/speaker_names.json
 test_main.py
 DESIGN.md

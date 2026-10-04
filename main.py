@@ -94,6 +94,12 @@
 #   Cascade : LLM_BACKEND, ROUTER_URL, ROUTER_ACK_DELAY, HERMES_API_URL, HERMES_API_KEY
 #   Legacy  : NANOBOT_WS_URL, NANOBOT_TOKEN, NANOBOT_SESSION_SALT
 #   Media   : WHISPER_URL, SPEAKER_ID_URL, TTS_URL, TTS_MODEL, TTS_VOICE, TTS_API_KEY
+#   Telegram: TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_CHAT_IDS, TELEGRAM_REPLY_VOICE,
+#             TELEGRAM_ALLOW_GROUPS, TELEGRAM_MAX_VOICE_S, TELEGRAM_TURN_TIMEOUT,
+#             TELEGRAM_COOLDOWN_S, TELEGRAM_API_BASE — the token and the chat
+#             allowlist live in .env.voice_gateway (docker-compose `env_file`,
+#             gitignored), NOT in this public repo; empty token = source off,
+#             empty allowlist = nobody is served.
 #   Auth    : ADMIN_USERNAME, ADMIN_PASSWORD (>= 8 chars and != username — enforced
 #             at import time, the module refuses to start otherwise)
 #   Tuning  : VAD_SILENCE_FRAMES, ENERGY_THRESHOLD, MIN_SPEECH_RATIO, WATCHDOG_TIMEOUT,
@@ -115,6 +121,18 @@
 #   (active_sessions, session_states, mcp_futures, _active_speaker_lock) are plain
 #   module-level dicts mutated only from the loop — no locks are needed because
 #   there is a single writer.
+#
+# TELEGRAM SOURCE (third request source, optional)
+#   telegram_client.py polls the Bot API in one long-lived asyncio task started
+#   in on_startup() and cancelled in on_shutdown() — same loop, no webhook, no
+#   extra port. A turn is: voice note -> fetch_transcription() ->
+#   llm_backend.generate_response() (the SAME backend object the devices use)
+#   -> streamed text via editMessageText (+ optional TTS voice note through
+#   synthesize_tts_mp3 -> ffmpeg ogg/opus). Deliberately NOT wired into the
+#   device state machine: no wake word, VAD, echo guard or watchdog applies to
+#   someone speaking into a phone — only TELEGRAM_TURN_TIMEOUT caps the turn.
+#   Helpers are INJECTED into build_telegram_bot() (this module imports
+#   telegram_client, never the other way round — that would be a cycle).
 #
 # KNOWN GOTCHAS / TODOs
 #   * The import block that follows the first config section is duplicated
@@ -308,10 +326,34 @@ ENERGY_THRESHOLD = float(os.getenv("ENERGY_THRESHOLD", "0.002"))
 MIN_SPEECH_RATIO = float(os.getenv("MIN_SPEECH_RATIO", "0.12"))
 VAD_ADAPTIVE = os.getenv("VAD_ADAPTIVE", "true").lower() == "true"
 
+# Telegram source (telegram_client.py) — see the TELEGRAM SOURCE section in
+# the header. The token and the chat allowlist come from .env.voice_gateway
+# via the compose `env_file` (gitignored): an empty token disables the source
+# entirely, an empty allowlist serves nobody (a leaked token must never buy
+# access to the house by default).
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_ALLOWED_CHAT_IDS = {
+    c.strip() for c in os.getenv("TELEGRAM_ALLOWED_CHAT_IDS", "").split(",") if c.strip()
+}
+TELEGRAM_REPLY_VOICE = os.getenv("TELEGRAM_REPLY_VOICE", "true").lower() == "true"
+TELEGRAM_ALLOW_GROUPS = os.getenv("TELEGRAM_ALLOW_GROUPS", "false").lower() == "true"
+TELEGRAM_MAX_VOICE_S = int(os.getenv("TELEGRAM_MAX_VOICE_S", "60"))
+# Per-turn cap; mirrors the device paths' 120 s player wait_for.
+TELEGRAM_TURN_TIMEOUT = int(os.getenv("TELEGRAM_TURN_TIMEOUT", "120"))
+TELEGRAM_COOLDOWN_S = float(os.getenv("TELEGRAM_COOLDOWN_S", "1.5"))
+TELEGRAM_API_BASE = os.getenv("TELEGRAM_API_BASE", "https://api.telegram.org")
+# Per-chat prefs (/room binding, /voice toggle) persist next to devices.json.
+TELEGRAM_STATE_FILE = os.path.join(os.path.dirname(DB_FILE), "telegram_chats.json")
+
 # Shared helpers extracted to audio_utils.py (also reused by camera_client.py):
 # pack_ogg() wraps the Opus frames into an Ogg container for the Whisper API,
 # is_valid_text() rejects hallucinations and mic echoes of our own TTS.
 from audio_utils import pack_ogg, is_valid_text
+
+# Telegram source module: imported here (main -> telegram_client) while the
+# STT/TTS helpers below are injected INTO it at startup — never import main
+# from telegram_client, that would close the cycle.
+import telegram_client
 
 # Fillers the user may say while deciding what to ask ("wait a second").
 # _handle_successful_transcription() detects them in the transcript and only
@@ -1987,6 +2029,13 @@ async def synthesize_tts_mp3(text: str, state: dict) -> bytes | None:
     return None
 
 
+async def _telegram_tts(text: str, sess: aiohttp.ClientSession | None) -> bytes | None:
+    """Adapter for telegram_client: synthesize_tts_mp3() reads its session
+    from state["http_session"], the bot passes a bare one. Same MP3 bytes
+    the device path gets — the bot re-encodes them to ogg/opus itself."""
+    return await synthesize_tts_mp3(text, {"http_session": sess})
+
+
 async def stream_tts_pcm(
     mp3_data: bytes,
     device_ws: WebSocket,
@@ -3610,6 +3659,12 @@ async def stop_camera_sessions():
 _LOOP_STALL_THRESHOLD = 2.0
 _loop_monitor_task: asyncio.Task | None = None
 
+# Telegram source (optional): the bot and its long-poll task, created in
+# on_startup() only when TELEGRAM_BOT_TOKEN is set, cancelled there in
+# on_shutdown() so no poll request or chat worker outlives the app.
+_telegram_bot: "telegram_client.TelegramBot | None" = None
+_telegram_task: asyncio.Task | None = None
+
 
 async def loop_stall_monitor() -> None:
     """Log when the event loop stops scheduling tasks for more than 2 s.
@@ -3635,6 +3690,34 @@ async def on_startup():
     # loop is invisible to the code running inside it.
     global _loop_monitor_task
     _loop_monitor_task = asyncio.create_task(loop_stall_monitor())
+    # Telegram as a third source: one long-poll task in the SAME loop (no
+    # webhook, no extra port). Disabled entirely without a token; the
+    # helpers are injected here because telegram_client must not import
+    # main (main imports it).
+    global _telegram_bot, _telegram_task
+    if TELEGRAM_BOT_TOKEN:
+        _telegram_bot = telegram_client.build_telegram_bot(
+            token=TELEGRAM_BOT_TOKEN,
+            allowed_chat_ids=TELEGRAM_ALLOWED_CHAT_IDS,
+            reply_voice=TELEGRAM_REPLY_VOICE,
+            allow_groups=TELEGRAM_ALLOW_GROUPS,
+            max_voice_s=TELEGRAM_MAX_VOICE_S,
+            turn_timeout=TELEGRAM_TURN_TIMEOUT,
+            cooldown=TELEGRAM_COOLDOWN_S,
+            api_base=TELEGRAM_API_BASE,
+            state_file=TELEGRAM_STATE_FILE,
+            log_transcripts=LOG_TRANSCRIPTIONS,
+            backend=llm_backend,
+            transcribe=fetch_transcription,
+            tts_mp3=_telegram_tts,
+            make_session_id=lambda chat: make_chat_id(f"tg:{chat}"),
+        )
+        _telegram_task = asyncio.create_task(
+            _telegram_bot.run(), name="telegram-poll"
+        )
+        logger.info("✈️ Telegram source starting (long polling)")
+    else:
+        logger.info("✈️ Telegram source disabled (TELEGRAM_BOT_TOKEN is empty)")
 
 
 @app.on_event("shutdown")
@@ -3642,6 +3725,22 @@ async def on_shutdown():
     """Lifespan hook: tear the camera sessions down before exit."""
     if _loop_monitor_task is not None:
         _loop_monitor_task.cancel()
+    # Telegram: cancel the poll (its finally cancels every per-chat worker
+    # and closes the aiohttp session) and wait for it, so shutdown never
+    # leaves a stray getUpdates against a dead loop.
+    global _telegram_bot, _telegram_task
+    if _telegram_task is not None:
+        _telegram_task.cancel()
+        try:
+            await _telegram_task
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            # The task logs its own fatal errors (bad token); never let a
+            # cleanup await fail the shutdown sequence.
+            logger.warning(f"[Telegram] task ended with: {e}")
+        _telegram_task = None
+        _telegram_bot = None
     await stop_camera_sessions()
 
 

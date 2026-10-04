@@ -163,6 +163,63 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
 - **Wake gate cascade** (in order): own-playback guard → appliance hold (60 s bg median >800 ⇒ top score must be ≥0.60; a held [0.55, 0.60) opens an STT-confirm window) → quiet-source hold (own level <3000 ⇒ ≥0.58 below level 2000, ≥0.55 above; a held [tier−0.05, tier) opens an STT-confirm window) → distant-source veto (level <3000 while another room hears ≥1.4× louder ⇒ stand down 5 s) → clipping-bang gate (peak >24k & score <0.85) → crest-factor gate (dense impact: rms·2 > peak) → ambiguous-zone STT confirm (top <0.55 or a recent unanswered auto-greet, level <3000 ⇒ no pip, route to Whisper) → debounce → arbiter.
 - **Cross-camera arbiter** (`_arbiter_*` in camera_client.py): first detector becomes interaction owner; others stand down. Proximity steal: a room with ≥5× the owner's loudness level takes over a not-yet-dispatched wake. `_ARB_STATE["cmd_sent"]` blocks steal once the owner dispatched to Nanobot.
 - **TTS pipeline**: Nanobot text → sentence splitter → prefetch player (sentence N+1 synthesises while N plays; `_tts_fetch` + `_speak_pcm`) → pydub decode + resample → Opus to ESP32 / 48 kHz PCM POSTed to the camera's `/play_audio`. Every played clip is registered in the echo-reference ring (resampled to the 16 kHz mic feed — the rate must track `TTS_PLAY_RATE` or `_is_echo` stops matching); confirmed mic echoes extend `_wake_suppress_until`.
+- **DO NOT PLAY TEST TONES THROUGH THE CAMERA AT NIGHT — there is a hamster cage
+  under it.** On the night of 04→05.10.2026 I rang 1 kHz tones through `/play_audio`
+  at three levels and then four declared sample rates to diagnose crackling
+  playback. That is what I did without asking, and it was the wrong call: the
+  data I already had (`peak/median` says the room is quiet, THD is unmeasurable
+  through a saturated mic) did not justify more sound. Open with
+  `/api/camera/tts` at a LOW volume, once, during the day, and let the user judge
+  the result by ear — the microphone cannot be the instrument here (see below).
+- **The microphone CANNOT measure playback quality: it is saturated.** Measured
+  05.10.2026 00:01 by playing pure tones and recording the room: input peaks
+  20000, 10000 and 4000 were all captured as **rms ~26 300, peak 32768, ~40%
+  of samples pinned at the rail**, with 2nd–5th harmonics within −2 dB of the
+  fundamental. The captured level does not follow the input at all. A recording
+  taken through this microphone therefore tells you nothing about what the
+  speaker produced — an earlier conclusion of mine ("found clipping, 1197
+  samples on the rail, that's the crackle") was exactly this mistake and was
+  retracted. Judge playback **by ear, from the user**, or through a non-acoustic
+  path. The ambient level is unaffected (`feed rms=424 peak=2685`),
+  `speed=1.04x` direct from the camera, and vosk reads the room fine — so this
+  is a capture-path limit, not a dead mic.
+- **Crackling playback (`хрипит`), reported by the user 05.10.2026: cause NOT
+  found, and everything on the gateway side is clean.** Three hypotheses were
+  measured and all three are dead ends — do not re-run them:
+  1. *Clipping in our PCM.* Real `_tts_fetch` output for a spoken sentence:
+     peak **17091** (52% of full scale), **0** samples at the rail. Clean.
+  2. *Broken resampling.* The TTS mp3 decodes at 24 kHz; `set_frame_rate(48000)`
+     gives 141696 → **283391** samples with duration 5.90 s → 5.90 s, i.e. it
+     really resamples (the pydub "changes the header only" trap does not apply
+     here).
+  3. *Sample-rate mismatch.* The same 1 kHz waveform sent with
+     `;rate=48000`, `24000`, `16000` and `8000` was heard by the microphone as
+     **exactly 1000 Hz in all four cases** — the camera plays a fixed rate, so
+     the declared rate does not need to match and 48 kHz is not the problem.
+  What is left is the camera's own output stage (speaker/amp overdrive), which
+  is exactly what the saturated microphone cannot distinguish — so the cheap
+  next step is one quiet daytime phrase at reduced level and the user's ear.
+  Meanwhile the log-only suspect is the SENTENCE PREFETCH: the reply is
+  synthesised one sentence at a time and each sentence is a separate
+  `/play_audio` POST, so a gap between sentences would stutter rather than
+  crackle — worth ruling out before touching gain.
+- **The wake path is proven end-to-end, by loopback rather than by asking the
+  user to talk.** 05.10.2026 00:57: `POST /api/camera/tts` with the phrase
+  «Проверка микрофона. Компьютер, включи свет в гостиной.» → the camera's own
+  microphone recorded the playback at **52× the room floor** (rms 30 436 vs a
+  median of 468, i.e. unmistakable speech) → vosk decoded it verbatim and
+  flagged it: `[WAKE] компьютер включи свет в гостиной`. So speaker → air →
+  mic → decoder is intact and the 20:18 outage has not returned.
+- **A silent capture window is not a failed wake word — check the levels before
+  blaming the detector.** Across five recordings totalling ~7 minutes (some taken
+  while the user believed they were speaking) `max/median` never exceeded
+  **3.6×** (speech is 5–20×), and vosk produced **0** segments, which is the
+  correct answer to a room containing no speech. Meanwhile the real
+  `feed rms`/`peak` logs showed one genuine burst at 21:44:04 (rms 3787, peak
+  12178) — and `feed rms` is only printed **once every ~3 s**, so a 1-second
+  command can fall entirely between two lines and leave no trace at all. That
+  sampling is too coarse to prove a command was captured; the live test still
+  has to be a real utterance followed by a `grep UTTERANCE END`.
 - **VAD**: Silero ONNX server-side (`silero_vad.onnx`), 10 silence frames triggers processing, 7 s max-duration cap; VAD state is reset at wake fire so the post-wake command starts clean.
 - **Binary frame versions**: v1 = raw Opus, v2 = 16-byte header, v3 = 4-byte header
 - **MCP**: Gateway requests tool list (`tools/list` id=999) on connect; forwards to Nanobot as `tools_update`

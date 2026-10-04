@@ -146,6 +146,14 @@ def _echo_of_reply(norm: str, reply_norm: str) -> bool:
 
 logger.setLevel(logging.INFO)
 logging.getLogger("aiortc").setLevel(logging.WARNING)
+# aioice is NOT a child of "aiortc" — it is its own top-level logger, so the
+# line above never touched it. Measured 04.10.2026 21:31: one gateway restart
+# produced 1059 lines of `aioice.ice - Check CandidatePair(...) FAILED` in a
+# single minute, 80% of the container's entire log volume, while the ICE storm
+# is only a startup burst (zero aioice lines in the 14 minutes after ICE
+# connected). Every (re)connect pays it again, so it is log noise that hides
+# the lines that matter, not a steady CPU cost.
+logging.getLogger("aioice").setLevel(logging.WARNING)
 logging.getLogger().setLevel(logging.INFO)
 _r = logging.getLogger()
 if not _r.handlers:

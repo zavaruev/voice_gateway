@@ -210,6 +210,24 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
   * Every end now logs `via <reason>` plus the rms/ref numbers, and tallies per
     boot, so «is the endpoint working or is everything still hitting the cap?»
     is one `grep UTTERANCE END` away instead of an argument.
+  * **The endpoint is gated on an ACTIVE WAKE WINDOW, not on "an utterance is
+    open", and so is the tally.** Measured 04.10.2026 21:01-21:05 on the living
+    room: **70 `UTTERANCE END ... via cap 7s` in four minutes, not one of them
+    a command.** The VAD there reports `speech=True` continuously, so the
+    television opens an utterance every ~7.2 s, fills 7 s of buffer and hits
+    the cap, and `_process_utterance` discards it one line later for want of a
+    wake window. Endpoints on that audio would have made `pause` in the tally
+    mean mostly "the television" — the one number that decides whether the
+    endpoint works would have answered the wrong question — and the ambient
+    ends put one INFO line every 7 s into the log (~12000 a day). Ambient ends
+    still reach `_process_utterance` (dispatch unchanged) and are logged at
+    DEBUG with their reason, so nothing is hidden; the line now says
+    `awake ends:` and not `since boot:`, because the difference is not
+    something anyone should be able to miss.
+  * **ENABLED in the living room 04.10.2026 21:37** via
+    `CAMERA_PAUSE_ENDPOINT_LIVINGROOM=true` in `docker-compose.yml`, after the
+    baseline above was read off a real log. Ship the same way to another room:
+    read that room's own `UTTERANCE END` lines first.
   * All three terminators (silence, pause, cap) go through ONE method,
     `_end_utterance()`. They used to inline three copies of the same reset
     block and had already drifted: the cap copy reset `_vad_start_time` and
@@ -239,6 +257,26 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
   **Diagnostic rule worth keeping:** `feed rms=` absent from a log while
   reconnects repeat means NOTHING EVER ARRIVED, and the heal paths are all
   keyed on bytes having flowed. Absence of the watchdog lines was the tell.
+* **`aioice` IS NOT A CHILD OF `aiortc`, so silencing one does not silence the
+  other — and an ICE startup burst is 80% of the whole log.** Measured
+  04.10.2026 21:31: one gateway restart produced **1059** lines of
+  `aioice.ice - Check CandidatePair(...) FAILED` inside one minute, against
+  1221 lines total for the container; `logging.getLogger("aiortc")` was
+  already at WARNING and none of it helped, because `aioice` is a separate
+  top-level logger. It is a **burst, not a steady cost** — 0 aioice lines in
+  the 14 minutes after ICE connected, and the gateway measured **29% of one
+  core** (AGENTS.md's budget is 31%), so do not go looking for a CPU leak
+  here. It still fires on every (re)connect, so the fix is
+  `logging.getLogger("aioice").setLevel(logging.WARNING)`: 1059 -> 0, total log
+  1221 -> 110. Read it as noise that buried the lines that matter.
+* **The WebRTC session decodes camera audio and throws it away.** `_connect()`
+  opens a `recvonly` transceiver and `_recv_audio` runs Opus decode in Python on
+  every frame, with a comment saying the mic actually arrives via the RTSP
+  loop. The `sendonly` `AIVoiceOutputTrack` is the ONVIF backchannel, which is
+  the pitch-broken path `/play_audio` replaced. So the session is currently
+  there for a keepalive that nothing reads. It is NOT worth ripping out for CPU
+  (29% of one core total, measured) — but do not assume the recv track feeds
+  the VAD, and do not debug wake behaviour through it.
 - **go2rtc IS REACHABLE WITHOUT AUTH FROM MOST HOSTS** (`/api/streams`,
   `/api/frame.jpeg`), as is `jev-router` on 8091 — so when shell access is
   unavailable, `fetch` can still drive the stack. That is how this was

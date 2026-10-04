@@ -43,6 +43,7 @@ from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 
 import config
+from ha_client import ordinal_digit
 
 logger = logging.getLogger("router.resolver")
 
@@ -66,6 +67,12 @@ ROOMS: dict[str, list[str]] = {
     "улиц": ["улица", "street"],
     "двор": ["двор", "yard"],
     "подвал": ["подвал", "basement"],
+    # «во владиной комнате» (field case 03.10.2026): the Kodi's HA area is
+    # named «Bedroom Vlada», so without this entry the room word matched
+    # nothing, the area never left the function, and the turn was resolved as
+    # «no room at all» — with four players in the house that is exactly the
+    # ambiguity the fast path refuses to guess through.
+    "владин": ["Bedroom Vlada", "спальня Влади"],
 }
 
 # Default area when the speaker does not name one (from the device stream name).
@@ -112,6 +119,16 @@ THING: dict[str, tuple[list[str] | None, str | None]] = {
     "телевизор": (["media_player"], "телевизор"),
     "музык": (["media_player"], None),
     "плеер": (["media_player"], None),
+    # «коди» is the word the user actually uses for the four Kodi boxes
+    # (media_player.le_vlada / le_zal_2 / le_spalnya / le_kitchen), and it
+    # matched nothing before 03.10.2026 — «пауза коди во владиной комнате»
+    # found no device at all and L2 fell back to the robot from the dialogue
+    # history. `name` stays None: the HA matcher does not know the word
+    # «коди», the registry resolver does (hint -> _HINT_LAT -> «le»).
+    "коди": (["media_player"], None),
+    "kodi": (["media_player"], None),
+    "медиаплеер": (["media_player"], None),
+    "колонк": (["media_player"], None),
     "кондиционер": (["climate"], None),
     "климат": (["climate"], None),
     "утюг": (["switch"], "утюг"),
@@ -258,9 +275,132 @@ def _find_thing(text: str) -> tuple[list[str] | None, str | None, str, str]:
 # when THING had no stem to offer.
 _DEVICE_NOUN = re.compile(
     r"свет|ламп|подсветк|штор|пылесос|чайник|розетк|телевизор|музык|кофеварк|"
-    r"кафеварк|кофемашин|утюг|кондиционер|обогревател|освещени|люстр|жалюзи|насос",
+    r"кафеварк|кофемашин|утюг|кондиционер|обогревател|освещени|люстр|жалюзи|насос|"
+    r"коди|медиаплеер|плеер|колонк|кино|фильм|сериал|сери[юяи]|эпизод",
     re.IGNORECASE,
 )
+
+# --- Media transport -------------------------------------------------------
+# HA's MCP server exposes TEN tools and not one of them is a media intent
+# (tools/list, read live 03.10.2026), which is why «поставь его на паузу»
+# ended in «не удалось»: the model had to invent intent__HassMediaPause.
+# The SERVICES do exist (`media_player.media_pause`), so a media command is
+# resolved here into a REST call instead: tool = "media__" + service, and
+# app._execute_action sends it to /api/services. This is the fast path the
+# same command used to lose 7 s and a turn to reach L2 for.
+#
+# Keys are HA service names — the same names smolagents-worker/ha_match.py
+# accepts in media_control(action=…), and tests/test_hint_sync.py fails if
+# the two tables drift.
+MEDIA_SERVICES: dict[str, str] = {
+    "media_pause": "media_pause",
+    "media_play": "media_play",
+    "media_play_pause": "media_play_pause",
+    "media_stop": "media_stop",
+    "media_next_track": "media_next_track",
+    "media_previous_track": "media_previous_track",
+    "volume_up": "volume_up",
+    "volume_down": "volume_down",
+    "volume_set": "volume_set",
+    "volume_mute": "volume_mute",
+}
+
+# (regex, service, exclusive) triples, checked in order — the first match
+# wins, so the specific phrases precede the loose ones. `exclusive` marks a
+# word that can ONLY mean transport («пауза», «громче», «следующий трек»):
+# it resolves even with no device noun, because «поставь ЕГО на паузу» names
+# its target with a pronoun the registry can answer. Non-exclusive words
+# («приглуши», «заглуши») are shared with the light/TV families and need an
+# object.
+RE_MEDIA: tuple[tuple[re.Pattern[str], str, bool], ...] = (
+    (re.compile(r"\bпауз\w*|\bприостанов\w*|\bзамороз\w*", re.IGNORECASE),
+     "media_pause", True),
+    (re.compile(r"\bпродолж\w*|\bвозобнов\w*|\bдоигр\w*|сними\s+с\s+паузы",
+                re.IGNORECASE), "media_play", True),
+    # «трек/песня» only, NOT «серию/эпизод»: those are LIBRARY items, and a
+    # transport next_track on the wrong box is a wrong side effect — «включай
+    # следующую серию "Темного зеркала" в гостиной» must go to L2's
+    # media_search + media_play, with the room from the escalation context.
+    (re.compile(r"\bследующ\w*\s+(трек|песн|композиц)|\bдальше\b|"
+                r"\bпереключ\w*\s+трек", re.IGNORECASE),
+     "media_next_track", True),
+    (re.compile(r"\bпредыдущ\w*\s+(трек|песн|композиц)|\bназад\b",
+                re.IGNORECASE),
+     "media_previous_track", True),
+    (re.compile(r"\bгромче\b|\bприбав\w*\s+(громкост|звук)", re.IGNORECASE),
+     "volume_up", True),
+    (re.compile(r"\bтише\b|\bубав\w*\s+(громкост|звук)|"
+                r"\bуменьш\w*\s+(громкост|звук)", re.IGNORECASE),
+     "volume_down", True),
+    # «приглуши» is split off: on its own it is the HOUSE'S dimming verb
+    # (RE_DIMMER handles it for lights), so it only means a player when an
+    # object is named — hence exclusive=False.
+    (re.compile(r"\bприглуш\w*", re.IGNORECASE), "volume_down", False),
+    (re.compile(r"\bзаглуш\w*|\bвыключ\w*\s+звук|\bзвук\s+выключ|"
+                r"\bmute", re.IGNORECASE), "volume_mute", False),
+    (re.compile(r"\bвключ\w*\s+звук|\bразглуш\w*|\bзвук\s+включ|"
+                r"\bunmute", re.IGNORECASE), "volume_mute", False),
+    (re.compile(r"\bгромкост\w*|\bгромк\w*|\bvolume", re.IGNORECASE),
+     "volume_set", True),
+    (re.compile(r"\b(?:останов|стоп)\w*\s+(?:плеер|воспроизвод|музык|фильм|видео)",
+                re.IGNORECASE), "media_stop", True),
+)
+
+# Any word that says «this sentence is about a player» — enough to keep the
+# light/vacuum branches from claiming it and to accept a shared verb. The
+# CONTENT words («серию», «эпизод») belong here because that is how the user
+# asks for it: «Включай следующую серию "Темного зеркала в гостиной» cost an
+# 11 s L2 round trip before anyone noticed the room held a player at all.
+RE_MEDIA_NOUN = re.compile(
+    r"коди|kodi|медиаплеер|медиа\s+плеер|плеер|колонк|телевизор|музык|"
+    r"кино|фильм|сериал|сери[юяи]|эпизод|часть|трек|песн|воспроизвод|"
+    r"передач[уаи]|ролик|клип",
+    re.IGNORECASE,
+)
+
+# Device words that may travel as the registry hint. «трек»/«кино» are left
+# out on purpose: they name WHAT is playing, not WHICH box, and a hint that
+# matches no entity only narrows the pool wrongly.
+RE_MEDIA_HINT = re.compile(
+    r"коди|kodi|медиаплеер|медиа\s+плеер|плеер|колонк|телевизор", re.IGNORECASE,
+)
+
+# A volume level. Two spellings matter: «громкость 40» (the number sits right
+# after the word and carries NO unit, which RE_PCT — the light branch's, «40%»
+# only — cannot see) and «40 процентов».
+RE_MEDIA_PCT = re.compile(
+    r"\b(?:громкост\w*|громк\w*|уровень|volume)\D{0,12}?(\d{1,3})"
+    r"|(\d{1,3})\s*(?:%|процент\w*)",
+    re.IGNORECASE,
+)
+
+# What «включи/выключи <плеер>» means for a media_player. NOT HassTurnOn/Off:
+# field check 03.10.2026 18:21, «Ну так найди её и включи» — the intent answered
+# MatchFailedReason.INVALID_AREA for the RU room and then
+# MatchFailedReason.ASSISTANT for `name='LE-zal'`, because the Kodi entities are
+# NOT exposed to the voice assistant and the MCP server has no media intent at
+# all. The transport services work regardless of Assist exposure, so «включи
+# коди» is media_play and «выключи коди» is media_stop. Powering the BOX off is
+# deliberately NOT `homeassistant.turn_off`: the box would sleep and no voice
+# command could wake it again.
+MEDIA_POWER_ON = "media_play"
+MEDIA_POWER_OFF = "media_stop"
+
+# Phrase to speak after a confirmed call. Kept short and TTS-shaped; the
+# idempotent cases («уже на паузе») are decided from the live state in
+# app._execute_media.
+MEDIA_SPEAK: dict[str, str] = {
+    "media_pause": "Поставила на паузу",
+    "media_play": "Продолжаю",
+    "media_play_pause": "Переключила",
+    "media_stop": "Остановила",
+    "media_next_track": "Следующий трек",
+    "media_previous_track": "Предыдущий трек",
+    "volume_up": "Сделала громче",
+    "volume_down": "Сделала тише",
+    "volume_set": "Поставила громкость",
+    "volume_mute": "Выключила звук",
+}
 
 # Negated imperative ("не включи свет") — a wrong side-effect is the worst
 # possible outcome, so escalate instead of guessing intent.
@@ -270,6 +410,18 @@ RE_NEGATION = re.compile(
     r"отключи|отключить|подними|поднять|опусти|опустить|запусти|сруби|сделай)\b",
     re.IGNORECASE,
 )
+
+
+def area_of(text: str, stream_name: str) -> tuple[str | None, str]:
+    """Public `_find_area`: (HA area display name or None, source).
+
+    app.py needs it to hand L2 the CANONICAL room name on every escalation:
+    «гостиная» is not an HA area (it is `Living Room`), and passing the RU word
+    straight to an intent answered MatchFailedReason.INVALID_AREA and cost the
+    model a step it then spent guessing device names instead (field case
+    03.10.2026 18:21).
+    """
+    return _find_area(text or "", stream_name)
 
 
 def resolve_action(text: str, stream_name: str) -> ResolvedCall | None:
@@ -394,6 +546,72 @@ def resolve_action(text: str, stream_name: str) -> ResolvedCall | None:
             "light__HassLightSet", args, speak_ok=speak, area_source=area_src,
         )
 
+    # --- Media transport (pause / tracks / volume) --------------------------
+    # BEFORE the on/off branch on purpose: «выключи звук» matches RE_OFF, and
+    # HassTurnOff cannot mute anything — the transport services must win.
+    media_noun = bool(RE_MEDIA_NOUN.search(t))
+    media_service, media_exclusive = "", False
+    for pattern, service, exclusive in RE_MEDIA:
+        if pattern.search(t):
+            media_service, media_exclusive = service, exclusive
+            break
+    # «включи/выключи <плеер>» joins them: HassTurnOn/HassTurnOff CANNOT
+    # control these entities (no media intent in MCP, and the Kodis are not
+    # exposed to Assist — both proven in the field on 03.10.2026 18:21), so
+    # it is media_play/media_stop. Only a media NOUN qualifies: a bare
+    # «включи» stays with the light/vacuum intents.
+    if (
+        not media_service
+        and media_noun
+        and thing_domain == ["media_player"]
+        and (RE_ON.search(t) or RE_OFF.search(t))
+    ):
+        media_service = MEDIA_POWER_ON if RE_ON.search(t) else MEDIA_POWER_OFF
+    # A device word from another family wins over any media reading:
+    # «включи свет и поставь музыку» is not a media-only command, and half a
+    # command is an escalation, never a partial side effect.
+    if media_service and thing_domain and thing_domain != ["media_player"]:
+        return None
+    if media_service and not (media_exclusive or media_noun or thing_stem):
+        # A shared verb with no object («приглуши», «заглуши», «стоп») — in
+        # this house those are light/TV words; refuse to guess the device.
+        if not re.search(r"громкост|звук", t, re.IGNORECASE):
+            return None
+    if media_service:
+        if area_src == "default" and not media_noun and not thing_stem:
+            # «громче» said in the kitchen satellite with no device word: the
+            # default area is a speaker LOCATION, not a claim about which
+            # player the user means.
+            area, area_src = None, "none"
+        args: dict = {}
+        if area:
+            args["area"] = area
+        hint = thing_name or thing_stem
+        if not hint:
+            m = RE_MEDIA_HINT.search(t)
+            hint = m.group(0) if m else ""
+        service_data: dict = {}
+        speak = MEDIA_SPEAK[media_service]
+        if media_service == "volume_set":
+            pct = RE_MEDIA_PCT.search(t)
+            if not pct:
+                return None  # «сделай громче»-less «поставь громкость»: escalate
+            level = int(pct.group(1) or pct.group(2))
+            service_data["volume_level"] = round(min(100, level) / 100.0, 2)
+            speak = f"Громкость {level} процентов"
+        elif media_service == "volume_mute":
+            # RE_MEDIA maps the sound-on case to volume_mute as well; the flag
+            # is what separates them, and «выключи звук» must not unmute.
+            service_data["is_volume_muted"] = not bool(
+                re.search(r"включ\w*\s+звук|разглуш|unmute", t, re.IGNORECASE))
+            speak = ("Выключила звук" if service_data["is_volume_muted"]
+                     else "Включила звук")
+        args["service_data"] = service_data
+        return ResolvedCall(
+            f"media__{media_service}", args,
+            speak_ok=speak, area_source=area_src, hint=hint,
+        )
+
     # --- Need an action verb for plain on/off ---
     if not (RE_ON.search(t) or RE_OFF.search(t)):
         return None
@@ -423,6 +641,14 @@ def resolve_action(text: str, stream_name: str) -> ResolvedCall | None:
     if not hint:
         dm = _DEVICE_NOUN.search(t)
         hint = dm.group(0) if dm else ""
+    # «в первом коридоре»: the ordinal travels INSIDE the hint, because the
+    # slots are HA matcher slots and a digit is not one of them. Dropped
+    # before 02.10.2026, so «первый» and «второй» both moved corridor1 AND
+    # corridor2 — find_action_targets reads the digit back and keeps only
+    # the relay the user named.
+    digit = ordinal_digit(t)
+    if hint and digit:
+        hint = f"{hint} {digit}"
     return ResolvedCall(
         tool, args,
         speak_ok="Включила" if turn_on else "Выключила",
@@ -710,6 +936,16 @@ def resolve_query(text: str, stream_name: str) -> ResolvedQuery | None:
             args["name"] = thing_name
         if area:
             args["area"] = area
+        # A playback question with a ROOM and no device word is about the
+        # players of that room: the media default used to sit behind
+        # `if not args`, so «что сейчас играет в гостиной» carried the area
+        # alone and answered «Не нашла такого устройства» about a TV that was
+        # playing (field check 03.10.2026).
+        if (
+            not thing_domain
+            and re.search(r"играет|воспроизвод|музык|фильм|сериал|показ", t, re.I)
+        ):
+            args["domain"] = ["media_player"]
         if not args:
             # "что сейчас играет" with no named device: default to the
             # media domain rather than escalating a very common query.

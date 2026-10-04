@@ -152,7 +152,14 @@ def same_block_check(final_answer, memory, agent=None) -> bool:
 _RE_CLAIM = re.compile(
     r"(?<!не )\b(?:включ\w*|выключ\w*|зажг\w*|погас\w*|сдела(?:л\w*|но|на)|"
     r"выполнено|запущен\w*|запусти\w*|запуска\w*|подготовлен\w*|передала|"
-    r"активир\w*|открыл\w*|закрыл\w*|отправ\w*|начина\w*|убира\w*|убер[её]т\w*)\b",
+    r"активир\w*|открыл\w*|закрыл\w*|отправ\w*|начина\w*|убира\w*|убер[её]т\w*)\b"
+    # Media transport promises (03.10.2026): «поставила на паузу»,
+    # «переключила трек», «заглушила» are exactly as much a promise as
+    # «включила» and must be vetoed the same way — and «поставила» alone is
+    # the model's usual wording. The extra lookbehind keeps the STATUS report
+    # «не на паузе» out — the plain `(?<!не )` cannot see two words back.
+    r"|(?<!не на )\bпауз\w*|\bпереключ\w*|\bзаглуш\w*|\bприостанов\w*"
+    r"|(?<!не )\bпостав\w*",
     re.IGNORECASE,
 )
 
@@ -225,6 +232,37 @@ def _truth(events: list[dict]) -> str:
                 "в Home Assistant.")
     if "Некорректный arguments_json" in detail:
         return "Не получилось: команда собрана с ошибкой, попробуй переформулировать."
+    # Media (03.10.2026): an invented MCP tool name and an unresolvable
+    # player are different blockers and deserve different sentences — the
+    # first one is «я назвала несуществующий тул», which used to be spoken to
+    # the user as a vague «Home Assistant отклонил команду».
+    if "нет тула" in detail:
+        return ("Не получилось: такого действия Home Assistant не умеет — "
+                "плеером надо управлять через media_control.")
+    if "не нашла медиаплеер" in detail:
+        return ("Не нашла медиаплеер, к которому это относится: скажи "
+                "комнату или как называется устройство.")
+    # A media command the box could not act on because it is not doing
+    # anything: «ничего не играет» is the truth, «отклонил команду» is a
+    # different (wrong) story — and the veto must not spend the retry pass on
+    # it either, which it does not: failure_note feeds a fix, not a re-ask.
+    if "ничего не играет" in detail:
+        return "Ничего не играет."
+    if "уже на паузе" in detail:
+        return "Уже на паузе."
+    if "уже не играет" in detail:
+        return "Уже не играет."
+    if "вместо" in detail and "открыл" in detail:
+        # Kodi started something OTHER than what was asked for (a plugin
+        # redirect, a stale queue). The refusal must name both titles or the
+        # user cannot tell what is now on the screen (03.10.2026).
+        m = re.search(r"открыл «(.+?)» вместо «(.+?)»", detail)
+        if m:
+            return f"Включилось «{m.group(1)}» вместо «{m.group(2)}»."
+    if "громкость не изменилась" in detail:
+        return "Громкость не изменилась."
+    if "подходит несколько медиаплееров" in detail:
+        return "Подходит несколько медиаплееров — назови комнату."
     return "Не получилось: Home Assistant отклонил команду."
 
 

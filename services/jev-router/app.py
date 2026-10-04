@@ -61,12 +61,27 @@ from classifier import Classifier
 from ha_client import (
     HAClient,
     _area_phrase,
+    confirm_delays,
     dedupe_device_facets,
     describe_entity,
     find_action_targets,
     find_entity,
+    find_media_targets,
+    media_fingerprint,
+    media_no_movement_answer,
+    volume_unverifiable,
+    MEDIA_ACTIVE,
+    MEDIA_PREFER,
+    MEDIA_STATE_ANSWER,
+    MEDIA_TRANSPORT,
+    MEDIA_VOLUME,
 )
-from resolver import resolve_action, resolve_query, unresolved_hint
+from resolver import (
+    area_of as resolver_area_of,
+    resolve_action,
+    resolve_query,
+    unresolved_hint,
+)
 
 # stdout logging: uvicorn does not configure root logging by default, and the
 # route decisions logged here are the main debugging surface in `docker logs`.
@@ -111,11 +126,17 @@ class RouteRequest(BaseModel):
     `stream_name` is the physical satellite (kitchen/livingroom/...) — the
     resolver uses it as the default room when the utterance names none;
     `session_id` tags the memory write for L2's qdrant_search.
+    `room` is an OPTIONAL default-area hint from a source whose stream_name
+    is NOT a room (the Telegram source keys history on "tg:<chat_id>").
+    It wins over stream_name for the resolver ONLY — the history/memory key
+    stays `stream_name or session_id`, so a chat never shares its turn ring
+    with a camera.
     """
 
     text: str
     session_id: str = ""
     stream_name: str = ""
+    room: str = ""
 
 
 def _sse(obj: dict) -> str:
@@ -211,6 +232,122 @@ def _target_rank(e: dict) -> tuple:
     return (0 if dom == "light" else 1, len(name), eid)
 
 
+# The state a player is already in for the service we are about to call, and
+# the honest answer when nothing has to move: MEDIA_STATE_ANSWER, which lives
+# in ha_client next to MEDIA_PREFER (tests import ha_client, never this module
+# — there is no fastapi on the host).
+
+
+# A media service call is ASYNCHRONOUS from HA's point of view: `media_pause`
+# on a Kodi answered `[]` instantly and the entity flipped to `paused` two
+# seconds later (field check 03.10.2026, le_vlada). Verifying in the same
+# breath therefore declared a working command a failure. The wait only runs
+# when the reply listed no change, so the common path stays one call.
+_MEDIA_CONFIRM_DELAYS = (0.0, 0.6, 1.5)
+
+
+async def _media_moved(eid: str, before_fp: tuple,
+                       delays: tuple[float, ...] = _MEDIA_CONFIRM_DELAYS
+                       ) -> dict | None:
+    """Re-read `eid` until its fingerprint differs from `before_fp`.
+
+    Returns the new state object, or None when the box stayed put. The wait is
+    spent only on an empty `changed` reply, and volume services get the longer
+    schedule (`ha_client.confirm_delays`) because their change lands late.
+    """
+    for delay in delays:
+        if delay:
+            await asyncio.sleep(delay)
+        state = await ha.get_entity_state(eid)
+        if state and media_fingerprint(state) != before_fp:
+            return state
+    return None
+
+
+async def _execute_media(call) -> tuple[str | None, dict | None]:
+    """Transport command for one media_player -> HA REST service call.
+
+    Separate from `_execute_action`'s on/off branch because it CANNOT go
+    through MCP: HA's MCP server exposes ten tools and none of them is a
+    media intent (verified 03.10.2026), which is why «поставь его на паузу»
+    used to cost a 7 s L2 round trip and still answer «не удалось».
+
+    Escalates rather than guessing, exactly like the on/off branch: an unknown
+    device gets a spoken refusal, an ambiguity and a dead player get escalated
+    to L2, which owns a `media_control` tool of its own.
+    """
+    service = call.tool.split("__", 1)[1]
+    states = await ha.get_states(force=True)
+    if not states:
+        return None, {"ok": False, "error": "no_states"}
+    targets = find_media_targets(
+        states, await ha.get_entity_areas(), call.hint, call.args.get("area"),
+        MEDIA_PREFER.get(service, ("playing", "buffering")),
+    )
+    if not targets:
+        # [] covers both «no such player» and «several, none playing»; the
+        # named case deserves a spoken question, not an escalation.
+        if call.hint and not find_media_targets(states, {}, call.hint, None):
+            return "Не нашла такого устройства. Может, уточните название?", None
+        # A pronoun with nothing playing anywhere is not an ambiguity, it is
+        # the answer — escalating only made L2 repeat it in 4 more seconds.
+        if (
+            service in MEDIA_TRANSPORT
+            and not call.hint
+            and not call.args.get("area")
+            and not any(str(e.get("state", "")).lower() in MEDIA_ACTIVE
+                        for e in states
+                        if e.get("entity_id", "").startswith("media_player."))
+        ):
+            return "Ничего не играет.", None
+        return None, {"ok": False, "error": "media_target_ambiguous_or_absent"}
+    eid = targets[0]["entity_id"]
+    state = str(targets[0].get("state", "")).lower()
+    known = MEDIA_STATE_ANSWER.get(service, {}).get(state)
+    if known:
+        # A fragment gets the room in front of it («На кухне ничего не
+        # играет»), a whole sentence is spoken as is.
+        if not known.endswith("."):
+            phrase = _area_phrase(call.args.get("area") or "")
+            return f"{phrase} {known}." if phrase else known.capitalize() + ".", None
+        return known, None
+    data = {"entity_id": eid, **(call.args.get("service_data") or {})}
+    res = await ha.call_service("media_player", service, data)
+    if not res.get("ok"):
+        return None, {"ok": False, "error": _err_text(res)}
+    if not res.get("changed"):
+        # Empty reply is NOT proof of failure: HA answers before the box has
+        # reported the new state (a pause lands ~2 s later) and an
+        # attribute-only change (volume_level) may never appear in the list.
+        # Poll the player briefly, then decide — this and the worker's
+        # media_control compare the same fingerprint.
+        #
+        # A box reporting NO volume_level is not polled at all: there is no
+        # level to move, so no wait can confirm anything and the answer is the
+        # same one every idle box gets.
+        if service in MEDIA_VOLUME and volume_unverifiable(targets[0]):
+            logger.info("media %s on %s: %s reports no volume_level, "
+                        "nothing to confirm", service, eid, state)
+        else:
+            moved = await _media_moved(eid, media_fingerprint(targets[0]),
+                                       confirm_delays(service))
+            if moved:
+                logger.info("media %s on %s moved after an empty reply",
+                            service, eid)
+                return call.speak_ok, None
+            logger.info("media %s on %s changed nothing", service, eid)
+        # Nothing moved: a box that was already idle has nothing to play, so the
+        # command was about nothing. Said here in 0.2 s rather than escalated —
+        # ha_client.media_no_movement_answer owns the rule (and the volume case
+        # that used to cost a minute, field check 04.10.2026 21:08).
+        spoken = media_no_movement_answer(service, targets[0],
+                                          call.args.get("area") or "")
+        if spoken:
+            return spoken, None
+        return None, {"ok": False, "error": f"no_state_change:{eid}"}
+    return call.speak_ok, None
+
+
 async def _execute_action(call) -> tuple[str | None, dict | None]:
     """Run one easy_action MCP call. Returns (sentence, None) on success or
     an «already in state» answer, (None, error) otherwise — it never claims
@@ -221,7 +358,13 @@ async def _execute_action(call) -> tuple[str | None, dict | None]:
     unavailable status LEDs), entity names are latin, and a blind
     domain+area match would either miss it or silently no-op on
     `unavailable` states.
+
+    Media transport (`media__*`) is NOT an MCP call at all and leaves here
+    immediately: HA exposes no media intent over MCP, so the resolver's tool
+    name is a marker for `_execute_media`'s REST service call.
     """
+    if call.tool.startswith("media__"):
+        return await _execute_media(call)
     if call.tool in _ONOFF_TOOLS:
         states = await ha.get_states(force=True)
         if states:
@@ -268,12 +411,20 @@ async def _execute_action(call) -> tuple[str | None, dict | None]:
                 skipped: list[str] = []
                 for ent in todo:
                     eid = ent["entity_id"]
-                    name = (ent.get("attributes", {}) or {}).get("friendly_name") or eid
                     # Fresh copy per entity: name/domain are pinned to the
                     # registry entry so the matcher targets exactly what was
                     # resolved, and the next iteration starts from clean args.
                     args = dict(call.args)
-                    args["name"] = name
+                    # `name` gets the ENTITY ID, not the friendly_name: HA's
+                    # matcher only accepts the concatenated friendly name for
+                    # some entities — field check 02.10.2026, «corridor1_light_
+                    # switch Relay» and «coffemaker» both answer
+                    # MatchFailedReason.NAME while «entrance_light_switch
+                    # Relay» matches, so every fast-path corridor command used
+                    # to fail here and escalate. The entity id is unique and
+                    # always resolves; exposure is still enforced (the same
+                    # `assistant='conversation'` filter applies to it).
+                    args["name"] = eid
                     args["domain"] = [eid.split(".", 1)[0]]
                     res = await ha.call_tool(call.tool, args)
                     if res.get("ok"):
@@ -292,6 +443,21 @@ async def _execute_action(call) -> tuple[str | None, dict | None]:
                 # merely not exposed to the assistant were skipped, not failed.
                 if ok and not fatal:
                     return call.speak_ok, None
+                if not ok and not fatal and skipped:
+                    # Every entity that NEEDED a change was an unexposed facet
+                    # (the "Network led switch" of the Sonoff relays), while
+                    # the controllable one is already in the requested state
+                    # per the registry — say that truth instead of escalating
+                    # on «сущность не открыта голосовому ассистенту»: «включи
+                    # свет в прихожей» with the light already on used to fail
+                    # here, because the LED facet was still in `todo`.
+                    if any(str(e.get("state", "")).lower() != opposite
+                           for e in targets):
+                        word = "включено" if want_on else "выключено"
+                        area_ph = _area_phrase(call.args.get("area") or "")
+                        sentence = (f"{area_ph} уже {word}." if area_ph
+                                    else f"Уже {word}.")
+                        return sentence, None
                 fails = fatal + [
                     f"{e}: сущность не открыта голосовому ассистенту"
                     for e in skipped
@@ -401,17 +567,33 @@ async def _handle(req: RouteRequest):
     # pronoun a whole room (field case 28.09.2026).
     ctx = ""
     hist = history.block(req.stream_name or req.session_id)
+    # Default-room hint for the resolvers: an explicit /room binding (a
+    # source whose stream_name is not a room) beats the stream name. Passed
+    # ONLY to the resolvers' default lookup — never used as the history key
+    # above (that double duty would merge a Telegram chat's turns into the
+    # kitchen camera's ring).
+    area_hint = req.room or req.stream_name
     if route == "easy_action":
-        call = resolve_action(text, req.stream_name)
+        call = resolve_action(text, area_hint)
         if call is None:
             logger.info("resolver ambiguous -> complex_logic: %r", text[:80])
             route, reason = "complex_logic", "resolver_ambiguous"
             ctx = unresolved_hint(text)  # «кашеварку» -> «кофеварка», or ""
     elif route == "easy_query":
-        q = resolve_query(text, req.stream_name)
+        q = resolve_query(text, area_hint)
         if q is None:
             logger.info("query resolver ambiguous -> complex_logic: %r", text[:80])
             route, reason = "complex_logic", "query_resolver_ambiguous"
+    # Every escalation carries the canonical room name: the RU word is NOT an
+    # HA area, and an intent fed «гостиная» answers INVALID_AREA (field case
+    # 03.10.2026 18:21, where the model then spent a step guessing device
+    # names instead of reading a real blocker).
+    _room, _room_src = resolver_area_of(text, area_hint)
+    if _room and _room_src == "explicit":
+        ctx = (ctx + " " if ctx else "") + (
+            f"Комната в Home Assistant называется «{_room}» — используй это "
+            "имя, не переводи."
+        )
 
     # The (usually single) route event: emitted before any execution so the
     # caller can log/telemetry the verdict immediately.
@@ -425,7 +607,7 @@ async def _handle(req: RouteRequest):
         if route == "easy_action":
             # Resolved a second time (pure regex, no I/O): the pre-flight
             # already turned this branch off if the resolver said None.
-            call = resolve_action(text, req.stream_name)
+            call = resolve_action(text, area_hint)
             sentence, err = await _execute_action(call)
             if sentence:
                 reply_parts.append(sentence)
@@ -457,6 +639,20 @@ async def _handle(req: RouteRequest):
                         f" Комната в Home Assistant называется "
                         f"«{call.args['area']}» — используй это имя, не переводи."
                     )
+                if call.tool.startswith("media__"):
+                    # The MCP intent name is meaningless to L2 — it does not
+                    # speak `media__*` at all, and its own tool is media_control.
+                    # Handing over the resolved room and the service keeps the
+                    # retry deterministic instead of a re-invention.
+                    ctx += (
+                        " Управление плеером в Home Assistant идёт через тул "
+                        "media_control (не через ha_action): действие "
+                        f"{call.tool.split('__', 1)[1]},"
+                        + (f" комната «{call.args['area']}»" if call.args.get("area")
+                           else " комната не названа")
+                        + (f", устройство «{call.hint}»" if call.hint else "")
+                        + "."
+                    )
                 if "ASSISTANT" in err_text:
                     ctx += (
                         " Причина ASSISTANT — устройство не открыто голосовому "
@@ -478,7 +674,7 @@ async def _handle(req: RouteRequest):
         # --- easy_query: states/history/datetime --------------------------
         elif route == "easy_query":
             # Same double-resolve pattern as easy_action (pure, cheap).
-            q = resolve_query(text, req.stream_name)
+            q = resolve_query(text, area_hint)
             sentence = None
             emitted = False  # weather streams its own sentences
             # Three kinds, answered deterministically where possible:
@@ -523,6 +719,27 @@ async def _handle(req: RouteRequest):
                     domain=q.args.get("domain"),
                     device=q.args.get("device"),
                 )
+                if ent is None and area and q.args.get("domain"):
+                    # A DOMAIN + ROOM query the names cannot answer: no entity
+                    # id carries «Living Room», so find_entity filtered the
+                    # player out and «что сейчас играет в гостиной» answered
+                    # «Не нашла такого устройства» while the TV was playing
+                    # (field check 03.10.2026). The area REGISTRY is the
+                    # authoritative second source — same shape as the ha_read
+                    # fix on the worker side.
+                    area_map = await ha.get_entity_areas()
+                    wanted = {d.lower() for d in q.args["domain"]}
+                    for e in states:
+                        eid = str(e.get("entity_id", ""))
+                        if eid.split(".", 1)[0] not in wanted:
+                            continue
+                        if str(e.get("state", "")).lower() in (
+                                "unavailable", "unknown"):
+                            continue
+                        if area_map.get(eid) == area or (
+                                area in str(area_map.get(eid, "")).lower()):
+                            ent = e
+                            break
                 if ent is not None:
                     sentence = describe_entity(
                         ent, area, label=q.args.get("label", "")

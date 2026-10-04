@@ -390,3 +390,111 @@ def test_guard_fires_once_and_rearms_per_run():
     reset_run_state()     # …but the next attempt starts armed again
     mark_tool_call()
     assert _refused() is True
+
+
+# --- Media transport (03.10.2026) -------------------------------------------
+# The turn was honest («К сожалению, не удалось поставить медиаплеер на паузу»)
+# only by luck: the model had invented intent__HassMediaPause, spent two steps
+# on «Tool … not found» and then reported failure. Two things must hold now —
+# a claim about a player is a claim, and the two new blockers have their own
+# sentences instead of a generic «Home Assistant отклонил команду».
+_FAIL_NO_TOOL = [{"tool": "intent__HassMediaPause", "ok": False,
+                  "detail": 'Тул вернул ошибку: в Home Assistant нет тула '
+                            '«intent__HassMediaPause». Для паузы, треков и '
+                            'громкости тул media_control; …'}]
+_FAIL_NO_PLAYER = [{"tool": "media_control", "ok": False,
+                    "detail": "Тул вернул ошибку: не нашла медиаплеер, к "
+                              "которому это относится"}]
+_FAIL_SOME_PLAYERS = [{"tool": "media_control", "ok": False,
+                       "detail": "Тул вернул ошибку: подходит несколько "
+                                 "медиаплееров (media_player.le_vlada)"}]
+_FAIL_MEDIA = [{"tool": "media_control", "ok": False,
+                "detail": "Тул вернул ошибку: Home Assistant отклонил "
+                          "media_pause (not a valid entity id)"}]
+
+
+def test_veto_covers_media_promises():
+    """«Поставила на паузу» is exactly as much a promise as «включила»: the
+    claim list had no transport verb at all, so a failed media_control with
+    that sentence was spoken as if it had happened."""
+    for claim in ("Поставила на паузу.", "Переключила трек.",
+                  "Заглушила телевизор."):
+        out, replaced = vet_answer(claim, _FAIL_MEDIA)
+        assert replaced is True, claim
+        assert out.startswith("Не получилось")
+
+
+def test_media_status_report_is_not_a_claim():
+    """«Коди не на паузе» is a status report, not a promise — the two-word
+    guard keeps it out of the claim set (the plain `(?<!не )` cannot see two
+    words back)."""
+    out, replaced = vet_answer("Коди не на паузе.", _FAIL_MEDIA)
+    assert replaced is False and out == "Коди не на паузе."
+
+
+def test_invented_tool_name_speaks_the_real_blocker():
+    """The invented name was the whole story of the lost turn; the spoken
+    refusal must name the real blocker AND the tool that does exist."""
+    out, replaced = vet_answer("Поставила на паузу.", _FAIL_NO_TOOL)
+    assert replaced is True
+    assert "не умеет" in out and "media_control" in out
+
+
+def test_unresolvable_player_and_ambiguity_have_their_own_sentences():
+    miss, replaced = vet_answer("Готово, поставила!", _FAIL_NO_PLAYER)
+    assert replaced is True and "не нашла медиаплеер" in miss.lower()
+    many, replaced = vet_answer("Готово, поставила!", _FAIL_SOME_PLAYERS)
+    assert replaced is True and "несколько" in many
+
+
+def test_confirmed_media_action_arms_the_claim():
+    ok = [{"tool": "media_control", "ok": True,
+           "detail": "media_player.le_vlada: media_pause выполнено, "
+                     "состояние playing -> paused"}]
+    out, replaced = vet_answer("Поставила на паузу.", ok)
+    assert replaced is False and out == "Поставила на паузу."
+    # …and a confirmed action also backs the state claim it produced.
+    out, replaced = vet_answer("Коди на паузе.", ok)
+    assert replaced is False
+
+
+def test_failure_note_carries_the_new_blockers():
+    note = failure_note(_FAIL_NO_TOOL)
+    assert "media_control" in note
+    assert note == failure_note(_FAIL_NO_TOOL)
+
+
+_FAIL_NOTHING_PLAYING = [{"tool": "media_control", "ok": False,
+                          "detail": "Тул вернул ошибку: media_player.le_kitchen: "
+                                    "media_pause — ничего не играет (состояние idle)."}]
+_FAIL_ALREADY_PAUSED = [{"tool": "media_control", "ok": False,
+                         "detail": "Тул вернул ошибку: media_player.le_vlada: "
+                                   "media_pause — уже на паузе (состояние paused)."}]
+
+
+def test_a_media_call_that_moved_nothing_is_not_a_confirmed_action():
+    """Field check 03.10.2026: the no-change branch was recorded ok=True, which
+    armed the veto and let the model say «Переключил трек на кухне» after the
+    box had done nothing. No change == no side effect."""
+    out, replaced = vet_answer("Переключил трек на кухне.", _FAIL_NOTHING_PLAYING)
+    assert replaced is True
+    assert out == "Ничего не играет."
+    out, replaced = vet_answer("Поставила на паузу.", _FAIL_ALREADY_PAUSED)
+    assert replaced is True and out == "Уже на паузе."
+
+
+_FAIL_WRONG_TITLE = [{"tool": "media_play", "ok": False,
+                     "detail": "Тул вернул ошибку: media_player.le_zal_2: Kodi "
+                               "открыл «The Simpsons» вместо «Black Mirror» — то, "
+                               "что просили, не запустилось."}]
+
+
+def test_a_wrong_title_is_reported_with_both_names():
+    """A `playing` state does not prove the RIGHT thing started: Kodi can open
+    something else (plugin redirect, stale queue). Announcing «Black Mirror
+    запущено» for The Simpsons is the same confident-wrong the veto exists to
+    stop, and the refusal is useless unless it names both titles."""
+    out, replaced = vet_answer("Включила Black Mirror в гостиной.",
+                               _FAIL_WRONG_TITLE)
+    assert replaced is True
+    assert out == "Включилось «The Simpsons» вместо «Black Mirror»."

@@ -77,6 +77,16 @@ _HINT_LAT: dict[str, list[str]] = {
     "торшер": ["light"],
     "штор": ["cover", "curtain", "blind"],
     "музык": ["media_player", "speaker", "receiver"],
+    # Media transport (03.10.2026). «коди» is what the user calls the four
+    # Kodi boxes (media_player.le_vlada / le_zal_2 / le_spalnya / le_kitchen)
+    # and «ле» is the shared prefix of every one of their friendly names
+    # («LE-vlada», «LE-zal»): hint «коди» finds nothing without it, which is
+    # how «пауза коди во владиной комнате» found no device at all.
+    "коди": ["kodi", "le"],
+    "kodi": ["kodi", "le"],
+    "медиаплеер": ["media_player", "kodi", "le"],
+    "плеер": ["media_player", "speaker", "kodi", "le"],
+    "колонк": ["media_player", "speaker", "le"],
 }
 
 # RU area stem -> latin fragments that occur in entity_ids/friendly_names.
@@ -113,6 +123,10 @@ _AREA_LAT: dict[str, list[str]] = {
     "basement": ["basement"],
     "office": ["office"],
     "kids": ["kids", "children"],
+    # «во владиной комнате» -> HA area «Bedroom Vlada» (03.10.2026).
+    "влади": ["vlada"],
+    "владин": ["vlada"],
+    "vlada": ["vlada"],
 }
 
 
@@ -334,6 +348,65 @@ class HAClient:
             self._entity_areas_at = now
         return self._entity_areas
 
+    async def call_service(
+        self, domain: str, service: str, data: dict
+    ) -> dict:
+        """POST /api/services/{domain}/{service}. {"ok", "changed", "error"}.
+
+        The only way to reach an action HA does NOT expose as an MCP tool.
+        Media transport is exactly that case (field case 03.10.2026):
+        `media_player.media_pause` exists in HA, the MCP server has no intent
+        for it, so «поставь на паузу» had to be invented by the model and
+        failed. Never raises.
+
+        `changed` is HA's answer — the list of entities whose state the call
+        moved. EMPTY means the service ran but nothing changed (the player was
+        already paused, or the box is offline), which the caller must not
+        report as success; that decision is left to app.py, which knows which
+        of the two it asked for.
+        """
+        sess = await self._sess()
+        try:
+            async with sess.post(
+                f"{self.url}/api/services/{domain}/{service}",
+                json=data,
+                headers=self._headers(),
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    logger.error(
+                        "HA service %s.%s -> HTTP %s: %s",
+                        domain, service, resp.status, body[:200],
+                    )
+                    return {"ok": False, "error": f"http_{resp.status}",
+                            "raw": body[:300]}
+                changed = await resp.json(content_type=None)
+        except Exception as e:
+            logger.error("HA service %s.%s transport error: %s",
+                         domain, service, e)
+            return {"ok": False, "error": str(e)}
+        return {"ok": True, "changed": changed if isinstance(changed, list) else []}
+
+    async def get_entity_state(self, entity_id: str) -> dict:
+        """One entity's FRESH state object (not the cached list), {} on error.
+
+        Used to confirm a media service call actually moved something: the
+        service reply's `changed` list is empty for attribute-only changes
+        (volume), so the only honest verification is to read the entity back.
+        """
+        sess = await self._sess()
+        try:
+            async with sess.get(
+                f"{self.url}/api/states/{entity_id}", headers=self._headers()
+            ) as resp:
+                if resp.status != 200:
+                    return {}
+                data = await resp.json(content_type=None)
+        except Exception as e:
+            logger.error("HA entity state %s: %s", entity_id, e)
+            return {}
+        return data if isinstance(data, dict) else {}
+
     async def close(self) -> None:
         """Release the aiohttp session (lifespan shutdown hook)."""
         if self._session and not self._session.closed:
@@ -483,6 +556,42 @@ def _norm(s: str) -> str:
 # a broad domain filter would turn off security recording.
 _ONOFF_DOMAINS = ("light", "switch")
 
+# Spoken ordinal -> the digit it selects inside an entity id: «свет в первом
+# коридоре» must reach `corridor1_light_switch_relay` and «во втором» the
+# corridor2 one. WITHOUT this the ordinal was dropped in resolve_action and
+# both relays moved for a request that named exactly one of them (field case
+# 02.10.2026). Duplicated in smolagents-worker/ha_match.py on purpose (two
+# images) — tests/test_hint_sync.py reads both copies and fails on drift,
+# same contract as _HINT_LAT.
+ORDINAL_STEMS: dict[str, str] = {"перв": "1", "втор": "2", "трет": "3"}
+
+# Endings that turn a stem into an ordinal («первый/первом/первых»,
+# «второй/втором», «третий/третьем»). The ending is the guard against the
+# stems' false friends: «вторник» starts with «втор» but ends in «ник», so
+# Tuesday never selects digit 2.
+ORDINAL_ENDINGS: tuple[str, ...] = (
+    "ый", "ий", "ой", "ом", "ого", "ому", "ую", "ые", "ых", "ем",
+    "ья", "ье", "ей", "яя", "ее",
+)
+
+
+def ordinal_digit(text: str) -> str:
+    """'1'..'3' when `text` names a NUMBERED instance of a device, else ''.
+
+    Whole-token match only. A literal 1-3 is honoured too («коридор 1»,
+    STT likes to spell them out as digits).
+    """
+    for raw in (text or "").lower().split():
+        tok = raw.strip(".,!?;:()«»\"'\u2013-")
+        if tok in ("1", "2", "3"):
+            return tok
+        if len(tok) < 3 or not tok.endswith(ORDINAL_ENDINGS):
+            continue
+        for stem, digit in ORDINAL_STEMS.items():
+            if tok.startswith(stem):
+                return digit
+    return ""
+
 
 def find_action_targets(
     states: list[dict],
@@ -514,6 +623,13 @@ def find_action_targets(
     variants = {area_n, area_n.replace(" ", "_"), area_n.replace("_", " ")} \
         if area_n else set()
 
+    # «в первом коридоре» arrives as hint «свет 1» (resolve_action appends
+    # the digit): only the relay whose id carries it may move. Returning an
+    # EMPTY list when nothing carries the digit is deliberate — moving BOTH
+    # corridor relays for a request that named one of them is worse than an
+    # honest escalation, which is what the caller does with [].
+    digit = ordinal_digit(hint_l)
+
     out: list[dict] = []
     for e in states:
         eid = e.get("entity_id", "")
@@ -523,6 +639,8 @@ def find_action_targets(
             continue
         name = (e.get("attributes", {}) or {}).get("friendly_name") or ""
         hay = f"{eid} {name}".lower()
+        if digit and digit not in hay:
+            continue
         if not any(h in hay for h in hints):
             continue
         if area_n:
@@ -535,6 +653,307 @@ def find_action_targets(
                 continue
         out.append(e)
     return out
+
+
+def _area_fragments(area: str) -> set[str]:
+    """Comparable fragments of a room name, whichever spelling it arrives in.
+
+    The resolver sends the registry DISPLAY name («Bedroom Vlada»), a tool
+    result may carry it back, and a caller of this module may just as well pass
+    the RU word («гостиной»). Comparing those as strings silently found
+    nothing, so the media path filtered every real room out and answered
+    «не удалось» (field case 03.10.2026). Normalised whole name, both
+    separator spellings, the _AREA_LAT expansion and the individual words.
+    """
+    n = _norm(area)
+    if not n:
+        return set()
+    out = {n, n.replace(" ", "_"), n.replace("_", " ")}
+    for stem, lats in _AREA_LAT.items():
+        if stem in n or n in stem:
+            out.update(lats)
+    out.update(w for w in re.split(r"[^0-9a-zа-яё]+", n) if len(w) >= 3)
+    return out
+
+
+# The state a player is already in for the service we are about to call, and
+# the honest answer when nothing has to move. Both directions matter: «уже на
+# паузе» is what the user hears when the Kodi is in fact paused, and saying
+# «поставила на паузу» there would be a side effect nobody made. The `idle`
+# rows exist because they were the EXPENSIVE case: all four boxes sit in
+# `idle`, so «пауза коди на кухне» escalated to L2 for 3-6 s to be told
+# «не играет» (field check 03.10.2026, all four rooms). Lives here, not in
+# app.py, because tests/test_router_resolution.py imports this module and
+# never app.py (no fastapi on the host).
+MEDIA_STATE_ANSWER: dict[str, dict[str, str]] = {
+    "media_pause": {
+        "paused": "Уже на паузе.",
+        # Sentence FRAGMENTS (no full stop): the caller prefixes the room —
+        # «На кухне ничего не играет» reads better than a bare «ничего не
+        # играет», and _area_phrase has a phrase for every room in the house.
+        "idle": "ничего не играет",
+        "off": "ничего не играет",
+    },
+    "media_play": {"playing": "Уже играет."},
+    "media_stop": {"idle": "Уже не играет.", "off": "Уже не играет."},
+    # Switching a track in a stopped box is not a failed command, it is a
+    # command about nothing — same honest answer as the pause, and it keeps
+    # «следующий трек на кухне» out of the L2 round trip (field check
+    # 03.10.2026: it escalated and the model then claimed «Переключил трек»).
+    "media_next_track": {"idle": "ничего не играет", "off": "ничего не играет"},
+    "media_previous_track": {"idle": "ничего не играет", "off": "ничего не играет"},
+}
+
+# Transport services answer «nothing is playing»; the volume ones do not (a
+# muted idle box is still a box whose loudness the user is asking about).
+MEDIA_TRANSPORT = frozenset({
+    "media_pause", "media_play", "media_play_pause", "media_stop",
+    "media_next_track", "media_previous_track",
+})
+
+# ...which is exactly why a volume call on an idle box used to ESCALATE: it is
+# no transport service, so the «nothing was playing, so there was nothing to
+# do» branch skipped it and the unmoved fingerprint became a failure. Field
+# check 04.10.2026 21:08: «сделай громче в спальне» on the idle bedroom box
+# (volume_level 0.80 -> 0.85, just after the window) escalated, and the turn
+# finished 60+ s later — a 29.7 s LLM step plus an httpx retry — for a command
+# HA had already accepted.
+MEDIA_VOLUME = frozenset({
+    "volume_up", "volume_down", "volume_set", "volume_mute",
+})
+
+# How long to re-read a player before calling the call a failure. Transport
+# flips `state` within ~2 s; a volume change never reaches HA's `changed` list
+# at all and lands late on an idle Kodi, so it needs a longer window. Waiting
+# is cheap here (no LLM) — escalating is what cost the minute.
+MEDIA_CONFIRM_DELAYS: dict[str, tuple[float, ...]] = {
+    "default": (0.0, 0.6, 1.5),                 # ~2.1 s
+    "volume": (0.0, 0.8, 1.7, 2.8, 4.0, 5.4),   # ~6.8 s
+}
+
+# States in which a player is DOING something — the difference between «which
+# one?» (a real ambiguity) and «ничего не играет» (a true answer).
+MEDIA_ACTIVE = ("playing", "buffering", "paused")
+
+
+def confirm_delays(service: str) -> tuple[float, ...]:
+    """The re-read schedule for `service` — see MEDIA_CONFIRM_DELAYS."""
+    return MEDIA_CONFIRM_DELAYS[
+        "volume" if service in MEDIA_VOLUME else "default"]
+
+
+def volume_unverifiable(state: dict) -> bool:
+    """The box reports no volume_level at all: there is no level to move, so
+    no amount of polling can confirm a volume call and waiting only delays the
+    answer the user is owed (verified live: le_kitchen / le_vlada report None
+    while idle, le_spalnya reports 0.85)."""
+    return ((state or {}).get("attributes") or {}).get("volume_level") is None
+
+
+def media_no_movement_answer(service: str, before: dict,
+                             area: str = "") -> str | None:
+    """The spoken answer for a media call HA ACCEPTED that moved nothing — or
+    None when this combination must be escalated instead.
+
+    A box that was idle before the call has nothing to play, so a transport
+    command is a command about nothing («ничего не играет») and a volume
+    command is about loudness that cannot be heard right now. Both are honest
+    answers, not failures, and both are worth 0.2 s instead of an L2 round
+    trip. Anything else (a PLAYING box that stayed playing after a pause) is a
+    real failure and belongs to L2.
+    """
+    if str((before or {}).get("state", "")).lower() not in ("idle", "off"):
+        return None
+    if service not in MEDIA_TRANSPORT and service not in MEDIA_VOLUME:
+        return None
+    phrase = _area_phrase(area)
+    return f"{phrase} ничего не играет." if phrase else "Ничего не играет."
+
+
+def media_fingerprint(state: dict) -> tuple:
+    """Everything about a player that a transport/volume call can move.
+
+    Needed because HA's `/api/services` reply cannot be trusted as proof of a
+    side effect: `changed` came back EMPTY for a `volume_up` that really did
+    turn the bedroom box up (0.7 -> 0.8, field check 03.10.2026) — the
+    attribute-only change does not always reach the service reply, and
+    `state` alone never shows it. `media_position` is deliberately absent: it
+    ticks on its own and would make every call look like a change. Same
+    function as smolagents-worker/ha_match.media_fingerprint (two images).
+    """
+    a = (state or {}).get("attributes") or {}
+    return (
+        str((state or {}).get("state", "")).lower(),
+        a.get("volume_level"),
+        a.get("is_volume_muted"),
+        a.get("media_title"),
+        a.get("media_content_id"),
+        a.get("source"),
+    )
+
+_MEDIA_DEAD = ("unavailable", "unknown", "none", "")
+
+# Protocol endpoints (AirPlay/DLNA receivers of the Android box) are not boxes
+# a person talks to and sit in the same room as the real player — counting them
+# made «громкость в гостиной» ambiguous (le_zal_2 + the AirPlay endpoint,
+# field check 03.10.2026). Dropped when a real player survives.
+_MEDIA_ENDPOINT_WORDS = frozenset({"airplay", "dlna", "chromecast"})
+
+# Playing first: a transport command with no room and no device word means
+# «поставь ЕГО на паузу», and «его» is the thing that is playing.
+_MEDIA_ORDER = {"playing": 0, "buffering": 1, "paused": 2, "idle": 3, "off": 4}
+
+
+# Which state makes a player the likely target of a given request. «поставь
+# ЕГО на паузу» names its target by what the device is DOING: the one that
+# plays (or, when the user is repeating the request, the one already paused —
+# live check 03.10.2026, where le_vlada was paused and «nothing is playing»
+# would have escalated a command whose answer is «уже на паузе»).
+MEDIA_PREFER: dict[str, tuple[str, ...]] = {
+    "media_pause": ("playing", "paused", "buffering"),
+    "media_play": ("paused", "playing", "buffering"),
+    "media_play_pause": ("playing", "paused"),
+    "media_stop": ("playing", "paused"),
+    "media_next_track": ("playing", "paused"),
+    "media_previous_track": ("playing", "paused"),
+    # Volume is not playback: a paused box is still a box whose loudness the
+    # user means, so it stays in the preference chain behind the live one.
+    "volume_up": ("playing", "buffering", "paused"),
+    "volume_down": ("playing", "buffering", "paused"),
+    "volume_set": ("playing", "buffering", "paused"),
+    "volume_mute": ("playing", "buffering", "paused"),
+}
+
+
+def find_media_targets(
+    states: list[dict],
+    area_map: dict[str, str],
+    hint: str,
+    area: str | None,
+    prefer: tuple[str, ...] = ("playing", "buffering"),
+) -> list[dict]:
+    """Media players a transport command may address, most likely first.
+
+    The media analogue of find_action_targets, and the reason «пауза коди во
+    владиной комнате» reaches `media_player.le_vlada` in ~0.1 s instead of
+    escalating: HA's MCP server exposes no media intent at all (03.10.2026),
+    so this is the only place a player can be picked.
+
+    Same honest contract as the on/off path — an empty list means "escalate",
+    never "pick one anyway":
+      * `unavailable` players are dropped (an offline box confirms nothing);
+      * a NAMED device that matches nothing falls back to the room alone
+        (hint «коди» -> «le» via _HINT_LAT, and even without that hint the
+        room decides) — an unnamed one may fall back to the whole pool;
+      * an exactly named room beats a room merely CONTAINED in a player's
+        area, same rule as find_action_targets;
+      * several survivors are narrowed by `prefer` (the state the request is
+        about); a tie inside that state is a real ambiguity -> [].
+    """
+    hint_l = (hint or "").lower().strip()
+    hints: set[str] = {hint_l} if hint_l else set()
+    for stem, lats in _HINT_LAT.items():
+        if hint_l and (stem in hint_l or hint_l in stem):
+            hints.update(lats)
+
+    pool: list[dict] = []
+    for e in states:
+        eid = e.get("entity_id", "")
+        if eid.split(".", 1)[0] != "media_player":
+            continue
+        if str(e.get("state", "")).lower() in _MEDIA_DEAD:
+            continue
+        pool.append(e)
+    if not pool:
+        return []
+    real = [
+        e for e in pool
+        if not any(w in _MEDIA_ENDPOINT_WORDS for w in
+                   re.split(r"[^a-z0-9]+", str(e.get("entity_id", "")).lower()))
+    ]
+    pool = real or pool
+
+    def _hay(e: dict) -> str:
+        return f"{e.get('entity_id', '')} " \
+               f"{(e.get('attributes', {}) or {}).get('friendly_name') or ''}".lower()
+
+    by_name = [e for e in pool if hints and any(h in _hay(e) for h in hints)]
+
+    area_n = _norm(area)
+    room_frags = _area_fragments(area or "")
+
+    by_area: list[dict] = []
+    for e in pool:
+        if not room_frags:
+            break
+        eid = e.get("entity_id", "")
+        if area_map:
+            # Registry area is authoritative; a player with no area at all is
+            # not in the requested room either.
+            if not (room_frags & _area_fragments(area_map.get(eid, ""))):
+                continue
+        elif not any(v in _hay(e) for v in room_frags):
+            continue
+        by_area.append(e)
+    if room_frags and not by_area:
+        # The room the user named holds no player: refusing beats answering
+        # for a box in another room («телевизор в коридоре» must not reach
+        # le_vlada just because «телевизор» matched something).
+        return []
+
+    # Name AND room are BOTH constraints, so they intersect. «коди» expands to
+    # «le», which every one of the four boxes carries — letting the name win
+    # on its own made «коди в гостиной» answer for le_vlada (the paused one)
+    # instead of le_zal_2. When the two cannot meet the room wins: the user
+    # named it and it holds exactly one player.
+    if by_name and by_area:
+        cand = [e for e in by_name if e in by_area] or by_area
+    elif by_name:
+        cand = by_name
+    elif by_area:
+        cand = by_area
+    else:
+        # Nothing named at all — a pronoun («поставь ЕГО на паузу») — may look
+        # at the whole pool, and `prefer` decides inside it.
+        cand = pool
+    if not cand:
+        return []
+
+    # Same two rules as smolagents-worker/ha_match (the two must never pick
+    # different boxes): keep the players whose area carries the MOST named
+    # room words — «Bedroom Vlada» is named twice over and «Bedroom» once — and
+    # then let an EXACTLY named room beat a merely containing one, so «спальне»
+    # never reaches «Bedroom Vlada». Exactness is tested against the fragment
+    # set, not the raw word, so a RU room name works too.
+    if by_area and area_map is not None:
+        counts = [(e, len(room_frags & _area_fragments(
+            area_map.get(e.get("entity_id", ""), "")))) for e in by_area]
+        top = max((c for _, c in counts), default=0)
+        if top:
+            by_area = [e for e, c in counts if c == top]
+        exact = [e for e in by_area
+                 if _norm(area_map.get(e.get("entity_id", ""), "")) in room_frags]
+        if exact:
+            by_area = exact
+        cand = [e for e in cand if e in by_area]
+
+    if len(cand) > 1:
+        # Walk the preference order and keep the first state that narrows
+        # anything: the player the user means is the one in the state the
+        # request is about. A tie INSIDE that state stays ambiguous.
+        for want in prefer:
+            narrowed = [e for e in cand
+                        if str(e.get("state", "")).lower() == want]
+            if narrowed:
+                cand = narrowed
+                break
+    if len(cand) > 1:
+        return []  # several players and nothing that says which one
+    return sorted(
+        cand,
+        key=lambda e: (_MEDIA_ORDER.get(str(e.get("state", "")).lower(), 9),
+                       e.get("entity_id", "")),
+    )
 
 
 def dedupe_device_facets(targets: list[dict]) -> list[dict]:
@@ -655,7 +1074,30 @@ _PREP_PHRASE = {
     "подвал": "В подвале", "basement": "В подвале",
     "кабинет": "В кабинете", "office": "В кабинете",
     "детская": "В детской", "kids": "В детской",
+    # The Kodi's own area (03.10.2026): the generic latin fallback spoke
+    # «В bedroom vlada» at the user.
+    "bedroom vlada": "Во владиной комнате",
 }
+
+
+def _prep_candidates(a: str) -> list[str]:
+    """Nominative and oblique spellings of a room, best first.
+
+    The resolver hands over the CANONICAL HA area name («Bedroom»), which is
+    why «В спальнее» never reached the user — but the helper is also called with
+    a Russian display name, and anything else that carries the user's own word
+    («спальне», «гостиной»). Those fell through to the generic rule and came out
+    as «В спальнее», silently. Deriving the nominative is cheaper than a second
+    table and never invents a room that is not in `_PREP_PHRASE`.
+    """
+    out = [a]
+    if a.endswith(("ой", "ей")):   # гостиной -> гостиная, прихожей -> прихожая
+        out.append(a[:-2] + "ая")
+    if a.endswith("е"):           # улице -> улица, спальне -> спальня/спальня
+        out.append(a[:-1] + "а")
+        out.append(a[:-1] + "я")
+        out.append(a[:-1])         # коридоре -> коридор
+    return out
 
 
 def _area_phrase(area: str) -> str:
@@ -663,8 +1105,9 @@ def _area_phrase(area: str) -> str:
     a = _norm(area)
     if not a:
         return ""
-    if a in _PREP_PHRASE:
-        return _PREP_PHRASE[a]
+    for cand in _prep_candidates(a):
+        if cand in _PREP_PHRASE:
+            return _PREP_PHRASE[cand]
     if not re.search(r"[а-яё]", a):
         return f"В {a}"  # unknown latin area (e.g. 'Bedroom Vlada')
     prep = "На" if any(a.startswith(s) for s in _ON_STEMS) else "В"

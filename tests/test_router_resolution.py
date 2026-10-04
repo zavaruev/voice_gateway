@@ -14,8 +14,24 @@ _ROUTER = os.path.abspath(
 sys.path.insert(0, _ROUTER)
 
 import classifier as clf  # noqa: E402
-from resolver import resolve_action, resolve_query, unresolved_hint  # noqa: E402
-from ha_client import find_entity, describe_entity  # noqa: E402
+from resolver import (  # noqa: E402
+    area_of,
+    resolve_action,
+    resolve_query,
+    unresolved_hint,
+)
+from ha_client import (  # noqa: E402
+    MEDIA_PREFER,
+    MEDIA_STATE_ANSWER,
+    _area_phrase,
+    confirm_delays,
+    describe_entity,
+    find_entity,
+    find_media_targets,
+    media_fingerprint,
+    media_no_movement_answer,
+    volume_unverifiable,
+)
 
 
 # --- find_entity: bilingual (RU stem -> latin entity registry) --------------
@@ -578,3 +594,395 @@ def test_battery_query_never_borrows_another_devices_reading():
     assert find_entity(_BAT_STATES, q.entity_hint, None,
                        domain=q.args.get("domain"),
                        device=q.args.get("device")) is None
+
+
+# --- Media transport (field case 03.10.2026, «поставь его на паузу») --------
+# HA's MCP server exposes ten tools and none of them is a media intent
+# (read from tools/list), so before this the turn cost a 7 s L2 round trip and
+# still answered «не удалось»: the model had to invent intent__HassMediaPause.
+# The services exist, so the fast path now emits a REST call instead.
+
+
+def test_media_pause_resolves_with_room_and_device_hint():
+    call = resolve_action("пауза коди во владиной комнате", "")
+    assert call is not None
+    assert call.tool == "media__media_pause"
+    # The room registry name, NOT the RU word: the REST service filters on
+    # entity_id, but the sentence must still be speakable.
+    assert call.args["area"] == "Bedroom Vlada"
+    assert call.hint == "коди"
+    assert call.speak_ok == "Поставила на паузу"
+
+
+def test_media_pronoun_resolves_without_a_device_word():
+    """«Поставь ЕГО на паузу» names its target by a pronoun; the registry
+    (which box is playing/paused) decides, so the fast path must NOT bail out
+    the way it does for an unknown device word."""
+    call = resolve_action("поставь его на паузу", "")
+    assert call is not None and call.tool == "media__media_pause"
+    assert call.hint == ""
+    assert call.args.get("service_data") == {}
+
+
+def test_media_default_area_of_a_satellite_is_dropped():
+    """«Сделай громче» said in the kitchen satellite: the stream's default area
+    is a speaker LOCATION, not a claim about which player the user means —
+    forwarding it would silence the kitchen box on every «громче»."""
+    call = resolve_action("сделай громче", "kitchen")
+    assert call is not None and call.tool == "media__volume_up"
+    assert "area" not in call.args and call.area_source == "none"
+    # …but an explicitly named room is kept.
+    named = resolve_action("сделай тише в спальне", "kitchen")
+    assert named is not None and named.args["area"] == "Bedroom"
+
+
+def test_media_volume_set_needs_a_number_it_understands():
+    """«Громкость 40» carries no unit at all (the light branch's RE_PCT only
+    knows «%»), and this model spells «40 процентов» — both must reach
+    volume_set instead of escalating."""
+    a = resolve_action("поставь громкость 40", "")
+    assert a is not None and a.tool == "media__volume_set"
+    assert a.args["service_data"] == {"volume_level": 0.4}
+    assert a.speak_ok == "Громкость 40 процентов"
+    b = resolve_action("громкость 30 процентов в гостиной", "")
+    assert b is not None and b.args["service_data"] == {"volume_level": 0.3}
+    assert b.args["area"] == "Living Room"
+    # No number at all: a level-less volume_set is a no-op, so escalate.
+    assert resolve_action("поставь громкость", "") is None
+    # …while «громче» is a step, not a level, and does not need one.
+    assert resolve_action("сделай громче погромче", "").tool == "media__volume_up"
+
+
+def test_media_mute_carries_the_flag_not_just_the_verb():
+    """Both directions map to volume_mute; only the flag separates them, and
+    «выключи звук» must never unmute the box."""
+    off = resolve_action("выключи звук", "")
+    assert off is not None and off.tool == "media__volume_mute"
+    assert off.args["service_data"] == {"is_volume_muted": True}
+    on = resolve_action("включи звук", "")
+    assert on is not None and on.args["service_data"] == {"is_volume_muted": False}
+
+
+def test_media_branch_does_not_steal_the_other_families():
+    """The neighbours that MUST keep their proven path: the light dimmer
+    («приглуши» means dim in this house), the on/off intents for light/switch
+    and a device from another domain entirely («поставь чайник на паузу» is
+    not a media command). «Включи телевизор» used to sit here too and moved
+    out on 03.10.2026 — see test_media_on_off_is_a_transport_call_not_a_dead_intent."""
+    assert resolve_action("приглуши свет", "") is None      # needs a level
+    assert resolve_action("приглуши", "") is None          # no object
+    light = resolve_action("включи свет", "")
+    assert light is not None and light.tool == "intent__HassTurnOn"
+    assert resolve_action("выключи свет в спальне", "").tool == "intent__HassTurnOff"
+    assert resolve_action("включи чайник", "").tool == "intent__HassTurnOn"
+    assert resolve_action("поставь чайник на паузу", "") is None
+
+
+def test_media_verbs_share_the_classifier_fast_path():
+    """«Громкость»/«звук» used to be RE_NO_TOOL («no MCP tool exists») and
+    every such turn was escalated; the reminder words must still escalate."""
+    assert clf.RE_MEDIA_ACTION.search("поставь его на паузу")
+    assert clf.RE_MEDIA_ACTION.search("сделай громче")
+    assert clf.RE_MEDIA_ACTION.search("убавь громкость")
+    # A reminder is still not a device action, whatever else is in the phrase.
+    assert clf.RE_NO_REMINDER.search("напомни отключить звук")
+    assert clf.RE_NO_TOOL.search("напомни выключить таймеры на кухне")
+
+
+_MEDIA_STATES = [
+    {"entity_id": "media_player.le_vlada", "state": "paused",
+     "attributes": {"friendly_name": "LE-vlada"}},
+    {"entity_id": "media_player.le_zal_2", "state": "idle",
+     "attributes": {"friendly_name": "LE-zal"}},
+    {"entity_id": "media_player.le_spalnya", "state": "idle",
+     "attributes": {"friendly_name": "LE-spalnya"}},
+    {"entity_id": "media_player.le_kitchen", "state": "idle",
+     "attributes": {"friendly_name": "LE-Kitchen"}},
+    {"entity_id": "media_player.x96q_pro1_157_dlna", "state": "unavailable",
+     "attributes": {"friendly_name": "X96Q X96Q_PRO1-157[DLNA]"}},
+    {"entity_id": "media_player.x96q_pro1_157_airplay", "state": "off",
+     "attributes": {"friendly_name": "X96Q_PRO1-157[AirPlay]"}},
+]
+_MEDIA_AREAS = {
+    "media_player.le_vlada": "Bedroom Vlada",
+    "media_player.le_zal_2": "Living Room",
+    "media_player.le_spalnya": "Bedroom",
+    "media_player.le_kitchen": "Kitchen",
+    "media_player.x96q_pro1_157_dlna": "Living Room",
+    "media_player.x96q_pro1_157_airplay": "Living Room",
+}
+
+
+def _media_call(text, stream=""):
+    call = resolve_action(text, stream)
+    if call is None:
+        return None
+    return find_media_targets(_MEDIA_STATES, _MEDIA_AREAS, call.hint,
+                              call.args.get("area"),
+                              MEDIA_PREFER.get(call.tool.split("__", 1)[1],
+                                              ("playing", "buffering")))
+
+
+def test_find_media_targets_answers_the_field_case_on_the_live_registry():
+    """The exact turn from the field log: «пауза коди во владиной комнате»
+    must reach media_player.le_vlada and nothing else."""
+    got = _media_call("пауза коди во владиной комнате")
+    assert [e["entity_id"] for e in got] == ["media_player.le_vlada"]
+
+
+def test_find_media_targets_pronoun_picks_the_one_in_the_requested_state():
+    """No device word, no room: the state the request is ABOUT decides. le_vlada
+    is the only box that is paused, so «поставь его на паузу» is unambiguous —
+    even though nothing is playing."""
+    got = _media_call("поставь его на паузу")
+    assert [e["entity_id"] for e in got] == ["media_player.le_vlada"]
+
+
+def test_find_media_targets_intersects_the_device_word_with_the_room():
+    """«коди» expands to «le», which every box carries: on its own the name
+    would answer for le_vlada in «коди в гостиной». Name AND room are both
+    constraints, and an exact room beats a room merely CONTAINED in another."""
+    got = _media_call("поставь коди на паузу в гостиной")
+    assert [e["entity_id"] for e in got] == ["media_player.le_zal_2"]
+    assert [e["entity_id"] for e in
+            _media_call("сделай тише в спальне")] == ["media_player.le_spalnya"]
+
+
+def test_find_media_targets_refuses_instead_of_guessing():
+    """Honest refusals: a room that holds no player, and several players with
+    nothing to tell them apart."""
+    # The corridor holds no player — answering for a box in another room is
+    # the wrong-device side effect this project keeps refusing to make.
+    assert _media_call("пауза телевизора в коридоре") == []
+    # Four idle boxes, no room and no device word: nothing to narrow by.
+    assert find_media_targets(_MEDIA_STATES, _MEDIA_AREAS, "", None) == []
+
+
+def test_find_media_targets_ignores_dead_and_protocol_entities():
+    """`unavailable` (the DLNA endpoint) is dropped, and the AirPlay receiver
+    is not counted as a second box in the living room — that pair made
+    «громкость в гостиной» ambiguous."""
+    got = _media_call("громкость 30 процентов в гостиной")
+    assert [e["entity_id"] for e in got] == ["media_player.le_zal_2"]
+    dead = [e for e in _MEDIA_STATES if e["state"] == "unavailable"]
+    assert find_media_targets(dead, _MEDIA_AREAS, "коди", None) == []
+
+
+def test_media_idle_answers_are_spoken_not_escalated():
+    """All four Kodi boxes sit in `idle` most of the day, so «пауза коди на
+    кухне» is a very common request whose honest answer is «ничего не
+    играет». Escalating it cost 3-6 s of L2 before the same words came back —
+    the state table answers it in _execute_media instead."""
+    assert MEDIA_STATE_ANSWER["media_pause"]["idle"] == "ничего не играет"
+    assert MEDIA_STATE_ANSWER["media_pause"]["off"] == "ничего не играет"
+    assert MEDIA_STATE_ANSWER["media_pause"]["paused"] == "Уже на паузе."
+    assert MEDIA_STATE_ANSWER["media_play"]["playing"] == "Уже играет."
+    # A track switch in a stopped box is about nothing, not a failed command.
+    for svc in ("media_next_track", "media_previous_track"):
+        assert MEDIA_STATE_ANSWER[svc]["idle"] == "ничего не играет"
+    # Volume has no such row on purpose: a muted idle box is still a box whose
+    # loudness the user is asking about.
+    assert "idle" not in MEDIA_STATE_ANSWER.get("volume_up", {})
+
+
+def test_area_phrase_speaks_the_kodis_own_room():
+    """«В bedroom vlada» at the user is the generic latin fallback; the area
+    registry name has a phrase of its own."""
+    assert _area_phrase("Bedroom Vlada") == "Во владиной комнате"
+    assert _area_phrase("Kitchen") == "На кухне"
+
+
+def test_media_fingerprint_sees_an_attribute_only_change():
+    """HA's service reply said `changed: []` for a volume_up that really did
+    turn the box up (0.7 -> 0.8), so the fast path verifies by reading the
+    player back. A fingerprint of `state` alone would call that a failure."""
+    before = {"entity_id": "media_player.a", "state": "idle",
+              "attributes": {"volume_level": 0.7, "is_volume_muted": False}}
+    after = {"entity_id": "media_player.a", "state": "idle",
+             "attributes": {"volume_level": 0.8, "is_volume_muted": False}}
+    ticking = {"entity_id": "media_player.a", "state": "idle",
+               "attributes": {"volume_level": 0.7, "is_volume_muted": False,
+                              "media_position": 412}}
+    assert media_fingerprint(before) != media_fingerprint(after)
+    assert media_fingerprint(before) == media_fingerprint(ticking)
+
+
+def test_media_on_off_is_a_transport_call_not_a_dead_intent():
+    """Field case 03.10.2026 18:21: «Ну так найди её и включи» ended in
+    intent__HassTurnOn answering MatchFailedReason.INVALID_AREA for the RU room
+    and then MatchFailedReason.ASSISTANT for `name='LE-zal'` — HA's MCP server
+    has no media intent and the Kodis are not exposed to Assist, so the on/off
+    intent can NEVER reach them. Transport services do not care about Assist
+    exposure, so «включи коди» is media_play now."""
+    on = resolve_action("включи коди в гостиной", "")
+    assert on is not None and on.tool == "media__media_play"
+    assert on.args["area"] == "Living Room"
+    off = resolve_action("выключи коди", "")
+    assert off is not None and off.tool == "media__media_stop"
+    for text in ("включи телевизор", "включи музыку", "включи колонку на кухне"):
+        c = resolve_action(text, "")
+        assert c is not None and c.tool == "media__media_play", text
+    # …and the OTHER families keep their proven intents.
+    for text, tool in (("включи свет в гостиной", "intent__HassTurnOn"),
+                       ("выключи свет", "intent__HassTurnOff"),
+                       ("включи чайник", "intent__HassTurnOn"),
+                       ("включи пылесос", "vacuum__HassVacuumStart")):
+        c = resolve_action(text, "")
+        assert c is not None and c.tool == tool, text
+
+
+def test_a_named_episode_is_a_library_request_not_a_track_skip():
+    """«Включай следующую серию "Темного зеркала" в гостиной» is a LIBRARY
+    item, not «the next track»: routed to media_next_track it switched a track
+    on whatever box answered (field check 03.10.2026 19:32 — it reached the
+    bedroom). It must escalate to L2, which owns media_search + media_play and
+    the room from the escalation context. «Следующий ТРЕК» stays a transport
+    command."""
+    assert resolve_action("включай следующую серию темного зеркала в гостиной",
+                          "") is None
+    assert resolve_action("следующая серия чёрного зеркала", "") is None
+    track = resolve_action("следующий трек в гостиной", "")
+    assert track is not None and track.tool == "media__media_next_track"
+    assert track.args["area"] == "Living Room"
+    # A pronoun with no device word stays an escalation: L2 owns the history.
+    assert resolve_action("ну так найди её и включи", "") is None
+
+
+def test_area_of_gives_l2_the_canonical_room_name():
+    """«гостиная» is not an HA area. Every escalation now carries the display
+    name, because an intent fed the RU word answers INVALID_AREA."""
+    assert area_of("включи коди в гостиной", "") == ("Living Room", "explicit")
+    assert area_of("включи коди во владиной комнате", "") == (
+        "Bedroom Vlada", "explicit")
+    assert area_of("включи коди", "") == (None, "none")
+    # A satellite's default room is NOT «explicit» — only a spoken one is.
+    assert area_of("включи коди", "kitchen") == ("Kitchen", "default")
+
+
+def test_the_regex_action_path_is_the_one_definition():
+    """The cosine path and the cold-embedder fallbacks share one test, so a
+    cold Ollama can never disagree with a warm one about what an action is."""
+    c = clf.Classifier.__new__(clf.Classifier)  # no embedder needed
+    for text in ("включи свет", "выключи свет в спальне", "поставь на паузу",
+                 "сделай громче", "включай следующую серию в гостиной"):
+        assert c._regex_action(text) is True, text
+    for text in ("напомни выключить таймеры на кухне", "какая сейчас погода",
+                 "привет как дела", "расскажи анекдот"):
+        assert c._regex_action(text) is False, text
+
+
+def test_cold_classifier_still_routes_a_command_it_can_resolve():
+    """One cold Ollama used to escalate EVERY voice command (18:38 warmup
+    timeout). The media/on-off fast path is pure regex, so it must survive."""
+    import asyncio
+
+    class DeadEmbedder:
+        async def embed(self, texts):
+            raise RuntimeError("ollama down")
+
+    c = clf.Classifier(embedder=DeadEmbedder())
+    d = asyncio.run(c.classify("поставь коди на паузу в гостиной"))
+    assert d.route == "easy_action" and d.reason == ""
+    q = asyncio.run(c.classify("какая сейчас погода"))
+    assert q.route == "complex_logic" and q.reason in (
+        "classifier_unavailable", "embed_failed")
+
+
+def test_the_embed_batch_is_chunked_to_fit_the_timeout():
+    """Measured 03.10.2026 on this host: 1 utterance ~1.7 s, the whole
+    60-utterance warm-up ~102 s against a 30 s client timeout — so the warm-up
+    failed on EVERY start and the classifier ran cold. A chunk must stay well
+    inside the timeout, and the rows must come back in order."""
+    parts = clf.chunked(list(range(60)))
+    assert [len(p) for p in parts] == [8] * 7 + [4]
+    assert [x for p in parts for x in p] == list(range(60))  # order kept
+    assert clf.chunked([]) == []
+    # A chunk must not be able to grow past the timeout budget: at the measured
+    # per-utteration cost, 8 is ~14 s of a 30 s window.
+    assert clf.EMBED_CHUNK * 1.7 < 30
+
+
+def test_a_playback_question_with_a_room_keeps_the_media_domain():
+    """«Что сейчас играет в гостиной» used to carry the area ALONE: the media
+    default sat behind `if not args`, so the lookup had no domain, no entity id
+    carries «Living Room», and the answer was «Не нашла такого устройства»
+    about a TV that was playing (field check 03.10.2026)."""
+    q = resolve_query("что сейчас играет в гостиной", "")
+    assert q is not None and q.kind == "state"
+    assert q.args["domain"] == ["media_player"]
+    assert q.args["area"] == "Living Room"
+    assert q.entity_hint == "media_player"
+    # No room -> the global media pool, unchanged.
+    g = resolve_query("что сейчас играет", "")
+    assert g is not None and g.args["domain"] == ["media_player"]
+    assert "area" not in g.args
+    # Another device keeps its own domain.
+    v = resolve_query("что там с пылесосом", "")
+    assert v is not None and v.args["domain"] == ["vacuum"]
+
+
+# --- a media call HA accepted that moved nothing -----------------------------
+# Field check 04.10.2026 21:08: «сделай громче в спальне» on the idle bedroom
+# box. volume_up is no transport service, so the «nothing was playing» branch
+# skipped it, the fingerprint had not moved yet inside the 2.1 s window, and the
+# call escalated — 29.7 s of LLM plus an httpx retry, >60 s for the turn, for a
+# command HA had already accepted. The box went 0.80 -> 0.85 a moment later.
+
+
+_IDLE_BOX = {"entity_id": "media_player.le_spalnya", "state": "idle",
+             "attributes": {"volume_level": 0.85, "friendly_name": "LE-spalnya"}}
+_PLAYING_BOX = {"entity_id": "media_player.le_spalnya", "state": "playing",
+                 "attributes": {"volume_level": 0.85, "media_title": "Black Mirror"}}
+
+
+def test_a_volume_call_on_an_idle_box_is_answered_not_escalated():
+    """Nothing moved, but the box had nothing to play — that is the answer, and
+    it costs 0.2 s instead of an L2 round trip."""
+    assert media_no_movement_answer("volume_up", _IDLE_BOX, "спальне") == \
+        "В спальне ничего не играет."
+    assert media_no_movement_answer("volume_set", _IDLE_BOX, "") == \
+        "Ничего не играет."
+    assert media_no_movement_answer("media_pause", _IDLE_BOX, "кухне") == \
+        "На кухне ничего не играет."
+
+
+def test_a_playing_box_that_stayed_playing_still_escalates():
+    """The rule is about a box that was ALREADY idle. A pause that left a
+    playing box playing is a real failure and belongs to L2."""
+    assert media_no_movement_answer("media_pause", _PLAYING_BOX, "спальне") is None
+    assert media_no_movement_answer("volume_up", _PLAYING_BOX, "спальне") is None
+
+
+def test_a_service_without_a_play_answer_still_escalates():
+    """Only the services that can be «about nothing» get the sentence; anything
+    else keeps its old behaviour."""
+    for service in ("turn_on", "switch_off", "ha_action", "brightness_set"):
+        assert media_no_movement_answer(service, _IDLE_BOX, "спальне") is None
+
+
+def test_a_room_word_is_declined_however_it_arrives():
+    """The resolver hands over the canonical HA name («Bedroom»), so «В
+    спальнее» never reached the user — but `_area_phrase` also takes a Russian
+    display name or whatever the caller carries, and its generic rule turned
+    «спальне» into «В спальнее» in silence."""
+    assert _area_phrase("спальня") == "В спальне" == _area_phrase("спальне")
+    assert _area_phrase("гостиная") == "В гостиной" == _area_phrase("гостиной")
+    assert _area_phrase("прихожая") == "В прихожей" == _area_phrase("прихожей")
+    assert _area_phrase("кухня") == "На кухне" == _area_phrase("кухне")
+    assert _area_phrase("коридор") == "На коридоре" == _area_phrase("коридоре")
+    assert _area_phrase("улица") == "На улице" == _area_phrase("улице")
+    assert _area_phrase("детская") == "В детской" == _area_phrase("детской")
+    assert _area_phrase("Bedroom Vlada") == "Во владиной комнате"
+    assert _area_phrase("") == ""
+
+
+def test_a_box_without_a_volume_level_is_not_polled_at_all():
+    """No level to move means no poll can ever confirm anything — waiting would
+    only spend the whole ~6.8 s window to reach the same answer."""
+    assert volume_unverifiable({"attributes": {"volume_level": None}})
+    assert volume_unverifiable({})
+    assert not volume_unverifiable({"attributes": {"volume_level": 0.0}})
+    # ...while a box that DOES report a level gets the longer volume window,
+    # because that is where the change lands late.
+    assert sum(confirm_delays("volume_up")) > sum(confirm_delays("media_pause"))
+    assert sum(confirm_delays("volume_set")) == sum(confirm_delays("volume_mute"))

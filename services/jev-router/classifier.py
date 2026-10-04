@@ -65,6 +65,9 @@ ROUTES: dict[str, list[str]] = {
         "выключи таймеры",
         "включи телевизор",
         "выключи музыку",
+        "поставь коди на паузу",
+        "сделай громче",
+        "переключи следующий трек",
         "скажи всем что обед готов",
         "включи лампу в гостиной",
         "выключи все светильники",
@@ -138,10 +141,37 @@ RE_QUERY = re.compile(
     r"|\b(?:включ[её]н|горит|работает|открыт|открыта|занят|активен|играет)\s+ли\b",
     re.IGNORECASE,
 )
-# Not actionable by voice: no MCP tool exists (documented limitation) => escalate.
+# Media transport verbs (03.10.2026). They look like nothing else in Russian —
+# no on/off verb, no question word — so the cosine alone kept sending
+# «поставь его на паузу» / «сделай громче» to complex_logic (field log:
+# route=complex_logic conf=0.32) for a command the resolver now answers in
+# one REST call. «громкость»/«звук» are IN this list because they are exactly
+# the words RE_NO_TOOL used to escalate on (see below) — the transport branch
+# is what made them actionable.
+ACTION_VERBS_MEDIA = (
+    r"пауз\w*|приостанов\w*|замороз\w*|продолж\w*|возобнов\w*|доиграй|"
+    r"следующ\w*\s+(?:трек|песн|сери[юяи]|сериал|эпизод|часть)|"
+    r"предыдущ\w*\s+(?:трек|песн|сери[юяи]|сериал|эпизод|часть)|"
+    r"переключ\w*\s+трек|"
+    r"громче|тише|приглуш\w*|заглуш\w*|разглуш\w*|громкост\w*|звук|"
+    r"останов\w*\s+(?:плеер|воспроизвод|музык)|стоп"
+)
+RE_MEDIA_ACTION = re.compile(
+    rf"\b(?:{ACTION_VERBS_MEDIA})\b", re.IGNORECASE
+)
+
+# Not actionable by voice: no tool exists (documented limitation) => escalate.
+# «громкость»/«звук» used to sit here as well — before 03.10.2026 that was
+# TRUE (HA's MCP tool list has no media intent at all), which sent «убавь
+# громкость» to L2 for a refusal. The media fast path handles them now, so
+# RE_NO_TOOL only has to keep the REMINDER words: a timer reminder is not a
+# device action, with or without a player in the sentence.
 RE_NO_TOOL = re.compile(
     r"\b(?:напомни|напоминание|напомни мне|таймер(?:ы)? на|громкость|звук)\b",
     re.IGNORECASE,
+)
+RE_NO_REMINDER = re.compile(
+    r"\b(?:напомни|напоминание|напомни мне|таймер(?:ы)? на)\b", re.IGNORECASE,
 )
 
 
@@ -164,6 +194,19 @@ class RouteDecision:
     @property
     def escalated(self) -> bool:
         return self.reason != ""
+
+
+# Utterances per /api/embed request. Measured on this host (03.10.2026):
+# 1 utterance ~1.2-1.7 s, the whole 60-utterance warm-up batch ~102 s — far
+# past the 30 s client timeout. 8 keeps a chunk near 14 s.
+EMBED_CHUNK = 8
+
+
+def chunked(seq: list, size: int = EMBED_CHUNK) -> list[list]:
+    """Split `seq` into consecutive chunks of at most `size` (pure)."""
+    if size < 1:
+        raise ValueError("chunk size must be >= 1")
+    return [seq[i:i + size] for i in range(0, len(seq), size)]
 
 
 def confidence_from_score(score: float) -> float:
@@ -191,19 +234,30 @@ class Embedder:
     async def embed(self, texts: list[str]) -> np.ndarray:
         """Embed `texts` and L2-normalise the rows (cosine = dot product).
 
+        CHUNKED, because one 60-utterance batch took 102 s on this box while
+        the HTTP client allows 30 s per request — the warm-up therefore timed
+        out on EVERY start (empty `asyncio.TimeoutError`, logged as
+        `classifier warmup failed: ` on 03.10.2026 18:38-18:43) and the
+        classifier stayed cold until a lazy retry happened to land in a loaded
+        Ollama. A chunk is ~8 x 1.7 s, comfortably inside the timeout, and the
+        rows are concatenated back in order.
+
         Raises RuntimeError on a non-200 so callers can fail the warm-up
         loudly instead of classifying against a half-built matrix.
         """
         sess = await self._sess()
-        async with sess.post(
-            f"{self.url}/api/embed",
-            json={"model": self.model, "input": texts},
-        ) as resp:
-            if resp.status != 200:
-                body = await resp.text()
-                raise RuntimeError(f"ollama embed {resp.status}: {body[:200]}")
-            data = await resp.json()
-        arr = np.asarray(data["embeddings"], dtype=np.float32)
+        rows: list[np.ndarray] = []
+        for chunk in chunked(texts, EMBED_CHUNK):
+            async with sess.post(
+                f"{self.url}/api/embed",
+                json={"model": self.model, "input": chunk},
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    raise RuntimeError(f"ollama embed {resp.status}: {body[:200]}")
+                data = await resp.json()
+            rows.append(np.asarray(data["embeddings"], dtype=np.float32))
+        arr = np.vstack(rows) if rows else np.zeros((0, 0), dtype=np.float32)
         norms = np.linalg.norm(arr, axis=1, keepdims=True)
         norms[norms == 0] = 1.0
         return arr / norms
@@ -231,27 +285,57 @@ class Classifier:
         self.warmed = False
 
     async def warmup(self) -> bool:
-        """Embed all route utterances once at startup. Failure is not fatal:
-        classify() will retry lazily; on repeated failure everything escalates."""
+        """Embed all route utterances once at startup, with ONE retry.
+
+        Failure is not fatal — classify() retries lazily — but a single attempt
+        is not enough in practice: Ollama loads a 639 MB embedding model on the
+        first call and the 30 s client timeout expires while it does, leaving
+        the classifier cold for minutes (field check 03.10.2026 18:38:
+        `classifier warmup failed: ` with an EMPTY message, i.e. a timeout,
+        while Ollama itself was perfectly healthy).
+        """
         texts: list[str] = []
         route_of: list[str] = []
         for route, utts in ROUTES.items():
             for u in utts:
                 texts.append(u)
                 route_of.append(route)
-        try:
-            self._matrix = await self.embedder.embed(texts)
-            self._route_of_row = route_of
-            self.warmed = True
-            logger.info(
-                "classifier warmed: %d utterances, %d routes",
-                len(texts), len(ROUTES),
-            )
-            return True
-        except Exception as e:
-            logger.error("classifier warmup failed: %s", e)
-            self.warmed = False
+        for attempt in (1, 2):
+            try:
+                self._matrix = await self.embedder.embed(texts)
+                self._route_of_row = route_of
+                self.warmed = True
+                logger.info(
+                    "classifier warmed: %d utterances, %d routes%s",
+                    len(texts), len(ROUTES), "" if attempt == 1 else " (retry)",
+                )
+                return True
+            except Exception as e:
+                self.warmed = False
+                if attempt == 2:
+                    # An empty str() here IS a timeout — name the type.
+                    logger.error("classifier warmup failed: %s",
+                                 e or type(e).__name__)
+                    return False
+                logger.warning("classifier warmup attempt 1 failed (%s), retrying",
+                               e or type(e).__name__)
+        return False
+
+    def _regex_action(self, text: str) -> bool:
+        """True for an unambiguous imperative the regex layer recognises.
+
+        The single definition of `action_like and not no_tool`, shared by the
+        cosine path and the cold-embedder fallbacks so the two can never
+        disagree about what counts as an action.
+        """
+        media_like = bool(RE_MEDIA_ACTION.search(text))
+        if bool(RE_NO_TOOL.search(text)) and not (
+            media_like and not RE_NO_REMINDER.search(text)
+        ):
             return False
+        return bool(
+            RE_ACTION.match(text) or RE_ACTION_MID.search(text) or media_like
+        )
 
     async def classify(self, text: str) -> RouteDecision:
         t = (text or "").strip()
@@ -261,12 +345,23 @@ class Classifier:
         if not self.warmed:
             await self.warmup()
         if not self.warmed or self._matrix is None:
+            # No embeddings — but the DETERMINISTIC action fast path needs no
+            # cosine at all, and app._handle re-runs resolve_action as a
+            # pre-flight (an unresolvable one is downgraded there, so this
+            # cannot produce a wrong side effect). Without it, one cold Ollama
+            # escalated every voice command in the house (03.10.2026 18:38).
+            if self._regex_action(t):
+                logger.info("classifier cold, regex action path: %r", t[:60])
+                return RouteDecision("easy_action", 0.92, reason="")
             return RouteDecision("complex_logic", 0.0, reason="classifier_unavailable")
 
         try:
             v = await self.embedder.embed([t])
         except Exception as e:
-            logger.error("embed failed, escalating: %s", e)
+            logger.error("embed failed, escalating: %s", e or type(e).__name__)
+            if self._regex_action(t):
+                logger.info("embed failed, regex action path: %r", t[:60])
+                return RouteDecision("easy_action", 0.92, reason="")
             return RouteDecision("complex_logic", 0.0, reason="embed_failed")
 
         cos = self._matrix @ v[0]
@@ -287,8 +382,14 @@ class Classifier:
         final_route = top_route
 
         # --- Deterministic fast-paths for imperative device commands ---------
-        no_tool = bool(RE_NO_TOOL.search(t))
-        action_like = bool(RE_ACTION.match(t)) or bool(RE_ACTION_MID.search(t))
+        # A media command («поставь на паузу», «сделай громче») is an action
+        # even without an on/off verb — and it clears RE_NO_TOOL, whose
+        # «громкость/звук» entries only meant "no such tool" back when HA had
+        # no media intent at all.
+        action_like = self._regex_action(t)
+        media_like = bool(RE_MEDIA_ACTION.search(t))
+        no_tool = bool(RE_NO_TOOL.search(t)) and not (
+            media_like and not RE_NO_REMINDER.search(t))
         query_like = bool(RE_QUERY.match(t))
         fast_path = False  # regex intent beats cosine doubt (see thresholds below)
 

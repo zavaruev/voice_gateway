@@ -68,6 +68,26 @@ QDRANT_URL = os.getenv("QDRANT_URL", "http://192.168.22.102:6333").rstrip("/")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://192.168.22.102:11434").rstrip("/")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "qwen3-embedding:0.6b")
 
+# --- Kodi boxes (media library search + play by title) ---
+# SEED HOSTS ONLY: a box is matched to its HA entity by its own zeroconf name
+# (System.FriendlyName -> "LE-zal" == friendly_name "LE-zal"), so this is not a
+# room table — an IP change means editing one list, nothing else. Verified
+# 03.10.2026: .105 = LE-zal (гостиная), .118 = LE-spalnya (спальня),
+# .245 = LE-Kitchen (кухня); the fourth box (LE-vlada) was OFFLINE and is not
+# in this list, which is why it is reported as unreachable rather than
+# silently absent.
+# Each entry is `[user:pass@]host` — the credentials are PER BOX, because they
+# are: LE-zal/.105, LE-spalnya/.118 and LE-Kitchen/.245 answer to kodi/2441,
+# while LE-vlada/.176 (found 03.10.2026 by DNS `le-vlada.local`) answers to
+# kodi/kodi. Without the inline form that box is probed with the wrong password
+# and reports itself «не отвечает» — a wrong diagnosis, not a real outage.
+# `[user:pass@]host` in KODI_HOSTS, global pair as the fallback.
+KODI_USER = os.getenv("KODI_USER", "")
+KODI_PASS = os.getenv("KODI_PASS", "")
+KODI_HOSTS: list[str] = [h.strip() for h in os.getenv("KODI_HOSTS", "").split(",")
+                         if h.strip()]
+KODI_TIMEOUT = _f("KODI_TIMEOUT", "6")
+
 # --- Runtime limits ---
 WORKER_TIMEOUT = _f("WORKER_TIMEOUT", "120")     # hard cap per /invoke request
 MAX_STEPS = _i("MAX_STEPS", "15")                # CodeAgent steps ceiling

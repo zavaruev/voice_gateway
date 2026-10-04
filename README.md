@@ -1,6 +1,6 @@
 # Voice Gateway
 
-![version](https://img.shields.io/badge/version-v2.34-blue)
+![version](https://img.shields.io/badge/version-v2.36-blue)
 [![tests](https://github.com/zavaruev/voice_gateway/actions/workflows/tests.yml/badge.svg)](https://github.com/zavaruev/voice_gateway/actions/workflows/tests.yml)
 ![python](https://img.shields.io/badge/python-3.12%2B-3776AB?logo=python&logoColor=white)
 ![backend](https://img.shields.io/badge/AI%20backend-Cascade-orange)
@@ -28,7 +28,7 @@ Home Assistant's own voice stack (Wyoming + ESPHome satellites) is the right ans
 | Who is speaking | — | CAMP++ speaker embeddings, cross-device speaker lock |
 | False-wake protection | per-device threshold | an 8-gate cascade (echo ring, appliance noise, distance, clipping, crest factor, …) with a Whisper confirm-rescue band instead of silence |
 
-Honest limits, so nobody is surprised later: the camera subsystem is implemented and tested but currently **disabled in production** (`DISABLE_CAMERAS=true`) — the ESP32 path is what runs live. See [`docs/REFERENCE.md`](docs/REFERENCE.md) → *Known Issues & Current Problems*.
+The camera subsystem is **in test operation** since 04.10.2026, living room first: the wake word there is detected by **decoding** it with a local vosk model (`vosk_wake.py`, 88 MB, CPU-only) rather than by scoring it acoustically — a head trained on 27 recordings of the word learned the envelope instead of the word and fired 114–229 times per hour on the television. Measured: 5/5 live detections, 0 false accepts over 7 minutes of TV. Set `WAKE_VOSK_MODEL_<NAME>` to enable per room; without it a room keeps the acoustic path. See [`docs/REFERENCE.md`](docs/REFERENCE.md) → *Known Issues & Current Problems*.
 
 ### Numbers from the production log
 
@@ -39,7 +39,7 @@ Honest limits, so nobody is surprised later: the camera subsystem is implemented
 | L2 turn with a verified side effect | **3.2–4.0 s** |
 | Wake debounce | ~240 ms (2 of 3 chunks); a single chunk ≥ 0.68 fires immediately |
 | Wake window / watchdog | 15 s / 90 s |
-| Test suite | 177 tests, 12 files, ~2,500 lines |
+| Test suite | 262 tests, 14 files, ~3,550 lines |
 
 ---
 
@@ -82,12 +82,13 @@ Full environment table, backend variants, REST API and OTA: [`docs/REFERENCE.md`
 | **`camera_client.py`** (~2,800 lines) | One `CameraSession` per stream: RTSP mic feed, wake word, cross-camera arbitration, replies into the WebRTC track | Cameras have their own transport and their own hard problem — echo arriving 3–40 s late |
 | **`engine.py`** (~480 lines) | Silero VAD + openWakeWord scoring — the "science" part, pure ONNX calls | Testable without a network, without a camera |
 | **`backends.py`** (~590 lines) | Who answers: `NanobotBackend` / `HermesBackend` / `CascadeBackend` | One interface — the brain is swappable with a single env var |
+| **`telegram_client.py`** (~1,180 lines) | Third request source: Telegram long-polling, chat allowlist, voice note → Whisper → the same backend → text reply (+ optional voice note) | No bot framework — three Bot API calls over the `aiohttp` the process already has; all main.py helpers injected (no import cycle) |
 | **`audio_utils.py`** (~220 lines) | `pack_ogg()` (Opus → Ogg for Whisper) and `is_valid_text()` (drops hallucinations and mic echoes of our own TTS) | Shared by both device paths |
 | **`services/jev-router/`** | **L1** — intent classifier, offline slot resolver, direct Home Assistant calls, weather, chat/expert proxy | ~0.1 s for a simple command, no LLM in the loop |
 | **`services/smolagents-worker/`** | **L2** — smolagents `CodeAgent` with HA / Qdrant / Hermes / weather tools, plus honesty vetoes | Multi-step tasks that must not lie about side effects |
-| **`tests/`** | 177 tests across 12 files | Pins the wake-gate bands, the protocol and the cascade contract |
+| **`tests/`** | 299 tests across 15 files | Pins the wake-gate bands, the protocol, the cascade contract and the Telegram source |
 
-> Production (`docker-compose.yml`) currently runs `LLM_BACKEND=cascade` with **`DISABLE_CAMERAS=true`** — the camera subsystem is implemented and tested but switched off in the live stack; only the ESP32 path is active.
+> Production (`docker-compose.yml`) runs `LLM_BACKEND=cascade` with **one camera enabled** (`CAMERA_STREAMS=livingroom`, `DISABLE_CAMERAS=false`) — cameras entered test operation on 04.10.2026; the ESP32 path remains the main one.
 
 ---
 
@@ -164,18 +165,19 @@ voice_gateway/
 ├── camera_client.py        # per-camera session (RTSP in, WebRTC out)
 ├── engine.py               # Silero VAD + openWakeWord
 ├── backends.py             # Nanobot / Hermes / Cascade backends
+├── telegram_client.py      # Telegram source: long polling, allowlist, /room
 ├── audio_utils.py          # pack_ogg(), is_valid_text()
 ├── config/                 # devices.json, wake-word ONNX heads
 ├── services/
 │   ├── jev-router/         # cascade L1
 │   └── smolagents-worker/  # cascade L2
-├── tests/                  # 177 tests / 12 files
+├── tests/                  # 299 tests / 15 files
 └── docs/
     └── REFERENCE.md        # full config tables, REST API, known issues, changelog
 ```
 
 - **Configuration, REST API, environment variables, known issues and the full changelog:** [`docs/REFERENCE.md`](docs/REFERENCE.md)
-- **Tests:** 177 tests across 12 files covering engine scoring and wake gates, camera arbitration, the ESP32 protocol, cascade streaming, honesty vetoes, router resolution and dialogue memory. Run them inside the container — see [`docs/REFERENCE.md`](docs/REFERENCE.md#tests), the host Python usually lacks `opuslib` / `onnxruntime`.
+- **Tests:** 299 tests across 15 files covering engine scoring and wake gates, the camera audio track and its echo guards, the ESP32 protocol, cascade streaming, honesty vetoes, HA entity matching, router resolution, dialogue memory and the Telegram source (allowlist, ack vs final text, turn timeout, voice turns, `/room`). Run them inside the container — see [`docs/REFERENCE.md`](docs/REFERENCE.md#tests), the host Python usually lacks `opuslib` / `onnxruntime`. CI (`.github/workflows/tests.yml`) runs the same recipe on every push and PR.
 
 ---
 

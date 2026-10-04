@@ -10,6 +10,11 @@
 
 set -o pipefail
 
+# Non-zero if any step that is not a test result failed (e.g. the push).
+# The test gate aborts before anything is shipped, so reaching the end with
+# FAIL=0 means: verified, committed, pushed and deployed.
+FAIL=0
+
 REPO=/mnt/media/docker-compose/ai-prod/voice_gateway
 STACK=/mnt/media/docker-compose/ai-prod
 BRANCH=feat/pause-endpoint
@@ -28,7 +33,10 @@ fi
 echo "проверка зелёная"
 
 echo
-echo "=== 2/5 коммит ==="
+echo "=== 2/5 ветка + коммит ==="
+# Ветка создаётся ДО коммита: раньше коммит уезжал в локальный main,
+# а push падал "src refspec does not match any" — ветки не существовало.
+git checkout -b "$BRANCH" 2>/dev/null || git checkout "$BRANCH"
 git add camera_client.py main.py \
         tests/test_vad_endpoint.py tests/test_camera_client.py \
         scripts/verify_endpoint.sh scripts/ship_endpoint.sh \
@@ -111,8 +119,14 @@ echo "Проверка: bash scripts/verify_endpoint.sh (это и есть ге
 
 echo
 echo "=== 3/5 пуш в ветку (main не трогаем) ==="
-git push -u origin "$BRANCH"
-echo "ветка: $BRANCH — main не изменён"
+if git push -u origin "$BRANCH"; then
+  echo "ветка $BRANCH запушена — main не изменён"
+else
+  echo "PUSH НЕ ПРОШЁ. Коммит остался только локально."
+  echo "  посмотреть: git log --oneline -1"
+  echo "  починить:    git push -u origin $(git rev-parse --abbrev-ref HEAD)"
+  FAIL=1
+fi
 
 echo
 echo "=== 4/5 пересборка и перезапуск шлюза ==="
@@ -141,3 +155,12 @@ echo "  4) если Whisper начал резать фразы — подкру�
 echo "     поlogged floor/rms, без пересборки кода, только restart."
 echo "     Если ВСЁ в cap — опорный уровень не ловится при работающем"
 echo "     телевизоре, и это результат, а не повод крутить дальше."
+
+echo
+echo "=== ИТОГ ==="
+if [ "$FAIL" -eq 0 ]; then
+  echo "  ПРОВЕРЕНО, ЗАКОММИЧЕНО, ЗАПУШЕНО, ЗАДЕПЛОЕНО."
+else
+  echo "  ЕСТЬ НЕЗАВЕРШЁННОЕ — см. выше. Деплой уже мог состояться."
+fi
+exit "$FAIL"

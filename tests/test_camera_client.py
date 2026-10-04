@@ -620,6 +620,159 @@ async def test_accounting_is_a_noop_inside_the_window():
     assert s._rate_check == 100.0, "window must not be reset early"
 
 
+
+
+# --- the greeting must not talk over the command it is waiting for ------
+# Field case 04.10.2026: «компьютер, включи свет» -> the camera answered «Да?».
+# `_vad_has_speech` was False for the whole window (the onset requires
+# `not _processing_utterance`, and a previous turn was still in flight), so
+# `_wake_greeting` read the room as silent — while the VAD reported
+# `speech=True consec=54` and the command never reached Whisper at all.
+
+
+async def _raise_cancelled(_delay):
+    """Stand-in for asyncio.sleep that ends the greeting immediately."""
+    raise asyncio.CancelledError
+
+
+async def _no_sleep(_delay):
+    return None
+
+
+def _greet_session():
+    s = CameraSession.__new__(CameraSession)
+    s.stream_name = "cam"
+    s._wake_detected = True
+    s._vad_has_speech = False       # an in-flight utterance blocks the onset
+    s._vad_speech_consecutive = 54  # ...yet speech frames keep arriving
+    s._wake_greeting_delay = 5.0
+    s._wake_greeting_task = None
+    s._auto_greeting = False
+    s._last_auto_greet_ts = 0.0
+    s.spoken = []
+
+    async def _tts_fetch(text):
+        return b"pcm"
+
+    async def _speak(pcm, text):
+        s.spoken.append(text)
+
+    s._tts_fetch = _tts_fetch
+    s._speak_pcm = _speak
+    return s
+
+
+@pytest.mark.asyncio
+async def test_no_greeting_while_speech_frames_are_still_arriving():
+    """`_last_speech_at` is the honest "is the user talking" signal."""
+    s = _greet_session()
+    s._last_speech_at = time.time()      # speech arriving RIGHT NOW
+    with patch("camera_client.asyncio.sleep", new=_raise_cancelled):
+        await s._wake_greeting()
+    assert s.spoken == [], (
+        "greeting interrupted live speech — this is how «включи свет» was lost"
+    )
+
+
+@pytest.mark.asyncio
+async def test_greeting_still_happens_in_a_quiet_room():
+    """A bare «компьютер» with nobody following it must still be answered."""
+    s = _greet_session()
+    s._last_speech_at = time.time() - 600.0
+    with patch("camera_client.asyncio.sleep", new=_no_sleep):
+        await s._wake_greeting()
+    assert s.spoken == ["Да?"]
+
+
+# --- the firing gate, tested by BEHAVIOUR and not by reading the source ---
+# Three earlier versions of these tests grepped the module source for strings.
+# That is the wrong instrument: the rules are stated IN THE COMMENTS as the
+# mistakes that were made, so a substring search finds the very counter-example
+# it is trying to prove absent. The gate is a method, so it is called.
+
+
+def _gate_session():
+    s = CameraSession.__new__(CameraSession)
+    s.stream_name = "cam"
+    s._wake_suppress_until = 0.0
+    s._last_wake_fired_at = 0.0
+    s._wake_detected = False
+    return s
+
+
+def test_a_wake_fires_when_nothing_is_playing():
+    assert _gate_session()._wake_gate_open(1000.0) is True
+
+
+def test_a_wake_is_muted_only_while_our_own_audio_is_in_the_air():
+    s = _gate_session()
+    s._wake_suppress_until = 1003.0
+    assert s._wake_gate_open(1002.9) is False, "tail of our own playback"
+    assert s._wake_gate_open(1003.1) is True, "a 3 s tail must not eat the next command"
+    assert "echo_tail" in s._wake_gate_reason(1002.9)
+
+
+def test_the_same_breath_cannot_fire_twice():
+    """A second `_fire_wake()` clears `_vad_speech_buf` and destroys the command
+    being collected."""
+    s = _gate_session()
+    s._last_wake_fired_at = 1000.0
+    assert s._wake_gate_open(1000.8) is False
+    assert "same_breath" in s._wake_gate_reason(1000.8)
+    assert s._wake_gate_open(1002.0) is True
+
+
+def test_an_open_dialogue_window_does_not_close_the_gate():
+    """THE regression of 04.10.2026.
+
+    `_wake_detected` stays True for the whole `_wake_timeout` (60 s) after a
+    wake. The gate used to consult it, so a second «компьютер» 8 s after the
+    reply was decoded and thrown away — twice — before the third attempt 28 s
+    later got through.
+    """
+    from camera_client import _WAKE_REARM_DEBOUNCE_S
+
+    s = _gate_session()
+    s._wake_detected = True          # the post-wake dialogue window is open
+    s._last_wake_fired_at = 1000.0  # the first wake
+    later = 1008.0                   # user repeats the word 8 s after the reply
+    assert later - s._last_wake_fired_at > _WAKE_REARM_DEBOUNCE_S
+    assert s._wake_gate_open(later) is True, (
+        "an open dialogue window must not silence the wake word"
+    )
+
+
+def test_the_gate_never_consults_wake_detected():
+    """Not even indirectly: two states differing ONLY in `_wake_detected` must
+    produce the same verdict at every instant."""
+    closed, opened = _gate_session(), _gate_session()
+    closed._wake_detected = True
+    opened._wake_detected = False
+    for t in (1000.0, 1000.5, 1005.0, 1050.0, 1061.0):
+        assert closed._wake_gate_open(t) == opened._wake_gate_open(t), (
+            f"verdict changed at t={t} only because _wake_detected differs"
+        )
+
+
+def test_echo_tail_is_short_enough_to_re_arm():
+    """15 s after a reply is what made «компьютер» stop working.
+
+    Measured 04.10.2026: a reply finished at T blocked every wake word until
+    T+18 s — the user's attempts at +8 s and +11 s were decoded and thrown away.
+    The delayed room echo is `_is_echo`'s job, and it drops such a chunk in
+    `_feed_audio` BEFORE it ever reaches the decoder.
+    """
+    from camera_client import _ECHO_TAIL_S
+
+    assert _ECHO_TAIL_S <= 3.0, "a long tail swallows the user's next command"
+
+
+def test_rearm_debounce_is_sub_second_not_a_minute():
+    from camera_client import _WAKE_REARM_DEBOUNCE_S
+
+    assert 0.3 <= _WAKE_REARM_DEBOUNCE_S <= 3.0
+
+
 # --- a connection that never starts -------------------------------------
 # Field case 04.10.2026 20:18: 25+ reconnects every 3.2 s, no AUDIO STARVED,
 # no heal, no reason logged. Four holes, and this block is the regression test
@@ -653,6 +806,16 @@ def _cycle_session(heal_stalls: int = 3):
     s._rate_starved = 0
     s._min_audio_rate = 0.5
     s._starve_restarts = 3
+    # _end_utterance() touches these; tests that call it need them present.
+    s._vad_speech_buf = bytearray()
+    s._vad_has_speech = True
+    s._vad_speech_consecutive = 5
+    s._vad_silence_frames = 0
+    s._vad_window = []
+    s._vad_silence_limit = 10
+    s._vad_max_duration = 7.0
+    s._end_reason = {}
+    s._wake_detected = False
     s.heals = 0
 
     async def _heal():
@@ -772,154 +935,36 @@ async def test_ffmpeg_stderr_handles_there_being_nothing_to_read():
     assert await s._read_ffmpeg_stderr(_FakeProc(b"")) == ""
 
 
+@pytest.mark.asyncio
+async def test_ambient_utterances_do_not_pollute_the_awake_tally():
+    """The VAD in this room reports speech=True continuously, so the television
+    opens an utterance every ~7 s that _process_utterance throws away.
+    Measured 04.10.2026 21:01-21:05: 70 ends in four minutes, none a command.
+    Counting them makes the tally answer the wrong question — `pause` would
+    mostly mean "the television" — and buries the log at one INFO line per 7 s.
+    """
+    s = _cycle_session()
+    sent = []
 
+    async def _fake_process(_buf):
+        sent.append(_buf)
 
-# --- the greeting must not talk over the command it is waiting for ------
-# Field case 04.10.2026: «компьютер, включи свет» -> the camera answered «Да?».
-# `_vad_has_speech` was False for the whole window (the onset requires
-# `not _processing_utterance`, and a previous turn was still in flight), so
-# `_wake_greeting` read the room as silent — while the VAD reported
-# `speech=True consec=54` and the command never reached Whisper at all.
+    s._process_utterance = _fake_process
 
+    # _end_utterance() is a plain method, not a coroutine — it hands the audio
+    # off with create_task. Awaiting it here would have raised on None.
+    s._vad_speech_buf = bytearray(32000)
+    s._end_utterance("cap 7s")
+    assert s._end_reason == {}, "an ambient utterance reached the tally"
 
-async def _raise_cancelled(_delay):
-    """Stand-in for asyncio.sleep that ends the greeting immediately."""
-    raise asyncio.CancelledError
-
-
-async def _no_sleep(_delay):
-    return None
-
-
-def _greet_session():
-    s = CameraSession.__new__(CameraSession)
-    s.stream_name = "cam"
     s._wake_detected = True
-    s._vad_has_speech = False       # an in-flight utterance blocks the onset
-    s._vad_speech_consecutive = 54  # ...yet speech frames keep arriving
-    s._wake_greeting_delay = 5.0
-    s._wake_greeting_task = None
-    s._auto_greeting = False
-    s._last_auto_greet_ts = 0.0
-    s.spoken = []
-
-    async def _tts_fetch(text):
-        return b"pcm"
-
-    async def _speak(pcm, text):
-        s.spoken.append(text)
-
-    s._tts_fetch = _tts_fetch
-    s._speak_pcm = _speak
-    return s
-
-
-@pytest.mark.asyncio
-async def test_no_greeting_while_speech_frames_are_still_arriving():
-    """`_last_speech_at` is the honest "is the user talking" signal."""
-    s = _greet_session()
-    s._last_speech_at = time.time()      # speech arriving RIGHT NOW
-    with patch("camera_client.asyncio.sleep", new=_raise_cancelled):
-        await s._wake_greeting()
-    assert s.spoken == [], (
-        "greeting interrupted live speech — this is how «включи свет» was lost"
+    s._vad_speech_buf = bytearray(32000)
+    s._end_utterance("cap 7s")
+    assert s._end_reason == {"cap": 1}, (
+        "an awake utterance missed the tally: " + repr(s._end_reason)
     )
 
+    # create_task only schedules; let both tasks run before counting them.
+    await asyncio.sleep(0)
+    assert len(sent) == 2, "both must still reach _process_utterance"
 
-@pytest.mark.asyncio
-async def test_greeting_still_happens_in_a_quiet_room():
-    """A bare «компьютер» with nobody following it must still be answered."""
-    s = _greet_session()
-    s._last_speech_at = time.time() - 600.0
-    with patch("camera_client.asyncio.sleep", new=_no_sleep):
-        await s._wake_greeting()
-    assert s.spoken == ["Да?"]
-
-
-# --- the firing gate, tested by BEHAVIOUR and not by reading the source ---
-# Three earlier versions of these tests grepped the module source for strings.
-# That is the wrong instrument: the rules are stated IN THE COMMENTS as the
-# mistakes that were made, so a substring search finds the counter-example it is
-# trying to prove absent. The gate is a method, so it is called.
-
-
-def _gate_session():
-    s = CameraSession.__new__(CameraSession)
-    s.stream_name = "cam"
-    s._wake_suppress_until = 0.0
-    s._last_wake_fired_at = 0.0
-    s._wake_detected = False
-    return s
-
-
-def test_a_wake_fires_when_nothing_is_playing():
-    assert _gate_session()._wake_gate_open(1000.0) is True
-
-
-def test_a_wake_is_muted_only_while_our_own_audio_is_in_the_air():
-    s = _gate_session()
-    s._wake_suppress_until = 1003.0
-    assert s._wake_gate_open(1002.9) is False, "tail of our own playback"
-    assert s._wake_gate_open(1003.1) is True, "a 3 s tail must not eat the next command"
-    assert "echo_tail" in s._wake_gate_reason(1002.9)
-
-
-def test_the_same_breath_cannot_fire_twice():
-    """A second `_fire_wake()` clears `_vad_speech_buf` and destroys the command
-    being collected."""
-    s = _gate_session()
-    s._last_wake_fired_at = 1000.0
-    assert s._wake_gate_open(1000.8) is False
-    assert "same_breath" in s._wake_gate_reason(1000.8)
-    assert s._wake_gate_open(1002.0) is True
-
-
-def test_an_open_dialogue_window_does_not_close_the_gate():
-    """THE regression of 04.10.2026.
-
-    `_wake_detected` stays True for the whole `_wake_timeout` (60 s) after a
-    wake. The gate used to consult it, so a second «компьютер» 8 s after the
-    reply was decoded and thrown away — twice — before the third attempt 28 s
-    later got through.
-    """
-    from camera_client import _WAKE_REARM_DEBOUNCE_S
-
-    s = _gate_session()
-    s._wake_detected = True          # the post-wake dialogue window is open
-    s._last_wake_fired_at = 1000.0  # the first wake
-    later = 1008.0                   # user repeats the word 8 s after the reply
-    assert later - s._last_wake_fired_at > _WAKE_REARM_DEBOUNCE_S
-    assert s._wake_gate_open(later) is True, (
-        "an open dialogue window must not silence the wake word"
-    )
-
-
-def test_the_gate_never_consults_wake_detected():
-    """Not even indirectly: two states differing ONLY in `_wake_detected` must
-    produce the same verdict at every instant."""
-    closed, opened = _gate_session(), _gate_session()
-    closed._wake_detected = True
-    opened._wake_detected = False
-    for t in (1000.0, 1000.5, 1005.0, 1050.0, 1061.0):
-        assert closed._wake_gate_open(t) == opened._wake_gate_open(t), (
-            f"verdict changed at t={t} only because _wake_detected differs"
-        )
-
-
-def test_echo_tail_is_short_enough_to_re_arm():
-    """15 s after a reply is what made «компьютер» stop working.
-
-    Measured 04.10.2026: a reply finished at T blocked every wake word until
-    T+18 s — the user's attempts at +8 s and +11 s were decoded and thrown away.
-    The delayed room echo is `_is_echo`'s job, and it drops such a chunk in
-    `_feed_audio` BEFORE it ever reaches the decoder.
-    """
-    from camera_client import _ECHO_TAIL_S
-
-    assert _ECHO_TAIL_S <= 3.0, "a long tail swallows the user's next command"
-
-
-def test_rearm_debounce_is_sub_second_not_a_minute():
-    from camera_client import _WAKE_REARM_DEBOUNCE_S
-
-    assert 0.3 <= _WAKE_REARM_DEBOUNCE_S <= 3.0

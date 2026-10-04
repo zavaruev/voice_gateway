@@ -1844,11 +1844,24 @@ class CameraSession:
                 self._end_utterance(f"cap {self._vad_max_duration:.0f}s")
 
             # Level-based endpoint: a pause in the LEVEL, not in Silero's
-            # verdict. Consulted only while an utterance is open, and only when
-            # the room enabled it. `speech` is deliberately NOT required to be
-            # False — in this room it never is, which is the whole reason this
-            # block exists.
-            if getattr(self, "_endpoint", None) is not None and self._vad_has_speech:
+            # verdict. `speech` is deliberately NOT required to be False — in
+            # this room it never is, which is the whole reason this block
+            # exists.
+            #
+            # Gated on an ACTIVE WAKE WINDOW, not merely on "an utterance is
+            # open": this room's VAD reports speech=True continuously, so the
+            # television opens an utterance every 7 s and fills 7 s of buffer
+            # for a transcript that _process_utterance discards one line later
+            # (measured 04.10.2026 21:01-21:05: 70 ends in 4 minutes, none of
+            # them a command). Endpoints on that audio would make the
+            # since-boot tally meaningless — `pause` would mostly count the
+            # television, and the one number that decides whether the endpoint
+            # works would answer the wrong question.
+            if (
+                getattr(self, "_endpoint", None) is not None
+                and self._vad_has_speech
+                and self._wake_detected
+            ):
                 verdict, detail = self._endpoint.feed(orig_rms)
                 if verdict == "end":
                     self._end_utterance(f"pause ({detail})")
@@ -2710,12 +2723,25 @@ class CameraSession:
         self._vad_window.clear()
         if getattr(self, "_endpoint", None) is not None:
             self._endpoint.reset()
-        key = reason.split(" ", 1)[0].split("(", 1)[0]
-        self._end_reason[key] = self._end_reason.get(key, 0) + 1
-        logger.info(
-            f"[{self.stream_name}] VAD UTTERANCE END dur={dur:.0f}ms "
-            f"via {reason} (since boot: {self._end_reason})"
-        )
+        # Tally and log ONLY for utterances a transcript could actually use.
+        # This room's VAD reports speech=True continuously, so a
+        # television-only utterance opens every ~7 s and is discarded by
+        # _process_utterance for want of a wake window. Counting those made the
+        # tally useless — measured 04.10.2026 21:01-21:05: 70 "via cap 7s" in
+        # four minutes, not one of them a command — and put one INFO line every
+        # 7 s into the log, i.e. ~12000 a day.
+        if self._wake_detected:
+            key = reason.split(" ", 1)[0].split("(", 1)[0]
+            self._end_reason[key] = self._end_reason.get(key, 0) + 1
+            logger.info(
+                f"[{self.stream_name}] VAD UTTERANCE END dur={dur:.0f}ms "
+                f"via {reason} (awake ends: {self._end_reason})"
+            )
+        else:
+            logger.debug(
+                f"[{self.stream_name}] ambient utterance ended after "
+                f"{dur:.0f}ms via {reason} — no wake window, discarded"
+            )
         asyncio.create_task(self._process_utterance(buf))
 
     async def _process_utterance(self, buf: bytes):

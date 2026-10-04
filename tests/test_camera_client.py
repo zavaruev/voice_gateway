@@ -620,81 +620,6 @@ async def test_accounting_is_a_noop_inside_the_window():
     assert s._rate_check == 100.0, "window must not be reset early"
 
 
-# --- vosk branch must not fire twice for one utterance ------------------
-
-@pytest.mark.asyncio
-async def test_vosk_branch_skipped_while_wake_window_is_open():
-    """`_fire_wake()` clears `_vad_speech_buf`, so a second call destroys the
-    command being collected.
-
-    The vosk branch used to have no `_wake_detected` guard: after a fire it
-    reset the decoder, re-heard the same word ~0.6 s later in the same phrase
-    («компьютер, включи свет») and called `_fire_wake()` a second time. The
-    openWakeWord branch directly below has always had both guards.
-    """
-    import vosk_wake
-
-    class _FiringMatcher:
-        active = True
-
-        def __init__(self):
-            self.triggers = 0
-            self.decodes = 0
-            self.last_partial = ""
-            self.last_text = "компьютер"
-            self.last_trigger_text = "компьютер"
-            self.feeds = 0
-            self.resets = 0
-
-        def begin(self):
-            pass
-
-        def feed(self, chunk):
-            self.feeds += 1
-            return True      # always "detects"
-
-        def reset(self):
-            self.resets += 1
-
-    s = _make_session()
-    s._vosk_wake = _FiringMatcher()
-    s._wake_detected = True            # wake window is open
-    s._wake_suppress_until = 0.0
-    fired = []
-    async def _boom(reason, score=1.0):
-        fired.append(reason)
-        raise AssertionError("_fire_wake must not run while the wake window is open")
-
-    s._fire_wake = _boom
-    chunk = (1000).to_bytes(2560, "little", signed=True)
-
-    # exercise the guard the same way _vad_process does
-    gated = (
-        s._vosk_wake is not None
-        and not s._wake_detected
-        and __import__("time").time() >= s._wake_suppress_until
-    )
-    assert gated is False, (
-        "vosk branch must be gated on _wake_detected / _wake_suppress_until"
-    )
-    assert fired == []
-    assert s._vosk_wake.feeds == 0, "matcher must not even be fed during the window"
-
-
-@pytest.mark.asyncio
-async def test_vosk_branch_is_gated_exactly_like_the_acoustic_one():
-    """Both detectors must present the SAME guards, or the two paths drift apart
-    again — that is what the shared `_fire_wake()` was introduced to prevent."""
-    import inspect
-    src = inspect.getsource(CameraSession._vad_process)
-    assert "and not self._wake_detected" in src
-    assert "time.time() >= self._wake_suppress_until" in src
-    # the openWakeWord branch keeps its own guards
-    assert src.count("not self._wake_detected") >= 2, (
-        "expected both the vosk and the openWakeWord branch to check it"
-    )
-
-
 # --- the greeting must not talk over the command it is waiting for ------
 # Field case 04.10.2026: «компьютер, включи свет» -> the camera answered «Да?».
 # `_vad_has_speech` was False for the whole window (the onset requires
@@ -716,13 +641,12 @@ def _greet_session():
     s = CameraSession.__new__(CameraSession)
     s.stream_name = "cam"
     s._wake_detected = True
-    s._vad_has_speech = False      # an in-flight utterance blocks the onset
+    s._vad_has_speech = False       # an in-flight utterance blocks the onset
     s._vad_speech_consecutive = 54  # ...yet speech frames keep arriving
     s._wake_greeting_delay = 5.0
     s._wake_greeting_task = None
     s._auto_greeting = False
     s._last_auto_greet_ts = 0.0
-    s._veto_until = 0.0
     s.spoken = []
 
     async def _tts_fetch(text):
@@ -738,11 +662,7 @@ def _greet_session():
 
 @pytest.mark.asyncio
 async def test_no_greeting_while_speech_frames_are_still_arriving():
-    """`_last_speech_at` is the honest "is the user talking" signal.
-
-    With it fresh (speech just arrived), `_wake_greeting` must wait instead of
-    saying «Да?» over a command that has not been transcribed yet.
-    """
+    """`_last_speech_at` is the honest "is the user talking" signal."""
     s = _greet_session()
     s._last_speech_at = time.time()      # speech arriving RIGHT NOW
     with patch("camera_client.asyncio.sleep", new=_raise_cancelled):
@@ -754,8 +674,7 @@ async def test_no_greeting_while_speech_frames_are_still_arriving():
 
 @pytest.mark.asyncio
 async def test_greeting_still_happens_in_a_quiet_room():
-    """The fix must not silence the greeting altogether — a bare «компьютер»
-    with nobody following it should still be answered."""
+    """A bare «компьютер» with nobody following it must still be answered."""
     s = _greet_session()
     s._last_speech_at = time.time() - 600.0
     with patch("camera_client.asyncio.sleep", new=_no_sleep):
@@ -763,23 +682,90 @@ async def test_greeting_still_happens_in_a_quiet_room():
     assert s.spoken == ["Да?"]
 
 
-@pytest.mark.asyncio
-async def test_vosk_is_fed_even_while_a_wake_window_is_open():
-    """The wake word must stay detectable at all times.
+# --- the firing gate, tested by BEHAVIOUR and not by reading the source ---
+# Three earlier versions of these tests grepped the module source for strings.
+# That is the wrong instrument: the rules are stated IN THE COMMENTS as the
+# mistakes that were made, so a substring search finds the counter-example it is
+# trying to prove absent. The gate is a method, so it is called.
 
-    Gating the FEED on `_wake_detected` (added 04.10.2026) made the room deaf
-    for the whole 60 s dialogue window: the user said «компьютер» again and
-    nothing happened, which is indistinguishable from a broken detector. The
-    guard belongs on the FIRING.
+
+def _gate_session():
+    s = CameraSession.__new__(CameraSession)
+    s.stream_name = "cam"
+    s._wake_suppress_until = 0.0
+    s._last_wake_fired_at = 0.0
+    s._wake_detected = False
+    return s
+
+
+def test_a_wake_fires_when_nothing_is_playing():
+    assert _gate_session()._wake_gate_open(1000.0) is True
+
+
+def test_a_wake_is_muted_only_while_our_own_audio_is_in_the_air():
+    s = _gate_session()
+    s._wake_suppress_until = 1003.0
+    assert s._wake_gate_open(1002.9) is False, "tail of our own playback"
+    assert s._wake_gate_open(1003.1) is True, "a 3 s tail must not eat the next command"
+    assert "echo_tail" in s._wake_gate_reason(1002.9)
+
+
+def test_the_same_breath_cannot_fire_twice():
+    """A second `_fire_wake()` clears `_vad_speech_buf` and destroys the command
+    being collected."""
+    s = _gate_session()
+    s._last_wake_fired_at = 1000.0
+    assert s._wake_gate_open(1000.8) is False
+    assert "same_breath" in s._wake_gate_reason(1000.8)
+    assert s._wake_gate_open(1002.0) is True
+
+
+def test_an_open_dialogue_window_does_not_close_the_gate():
+    """THE regression of 04.10.2026.
+
+    `_wake_detected` stays True for the whole `_wake_timeout` (60 s) after a
+    wake. The gate used to consult it, so a second «компьютер» 8 s after the
+    reply was decoded and thrown away — twice — before the third attempt 28 s
+    later got through.
     """
-    src = inspect.getsource(CameraSession._vad_process)
-    feed_at = src.index("self._vosk_wake.feed")
-    guard_at = src.index("self._vosk_suppressed += 1")
-    between = src[feed_at:guard_at]
-    assert "self._vosk_wake is not None" not in between, (
-        "the vosk feed must be unconditional"
+    from camera_client import _WAKE_REARM_DEBOUNCE_S
+
+    s = _gate_session()
+    s._wake_detected = True          # the post-wake dialogue window is open
+    s._last_wake_fired_at = 1000.0  # the first wake
+    later = 1008.0                   # user repeats the word 8 s after the reply
+    assert later - s._last_wake_fired_at > _WAKE_REARM_DEBOUNCE_S
+    assert s._wake_gate_open(later) is True, (
+        "an open dialogue window must not silence the wake word"
     )
-    assert "_wake_detected" in between, (
-        "the FIRING must still be guarded, or _fire_wake runs twice per utterance"
-    )
-    assert "_wake_suppress_until" in between
+
+
+def test_the_gate_never_consults_wake_detected():
+    """Not even indirectly: two states differing ONLY in `_wake_detected` must
+    produce the same verdict at every instant."""
+    closed, opened = _gate_session(), _gate_session()
+    closed._wake_detected = True
+    opened._wake_detected = False
+    for t in (1000.0, 1000.5, 1005.0, 1050.0, 1061.0):
+        assert closed._wake_gate_open(t) == opened._wake_gate_open(t), (
+            f"verdict changed at t={t} only because _wake_detected differs"
+        )
+
+
+def test_echo_tail_is_short_enough_to_re_arm():
+    """15 s after a reply is what made «компьютер» stop working.
+
+    Measured 04.10.2026: a reply finished at T blocked every wake word until
+    T+18 s — the user's attempts at +8 s and +11 s were decoded and thrown away.
+    The delayed room echo is `_is_echo`'s job, and it drops such a chunk in
+    `_feed_audio` BEFORE it ever reaches the decoder.
+    """
+    from camera_client import _ECHO_TAIL_S
+
+    assert _ECHO_TAIL_S <= 3.0, "a long tail swallows the user's next command"
+
+
+def test_rearm_debounce_is_sub_second_not_a_minute():
+    from camera_client import _WAKE_REARM_DEBOUNCE_S
+
+    assert 0.3 <= _WAKE_REARM_DEBOUNCE_S <= 3.0

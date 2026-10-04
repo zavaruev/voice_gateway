@@ -77,6 +77,22 @@ _CORRIDOR_STREAMS = frozenset({"corridor", "corridor1", "corridor2"})
 # whatever the camera negotiated on its backchannel (PCMU/8000 here).
 TTS_PLAY_RATE = 48000
 
+# How long the wake decoder stays deaf AFTER a clip we played ourselves.
+# Only the direct acoustic return needs a timer: `_is_echo` removes the delayed
+# room echo by cross-correlation in `_feed_audio`, before the chunk reaches the
+# decoder, and extends suppression itself when a correlation matches. The old
+# value was 15 s (16 s for the pip) and it silently ate the user's next wake
+# word — measured 04.10.2026, two «компьютер» 8 s and 11 s after the reply were
+# decoded and dropped before the third one got through 28 s later.
+_ECHO_TAIL_S = 3.0
+
+# Same-breath debounce: «...компьютер, да, компьютер, выключи свет» must fire
+# ONCE, because a second `_fire_wake()` clears `_vad_speech_buf` and throws
+# away the command being collected. This replaces `_wake_detected` as the
+# firing guard — a wake word must always be able to re-arm the interaction,
+# which is the entire point of having one.
+_WAKE_REARM_DEBOUNCE_S = 1.5
+
 # How we get audio ONTO the camera speaker. Two paths, and the difference is
 # not cosmetic:
 #
@@ -541,6 +557,7 @@ class CameraSession:
         # question; see the vosk diag log line in _vad_process
         self._vosk_chunks = 0
         self._vosk_suppressed = 0
+        self._last_wake_fired_at = 0.0
         self._vosk_last_peak = 0
         self._vosk_last_log = 0.0
         # Audio-rate watchdog. The stall handlers only catch total timeouts; a
@@ -1597,22 +1614,28 @@ class CameraSession:
                     self._vosk_last_peak, int(np.abs(s16).max())
                 )
                 got_wake = await asyncio.to_thread(self._vosk_wake.feed, chunk)
-                if got_wake and not (
-                    not self._wake_detected
-                    and time.time() >= self._wake_suppress_until
-                ):
-                    # Heard inside an open window (dialogue, or the echo of our
-                    # own reply). Fire anyway and a second `_fire_wake()` clears
-                    # `_vad_speech_buf`, destroying the command being collected
-                    # — so count it, roll the decoder over, and stay silent.
-                    self._vosk_wake.reset()
-                    self._vosk_suppressed += 1
-                    logger.info(
-                        f"[{self.stream_name}] VOSK wake heard while a window "
-                        f"was open — not fired (suppressed="
-                        f"{self._vosk_suppressed})"
-                    )
-                    got_wake = False
+                if got_wake:
+                    # A wake word that HEARD always re-arms the interaction,
+                    # even in the middle of a dialogue — that is what a wake
+                    # word is for, and the old `_wake_detected` guard made the
+                    # room ignore the user for the whole 60 s follow-up window
+                    # (field case 04.10.2026: two «компьютер» decoded and
+                    # dropped). The only thing that must not fire twice is the
+                    # same breath saying the word twice, and that is a
+                    # sub-second event, not a minute.
+                    now_w = time.time()
+                    if not self._wake_gate_open(now_w):
+                        # Our own playback still in the air, or the same
+                        # breath. Roll the decoder over so it cannot re-trigger
+                        # on the same audio, and stay silent.
+                        self._vosk_wake.reset()
+                        self._vosk_suppressed += 1
+                        logger.info(
+                            f"[{self.stream_name}] VOSK wake heard but not "
+                            f"fired: {self._wake_gate_reason(now_w)} "
+                            f"(suppressed={self._vosk_suppressed})"
+                        )
+                        got_wake = False
                 if now - self._vosk_last_log > 300.0:
                     # Deliberately rare: this is a debug aid for "the room is
                     # mute again", not a health line. It reports chunks fed,
@@ -1986,6 +2009,37 @@ class CameraSession:
                                 )
                                 await self._fire_wake(reason="oww")
 
+    def _wake_gate_open(self, now: float) -> bool:
+        """May a wake decoded at `now` actually FIRE?
+
+        Two things close the gate, and neither of them is `_wake_detected`:
+
+        * `echo_tail` — we are still hearing our own playback. This is the only
+          part a timer can decide, and it is deliberately short.
+        * `rearm` — the same breath said the word twice. A second
+          `_fire_wake()` would clear `_vad_speech_buf` and throw away the
+          command being collected.
+
+        `_wake_detected` is deliberately NOT consulted. It stays True for the
+        whole post-wake dialogue window (`_wake_timeout`, 60 s), and using it
+        here is what made the room ignore the user after the first trigger:
+        measured 04.10.2026, two «компьютер» 8 s and 11 s after the reply were
+        decoded and dropped before the third, 28 s later, got through. A wake
+        word exists so that saying it gets attention — always.
+        """
+        if now < self._wake_suppress_until:
+            return False
+        if now - self._last_wake_fired_at < _WAKE_REARM_DEBOUNCE_S:
+            return False
+        return True
+
+    def _wake_gate_reason(self, now: float) -> str:
+        """Which of the two closed the gate — for the log line, so a silent
+        room can be told apart from a deaf one."""
+        if now < self._wake_suppress_until:
+            return f"echo_tail={self._wake_suppress_until - now:+.1f}s"
+        return f"same_breath={now - self._last_wake_fired_at:.1f}s"
+
     async def _fire_wake(self, reason: str, score: float = 1.0):
         """Enter the post-wake state and announce the wake.
 
@@ -1998,6 +2052,7 @@ class CameraSession:
         _arbiter_set_owner(self.stream_name, self._proximity_level())
         self._wake_cmd_sent = False
         self._last_fire_ts = time.time()
+        self._last_wake_fired_at = time.time()
         self._wake_detected = True
         self._wake_expires = time.time() + self._wake_timeout
         self._ww_consec = 0
@@ -3007,10 +3062,18 @@ class CameraSession:
                 self._out_track._last_play_duration = duration
             if not await self._play_audio_http(pcm) and self._out_track:
                 await self._out_track.queue_frame(pcm, sr)
-            # The pip's own acoustic echo returns via the mic 8-15s later and
-            # (AGC-boosted) can re-trigger the wake model — suppress it.
+            # The pip's own acoustic echo returns via the mic seconds later and
+            # can re-trigger the decoder — but `_is_echo` already drops it by
+            # CROSS-CORRELATION in `_feed_audio`, before the chunk ever reaches
+            # vosk, and it is the pip's own pcm that was registered as the
+            # reference. A flat 16 s wall-clock ban on top of that only
+            # swallowed the user: measured 04.10.2026, «компьютер» spoken 8 s
+            # and 11 s after the reply was HEARD and dropped twice
+            # (`suppressed=1,2`), and only the third attempt 28 s later
+            # answered. Keep a short tail for the direct return, and let the
+            # correlation own the delayed one.
             self._wake_suppress_until = max(
-                self._wake_suppress_until, time.time() + 16.0
+                self._wake_suppress_until, time.time() + _ECHO_TAIL_S
             )
             # Only extend speaking_until if not already blocked longer by KWS
             delay = now + 0.35
@@ -3193,10 +3256,15 @@ class CameraSession:
                 self._speaking_until = time.time() + audio_dur + ECHO_TAIL
             global GLOBAL_TTS_UNTIL
             GLOBAL_TTS_UNTIL = time.time() + audio_dur + ECHO_TAIL
-            # Suppress the wake model for the whole delayed-echo window so the
-            # AI's own "компьютер" (echoed back 8-15s later) cannot re-trigger
-            # a beep. The mic itself stays open (handled by _speaking_until).
-            self._wake_suppress_until = time.time() + audio_dur + 15.0
+            # Suppress the decoder for the playback plus a SHORT tail. This used to be
+            # `audio_dur + 15.0`, which is the direct cause of "after the first
+            # trigger the word stops working": a reply finished at T blocked
+            # every «компьютер» until T+18, and the user's next two attempts
+            # were decoded and thrown away. The delayed room return is not this
+            # timer's job — `_is_echo` drops it by cross-correlation in
+            # `_feed_audio` (and extends suppression by up to 20 s when, and
+            # only when, a correlation actually matches).
+            self._wake_suppress_until = time.time() + audio_dur + _ECHO_TAIL_S
         except Exception as e:
             logger.warning(f"[{self.stream_name}] playback error: {e}")
 

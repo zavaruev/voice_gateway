@@ -45,6 +45,7 @@ import asyncio
 import io
 import logging
 import time
+import types
 import wave
 from enum import Enum
 import fractions
@@ -122,6 +123,95 @@ class AudioStreamTrack(MediaStreamTrack):
         await self._queue.put(frame)
 
 
+def _ring_buffer_tail(ring, write, filled, size, take):
+    """Last `take` samples of a ring, chronological, as a contiguous int16
+    array — the exact equivalent of openWakeWord's `list(deque)[-take:]`.
+
+    Free function rather than a method: _use_numpy_ring_buffer installs the
+    patched methods with types.MethodType, and a closure defined *inside* that
+    function is not reachable from them by name.
+    """
+    take = min(take, filled)
+    if take <= 0:
+        return ring[:0]
+    start = (write - take) % size
+    if start + take <= size:
+        return ring[start:start + take]
+    return np.concatenate([ring[start:], ring[:start + take - size]])
+
+
+def _use_numpy_ring_buffer(oww_model) -> None:
+    """Replace openWakeWord's deque-of-Python-ints audio buffer with a numpy ring.
+
+    openWakeWord's AudioFeatures keeps `raw_data_buffer` as a
+    `deque(maxlen=160_000)` and, on every mel update, does
+    `list(self.raw_data_buffer)[-n-480:]` — rebuilding the ENTIRE 10 s
+    history as 160 000 Python objects in order to use 3040 of them. Measured
+    on a 16 kHz livingroom capture: 3.8 ms of a 15.4 ms predict() call, 24% of
+    the whole wake path, spent on garbage. It is the single biggest per-camera
+    cost after the embedding CNN, and it grows with no useful signal.
+
+    The ring holds the same samples in the same order as int16, so the mel
+    model receives bit-identical input (`_get_melspectrogram` casts the list
+    path via `np.array(x).astype(np.int16)` anyway) and every downstream score
+    is unchanged. `tests/test_wake_ring_buffer.py` asserts that equality
+    against real ONNX graphs, because a wake model that silently shifts scores
+    is worse than a slow one.
+
+    Idempotent, and only touches openWakeWord's own two methods — grepped the
+    library: nothing outside utils.py reads `raw_data_buffer`.
+    """
+    feat = oww_model.preprocessor
+    if getattr(feat, "_numpy_ring", False):
+        return
+    size = feat.raw_data_buffer.maxlen
+    feat._ring = np.zeros(size, dtype=np.int16)
+    feat._ring_w = 0
+    feat._ring_n = 0
+
+    def _buffer_raw_data(self, x):
+        arr = np.asarray(x, dtype=np.int16)
+        if len(arr) < 400:
+            raise ValueError(
+                "The number of input frames must be at least 400 samples "
+                "@ 16khz (25 ms)!"
+            )
+        n = len(arr)
+        w = self._ring_w
+        first = min(n, size - w)
+        self._ring[w:w + first] = arr[:first]
+        if n > first:  # wrapped
+            self._ring[:n - first] = arr[first:]
+        self._ring_w = (w + n) % size
+        self._ring_n = min(self._ring_n + n, size)
+
+    def _streaming_melspectrogram(self, n_samples):
+        # list(...)[-n-480:] becomes an int16 view — same samples, no rebuild
+        self.melspectrogram_buffer = np.vstack(
+            (
+                self.melspectrogram_buffer,
+                self._get_melspectrogram(
+                    _ring_buffer_tail(
+                        self._ring, self._ring_w, self._ring_n, size,
+                        n_samples + 160 * 3,
+                    )
+                ),
+            )
+        )
+        if self.melspectrogram_buffer.shape[0] > self.melspectrogram_max_len:
+            self.melspectrogram_buffer = self.melspectrogram_buffer[
+                -self.melspectrogram_max_len:, :
+            ]
+
+    # Bound, not bare: these replace INSTANCE attributes, so a bare function
+    # would be called with no `self` and blow up on the first chunk.
+    feat._buffer_raw_data = types.MethodType(_buffer_raw_data, feat)
+    feat._streaming_melspectrogram = types.MethodType(
+        _streaming_melspectrogram, feat
+    )
+    feat._numpy_ring = True
+
+
 class LocalAudioEngine:
     """Shared inference state for VAD + wake word (one instance per mic).
 
@@ -176,6 +266,7 @@ class LocalAudioEngine:
         else:
             self.oww_model = Model()
             logger.info("Loading openWakeWord built-in models (alexa)...")
+        _use_numpy_ring_buffer(self.oww_model)
         logger.info("Local models initialized.")
 
     def reset_vad(self):

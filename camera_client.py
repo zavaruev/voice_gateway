@@ -34,6 +34,7 @@ All identifiers/comments in English; Russian string literals are runtime data.
 """
 
 import asyncio
+import base64
 import fractions
 import hashlib
 import io
@@ -44,6 +45,7 @@ import re
 import struct
 import time
 from dataclasses import dataclass
+from math import gcd
 
 import aiohttp
 import av
@@ -56,6 +58,51 @@ from audio_utils import is_valid_text
 from engine import LocalAudioEngine, CameraProcessor, AgentState
 
 logger = logging.getLogger("camera")
+
+# go2rtc stream names that count as "the corridor". There is NO plain
+# "corridor" entry any more — the second corridor cam split it into
+# corridor1/corridor2 (frigate/config/config.yaml) — so every `== "corridor"`
+# test below was matching nothing and the corridor-specific mic gain silently
+# stopped applying when the rename happened.
+_CORRIDOR_STREAMS = frozenset({"corridor", "corridor1", "corridor2"})
+
+# Sample rate of everything we push INTO the camera speaker (AIVoiceOutputTrack
+# -> go2rtc -> ONVIF AudioOutput backchannel).
+#
+# This was 8000 and it was WRONG: the OpenIPC speaker runs its output at
+# 48 kHz, so an 8 kHz stream came out six times too fast and an octave too
+# high — "пищит как бурундук". 8 kHz is the rate of the ESP32 leg (Opus to a
+# tiny speaker codec) and the mic feed is 16 kHz; neither sets the camera's
+# playback rate. Note this is the rate of OUR track: go2rtc re-encodes to
+# whatever the camera negotiated on its backchannel (PCMU/8000 here).
+TTS_PLAY_RATE = 48000
+
+# How we get audio ONTO the camera speaker. Two paths, and the difference is
+# not cosmetic:
+#
+# 1. `/play_audio` (PREFERRED) — a plain HTTP POST of raw mono s16le PCM with
+#    the rate in the Content-Type:
+#       curl -u root:PW -X POST --data-binary @x.pcm \
+#            -H 'Content-Type: application/octet-stream;rate=48000' \
+#            http://<cam>/play_audio
+#    (OpenIPC wiki, "How to play audio file on camera's speaker over
+#    network".) Straight into the speaker at the right rate — measured
+#    03.10.2026: a 1000 Hz tone comes back at 1000 Hz and speech F0 239 Hz in
+#    / 235 Hz out, in real time.
+#
+# 2. The go2rtc ONVIF backchannel via the WebRTC sendonly track (FALLBACK) —
+#    broken on this firmware. The camera advertises exactly ONE codec:
+#       m=audio 0 RTP/AVP 0 / a=rtpmap:0 PCMU/8000 / a=sendonly
+#            / a=control:audio-backchannel
+#    ...and then plays that 8 kHz stream at 48 kHz, so everything comes out
+#    ~6x too fast ("пищит как бурундук"). Measured with a tone: 1000 Hz sent,
+#    6000 Hz heard by the camera's own microphone. Pre-stretching by 6 fixes
+#    the pitch but makes every reply take 6x longer to play, so it is not
+#    usable for dialogue — hence /play_audio above.
+#
+# Audio OUTPUT also requires the ONVIF AudioOutput to be enabled on the cam;
+# until it is, /play_audio returns 200 but nothing is heard.
+
 
 
 def _echo_of_reply(norm: str, reply_norm: str) -> bool:
@@ -112,7 +159,7 @@ class AIVoiceOutputTrack(MediaStreamTrack):
 
     kind = "audio"
 
-    def __init__(self, sample_rate: int = 8000):
+    def __init__(self, sample_rate: int = TTS_PLAY_RATE):
         super().__init__()
         self._sample_rate = sample_rate
         # Buffer for ~10 seconds of audio. If the queue fills up, the
@@ -169,7 +216,7 @@ class AIVoiceOutputTrack(MediaStreamTrack):
         self._timestamp += frame.samples
         return frame
 
-    async def queue_frame(self, pcm: bytes, sample_rate: int = 8000):
+    async def queue_frame(self, pcm: bytes, sample_rate: int = TTS_PLAY_RATE):
         # We use `await put` so long TTS replies never overflow the track
         # and drop words in the middle of a sentence.
         frame = self._pcm_to_frame(pcm, sample_rate)
@@ -403,6 +450,21 @@ class CameraConfig:
     speaker_id_url: str = "http://192.168.22.102:8001/identify"
     aec_block_ms: int = 1500
     wake_keyword: str = "компьютер"
+    # Per-room openWakeWord threshold. 0 => the historical default (kitchen
+    # 0.40, everything else 0.30). A room-specific model has its own score
+    # distribution, so its operating point has to be measured, not inherited:
+    # the livingroom head saturates its positives at 1.000 and still fires on
+    # nothing else at 0.70 (36/36 hits, 0/42 false), while the library head it
+    # replaced sat at 0.006 median and reached only 2/36 even at 0.10.
+    wake_threshold: float = 0.0
+    # Path to a vosk model directory. When set, THIS room detects the wake word
+    # by DECODING it (vosk_wake.VoskWakeMatcher) instead of scoring it with
+    # openWakeWord, and the acoustic head is skipped entirely. Empty = acoustic
+    # as before, so corridor/kitchen keep their tuned openWakeWord behaviour.
+    # See vosk_wake's module docstring for the measured numbers: 94 % recall and
+    # 0 false accepts on a held-out television tail, where an acoustic head
+    # trained on this room managed 229 false/hour.
+    wake_vosk_model: str = ""
     wake_timeout: float = 15.0
     vad: object = None
     wakeword_model_path: str = ""
@@ -411,6 +473,13 @@ class CameraConfig:
     # audio track is lost after a camera reboot. If empty, the healer tries to
     # derive it from go2rtc's own /api/streams listing.
     go2rtc_source_url: str = ""
+    # OpenIPC /play_audio endpoint (e.g. http://192.168.22.241/play_audio) plus
+    # its HTTP basic credentials. When set, TTS is POSTed there as raw 48 kHz
+    # mono s16le — the only path that plays at the right pitch on this
+    # firmware. Empty => fall back to the (pitch-broken) go2rtc backchannel.
+    play_audio_url: str = ""
+    play_audio_user: str = ""
+    play_audio_password: str = ""
     # Consecutive ffmpeg stalls before triggering a go2rtc stream re-register.
     heal_stalls: int = 3
 
@@ -430,7 +499,14 @@ class CameraSession:
         self.stream_name = config.stream_name
 
         # LLM backend (BaseLLMBackend from backends.py). None => legacy Nanobot path.
-        self.backend = None
+        # This USED to be a hard `self.backend = None`, which silently threw
+        # away the backend main.start_camera_sessions() builds (Cascade ->
+        # jev-router -> Hermes) and sent every camera command down the legacy
+        # Nanobot WebSocket. Nanobot is retired, so that path 401s on connect
+        # and the camera goes mute after the wake word: observed 03.10.2026 —
+        # "Wake word (openWakeWord)" + "Whisper OK: 'компьютер компьютер'"
+        # followed by "Nanobot error: Cannot connect to host localhost:8765".
+        self.backend = backend
         self.go2rtc_host = config.go2rtc_host
         self.go2rtc_port = config.go2rtc_port
         self.chat_id = config.chat_id or self._make_chat_id(config.stream_name)
@@ -449,6 +525,40 @@ class CameraSession:
 
         self.go2rtc_source_url = config.go2rtc_source_url
         self._heal_stalls = config.heal_stalls
+        # Rate-watchdog knobs: below 50% of real time for 20 s counts as starved
+        # (measured healthy 100-170%, measured broken 3-6%), and after 3 heal
+        # attempts we stop pretending and report a camera reboot is needed.
+        self._min_audio_rate = 0.5
+        self._starve_restarts = 3
+        self._wake_threshold = config.wake_threshold
+        # vosk wake-word config, read in __init__ because _init_audio_processing()
+        # builds the matcher and has no access to the CameraConfig object.
+        self._wake_vosk_model = config.wake_vosk_model
+        # Always defined so _vad_process() can test it without a hasattr guard,
+        # and so tests that build a session via __new__ cannot trip over it.
+        self._vosk_wake = None
+        # diagnostic counters for the "why did the live room stay silent"
+        # question; see the vosk diag log line in _vad_process
+        self._vosk_chunks = 0
+        self._vosk_last_peak = 0
+        self._vosk_last_log = 0.0
+        # Audio-rate watchdog. The stall handlers only catch total timeouts; a
+        # camera whose mic driver wedges keeps delivering a trickle and the
+        # wake word just silently never fires.
+        self._rate_bytes = 0
+        self._rate_start = 0.0
+        self._rate_check = 0.0
+        self._rate_ratio = 1.0
+        self._rate_starved = 0
+        self._play_audio_url = config.play_audio_url
+        # Pre-built Authorization header: aiohttp.BasicAuth is deprecated in
+        # aiohttp 4, and /play_audio is the only place we do HTTP basic auth.
+        self._play_audio_headers = {}
+        if config.play_audio_url and config.play_audio_user:
+            token = base64.b64encode(
+                f"{config.play_audio_user}:{config.play_audio_password or ''}".encode()
+            ).decode()
+            self._play_audio_headers["Authorization"] = f"Basic {token}"
 
         self._vad = config.vad
         if self._vad is not None:
@@ -567,7 +677,32 @@ class CameraSession:
         # (measured live) — its base threshold is lowered so the room stays
         # usable; false-fire protection there still comes from the 2-chunk
         # debounce + cross-camera arbitration.
-        self._ww_thresh = 0.40 if self.stream_name == "kitchen" else 0.30
+        self._ww_base_thresh = self._wake_threshold or (
+            0.40 if self.stream_name == "kitchen" else 0.30
+        )
+        self._ww_thresh = self._ww_base_thresh
+
+        # vosk decoder replaces the acoustic head for this room when configured.
+        # The model is a process-wide singleton (88 MB); only the recogniser is
+        # per stream. A failure here must not take the room down — fall back to
+        # the acoustic path, which is deaf for this word but still handles the
+        # rest of the pipeline.
+        if self._wake_vosk_model:
+            try:
+                from vosk_wake import VoskWakeMatcher
+
+                self._vosk_wake = VoskWakeMatcher(self._wake_vosk_model)
+                logger.info(
+                    f"[{self.stream_name}] vosk wake-word: "
+                    f"{self._wake_vosk_model} "
+                    f"(openWakeWord отключён для этой комнаты)"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[{self.stream_name}] vosk недоступен ({e}), "
+                    f"остаюсь на openWakeWord"
+                )
+                self._vosk_wake = None
 
     @staticmethod
     def _make_chat_id(name: str) -> str:
@@ -774,7 +909,7 @@ class CameraSession:
                 pass
         self._pc = RTCPeerConnection()
 
-        self._out_track = AIVoiceOutputTrack(sample_rate=8000)
+        self._out_track = AIVoiceOutputTrack(sample_rate=TTS_PLAY_RATE)
         self._pc.addTransceiver(self._out_track, direction="sendonly")
         self._pc.addTransceiver("audio", direction="recvonly")
         logger.info(
@@ -896,6 +1031,65 @@ class CameraSession:
         up, down = 16000 // g, rate // g
         return resample_poly(arr, up, down).astype(np.int16).tobytes()
 
+    async def _account_audio_rate(self, nbytes: int) -> bool:
+        """Accumulate delivered audio against wall clock; return True if the
+        stream should be restarted.
+
+        Separate from `_rtsp_audio_loop` so the recovery decision is testable
+        without driving ffmpeg, and so the "restart" signal cannot be confused
+        with task cancellation (which is fatal here, see the call site).
+        """
+        now = time.time()
+        self._rate_bytes += nbytes
+        self._rate_start = self._rate_start or now
+        if now - self._rate_check < 20.0:
+            return False
+
+        span = now - self._rate_start
+        ratio = (
+            self._rate_bytes / (span * 16000 * 2) if span > 0 else 1.0
+        )
+        self._rate_ratio = ratio
+        self._rate_bytes = 0
+        self._rate_start = now
+        self._rate_check = now
+
+        if ratio >= self._min_audio_rate:
+            if self._rate_starved:
+                logger.info(
+                    f"[{self.stream_name}] audio rate recovered: "
+                    f"{ratio*100:.0f}% of real time"
+                )
+            self._rate_starved = 0
+            return False
+
+        self._rate_starved += 1
+        logger.warning(
+            f"[{self.stream_name}] ⚠ AUDIO STARVED: {ratio*100:.0f}% of real "
+            f"time (min {self._min_audio_rate*100:.0f}%), attempt "
+            f"{self._rate_starved}/{self._starve_restarts}"
+        )
+        if self._rate_starved >= self._starve_restarts:
+            # ffmpeg restarts and stream re-registration did not help. Measured
+            # root cause on this hardware: the camera's ai0_P0_MAIN thread
+            # wedges in CamOsTcondTimedWait and aio_dma drops to ~40/s, and only
+            # a CAMERA REBOOT recovers it (ONVIF Reboot is not implemented on
+            # OpenIPC). Say so instead of sitting silent.
+            logger.error(
+                f"[{self.stream_name}] 🔴 CAMERA AUDIO DEAD — ffmpeg restart and "
+                f"stream re-register did not help ({ratio*100:.0f}% of real "
+                f"time). Reboot {self.stream_name} manually; the mic driver "
+                f"wedges and only a power cycle clears it."
+            )
+            self._rate_starved = 0
+            return False
+
+        try:
+            await self._heal_go2rtc_stream()
+        except Exception as e:
+            logger.warning(f"[{self.stream_name}] starve heal error: {e}")
+        return True
+
     async def _recv_audio(self, track):
         """Pull audio frames off the go2rtc WebRTC track until stop().
 
@@ -942,6 +1136,7 @@ class CameraSession:
 
         # Resolve the source URL to (re)register.
         source_url = self.go2rtc_source_url
+        derived = False
         if not source_url:
             try:
                 base = f"http://{self.go2rtc_host}:{self.go2rtc_port}"
@@ -956,10 +1151,25 @@ class CameraSession:
                                 u = p.get("url", "")
                                 if u and u.startswith("rtsp://"):
                                     source_url = u
+                                    derived = True
                                     break
             except Exception as e:
                 logger.warning(
                     f"[{self.stream_name}] heal: failed to query go2rtc streams: {e}"
+                )
+            # go2rtc's own listing is a LOSSY copy of the configured source:
+            # it strips the credentials and the "#backchannel=1" fragment
+            # (rtsp://root:pass@cam/stream=0#backchannel=1 comes back as
+            # rtsp://cam/stream=0). Re-registering from it therefore either
+            # 401s (no credentials) or, worse, succeeds without the speaker
+            # track and this room stops answering out loud from the first
+            # heal on. Say so loudly instead of failing quietly later.
+            if derived and source_url:
+                logger.warning(
+                    f"[{self.stream_name}] heal: using the URL go2rtc reports "
+                    f"({source_url}), which carries no credentials and no "
+                    f"#backchannel=1 — set GO2RTC_SOURCE_URL_{self.stream_name.upper()} "
+                    f"to the verbatim go2rtc config entry"
                 )
 
         if not source_url:
@@ -1038,6 +1248,24 @@ class CameraSession:
                     if not chunk:
                         break
                     self._stall_count = 0
+                    # Rate accounting: the stall handlers above only fire on
+                    # TIMEOUTS, i.e. when ffmpeg stops delivering altogether.
+                    # They cannot see a stream that keeps delivering but at a
+                    # fraction of real time — which is exactly what happened on
+                    # 04.10.2026 and it went unnoticed for over an hour, with
+                    # the wake word simply never firing.
+                    #
+                    # `break` (not an exception) is the recovery signal: it
+                    # leaves the inner read loop, the `finally` reaps ffmpeg and
+                    # control falls through to the reconnect below. Raising
+                    # asyncio.CancelledError here would be caught by the
+                    # `except asyncio.CancelledError: break` of THIS task's
+                    # own handler and terminate the whole loop for good — the
+                    # session would never take audio again even after the
+                    # camera recovered, while still looking healthy (WebRTC
+                    # connected, keepalive ticking, /health ok).
+                    if await self._account_audio_rate(len(chunk)):
+                        break
                     await self._feed_audio(chunk)
             except asyncio.IncompleteReadError:
                 logger.info(f"[{self.stream_name}] RTSP ffmpeg stream ended")
@@ -1078,16 +1306,30 @@ class CameraSession:
                 logger.info(f"[{self.stream_name}] RTSP audio reconnecting in 3s...")
                 await asyncio.sleep(3)
 
-    def _store_tts_echo(self, pcm_8k: bytes) -> None:
-        """Record played TTS audio (8 kHz) into the echo reference ring buffer
-        (upsampled to 16 kHz to match the 16 kHz mic feed)."""
+    def _store_tts_echo(self, pcm: bytes, rate: int = TTS_PLAY_RATE) -> None:
+        """Record played TTS audio into the echo reference ring buffer,
+        resampled to the 16 kHz the mic feed runs at.
+
+        `rate` is whatever we queued on the output track (TTS_PLAY_RATE = 48 kHz).
+        The resampling has to track it: a hardcoded 8k->16k stretch here would
+        leave the reference 3x too long once playback moved to 48 kHz, and
+        _is_echo would stop matching the mic's echo at all.
+        """
         try:
-            arr = np.frombuffer(pcm_8k, dtype=np.int16).astype(np.float32)
+            arr = np.frombuffer(pcm, dtype=np.int16).astype(np.float32)
             if len(arr) == 0:
                 return
-            # 8k -> 16k by sample duplication (TTS is 8k-bandlimited; the mic
-            # records the echoed 8k signal at 16k, so this is the right match).
-            up = np.repeat(arr, 2)
+            if rate != 16000:
+                if rate <= 0 or 16000 % rate:
+                    # Non-integer ratio: resample properly rather than stretch.
+                    from scipy.signal import resample_poly
+
+                    g = gcd(16000, rate)
+                    up = resample_poly(arr, 16000 // g, rate // g).astype(np.float32)
+                else:
+                    up = np.repeat(arr, 16000 // rate)
+            else:
+                up = arr
             n = len(up)
             i0 = self._tts_total % self._tts_ring_len
             if i0 + n <= self._tts_ring_len:
@@ -1325,17 +1567,78 @@ class CameraSession:
                 self._vad_start_time = now
                 asyncio.create_task(self._process_utterance(buf))
 
-            # openWakeWord acoustic wake detector on the live 16k feed. This is
-            # the reliable wake: it matches the *sound* of "компьютер", so it
-            # works in the noisy corridor where Whisper transcription of the
-            # keyword is unreliable (the word simply isn't in the transcript).
-            # Tuned to wake ONLY on a genuine "компьютер": noisy-corridor live
-            # attempts score 0.55-0.78, quiet ambient 0.30-0.55. Threshold 0.58
-            # (was 0.65 — missed real attempts at 0.62 in bg-noise rms~880)
-            # + a 2-chunk debounce kills transient false fires, while the
-            # AGC boost still lifts a quiet "компьютер" (peak ~350 -> 4000).
+            # vosk wake word (rooms configured with WAKE_VOSK_MODEL_<NAME>).
+            # Fed EVERY chunk, with NO VAD gate: the Silero VAD rejects 95 % of
+            # chunks in this room (measured on a real 84 s recording where the
+            # word was plainly audible — 21 of 419 chunks passed), and the decoder
+            # then saw a sparse, discontinuous stream. That is why it fired once
+            # in five attempts while the same file decoded «компьютер» four times
+            # when fed continuously. The VAD exists to delimit utterances for
+            # STT; it has no business discarding audio a streaming decoder needs.
+            #
+            # Guarded exactly like the openWakeWord branch below. Without it the
+            # decoder restarts right after a fire, re-hears the same word ~0.6 s
+            # later and calls _fire_wake() again — and a second call clears
+            # `_vad_speech_buf`, destroying the command that was being
+            # collected. The acoustic path never had this problem because its
+            # 2-of-3 debounce plus `_wake_detected` covered it.
             if (
-                not self._wake_detected
+                self._vosk_wake is not None
+                and not self._wake_detected
+                and time.time() >= self._wake_suppress_until
+            ):
+                if not self._vosk_wake.active:
+                    self._vosk_wake.begin()
+                self._vosk_chunks += 1
+                self._vosk_last_peak = max(
+                    self._vosk_last_peak, int(np.abs(s16).max())
+                )
+                got_wake = await asyncio.to_thread(self._vosk_wake.feed, chunk)
+                if now - self._vosk_last_log > 300.0:
+                    # Deliberately rare: this is a debug aid for "the room is
+                    # mute again", not a health line. It reports chunks fed,
+                    # peak, trigger/decode tallies and the decoder's own live
+                    # hypothesis — which is what actually settled the last two
+                    # silent-room investigations. Raise it to log a silent room.
+                    self._vosk_last_log = now
+                    logger.info(
+                        f"[{self.stream_name}] vosk diag: "
+                        f"chunks={self._vosk_chunks} "
+                        f"peak_max={self._vosk_last_peak} "
+                        f"triggers={self._vosk_wake.triggers} "
+                        f"decodes={self._vosk_wake.decodes} "
+                        f"hyp='{self._vosk_wake.last_partial}'"
+                    )
+                    self._vosk_last_peak = 0
+                if got_wake:
+                    logger.info(
+                        f"[{self.stream_name}] VOSK WAKE "
+                        f"trig='{self._vosk_wake.last_trigger_text}' "
+                        f"conf='{self._vosk_wake.last_text}' "
+                        f"triggers={self._vosk_wake.triggers} "
+                        f"decodes={self._vosk_wake.decodes}"
+                    )
+                    self._vosk_wake.reset()
+                    await self._fire_wake(reason="vosk")
+                    return
+
+            # openWakeWord acoustic wake detector on the live 16k feed. This is
+            # the reliable wake for corridor/kitchen, where Whisper transcription
+            # of the keyword is unreliable (the word simply isn't in the
+            # transcript). Tuned to wake ONLY on a genuine "компьютер":
+            # noisy-corridor live attempts score 0.55-0.78, quiet ambient
+            # 0.30-0.55. Threshold 0.58 (was 0.65 — missed real attempts at 0.62
+            # in bg-noise rms~880) + a 2-chunk debounce kills transient false
+            # fires, while the AGC boost still lifts a quiet "компьютер"
+            # (peak ~350 -> 4000).
+            #
+            # SKIPPED ENTIRELY when this room decodes instead. Both detectors
+            # running at once cost ~13 ms per chunk (~8 % of a core) for nothing
+            # — and the acoustic head is a second, independent source of false
+            # wakes, which is exactly what the livingroom must not have.
+            if (
+                self._vosk_wake is None
+                and not self._wake_detected
                 and self._engine.oww_model is not None
                 and time.time() >= self._wake_suppress_until
                 and time.time() - self._audio_epoch > 5.0
@@ -1347,7 +1650,7 @@ class CameraSession:
                 # fixed gain preserves dynamics (unlike per-chunk peak
                 # normalization, which blinds Silero), and his raw peaks
                 # <=4k * 5 stay clear of clipping.
-                if self.stream_name == "corridor":
+                if self.stream_name in _CORRIDOR_STREAMS:
                     # Adaptive: loud speech must NOT be pushed into the rail
                     # (a square-wave chunk blinds both Silero and the model —
                     # 12:04 trace, raw rms 15500 x5 = clipped).
@@ -1376,7 +1679,7 @@ class CameraSession:
                 _WW_TARGET_PEAK = (
                     6500
                     if self.stream_name == "kitchen"
-                    else 9000 if self.stream_name == "corridor" else 4000
+                    else 9000 if self.stream_name in _CORRIDOR_STREAMS else 4000
                 )
                 if 100 <= raw_peak:
                     s16_w = np.clip(
@@ -1662,38 +1965,40 @@ class CameraSession:
                                 logger.info(
                                     f"[{self.stream_name}] 🎯 Wake word (openWakeWord)"
                                 )
-                                # Claim global interaction ownership so other
-                                # rooms' detectors stand down for this exchange.
-                                _arbiter_set_owner(
-                                    self.stream_name, self._proximity_level()
-                                )
-                                self._wake_cmd_sent = False
-                                self._last_fire_ts = time.time()
-                                self._wake_detected = True
-                                self._wake_expires = time.time() + self._wake_timeout
-                                self._ww_consec = 0
-                                self._ww_recent.clear()
-                                # Reset VAD collection: corridor's permanent noise
-                                # floor keeps _vad_has_speech=True indefinitely
-                                # (consec>100 observed), so the post-wake command
-                                # would otherwise be drowned inside a noise buffer
-                                # that never hits the silence limit. Start the
-                                # command utterance from a clean slate.
-                                self._vad_has_speech = False
-                                self._vad_speech_buf.clear()
-                                self._vad_speech_consecutive = 0
-                                self._vad_silence_frames = 0
-                                asyncio.create_task(self._play_attention("oww"))
-                                # Bare 'компьютер' with no follow-up used to
-                                # end in eternal silence (pip only). After a
-                                # short pause greet via nanobot so the user
-                                # knows they were heard.
-                                # Cap ownership: if nobody responds to pip +
-                                # greeting, release other rooms quickly.
-                                self._wake_expires = min(
-                                    self._wake_expires, time.time() + 14.0
-                                )
-                                self._schedule_wake_greeting()
+                                await self._fire_wake(reason="oww")
+
+    async def _fire_wake(self, reason: str, score: float = 1.0):
+        """Enter the post-wake state and announce the wake.
+
+        Shared by both detectors so the arbitration, pip, greeting and VAD reset
+        cannot drift apart between them. Extracted verbatim from the old inline
+        openWakeWord block — the only change is the `reason` in the log line.
+        """
+        # Claim global interaction ownership so other rooms' detectors stand
+        # down for this exchange.
+        _arbiter_set_owner(self.stream_name, self._proximity_level())
+        self._wake_cmd_sent = False
+        self._last_fire_ts = time.time()
+        self._wake_detected = True
+        self._wake_expires = time.time() + self._wake_timeout
+        self._ww_consec = 0
+        self._ww_recent.clear()
+        # Reset VAD collection: corridor's permanent noise floor keeps
+        # _vad_has_speech=True indefinitely (consec>100 observed), so the
+        # post-wake command would otherwise be drowned inside a noise buffer that
+        # never hits the silence limit. Start the command utterance from a clean
+        # slate.
+        self._vad_has_speech = False
+        self._vad_speech_buf.clear()
+        self._vad_speech_consecutive = 0
+        self._vad_silence_frames = 0
+        asyncio.create_task(self._play_attention(reason))
+        # Bare 'компьютер' with no follow-up used to end in eternal silence (pip
+        # only). After a short pause greet so the user knows they were heard.
+        # Cap ownership: if nobody responds to pip + greeting, release other
+        # rooms quickly.
+        self._wake_expires = min(self._wake_expires, time.time() + 14.0)
+        self._schedule_wake_greeting()
 
     async def _confirm_expiry_watch(self):
         """Confirm window closed with ZERO utterances: that pattern is a bare
@@ -2239,7 +2544,7 @@ class CameraSession:
             return
         self._wake_cmd_sent = True
         _ARB_STATE["cmd_sent"] = time.time()
-        base_thresh = 0.40 if self.stream_name == "kitchen" else 0.30
+        base_thresh = self._ww_base_thresh
         if self._ww_thresh > base_thresh:
             self._ww_thresh = base_thresh
         if time.time() < GLOBAL_TTS_UNTIL:
@@ -2272,7 +2577,7 @@ class CameraSession:
             return
         self._wake_cmd_sent = True
         _ARB_STATE["cmd_sent"] = time.time()
-        base_thresh = 0.40 if self.stream_name == "kitchen" else 0.30
+        base_thresh = self._ww_base_thresh
         if self._ww_thresh > base_thresh:
             logger.info(
                 f"[{self.stream_name}] ✅ real command — wake threshold reset to {base_thresh}"
@@ -2649,7 +2954,7 @@ class CameraSession:
         self._last_attention = now
         logger.info(f"[{self.stream_name}] 🔔 attention pip ({reason})")
         try:
-            sr = 8000
+            sr = TTS_PLAY_RATE
             duration = 0.4
             n = int(sr * duration)
             t = np.arange(n) / sr
@@ -2669,13 +2974,14 @@ class CameraSession:
             env[-fade_n:] = np.linspace(1, 0, fade_n)
             mix = tone * env
             pcm = (mix * 32767).astype(np.int16).tobytes()
-            # The pip's own echo returns through the RTSP backchannel seconds
-            # later; register it in the reference ring so _is_echo recognizes
-            # (and suppresses wake on) the distorted return signal.
+            # The pip's own echo returns through the speaker seconds later;
+            # register it in the reference ring so _is_echo recognizes (and
+            # suppresses wake on) the distorted return signal.
             self._store_tts_echo(pcm)
             if self._out_track:
-                await self._out_track.queue_frame(pcm, sr)
                 self._out_track._last_play_duration = duration
+            if not await self._play_audio_http(pcm) and self._out_track:
+                await self._out_track.queue_frame(pcm, sr)
             # The pip's own acoustic echo returns via the mic 8-15s later and
             # (AGC-boosted) can re-trigger the wake model — suppress it.
             self._wake_suppress_until = max(
@@ -2691,17 +2997,18 @@ class CameraSession:
     async def _play_activation_sound(self):
         """Queue the short "I'm listening" cue on the camera speaker.
 
-        The wav is normalised to 8 kHz mono s16le (the track's contract)
-        and its duration is registered so the echo guard stays closed for
-        exactly as long as the cue sounds.
+        The wav is normalised to 48 kHz mono s16le (the track's contract,
+        TTS_PLAY_RATE) and its duration is registered so the echo guard stays
+        closed for exactly as long as the cue sounds.
         """
         try:
             seg = AudioSegment.from_file(self._activation_wav_path)
-            seg = seg.set_frame_rate(8000).set_channels(1).set_sample_width(2)
+            seg = seg.set_frame_rate(TTS_PLAY_RATE).set_channels(1).set_sample_width(2)
             pcm = seg.raw_data
             if self._out_track:
-                await self._out_track.queue_frame(pcm, 8000)
-                self._out_track._last_play_duration = len(pcm) / (2 * 8000)
+                self._out_track._last_play_duration = len(pcm) / (2 * TTS_PLAY_RATE)
+            if not await self._play_audio_http(pcm) and self._out_track:
+                await self._out_track.queue_frame(pcm, TTS_PLAY_RATE)
         except Exception:
             pass
 
@@ -2720,10 +3027,11 @@ class CameraSession:
             await asyncio.sleep(0.2)
 
     async def _tts_fetch(self, text: str) -> bytes | None:
-        """Synthesize one sentence to PCM (8kHz mono s16le). Split out of
-        _speak so the player can prefetch the NEXT sentence while the current
-        one is still playing — without that overlap the playback queue runs
-        dry between sentences and the speaker stutters with silence gaps."""
+        """Synthesize one sentence to PCM (48kHz mono s16le, the camera
+        speaker's native rate — see TTS_PLAY_RATE). Split out of _speak so the
+        player can prefetch the NEXT sentence while the current one is still
+        playing — without that overlap the playback queue runs dry between
+        sentences and the speaker stutters with silence gaps."""
         headers = {}
         if self.tts_api_key:
             headers["Authorization"] = f"Bearer {self.tts_api_key}"
@@ -2746,7 +3054,7 @@ class CameraSession:
             return None
         try:
             seg = AudioSegment.from_file(io.BytesIO(mp3), format="mp3")
-            sr = 8000
+            sr = TTS_PLAY_RATE
             seg = seg.set_frame_rate(sr).set_channels(1).set_sample_width(2)
             pcm = seg.raw_data
             pcm_arr = np.frombuffer(pcm, dtype=np.int16)
@@ -2769,8 +3077,37 @@ class CameraSession:
             return False
         return await self._speak_pcm(pcm, reply)
 
+    async def _play_audio_http(self, pcm: bytes) -> bool:
+        """POST raw PCM to the camera's OpenIPC /play_audio endpoint.
+
+        The rate travels in the Content-Type (`;rate=48000`), which is how
+        majestic knows how to feed its 48 kHz speaker. Returns False when the
+        endpoint is not configured or the POST failed, so the caller can fall
+        back to the go2rtc backchannel.
+        """
+        if not self._play_audio_url:
+            return False
+        headers = dict(self._play_audio_headers)
+        headers["Content-Type"] = f"application/octet-stream;rate={TTS_PLAY_RATE}"
+        try:
+            async with self.http_session.post(
+                self._play_audio_url,
+                data=pcm,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as r:
+                if r.status == 200:
+                    return True
+                logger.warning(
+                    f"[{self.stream_name}] play_audio HTTP {r.status}"
+                )
+                return False
+        except Exception as e:
+            logger.warning(f"[{self.stream_name}] play_audio failed: {e}")
+            return False
+
     async def _speak_pcm(self, pcm: bytes, reply: str = "") -> bool:
-        sr = 8000
+        sr = TTS_PLAY_RATE
         is_question = bool(_HAS_QUESTION_RE.search((reply or "").strip()))
         self._speaking = True
         # Remember what we said so we can drop the echoed transcript later.
@@ -2785,23 +3122,41 @@ class CameraSession:
             # be checked for our own echo (cross-correlation in _is_echo).
             self._store_tts_echo(pcm)
 
-            # Mute the microphone only now, when the audio is really about
-            # to enter the playback channel.
             audio_dur = len(pcm) / (sr * 2)
-            self._tts_play_end = time.time() + audio_dur
-            if self._out_track:
-                self._out_track._last_play_duration = audio_dur
             echo_tail = 1.5 if is_question else 3.0
+            played = False
 
-            chunk_size = sr * 20 // 1000 * 2
-            for i in range(0, len(pcm), chunk_size):
-                c = pcm[i : i + chunk_size]
-                if len(c) < chunk_size:
-                    c += b"\x00" * (chunk_size - len(c))
+            if self._play_audio_url:
+                # Preferred path: straight to the speaker at the right rate.
+                played = await self._play_audio_http(pcm)
+                if not played:
+                    logger.warning(
+                        f"[{self.stream_name}] falling back to the go2rtc "
+                        f"backchannel — expect a ~6x pitch shift"
+                    )
+
+            if not played:
+                # Fallback: the WebRTC sendonly track -> go2rtc -> ONVIF
+                # backchannel. Timed as before.
+                self._tts_play_end = time.time() + audio_dur
                 if self._out_track:
-                    # We just push chunks asynchronously now; the pacing is
-                    # enforced inside AIVoiceOutputTrack.recv().
-                    await self._out_track.queue_frame(c, sr)
+                    self._out_track._last_play_duration = audio_dur
+                chunk_size = sr * 20 // 1000 * 2
+                for i in range(0, len(pcm), chunk_size):
+                    c = pcm[i : i + chunk_size]
+                    if len(c) < chunk_size:
+                        c += b"\x00" * (chunk_size - len(c))
+                    if self._out_track:
+                        # We just push chunks asynchronously now; the pacing
+                        # is enforced inside AIVoiceOutputTrack.recv().
+                        await self._out_track.queue_frame(c, sr)
+            else:
+                # /play_audio returns as soon as the body is uploaded and the
+                # camera then plays it in real time, so the playback window
+                # starts AFTER the POST, not before it.
+                self._tts_play_end = time.time() + audio_dur
+                if self._out_track:
+                    self._out_track._last_play_duration = audio_dur
 
             # Suppress wake detection AND inbound commands only for the direct
             # playback tail. The delayed TTS echo (returns via the mic 8-15s

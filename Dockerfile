@@ -9,7 +9,7 @@ RUN pip install --no-cache-dir -r requirements.txt speexdsp-ns
 
 RUN curl -L -o silero_vad.onnx https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx
 
-COPY main.py audio_utils.py camera_client.py engine.py .
+COPY main.py audio_utils.py camera_client.py engine.py backends.py telegram_client.py vosk_wake.py .
 # Whole config/ instead of individual files: the runtime caches
 # (config/chat_id_cache.json) are gitignored, so a fresh clone has no such
 # files and a per-file COPY fails the build. Both loaders tolerate a missing

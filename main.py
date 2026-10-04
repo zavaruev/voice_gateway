@@ -3578,6 +3578,30 @@ async def start_camera_sessions():
                 # Consecutive ffmpeg stalls (each ~20s read timeout) before the
                 # healer re-registers the stream in go2rtc.
                 heal_stalls=int(os.getenv("GO2RTC_HEAL_STALLS", "3")),
+                # Speaker output: OpenIPC /play_audio takes raw 48 kHz mono
+                # s16le and is the ONLY path that plays at the right pitch on
+                # this firmware — the go2rtc ONVIF backchannel is 6x too fast
+                # (PCMU/8000 played at 48 kHz). Unset => go2rtc fallback.
+                play_audio_url=(
+                    os.getenv(f"CAMERA_PLAY_AUDIO_URL_{name.upper()}")
+                    or os.getenv("CAMERA_PLAY_AUDIO_URL", "")
+                ),
+                play_audio_user=os.getenv("CAMERA_PLAY_AUDIO_USER", ""),
+                play_audio_password=os.getenv("CAMERA_PLAY_AUDIO_PASSWORD", ""),
+                # Operating point for THIS room's head. A room-specific model
+                # must not inherit the 0.30 default: its score distribution is
+                # its own. Unset/invalid => the historical per-room default.
+                wake_threshold=float(
+                    os.getenv(f"WAKE_WORD_THRESHOLD_{name.upper()}")
+                    or os.getenv("WAKE_WORD_THRESHOLD")
+                    or 0.0
+                ),
+                # Set to a vosk model directory to detect the wake word by
+                # DECODING it instead of scoring it acoustically. Unset = the
+                # openWakeWord path, which is what corridor/kitchen rely on.
+                wake_vosk_model=os.getenv(
+                    f"WAKE_VOSK_MODEL_{name.upper()}"
+                ) or os.getenv("WAKE_VOSK_MODEL", ""),
                 http_session=http,
                 nanobot_url=NANOBOT_WS_URL,
                 nanobot_token=NANOBOT_TOKEN,

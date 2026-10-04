@@ -43,7 +43,7 @@ jobs:
           docker exec vg-ci pip install -q pytest httpx pytest-asyncio
           docker exec vg-ci rm -rf /tmp/vg_src
           docker exec vg-ci mkdir -p /tmp/vg_src
-          for f in audio_utils.py backends.py camera_client.py engine.py main.py; do
+          for f in audio_utils.py backends.py camera_client.py engine.py main.py telegram_client.py vosk_wake.py; do
             docker cp "$f" vg-ci:/tmp/vg_src/"$f"
           done
           docker cp services vg-ci:/tmp/vg_src/services

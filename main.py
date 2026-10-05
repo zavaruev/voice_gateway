@@ -3649,6 +3649,21 @@ async def start_camera_sessions():
                     or os.getenv("CAMERA_TTS_TARGET_PEAK")
                     or 0
                 ),
+                # Follow-up listening windows, so a camera behaves like the
+                # satellites: STANDBY_TIMEOUT_QUESTION 30 s after a question,
+                # STANDBY_TIMEOUT_STATEMENT 10 s after an answer. 0 => built-in
+                # default. Before this the camera closed the mic the instant it
+                # had answered, so every follow-up needed the wake word again.
+                dialogue_question_s=float(
+                    os.getenv(f"CAMERA_DIALOGUE_QUESTION_S_{name.upper()}")
+                    or os.getenv("CAMERA_DIALOGUE_QUESTION_S")
+                    or 0
+                ),
+                dialogue_statement_s=float(
+                    os.getenv(f"CAMERA_DIALOGUE_STATEMENT_S_{name.upper()}")
+                    or os.getenv("CAMERA_DIALOGUE_STATEMENT_S")
+                    or 0
+                ),
                 http_session=http,
                 nanobot_url=NANOBOT_WS_URL,
                 nanobot_token=NANOBOT_TOKEN,

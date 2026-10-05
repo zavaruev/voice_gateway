@@ -1098,3 +1098,164 @@ async def test_ambient_utterances_do_not_pollute_the_awake_tally():
     await asyncio.sleep(0)
     assert len(sent) == 2, "both must still reach _process_utterance"
 
+
+
+# --- the player's end-of-stream sentinel -----------------------------------
+# Measured 05.10.2026 09:54:46 -> 09:56:45: one reply, then 119 s with no
+# VAD SPEECH START at all, and a command spoken in that window got «Да?».
+# The queue carried ["Включила", None]; the loop read TWO items per pass, so
+# the sentinel was consumed as the "next sentence", `sent = nxt` made sent
+# None, and the next pass did `sent = await q.get()` on a queue nobody would
+# ever write to again. `_call_backend` then sat on `wait_for(player_task,
+# 120.0)` — and because the utterance onset requires
+# `not _processing_utterance`, the room could not hear anything for 120 s.
+
+
+def _player_session():
+    s = CameraSession.__new__(CameraSession)
+    s.stream_name = "cam"
+    s._wake_timeout = 60.0
+    s._wake_expires = 0.0
+    s._auto_greeting = False
+    # The player touches these on every sentence. Note that a missing one is
+    # swallowed by the loop's broad `except Exception` and surfaces as
+    # "TTS sentence failed" — which is how a missing attribute in a test helper
+    # reads as a playback bug.
+    s._followup_open = False
+    s._wake_detected = False
+    s._dialogue_question_s = 30.0
+    s._dialogue_statement_s = 10.0
+    s.played = []
+    s.back_to_wake = 0
+
+    async def _tts(text):
+        return b"pcm"
+
+    async def _speak(pcm, reply):
+        s.played.append(reply)
+        return bool(getattr(s, "_next_reply_is_question", False))
+
+    async def _drain():
+        return None
+
+    def _back():
+        s.back_to_wake += 1
+
+    s._tts_fetch = _tts
+    s._speak_pcm = _speak
+    s._wait_playback_drain = _drain
+    s._back_to_wake = _back
+    return s
+
+
+@pytest.mark.asyncio
+async def test_player_terminates_on_the_sentinel_instead_of_blocking():
+    """A one-sentence reply must END, not park on the 120 s backend timeout."""
+    s = _player_session()
+    q: asyncio.Queue = asyncio.Queue()
+    q.put_nowait("Включила")
+    q.put_nowait(None)
+
+    # The 5 s bound IS the assertion: before the fix this never returned.
+    await asyncio.wait_for(s._nanobot_player_task(q), timeout=5.0)
+
+    assert s.played == ["Включила"], f"the reply was dropped: {s.played}"
+    # The window is NOT closed: an answer opens a follow-up window too, so the
+    # room stays audible. Returning at all is the assertion that matters here —
+    # before the sentinel fix this call never returned.
+    assert s._followup_open is True
+    assert s.back_to_wake == 0
+
+
+@pytest.mark.asyncio
+async def test_player_plays_every_sentence_before_the_sentinel():
+    """The sentinel must not swallow the sentence it arrives with."""
+    s = _player_session()
+    q: asyncio.Queue = asyncio.Queue()
+    for line in ("Включила свет", "В гостиной уже включено."):
+        q.put_nowait(line)
+    q.put_nowait(None)
+
+    await asyncio.wait_for(s._nanobot_player_task(q), timeout=5.0)
+
+    assert s.played == ["Включила свет", "В гостиной уже включено."], s.played
+
+
+@pytest.mark.asyncio
+async def test_player_opens_the_dialogue_window_after_a_question():
+    """A question keeps the mic open, an answer does not."""
+    s = _player_session()
+    s._next_reply_is_question = True
+    q: asyncio.Queue = asyncio.Queue()
+    q.put_nowait("Что именно включить?")
+    q.put_nowait(None)
+
+    await asyncio.wait_for(s._nanobot_player_task(q), timeout=5.0)
+
+    assert s._wake_detected is True, "the window must stay open after a question"
+    assert s.back_to_wake == 0, "_back_to_wake must not fire when a question opened"
+
+
+def _dialogue_session(question: bool):
+    s = _player_session()
+    s._next_reply_is_question = question
+    s._dialogue_question_s = 30.0
+    s._dialogue_statement_s = 10.0
+    return s
+
+
+@pytest.mark.asyncio
+async def test_the_microphone_stays_open_after_an_ANSWER_too():
+    """Reported 05.10.2026: "the dialogue setting does not work for cameras the
+    way it does for the ESP32".
+
+    ESP32 does this in main.py `_finalize_turn_followup()` — status LISTENING in
+    BOTH branches, 30 s after a question and 10 s after a statement. The camera
+    opened a window only after a QUESTION, and `_back_to_wake()` closed it the
+    moment it had answered, so "а теперь выключи" was never heard.
+    """
+    s = _dialogue_session(question=False)
+    q: asyncio.Queue = asyncio.Queue()
+    q.put_nowait("Включила")
+    q.put_nowait(None)
+
+    await asyncio.wait_for(s._nanobot_player_task(q), timeout=5.0)
+
+    assert s._wake_detected is True, "the mic closed right after the answer"
+    assert s._followup_open is True
+    assert s.back_to_wake == 0, "_back_to_wake closed a window we had opened"
+    assert s._wake_expires > time.time(), "the window must have an expiry in the future"
+    # ~10 s: the satellite's STANDBY_TIMEOUT_STATEMENT, not the question's 30.
+    assert 5.0 < s._wake_expires - time.time() < 20.0
+
+
+@pytest.mark.asyncio
+async def test_a_followup_window_is_per_turn_not_sticky():
+    """A window opened by an earlier turn must not keep the mic open forever."""
+    s = _dialogue_session(question=True)
+    q: asyncio.Queue = asyncio.Queue()
+    q.put_nowait("Что именно?")
+    q.put_nowait(None)
+    await asyncio.wait_for(s._nanobot_player_task(q), timeout=5.0)
+    assert s._followup_open is True
+
+    # Next turn with playback disabled entirely: no window, so it must close.
+    s2 = _dialogue_session(question=False)
+    s2._followup_open = True          # stale from the previous turn
+    q2: asyncio.Queue = asyncio.Queue()
+    q2.put_nowait(None)               # stream ends with no sentence at all
+    await asyncio.wait_for(s2._nanobot_player_task(q2), timeout=5.0)
+    assert s2.back_to_wake == 1, "a stale flag kept the mic open forever"
+
+
+def test_dialogue_windows_default_to_the_satellite_numbers():
+    """So a camera and an ESP32 answer a follow-up on the same terms."""
+    from camera_client import (
+        CAMERA_DIALOGUE_QUESTION_S,
+        CAMERA_DIALOGUE_STATEMENT_S,
+    )
+
+    assert CAMERA_DIALOGUE_QUESTION_S == 30.0
+    assert CAMERA_DIALOGUE_STATEMENT_S == 10.0
+    cfg = CameraConfig("livingroom")
+    assert cfg.dialogue_question_s == 0.0, "unset must stay 0 in the config"

@@ -76,6 +76,23 @@ _CORRIDOR_STREAMS = frozenset({"corridor", "corridor1", "corridor2"})
 # playback rate. Note this is the rate of OUR track: go2rtc re-encodes to
 # whatever the camera negotiated on its backchannel (PCMU/8000 here).
 TTS_PLAY_RATE = 48000
+# Follow-up listening windows after a reply, per room via ENV (0 => these
+# defaults). They exist because the cameras did NOT listen after an ANSWER,
+# only after a question: `_back_to_wake()` closed the window unconditionally
+# on any non-question reply. Reported 05.10.2026 as "the dialogue setting does
+# not work for cameras the way it does for the ESP32", and it is exactly the
+# asymmetry: `_finalize_turn_followup()` in main.py sets status LISTENING in
+# BOTH branches for satellites, with STANDBY_TIMEOUT_QUESTION 30 s and
+# STANDBY_TIMEOUT_STATEMENT 10 s.
+#
+# The statement window is the short one on purpose — it exists so a natural
+# follow-up ("а теперь выключи") is heard without a second wake word, not so
+# the room stays open to the television. Note what makes that safe here and not
+# a false-wake risk: the wake word is DECODED, so television speech has to
+# actually contain «компьютер» to open the window, and `_wake_gate_open()`
+# still refuses while our own playback is in the air.
+CAMERA_DIALOGUE_QUESTION_S = 30.0
+CAMERA_DIALOGUE_STATEMENT_S = 10.0
 # Peak a synthesised reply is normalised to before it is POSTed to the camera
 # speaker. 20000 of 32767 is 61 % of full scale. Overridable per room via
 # CAMERA_TTS_TARGET_PEAK[_<NAME>] — see CameraConfig.tts_target_peak for why
@@ -669,6 +686,12 @@ class CameraConfig:
     # the level is found by listening and restarting, with no rebuild per
     # iteration — the same rule the pause endpoint follows.
     tts_target_peak: int = 0
+    # Follow-up listening windows, per room, as ENV rather than constants:
+    # 0 => CAMERA_DIALOGUE_QUESTION_S / CAMERA_DIALOGUE_STATEMENT_S. Mirrors the
+    # satellite's STANDBY_TIMEOUT_QUESTION 30 s / STANDBY_TIMEOUT_STATEMENT 10 s
+    # so a camera and an ESP32 answer a follow-up on the same terms.
+    dialogue_question_s: float = 0.0
+    dialogue_statement_s: float = 0.0
 
 
 class CameraSession:
@@ -729,6 +752,10 @@ class CameraSession:
         self._pause_min_speech_frames = config.pause_min_speech_frames
         # 0 => the default, so a half-filled override cannot mute the speaker.
         self._tts_target_peak = config.tts_target_peak or _TTS_TARGET_PEAK_DEFAULT
+        # 0 => the default, so a half-filled override cannot close the window
+        # the user is trying to lengthen.
+        self._dialogue_question_s = config.dialogue_question_s or CAMERA_DIALOGUE_QUESTION_S
+        self._dialogue_statement_s = config.dialogue_statement_s or CAMERA_DIALOGUE_STATEMENT_S
         # Always defined so _vad_process() can test it without a hasattr guard,
         # and so tests that build a session via __new__ cannot trip over it.
         self._vosk_wake = None
@@ -788,6 +815,11 @@ class CameraSession:
         self._last_auto_greet_ts = 0.0
         self._last_tts_reply = ""  # normalized text we last spoke (echo guard)
         self._wake_greeting_delay = 5.0
+        # True while a follow-up window WE opened is still live. The player's
+        # finally block uses it to decide whether it may close the window, and
+        # it must be per-TURN: leftover True from an earlier turn would keep
+        # the mic open forever.
+        self._followup_open = False
         # Wall clock of the most recent VAD "speech" frame. The greeting
         # asks "is the user talking?", and `_vad_has_speech` answers that
         # wrongly while an utterance is in flight (see _wake_greeting).
@@ -3185,6 +3217,9 @@ class CameraSession:
 
     async def _nanobot_player_task(self, q: asyncio.Queue) -> None:
         last_q = False
+        # Per turn: a window opened by an EARLIER turn must not make this turn's
+        # finally block believe it may leave the mic open forever.
+        self._followup_open = False
         # Pipeline TTS: while sentence N is PLAYING, sentence
         # N+1 is already being synthesized. Without this overlap
         # the playback queue runs dry between sentences (each
@@ -3211,7 +3246,27 @@ class CameraSession:
                 # then start its TTS immediately too — its
                 # latency hides behind our playback as well.
                 nxt = await q.get()
-                if nxt is not None:
+                # The sentinel is END OF STREAM and it was just consumed as the
+                # "next sentence". Before this was handled, `nxt` held it, the
+                # `if nxt is not None` check correctly skipped the prefetch, and
+                # then `sent = nxt` made `sent` None — so the loop came back
+                # around to its own exit test and did `sent = await q.get()` on a
+                # queue nobody would ever write to again. It blocked forever.
+                # `_call_backend` then sat on `wait_for(player_task, 120.0)`, and
+                # because the utterance onset requires
+                # `not _processing_utterance`, THE ROOM WAS DEAF FOR THE WHOLE
+                # 120 s after every single reply.
+                #
+                # Measured 05.10.2026 09:54:46 -> 09:56:45: one reply, then 119 s
+                # with no VAD SPEECH START at all, and a command spoken in that
+                # window got the greeting instead, because the utterance was
+                # never committed and nothing reached Whisper.
+                #
+                # NOTE the sentinel must NOT break out HERE: `sent` has not been
+                # played yet, so breaking early would drop the reply on the
+                # floor. Flag it, play, and stop AFTER the playback.
+                stream_done = nxt is None
+                if not stream_done:
                     pending = asyncio.create_task(self._tts_fetch(nxt))
                 try:
                     pcm = await asyncio.wait_for(tts_task, timeout=90.0)
@@ -3222,21 +3277,36 @@ class CameraSession:
                         else False
                     )
                     last_q = bool(is_q)
-                    if is_q:
-                        # Open the follow-up window when the question
-                        # actually FINISHES sounding, not when it was
-                        # merely queued (long replies played long past
-                        # the old queue-time expiry).
+                    # The follow-up window opens when the reply actually
+                    # FINISHES sounding, not when it was merely queued — a long
+                    # reply played long past the old queue-time expiry.
+                    #
+                    # BOTH branches open it, and that is the whole point: a
+                    # camera that closes the mic the instant it has answered
+                    # cannot hear "а теперь выключи", so the user must repeat the
+                    # wake word for every follow-up. main.py's
+                    # `_finalize_turn_followup()` does exactly this for
+                    # satellites (status LISTENING in both branches) and the
+                    # windows are its numbers: 30 s after a question, 10 s after
+                    # a statement.
+                    window = (
+                        self._dialogue_question_s
+                        if is_q
+                        else self._dialogue_statement_s
+                    )
+                    if window > 0:
                         await self._wait_playback_drain()
                         self._wake_detected = True
-                        self._wake_expires = time.time() + (
-                            6.0 if self._auto_greeting else 12.0
-                        )
+                        self._wake_expires = time.time() + window
+                        self._followup_open = True
                         logger.info(
-                            f"[{self.stream_name}] 💬 Dialogue open until "
-                            f"{self._wake_expires:.1f}"
+                            f"[{self.stream_name}] 💬 Follow-up open "
+                            f"({'question' if is_q else 'answer'}) "
+                            f"{window:.0f}s until {self._wake_expires:.1f}"
                         )
                     sent = nxt
+                    if stream_done:
+                        break
                     nxt = None
                 except Exception as e:
                     logger.warning(f"[{self.stream_name}] TTS sentence failed: {e}")
@@ -3244,7 +3314,11 @@ class CameraSession:
         finally:
             if pending:
                 pending.cancel()
-            if not last_q:
+            # Close the window only when we did NOT open one. Deciding from
+            # `last_q` alone is what made the camera deaf after every answer: a
+            # statement set last_q False and the window was torn down even
+            # though the utterance it belonged to had just been dispatched.
+            if not self._followup_open:
                 self._back_to_wake()
 
     def _encode_wav(self, pcm_16k: bytes) -> bytes:

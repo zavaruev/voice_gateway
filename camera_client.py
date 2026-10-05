@@ -127,6 +127,24 @@ _WAKE_REARM_DEBOUNCE_S = 1.5
 # `_echo_of_reply`'s job, not this timer's.
 _SPEAKER_SETTLE_S = 0.3
 
+# Chunks of audio kept BEFORE the VAD confirms speech, seeded into the utterance
+# when it opens. 160 ms each, so 8 is 1.28 s.
+#
+# The VAD needs 3 speech frames inside a 6-frame sliding window to call an onset,
+# which is up to 0.96 s — and until now every chunk in that window was discarded.
+# For a wake-word turn this is invisible, because the wake clears the buffer and
+# the command then starts from silence. For a follow-up it is fatal: «а теперь
+# выключи» is ~1.3 s, so most of it can be thrown away before the buffer opens,
+# and the measured result was an utterance containing no speech at all
+# (raw_rms=496 — the room and nothing else).
+#
+# Overlapping the onset is exactly what a pre-roll is for, and it costs 20 kB.
+# The 7 s duration cap now counts the pre-roll as part of the utterance, so it
+# fires after 7 s of accumulated audio instead of 7 s of post-onset audio; that
+# leaves 5.7 s of speech, still well above the 3.5 s at which Whisper starts
+# chopping sentences (measured 04.10.2026).
+_PREROLL_FRAMES = 8
+
 # Raw peak an utterance must reach to count as the USER inside a follow-up window
 # (one opened by our own reply, with no wake word spoken).
 #
@@ -1082,6 +1100,8 @@ class CameraSession:
 
         self._vad_buf = bytearray()
         self._vad_speech_buf = bytearray()
+        # Audio seen before the VAD confirmed an onset. See _PREROLL_FRAMES.
+        self._preroll: list[bytes] = []
         self._vad_silence_frames = 0
         self._vad_has_speech = False
         self._vad_speech_consecutive = 0
@@ -2005,6 +2025,11 @@ class CameraSession:
         else:
             pcm_16k = await asyncio.to_thread(self._resample_generic, pcm, rate)
             if self._is_echo(pcm_16k):
+                # Counted HERE as well as on the 48 kHz path above. The counter
+                # was first added to only one of the two call sites and read
+                # `echo=0` while `Echo chunk dropped (corr)` was in the log every
+                # few minutes — an instrument that lies is worse than none.
+                self._drop_echo += 1
                 now = time.time()
                 if now - self._last_echo_log > 2.0:
                     self._last_echo_log = now
@@ -2030,6 +2055,15 @@ class CameraSession:
         while len(self._vad_buf) >= chunk_bytes:
             chunk = bytes(self._vad_buf[:chunk_bytes])
             del self._vad_buf[:chunk_bytes]
+
+            # Pre-roll: keep the last `_PREROLL_FRAMES` chunks of audio that has
+            # already passed the mute and echo gates, so the moment the VAD
+            # confirms speech the utterance can start at the beginning of what was
+            # said rather than 0.96 s into it. Filled HERE, after the gates and
+            # before any speech decision, so it can never hold muted audio.
+            self._preroll.append(chunk)
+            while len(self._preroll) > _PREROLL_FRAMES:
+                self._preroll.pop(0)
 
             now = time.time()
             if now - self._last_feed_log >= 3.0:
@@ -2112,7 +2146,8 @@ class CameraSession:
                 if not self._vad_has_speech:
                     if win_speech >= 3 and not self._processing_utterance:
                         logger.info(
-                            f"[{self.stream_name}] VAD SPEECH START rms={orig_rms}"
+                            f"[{self.stream_name}] VAD SPEECH START rms={orig_rms} "
+                            f"(pre-roll {_PREROLL_FRAMES * 0.16:.1f}s)"
                         )
                         self._vad_has_speech = True
                         self._vad_silence_frames = 0
@@ -2120,6 +2155,19 @@ class CameraSession:
                             # A new utterance must not inherit the previous
                             # one's dip run, or it can end before it begins.
                             self._endpoint.reset()
+                        # Seed with the audio that arrived BEFORE the VAD
+                        # confirmed anything.
+                        #
+                        # `win_speech >= 3` over a 6-frame window means the
+                        # utterance opens up to 0.96 s after the user actually
+                        # started speaking, and until now all of that was thrown
+                        # away. Measured 05.10.2026: that is the whole of «а
+                        # теперь выключи» — the wake-word turns work because the
+                        # wake clears the buffer and the command then starts from
+                        # silence, but a follow-up spoken right after the answer
+                        # arrived with its first word missing and never
+                        # transcribed.
+                        self._vad_speech_buf.extend(self._preroll)
                         self._vad_speech_buf.extend(chunk)
                 else:
                     self._vad_speech_buf.extend(chunk)

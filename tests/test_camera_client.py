@@ -18,6 +18,7 @@ import camera_client
 from camera_client import (
     AIVoiceOutputTrack,
     _FOLLOWUP_MIN_PEAK,
+    _PREROLL_FRAMES,
     _SPEAKER_SETTLE_S,
     CameraSession,
     TTS_PLAY_RATE,
@@ -1662,4 +1663,46 @@ def test_the_diag_line_carries_the_drop_counters():
     assert "drop[muted=" in src, (
         "the diag line must carry the drop counters, or a vanished follow-up is "
         "undiagnosable again"
+    )
+
+
+# --- the pre-roll: the utterance must start where the speech started ----------
+#
+# The VAD needs 3 speech frames inside a 6-frame sliding window, so an utterance
+# opens up to 0.96 s after the user began speaking and everything before it used
+# to be discarded. For «а теперь выключи» (~1.3 s) that is most of the sentence,
+# and the measured result was an utterance with no speech in it at all.
+
+
+def test_the_preroll_is_long_enough_to_cover_the_onset_latency():
+    """3-of-6 over 160 ms frames is 0.96 s of confirmation; the pre-roll has to
+    be at least that or it buys nothing."""
+    assert _PREROLL_FRAMES * 0.16 >= 0.96, (
+        f"pre-roll {_PREROLL_FRAMES * 0.16:.2f}s cannot cover the 0.96s the VAD "
+        "takes to confirm an onset"
+    )
+    assert _PREROLL_FRAMES * 2560 <= 64 * 1024, "pre-roll should stay small"
+
+
+def test_the_preroll_ring_keeps_only_the_last_frames():
+    s = _make_session()
+    s._preroll = []
+    for i in range(_PREROLL_FRAMES * 3):
+        s._preroll.append(b"%d" % (i % 256))
+        while len(s._preroll) > _PREROLL_FRAMES:
+            s._preroll.pop(0)
+    assert len(s._preroll) == _PREROLL_FRAMES
+    # The newest frames survive, the oldest are gone.
+    assert s._preroll[-1] == b"%d" % ((_PREROLL_FRAMES * 3 - 1) % 256)
+
+
+def test_the_echo_counter_is_on_both_call_sites():
+    """It was on one of the two `_is_echo` call sites and read `echo=0` while the
+    log showed `Echo chunk dropped (corr)` every few minutes."""
+    import inspect
+
+    src = inspect.getsource(CameraSession._feed_audio)
+    assert src.count("self._drop_echo += 1") == 2, (
+        "both the 48 kHz and the generic-rate path must count, or the counter "
+        "under-reports and cannot be trusted"
     )

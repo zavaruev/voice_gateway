@@ -3588,6 +3588,20 @@ async def start_camera_sessions():
                 ),
                 play_audio_user=os.getenv("CAMERA_PLAY_AUDIO_USER", ""),
                 play_audio_password=os.getenv("CAMERA_PLAY_AUDIO_PASSWORD", ""),
+                # The WebRTC session delivers nothing this gateway uses (the VAD
+                # is fed by the RTSP loop, replies go out over /play_audio) but
+                # every offer makes go2rtc rebuild the stream producer. An
+                # abandoned one left a session nobody read, the camera's send
+                # queue filled to 193 kB and majestic blocked — HTTP 14 s, no
+                # RTSP, "the camera is dead". Measured 05.10.2026: a plain
+                # gateway restart cleared it (14.3 s -> 0.02 s, audio 100 %).
+                # Default true so a room relying on the backchannel as its
+                # playback fallback is unchanged; turn it off for a room that
+                # has /play_audio.
+                webrtc=os.getenv(
+                    f"CAMERA_WEBRTC_{name.upper()}",
+                    os.getenv("CAMERA_WEBRTC", "true"),
+                ).lower() == "true",
                 # Operating point for THIS room's head. A room-specific model
                 # must not inherit the 0.30 default: its score distribution is
                 # its own. Unset/invalid => the historical per-room default.

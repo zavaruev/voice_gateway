@@ -1,34 +1,35 @@
 #!/usr/bin/env bash
-# Self-healing for the living-room camera, which stops producing RTSP audio on
-# its own. Written after the measurements of 05.10.2026, all of which changed
-# the design:
+# Self-healing for the living-room camera.
 #
-#   * HTTP LATENCY ALONE IS NOT A HEALTH SIGNAL. The camera was measured
-#     answering `GET /` in 0.066 s while its RTSP stream was already dead —
-#     a fast web server next to a dead media pipeline. The signal is therefore
-#     BOTH: the camera must answer quickly AND go2rtc must hold a live producer
-#     with a consumer on it.
-#   * `aio_dma` in /proc/interrupts is the PLAYBACK dma, not capture. With
-#     `audio.outputEnabled: true` it sits near zero while audio streams at
-#     100 % of real time. Do not use it.
-#   * `/proc/loadavg` is a constant on this box (11.3 while 88.8 % idle),
-#     inflated by vendor threads parked in D. Not a symptom.
+# MEASURED 05.10.2026 — the first version of this script blamed dying hardware
+# and was wrong. During an "outage" the camera had 193 kB stuck in the send queue
+# of ONE socket (netstat on the box: `tcp 0 193712 192.168.22.241:554
+# 192.168.22.102:37544 ESTABLISHED`). It was not dead: our own gateway had stopped
+# reading, its single-threaded majestic blocked on the full buffer, and it
+# answered HTTP in 14 s while producing no RTSP. `docker restart voice_gateway`
+# cleared it completely — 14.34 s -> 0.021 s, audio back to 100 % of real time,
+# no power cycle and no camera-side restart.
+#
+# So the ladder below starts with US. Rebooting the camera to fix our own
+# back-pressure is the mistake this file used to make.
+#
+# What is still true of the camera, all measured:
+#   * A `majestic` restart does restore audio completely without a power cycle.
+#   * The box is 70-89 % idle with 32 MB free throughout — not CPU or memory.
 #   * `ai0_P0_MAIN` sits in D whether the audio works or not. Not a symptom.
-#   * A `majestic` restart restores audio COMPLETELY without a power cycle —
-#     measured: audio "none" -> "100 % of real time", box uptime unchanged at
-#     8 min. So the ladder starts there and reboots only as a last resort.
-#   * BUT the fault recurs: a reboot bought 5-15 min and a majestic restart
-#     about 3-5 min. This is a hardware/driver fault being mitigated, not fixed.
-#   * Restarting majestic KILLS the go2rtc producer too — it then shows a bare
-#     `recv=None` with zero consumers — so the recovery must re-register the
-#     stream as well, or the room stays mute even though the camera is healthy.
+#   * `aio_dma` is the PLAYBACK dma, not capture. Not a health signal.
+#   * `/proc/loadavg` is a constant here (11.3 while 88.8 % idle), inflated by
+#     vendor threads parked in D. Not a symptom.
+#   * Restarting majestic kills the go2rtc producer (bare `recv=None`, zero
+#     consumers), so re-register the stream after touching the camera.
+#   * HTTP latency alone is not a health signal — it measured 0.066 s while RTSP
+#     was dead and 14 s while alive-but-blocked. Pair it with go2rtc.
 #
 # Install:
 #   (crontab -l 2>/dev/null; echo '*/2 * * * * .../scripts/camera_watchdog.sh >/dev/null 2>&1') | crontab -
 #
-# Recovery is idempotent and rate-limited, and it never reboots a camera it
-# cannot reach: no answer means the network, and a reboot of something you
-# cannot reach costs a boot cycle and fixes nothing.
+# A camera that cannot be reached is never rebooted: no answer means the network,
+# and rebooting something you cannot reach costs a boot cycle and fixes nothing.
 
 set -u
 
@@ -37,8 +38,10 @@ CAM_STREAM="${CAM_STREAM:-livingroom}"
 CAM_SRC_URL="${CAM_SRC_URL:-rtsp://root:2441@192.168.22.241/stream=0#backchannel=1}"
 GO2RTC="${GO2RTC:-http://192.168.22.102:1984}"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/voice_watchdog_ed25519}"
-LOG="${LOG:-/var/log/camera_watchdog.log}"
+LOG="${LOG:-/tmp/camera_watchdog.log}"
 STAMP_FILE="${STAMP_FILE:-/tmp/.camera_watchdog_last}"
+GATEWAY="${GATEWAY:-voice_gateway}"          # our container: the usual culprit
+CAMERA_HOST="${CAMERA_HOST:-192.168.22.241}"
 
 WEDGE_S="${WEDGE_S:-2.5}"          # camera must answer faster than this
 CONFIRM_N="${CONFIRM_N:-2}"         # consecutive bad samples before acting
@@ -58,8 +61,20 @@ cam_ssh() {
       root@"$CAM_IP" "$@" 2>/dev/null
 }
 
+# Seconds for the camera to answer, or nothing at all when it did not answer.
+#
+# The curl EXIT CODE is the whole point here. `-w %{time_total}` prints a number
+# even when the connection is REFUSED — measured: `Connection refused` (exit 7)
+# prints **0.000616 s**, which is faster than any real answer this camera has ever
+# given (0.016-0.031 s healthy). So the first version of this function called a
+# dead box the healthiest thing on the network, and its "unreachable is never
+# rebooted" rule could never fire. Non-zero exit => print nothing => unreachable.
 cam_latency() {
-  curl -s -m 20 -o /dev/null -w '%{time_total}' "http://$CAM_IP/" 2>/dev/null
+  local out
+  out="$(curl -s -m 20 -o /dev/null -w '%{time_total}' "http://$CAM_IP/" 2>/dev/null)" \
+    || return 0
+  [ -n "$out" ] || return 0
+  printf '%s' "$out"
 }
 
 # "up" when go2rtc holds a producer that is actually flowing, with a consumer.
@@ -147,10 +162,27 @@ log "UNHEALTHY stream=$CAM_STREAM state=$STATE http=$(cam_latency)s (${CONFIRM_N
 
 claim || { log "  skipped: attempted less than ${MIN_GAP_S}s ago"; exit 0; }
 
-# --- step 1: restart the media service, then re-register the stream --------
-log "  step 1: restart majestic + re-register the go2rtc stream"
-cam_ssh '/etc/init.d/S95majestic restart >/dev/null 2>&1'
+# --- step 1: OUR side -------------------------------------------------------
+# The reader that stopped draining the camera. This is the step that works, and
+# it was measured working: HTTP 14.34 s -> 0.021 s and audio back to 100 % of real
+# time, with the camera untouched.
+log "  step 1: restart $GATEWAY (the side that stopped reading)"
+docker restart "$GATEWAY" >/dev/null 2>&1
 sleep "$SETTLE_S"
+
+if wait_healthy 8 15; then
+  log "  RECOVERED by restarting $GATEWAY (http ${CAM_LATENCY}s) — the camera was never at fault"
+  exit 0
+fi
+log "  still $STATE after restarting $GATEWAY"
+
+# --- step 2: drop go2rtc's sessions, then the camera's service ---------------
+# Only now is the camera involved at all: its producer has to be re-created after
+# anything on that path is disturbed.
+log "  step 2: re-register the go2rtc stream + restart majestic"
+reregister
+sleep "$SETTLE_S"
+cam_ssh '/etc/init.d/S95majestic restart >/dev/null 2>&1'
 reregister
 
 if wait_healthy 6 15; then
@@ -159,10 +191,10 @@ if wait_healthy 6 15; then
 fi
 log "  still $STATE after majestic restart"
 
-# --- step 2: reboot the box ------------------------------------------------
+# --- step 3: reboot the box ------------------------------------------------
 # Reached only when restarting the service did not help. ONVIF Reboot is not
 # implemented on OpenIPC, so this is SSH or nothing.
-log "  step 2: reboot the camera over SSH"
+log "  step 3: reboot the camera over SSH — last resort, and probably wrong"
 cam_ssh 'nohup sh -c "sleep 1; reboot" >/dev/null 2>&1 &'
 
 wait_healthy $((WAIT_UP_S / 15)) 15 || { log "  camera did not come back"; exit 1; }
@@ -173,5 +205,5 @@ if wait_healthy 6 15; then
   exit 0
 fi
 
-log "  NOT RECOVERED — the camera needs a manual power cycle"
+log "  NOT RECOVERED — every layer restarted, so this is now worth a look"
 exit 1

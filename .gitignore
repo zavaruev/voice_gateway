@@ -47,3 +47,6 @@ config/*.onnx.bak*
 # editor/working-tree backups
 *.bak-*
 main.py.bak*
+
+# Генерируется при инициализации сессии, в репозитории не нужен
+activation.wav

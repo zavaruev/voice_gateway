@@ -14,6 +14,7 @@ import inspect
 import av
 import fractions
 
+import camera_client
 from camera_client import (
     AIVoiceOutputTrack,
     CameraSession,
@@ -185,6 +186,155 @@ def _make_http_session():
         play_audio_password="pw",
     )
     return CameraSession(config=cfg)
+
+
+@pytest.mark.asyncio
+async def test_the_mic_is_muted_while_a_reply_plays_with_no_webrtc_track():
+    """The hard mute is keyed on _speaking_until and _feed_audio returns early
+    on it. It used to be written only `if self._out_track`, so a room playing
+    over /play_audio with the WebRTC session off lost the guard entirely — the
+    reply came back into the decoder as if the user had said it."""
+    s = _make_http_session()
+    s.http_session = _FakeHttp(200)
+    assert s._out_track is None, "no WebRTC session in this test"
+
+    await s._speak_pcm(b"\x03\x04" * 24000, "сказано")  # 0.5 s @ 48 kHz
+
+    assert s._speaking_until > time.time(), "mic left open during playback"
+
+    # And it must actually keep chunks out.
+    fed = []
+    s._feed_audio = lambda pcm, rate=16000: fed.append(pcm)
+    await CameraSession._feed_audio(s, b"\x01\x02" * 160)
+    assert fed == []
+
+
+@pytest.mark.asyncio
+async def test_webrtc_off_never_offers_and_webrtc_on_does(monkeypatch):
+    """Every offer makes go2rtc rebuild the stream producer; an abandoned one
+    left a session nobody read and filled the camera's send queue to 193 kB,
+    which blocked majestic (HTTP 14 s, no RTSP). So with the session disabled no
+    connection attempt may be made at all."""
+    attempts = []
+
+    class _Sess(CameraSession):
+        async def _connect(self):
+            attempts.append(1)
+            self._stopped.set()
+            return False
+
+        async def _init_engine(self):
+            return None
+
+        async def _rtsp_audio_loop(self):
+            self._stopped.set()
+
+    # The supervisor's retry pause is what this test must not wait on.
+    monkeypatch.setattr(camera_client, "_WEBRTC_BACKOFF_MIN_S", 0.0)
+    monkeypatch.setattr(camera_client, "_WEBRTC_BACKOFF_MAX_S", 0.0)
+
+    off = _Sess(CameraConfig(stream_name="cam", webrtc=False))
+    await off.start()
+    await _drain(off)
+    assert attempts == [], "opened a WebRTC session that was disabled"
+
+    on = _Sess(CameraConfig(stream_name="cam", webrtc=True))
+    await on.start()
+    await _drain(on)
+    assert attempts == [1], f"session enabled but not attempted once: {attempts}"
+
+
+@pytest.mark.asyncio
+async def test_the_webrtc_supervisor_backs_off_instead_of_spinning(monkeypatch):
+    """7 offers in 12 minutes is what wedged the camera. An un-answered attempt
+    must be followed by a growing pause, and an answered one resets it."""
+    from camera_client import _WEBRTC_BACKOFF_MAX_S, _WEBRTC_BACKOFF_MIN_S
+
+    sleeps = []
+
+    async def _record(delay):
+        sleeps.append(delay)
+
+    class _Sess(CameraSession):
+        def __init__(self, results):
+            super().__init__(CameraConfig(stream_name="cam"))
+            self._results = list(results)
+
+        async def _connect(self):
+            if not self._results:
+                self._stopped.set()
+                return False
+            return self._results.pop(0)
+
+    wait_for = asyncio.wait_for
+    monkeypatch.setattr(asyncio, "sleep", _record)
+
+    s = _Sess([False, False, False])
+    await wait_for(s._run(), timeout=5)
+
+    assert sleeps[:3] == [
+        _WEBRTC_BACKOFF_MIN_S,
+        _WEBRTC_BACKOFF_MIN_S * 2,
+        _WEBRTC_BACKOFF_MIN_S * 4,
+    ], f"no exponential backoff: {sleeps}"
+    assert max(sleeps) <= _WEBRTC_BACKOFF_MAX_S
+
+    # An answered session resets the ladder instead of inheriting the pause the
+    # failures had built up. The trailing 30 s is the final un-answered attempt
+    # after the answers ran out, which is what proves the reset happened.
+    sleeps.clear()
+    s2 = _Sess([False, True, False])
+    await wait_for(s2._run(), timeout=5)
+    assert sleeps == [_WEBRTC_BACKOFF_MIN_S, _WEBRTC_BACKOFF_MIN_S, 30.0], sleeps
+
+
+@pytest.mark.asyncio
+async def test_a_webrtc_attempt_reports_whether_it_was_answered():
+    """The supervisor's backoff is driven by this bool, so the timeout exit has
+    to say False rather than falling off the end of the function."""
+    import aiohttp
+
+    s = _make_session()
+
+    class _Ws:
+        async def receive(self, timeout=None):
+            raise asyncio.TimeoutError()
+
+        async def send_json(self, _payload):
+            return None
+
+    class _WsCtx:
+        async def __aenter__(self):
+            return _Ws()
+
+        async def __aexit__(self, *a):
+            return False
+
+    class _SessCtx:
+        def __init__(self, *a, **kw):
+            pass
+
+        def ws_connect(self, url):
+            return _WsCtx()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    orig = aiohttp.ClientSession
+    aiohttp.ClientSession = _SessCtx
+    try:
+        assert await s._connect() is False, "un-answered offer reported success"
+    finally:
+        aiohttp.ClientSession = orig
+
+
+async def _drain(session, rounds=6):
+    """Let created tasks run so their side effects are visible."""
+    for _ in range(rounds):
+        await asyncio.sleep(0)
 
 
 class _FakeResp:

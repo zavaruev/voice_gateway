@@ -115,6 +115,15 @@ _ECHO_TAIL_S = 3.0
 # which is the entire point of having one.
 _WAKE_REARM_DEBOUNCE_S = 1.5
 
+# Pause before re-offering the WebRTC session, doubling up to the max. This is
+# not politeness, it is the fix: an un-answered offer still makes go2rtc rebuild
+# the stream producer, and the abandoned session is what filled the camera's
+# send queue to 193 kB and blocked majestic (HTTP 14 s, no RTSP) — measured
+# 05.10.2026. Retrying every 24 s produced 7 offers in 12 min; the same session
+# connected within 90 s of a gateway restart.
+_WEBRTC_BACKOFF_MIN_S = 15.0
+_WEBRTC_BACKOFF_MAX_S = 300.0
+
 # How loud a frame must be, relative to the utterance anchor, to count as
 # SPEECH rather than as background. The pause test uses the windowed percentile
 # above (a responsive question: has the speaker stopped?); this one is about
@@ -653,6 +662,19 @@ class CameraConfig:
     play_audio_url: str = ""
     play_audio_user: str = ""
     play_audio_password: str = ""
+    # Open the WebRTC session at all. Measured 05.10.2026: the session delivers
+    # NOTHING this gateway uses — the VAD is fed by the RTSP loop and TTS goes
+    # out over /play_audio — while its negotiation makes go2rtc rebuild the
+    # stream's producer. When the answer never arrives the supervisor used to
+    # re-offer every 24 s with no pause, and the abandoned offers left sessions
+    # whose send queue on the CAMERA filled to 193 kB, blocking majestic: the
+    # camera then answered HTTP in 11-15 s and produced no RTSP at all, while a
+    # plain `docker restart voice_gateway` cleared it completely (HTTP 14.3 s ->
+    # 0.02 s, audio back to 100 % of real time). So the session is opt-in for
+    # rooms that need its backchannel fallback for playback; a room with
+    # /play_audio configured gains nothing from it. Default stays true so the
+    # rooms relying on the fallback are unchanged.
+    webrtc: bool = True
     # Consecutive ffmpeg stalls before triggering a go2rtc stream re-register.
     heal_stalls: int = 3
     # Level-based utterance endpointing for this room. Off by default because
@@ -775,6 +797,7 @@ class CameraSession:
         self._rate_ratio = 1.0
         self._rate_starved = 0
         self._play_audio_url = config.play_audio_url
+        self.webrtc = config.webrtc
         # Pre-built Authorization header: aiohttp.BasicAuth is deprecated in
         # aiohttp 4, and /play_audio is the only place we do HTTP basic auth.
         self._play_audio_headers = {}
@@ -981,9 +1004,18 @@ class CameraSession:
         """
         self._stopped.clear()
         await self._init_engine()
-        task = asyncio.create_task(self._run())
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+        if self.webrtc:
+            task = asyncio.create_task(self._run())
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+        else:
+            logger.info(
+                f"[{self.stream_name}] WebRTC session disabled (CAMERA_WEBRTC="
+                f"false): audio comes from the RTSP loop and replies go out over "
+                f"/play_audio, so nothing here needs it — and every abandoned "
+                f"offer made go2rtc rebuild the producer, which is what wedged "
+                f"the camera"
+            )
         rtsp_task = asyncio.create_task(self._rtsp_audio_loop())
         self._tasks.add(rtsp_task)
         rtsp_task.add_done_callback(self._tasks.discard)
@@ -1071,16 +1103,35 @@ class CameraSession:
         """Reconnect supervisor: keep _connect() alive until stop() is called.
 
         Any connect failure (go2rtc down, camera rebooting, SDP mismatch)
-        is logged and retried after 5 s instead of killing the session.
+        is logged and retried instead of killing the session.
+
+        The pause between attempts is BACKED OFF, and that is the whole point of
+        this function. `_connect()` returns after 24 s when go2rtc accepts the
+        websocket but never answers the offer, and the supervisor used to call
+        it again immediately: 7 offers in 12 minutes, measured. Every offer makes
+        go2rtc rebuild this stream's producer, and an abandoned one leaves a
+        session that nobody reads — the camera's own send queue then fills
+        (193 kB observed) and blocks majestic, which is the "wedged camera" this
+        was blamed on for hours. Retrying slower costs nothing: the session
+        carries no audio we use, and it did connect within 90 s of a restart.
         """
+        backoff = _WEBRTC_BACKOFF_MIN_S
         while not self._stopped.is_set():
+            connected = False
             try:
-                await self._connect()
+                connected = await self._connect()
             except asyncio.CancelledError:
                 break
             except Exception as exc:
                 logger.warning(f"[{self.stream_name}] {exc}", exc_info=True)
-                await asyncio.sleep(5)
+            if connected:
+                backoff = _WEBRTC_BACKOFF_MIN_S
+                continue
+            logger.info(
+                f"[{self.stream_name}] WebRTC retrying in {backoff:.0f}s"
+            )
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, _WEBRTC_BACKOFF_MAX_S)
 
     @staticmethod
     def _filter_sdp(sdp: str, drop_ip: str = "192.168.22.250") -> str:
@@ -1161,6 +1212,12 @@ class CameraSession:
             logger.debug(f"candidate add failed: {e}")
 
     async def _connect(self):
+        """Negotiate one WebRTC session. Returns True if it was ever answered.
+
+        The bool is the supervisor's only input for its backoff: a session that
+        never got an answer must be retried slowly (see _run), one that did is
+        not a failure even though the socket later closes.
+        """
         sig_url = (
             f"ws://{self.go2rtc_host}:{self.go2rtc_port}"
             f"/api/ws?src={self.stream_name}"
@@ -1214,14 +1271,14 @@ class CameraSession:
                                 logger.warning(
                                     f"[{self.stream_name}] no WebRTC answer in 24s, reconnecting"
                                 )
-                                return
+                                return False
                             continue
                         st = self._pc.connectionState
                         if st not in ("connected", "connecting"):
                             logger.warning(
                                 f"[{self.stream_name}] ICE lost ({st}), reconnecting"
                             )
-                            return
+                            return False
                         ticks += 1
                         if ticks % 10 == 0:
                             logger.info(
@@ -1234,7 +1291,7 @@ class CameraSession:
                         logger.warning(
                             f"[{self.stream_name}] signaling WS closed ({st}), reconnecting"
                         )
-                        return
+                        return answered
 
                     if msg.type != aiohttp.WSMsgType.TEXT:
                         continue
@@ -1264,7 +1321,10 @@ class CameraSession:
                             logger.warning(
                                 f"[{self.stream_name}] WebRTC failed, retrying"
                             )
-                            return
+                            return False
+
+        # Only reached when stop() set the flag: no session worth keeping.
+        return False
 
     @staticmethod
     def _resample_16k(mono_48k: bytes) -> bytes:
@@ -3667,8 +3727,14 @@ class CameraSession:
 
         # Block mic immediately: TTS request takes seconds over network,
         # and queued frames may already be playing out of the camera speaker.
-        if self._out_track:
-            self._speaking_until = time.time() + self._out_track.queue_seconds() + 3.0
+        # With no WebRTC track there are no queued frames, so fall back to the
+        # clip's own length — this guard used to be skipped entirely in that
+        # case, which silently removed the hard mic mute and let the room hear
+        # its own reply.
+        queued = self._out_track.queue_seconds() if self._out_track else (
+            len(pcm) / (TTS_PLAY_RATE * 2)
+        )
+        self._speaking_until = time.time() + queued + 3.0
         try:
             # Record the audio we are about to play so the mic feed can later
             # be checked for our own echo (cross-correlation in _is_echo).
@@ -3716,8 +3782,12 @@ class CameraSession:
             # so we no longer need a long blind lock that would also swallow
             # the user's answer to a question.
             ECHO_TAIL = echo_tail
-            if self._out_track:
-                self._speaking_until = time.time() + audio_dur + ECHO_TAIL
+            # Unconditional, and that is the fix: the hard mic mute in
+            # _feed_audio is keyed on this timestamp, so guarding it on
+            # `self._out_track` removed it entirely for a room playing over
+            # /play_audio. The reply then arrives at the decoder as if the user
+            # had said it.
+            self._speaking_until = time.time() + audio_dur + ECHO_TAIL
             global GLOBAL_TTS_UNTIL
             GLOBAL_TTS_UNTIL = time.time() + audio_dur + ECHO_TAIL
             # Suppress the decoder for the playback plus a SHORT tail. This used to be

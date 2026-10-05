@@ -383,27 +383,77 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
   for exactly this, and the deterministic refusal is what kept it from getting
   there. The refusal is now noun-aware and returns an error L2 can act on.
 
-- **THE LIVING-ROOM CAMERA'S AUDIO DRIVER IS DYING — measured repeatedly on
-  05.10.2026, and it is hardware, not software.** The full sequence, measured:
-  * `majestic` restart restores audio COMPLETELY with NO power cycle: audio
-    "none" -> **100 % of real time**, box uptime unchanged at 8 min. So the
-    user's instinct was right — a service hangs, not the whole system.
-  * **But it recurs within minutes.** A reboot bought 5–15 min, a `majestic`
-    restart 3–5 min. Two full runs of the recovery ladder, each ending in
-    `NOT RECOVERED`, the second time even after a real reboot.
-  * The box is IDLE through all of it: 70–89 % idle, 32 MB of memory free. It is
-    not CPU or memory pressure.
-  * `ai0_P0_MAIN` sits in `D` with `wchan=CamOsTcondTimedWait` **whether the
-    audio works or not** — it was present during a 100 %-of-real-time capture.
-    **Not a symptom**; the earlier note naming it as the culprit is withdrawn.
-  * Restarting `majestic` also kills the go2rtc producer: it then shows a bare
-    `recv=None` with zero consumers, so any recovery MUST re-register the
-    stream or the room stays mute on a perfectly healthy camera.
+- **THE "DYING CAMERA" WAS US ALL ALONG — the gateway's own WebRTC churn
+  wedged it. Measured 05.10.2026; the hardware-fault story below is WITHDRAWN.**
+  It looked exactly like failing silicon: `majestic` restart brought audio back
+  ("none" -> 100 % of real time) and then it wedged again within minutes, twice
+  over a real reboot. What actually ended it:
+
+  | | before | after `docker restart voice_gateway` |
+  |---|---|---|
+  | connections on 554 | 3, one with **Send-Q 193712** | **0** |
+  | `GET /` | **14.34 s** | **0.021 s** |
+  | audio straight off the camera | **none** | **100 % of real time** |
+
+  The `Send-Q 193712` was the whole answer: the camera had written 193 kB into a
+  socket that **our side never read**. Its single-threaded majestic then blocked
+  on the full send buffer, so the web UI answered in 14 s and RTSP produced
+  nothing — a fast-looking box that is completely deaf. `docker restart
+  voice_gateway` dropped the reader and it recovered instantly, with no power
+  cycle and no service restart on the camera at all.
+
+  **The mechanism, and it is ours:** `_connect()` offers `webrtc/offer` on
+  `src=livingroom`, which makes **go2rtc rebuild that stream's producer**. When
+  go2rtc accepted the websocket but never answered (7 offers in 12 min, measured)
+  the offer was **abandoned**, leaving a producer with nobody consuming it — go2rtc
+  stopped reading the camera, and the camera's send queue filled. That is the
+  24 s retry loop, and `_run()` re-entered `_connect()` with **no pause at all**,
+  so it was permanent churn. Two fixes, both measured:
+  1. **Exponential backoff** in `_run()` (15 s -> 300 s cap, reset on an answered
+     session). The session carries no audio we use, so retrying slowly costs
+     nothing; it did connect within 90 s of a restart.
+  2. **`CAMERA_WEBRTC[_<NAME>]=false`** — no offer is made at all. Set on the
+     living room, which has `/play_audio`, so it needs the session for nothing.
+     Default stays `true` because for a room **without** `/play_audio` the
+     sendonly track is the only playback path left.
+
+  **The WebRTC session delivers NOTHING this gateway uses** — `_recv_audio` runs
+  Opus decode and discards it (the VAD is fed by the RTSP loop) and replies go
+  out over `/play_audio`. It was described earlier in this file as "there for a
+  keepalive that nothing reads"; that was right and the cost was much higher than
+  CPU.
+
+  **A guard this bug would have exposed silently:** `_speak_pcm` wrote
+  `_speaking_until` only `if self._out_track`. That timestamp is the hard mic mute
+  in `_feed_audio`, so with the session off the room would have heard **its own
+  reply** come back through the decoder. It is now unconditional, and the pre-POST
+  block falls back to the clip's own length when there is no track.
+
+- **MEASURE THE SEND QUEUES BEFORE CALLING A BOX DEAD.** `netstat -ant` on the
+  camera, one line per connection, is the instrument that settled this:
+  `tcp 0 193712 192.168.22.241:554 192.168.22.102:37544 ESTABLISHED` — 193 kB
+  written and unread. It answers three questions at once: who is not reading (the
+  peer), how badly (the byte count), and whether the box is at fault (a large
+  Send-Q is the box waiting on us, not the box failing). Still on record, all
+  measured 05.10.2026:
+  * A `majestic` restart does restore audio **completely without a power cycle**
+    — audio "none" -> 100 % of real time, uptime unchanged at 8 min. So the
+    user's instinct was right that a service hangs rather than the whole system.
+    It is also only a band-aid: the room wedged again minutes later.
+  * The box is **70-89 % idle** with 32 MB free throughout. Not CPU or memory.
+  * `ai0_P0_MAIN` sits in `D` with `wchan=CamOsTcondTimedWait` **whether the audio
+    works or not** — present during a 100 %-of-real-time capture. **Not a
+    symptom**; the earlier note naming it as the culprit is withdrawn.
+  * Restarting `majestic` also kills the go2rtc producer (bare `recv=None`, zero
+    consumers), so any camera-side recovery MUST re-register the stream or the
+    room stays mute on a perfectly healthy camera.
   * `HTTP latency alone is not a health signal`: the camera measured 0.066 s
-    while its RTSP stream was already dead. The watchdog checks BOTH.
-  **Consequence:** `scripts/camera_watchdog.sh` is a MITIGATION, not a fix. It
-  cuts the outage from "until a human notices" to ~1 min, but the camera needs
-  repair or replacement. Do not spend more time tuning software on it.
+    while RTSP was already dead, and 14 s while it was alive-but-blocked. Pair it
+    with a producer that has a non-null `recv` and a consumer.
+  **Consequence:** `scripts/camera_watchdog.sh` stays as a mitigation, but its
+  first step is now the one that actually works — **restart the gateway**, not the
+  camera. Nothing in it reboots hardware to fix our own back-pressure.
+
 - **THE CAMERA IS REACHABLE OVER SSH (root@192.168.22.241, dropbear), and two
   "symptoms" in this file are measurement errors, not faults.** Added 05.10.2026 so
   that nobody re-derives them:
@@ -599,6 +649,7 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
 | `TELEGRAM_MAX_VOICE_S` / `TELEGRAM_TURN_TIMEOUT` / `TELEGRAM_COOLDOWN_S` | `60` / `120` / `1.5` | Voice length cap, per-turn cap, spacing between turn starts in one chat |
 | `WAKE_VOSK_MODEL_<NAME>` | `""` | Per-room vosk model dir. Set => that room DECODES the wake word and the acoustic head is skipped. Empty => openWakeWord (corridor/kitchen) |
 | `CAMERA_PAUSE_ENDPOINT[_<NAME>]` | `false` | Per-room level-based utterance endpointing (removes the 7 s wait). **Off by default** — it changes WHEN a command is dispatched; enable only after reading that room's `UTTERANCE END` lines on real audio |
+| `CAMERA_WEBRTC[_<NAME>]` | `true` | Open the WebRTC session at all. Set `false` for a room that has `/play_audio`: the session feeds the VAD nothing (audio comes from the RTSP loop) and delivers replies nowhere we read, but every `webrtc/offer` makes go2rtc rebuild the producer, and an abandoned one fills the **camera's** send queue and blocks majestic (measured 05.10.2026). Keep `true` where the sendonly track is the only playback path |
 | `CAMERA_TTS_TARGET_PEAK[_<NAME>]` | `0` (=> 20000) | Peak a reply is normalised to before the camera plays it, per room. 0 => built-in 20000 (61 % of full scale). Exists for the **unresolved** crackling playback report of 05.10.2026 — the gateway's own audio is measured clean, so the camera's output stage is the remaining suspect and the level has to be found by ear. Applies in **both** directions (dead band 0.85..1.2), so lowering it is actually audible |
 
 ## Gotchas

@@ -3597,13 +3597,39 @@ class CameraSession:
             pass
 
     async def _wait_playback_drain(self) -> None:
-        """Block until the WebRTC output queue has actually finished playing.
+        """Block until the reply has actually STOPPED sounding.
 
-        Used before opening the dialogue follow-up window: the window must
-        start when the question STOPS sounding, not when it was queued.
+        Used before opening the dialogue follow-up window: the window must start
+        when the answer ends, not when it was queued.
+
+        This used to return immediately whenever there was no WebRTC output
+        track — and there almost never is one, because the session mostly fails
+        to get an answer from go2rtc, so `_out_track` stayed None. The window
+        therefore opened while the camera was still playing: measured 05.10.2026,
+        `Follow-up open` landed 0.07 s after the TTS fetch while `_speaking_until`
+        ran 4.3 s further, so for those 4.3 s the window was "open" and the mic
+        was hard-muted — anything the user said was discarded. That is the room
+        being deaf straight after it answers, and it is why the 10 s statement
+        window felt like it never arrived.
+
+        Without a track the playback end is known exactly: `_tts_play_end` is
+        written from the clip's own length after the POST returns — which is when
+        the camera starts playing — so it is the moment the sound stops. It is
+        only honoured when it is still in the future, so a stale value from the
+        previous turn cannot park the player for the length of a whole reply.
+
+        `_speaking_until` is deliberately NOT used as the bound: it adds the
+        echo tail on top of the audio, and the window should open when the answer
+        is over, not 3 s into the quiet that follows it.
         """
         ot = self._out_track
         if not ot:
+            now = time.time()
+            end = getattr(self, "_tts_play_end", 0.0)
+            if end <= now:
+                return
+            while not self._stopped.is_set() and time.time() < end:
+                await asyncio.sleep(0.1)
             return
         while not self._stopped.is_set():
             if ot.queue_seconds() < 0.1 and time.time() >= self._speaking_until - 1.6:

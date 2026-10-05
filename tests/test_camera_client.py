@@ -210,6 +210,53 @@ async def test_the_mic_is_muted_while_a_reply_plays_with_no_webrtc_track():
 
 
 @pytest.mark.asyncio
+async def test_the_followup_window_waits_for_the_reply_to_finish_sounding():
+    """The window must open when the answer STOPS, not when it was queued.
+
+    `_wait_playback_drain` used to return immediately with no WebRTC track — and
+    there almost never is one — so the window opened while the camera was still
+    talking while `_speaking_until` held the mic hard-muted. Measured
+    05.10.2026: `Follow-up open` 0.07 s after the TTS fetch against a playback
+    that ran 4.3 s longer, so for those 4.3 s anything the user said was thrown
+    away. That is the room being deaf immediately after it answers.
+    """
+    s = _make_http_session()
+    s.http_session = _FakeHttp(200)
+    assert s._out_track is None, "no WebRTC track in this test"
+
+    # A 2 s reply: the drain must not return before it has finished.
+    pcm = b"\x03\x04" * int(TTS_PLAY_RATE * 2)
+    await s._speak_pcm(pcm, "Включила")
+
+    drained_at = time.monotonic()
+    await s._wait_playback_drain()
+    waited = time.monotonic() - drained_at
+
+    assert waited > 0.3, (
+        f"returned in {waited:.2f}s — the window opened while the reply played"
+    )
+    assert time.time() >= s._tts_play_end - 0.2, (
+        "drain returned before the reply finished sounding"
+    )
+    # It must NOT wait out the echo tail as well: the window is for the moment
+    # the answer ends, not 3 s into the quiet after it.
+    assert time.time() < s._speaking_until + 0.3, "waited out the echo tail too"
+
+
+@pytest.mark.asyncio
+async def test_the_drain_does_not_hang_when_nothing_is_playing():
+    """It waits on a timestamp, so a stale one must not park the player forever
+    — that is how the reply would never open its window."""
+    s = _make_session()
+    s._tts_play_end = 0.0
+    s._speaking_until = 0.0
+
+    started = time.monotonic()
+    await asyncio.wait_for(s._wait_playback_drain(), timeout=5)
+    assert time.monotonic() - started < 1.0
+
+
+@pytest.mark.asyncio
 async def test_webrtc_off_never_offers_and_webrtc_on_does(monkeypatch):
     """Every offer makes go2rtc rebuild the stream producer; an abandoned one
     left a session nobody read and filled the camera's send queue to 193 kB,

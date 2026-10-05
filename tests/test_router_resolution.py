@@ -5,6 +5,7 @@ no Ollama/Qdrant/HA network calls). services/jev-router is put on sys.path
 because the host has no fastapi — app.py is never imported here.
 """
 
+import contextlib
 import os
 import sys
 
@@ -331,6 +332,158 @@ def test_routes_cover_manifest_five():
     assert set(clf.ROUTES) == {
         "easy_action", "easy_query", "complex_logic", "expert", "general_qa"
     }
+
+
+# --- warm-up: the 22 s charged to the first command (05.10.2026) --------------
+#
+# Ollama and Qdrant are containers on the same host, started in PARALLEL with
+# this router, so at boot they are normally not listening yet. Both restarts on
+# 05.10.2026 logged `Cannot connect to host 192.168.22.102:11434`, the warm-up
+# gave up, and the first voice command then took 22.35 s — from 14:52:57.7 to
+# 14:53:20.8, with `classifier warmed` logged from inside that request. Two
+# separate faults, both pinned here: give up too early, and let a user request
+# pay for the retry.
+
+
+class _FlakyEmbedder:
+    """Fails the first `fail_times` calls, then embeds trivially."""
+
+    def __init__(self, fail_times: int):
+        self.fail_times = fail_times
+        self.calls = 0
+
+    async def embed(self, texts):
+        self.calls += 1
+        if self.calls <= self.fail_times:
+            raise RuntimeError("Cannot connect to host 192.168.22.102:11434")
+        import numpy as np
+
+        return np.ones((len(texts), 4), dtype=np.float32) / 2.0
+
+    async def close(self):
+        return None
+
+
+@contextlib.contextmanager
+def _fast_schedule():
+    """Shrink the retry schedule so the tests do not sleep for minutes.
+
+    The real schedule is asserted separately — this only makes the failure paths
+    runnable.
+    """
+    old = (clf._WARMUP_ATTEMPTS, clf._WARMUP_BACKOFF_S, clf._WARMUP_MAX_S)
+    clf._WARMUP_ATTEMPTS, clf._WARMUP_BACKOFF_S, clf._WARMUP_MAX_S = 6, 0.0, 0.0
+    try:
+        yield
+    finally:
+        (clf._WARMUP_ATTEMPTS,
+         clf._WARMUP_BACKOFF_S,
+         clf._WARMUP_MAX_S) = old
+
+
+def _run(coro):
+    import asyncio
+
+    return asyncio.run(coro)
+
+
+def test_the_warmup_schedule_outlasts_a_container_boot():
+    """The whole point of the retry schedule, asserted without running it.
+
+    Before the fix there were two attempts with no delay between them, so both
+    hit a socket that had not opened yet. Anything that cannot wait out a
+    parallel container start will bring the 22 s first-command cost back.
+    """
+    total = 0.0
+    for attempt in range(1, clf._WARMUP_ATTEMPTS):
+        total += min(clf._WARMUP_BACKOFF_S * attempt, clf._WARMUP_MAX_S)
+    assert clf._WARMUP_ATTEMPTS >= 5, "too few attempts to survive a slow boot"
+    assert total >= 60.0, (
+        f"warm-up only waits {total:.0f}s in total — Ollama needs longer"
+    )
+
+
+def test_warmup_retries_a_dependency_that_is_not_up_yet():
+    """Two microsecond-apart attempts both hit a socket that had not opened.
+    The schedule must outlast a container boot, not just a blip."""
+    with _fast_schedule():
+        c = clf.Classifier(embedder=_FlakyEmbedder(fail_times=3))
+        assert _run(c.warmup()) is True, "gave up while Ollama was still starting"
+    assert c.warmed is True
+
+
+def test_warmup_gives_up_eventually_and_stays_cold():
+    with _fast_schedule():
+        c = clf.Classifier(embedder=_FlakyEmbedder(fail_times=99))
+        assert _run(c.warmup()) is False
+    assert c.warmed is False
+
+
+def test_a_cold_classify_answers_at_once_and_warms_in_the_background():
+    """The regression that cost 22 s: `classify()` used to `await self.warmup()`.
+
+    Nothing in the answer needs the matrix — `_regex_action` is the deterministic
+    path — so classify must return an easy_action decision immediately and leave
+    the warm-up running behind it.
+    """
+    import asyncio
+    import time
+
+    async def scenario():
+        c = clf.Classifier(embedder=_FlakyEmbedder(fail_times=1))
+        c._matrix = None  # force the cold branch
+        started = time.monotonic()
+        decision = await c.classify("включи свет")
+        elapsed = time.monotonic() - started
+        # The warm-up must be in flight, not awaited to completion.
+        await asyncio.sleep(0)
+        warming = c._warming or c._warming_task is not None
+        c._warming_task.cancel()
+        return decision, elapsed, warming
+
+    with _fast_schedule():
+        decision, elapsed, warming = _run(scenario())
+
+    assert decision.route == "easy_action", (
+        "a cold classifier must still answer a plain action"
+    )
+    assert decision.reason == "", "cold-but-served must not look like a failure"
+    assert elapsed < 1.0, f"classify() waited {elapsed:.2f}s on the warm-up"
+    assert warming, "warm-up was not left running in the background"
+
+
+def test_only_one_warmup_runs_at_a_time():
+    """Startup and a cold first request must not embed the same 60 utterances
+    concurrently against one Ollama."""
+
+    import asyncio
+
+    class _Slow:
+        def __init__(self):
+            self.max_concurrent = 0
+            self.in_flight = 0
+
+        async def embed(self, texts):
+            self.in_flight += 1
+            self.max_concurrent = max(self.max_concurrent, self.in_flight)
+            await asyncio.sleep(0.05)
+            self.in_flight -= 1
+            raise RuntimeError("nope")
+
+        async def close(self):
+            return None
+
+    async def scenario():
+        emb = _Slow()
+        c = clf.Classifier(embedder=emb)
+        await asyncio.gather(c.warmup(), c.warmup(), c.warmup())
+        return emb
+
+    with _fast_schedule():
+        emb = _run(scenario())
+    assert emb.max_concurrent == 1, (
+        f"{emb.max_concurrent} concurrent embed batches against one Ollama"
+    )
 
 
 # --- chat sanitizer: markdown must never reach TTS (E2E-verified leaks) -----

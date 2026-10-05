@@ -429,6 +429,55 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
   reply** come back through the decoder. It is now unconditional, and the pre-POST
   block falls back to the clip's own length when there is no track.
 
+- **THE FIRST COMMAND AFTER A RESTART COST 22 s — a warm-up that gave up in
+  microseconds and then blocked the user's turn. Measured 05.10.2026.**
+  `включи свет` went Whisper-done at 14:52:57.7 to `speaking:` at 14:53:20.8:
+  `elapsed=22.35s`. The log said why: `classifier warmed: 60 utterances` was
+  printed at 14:53:20.6 **from inside that request**.
+
+  Two independent faults, both of which had to be fixed:
+
+  1. **`warmup()` retried with no delay.** `for attempt in (1, 2)` with no
+     `await` between them, so both attempts hit the same unopened socket.
+     Ollama and Qdrant are containers on the same host started **in parallel**
+     with the router, so at boot "not listening yet" is the NORMAL case, not an
+     exception — and indeed the router restarted twice (12:09 and 12:46 UTC),
+     logging `Cannot connect to host 192.168.22.102:11434` and
+     `qdrant ... 6333` **both times**. `ollama`/`qdrant` then show `Up 2 hours`,
+     i.e. they came up after the router gave up. It stayed cold for two hours.
+     Now: 6 attempts with a linear backoff (~2 min total, `_WARMUP_*`), one
+     warm-up at a time (`_warming`), and `lifespan` starts it in the BACKGROUND
+     so the port opens immediately instead of blocking on a dependency that is
+     not there yet. Qdrant got the same patience via `_retry_memory()`.
+  2. **`classify()` awaited the warm-up.** `if not self.warmed: await
+     self.warmup()` — so whoever asked first paid for it. It now calls
+     `start_warmup()` (fire-and-forget) and answers from the deterministic
+     `_regex_action` path, which is what that path was written for.
+
+  Measured after: the port answers `/health` in **1.6 ms** at startup, and the
+  **first command on a deliberately cold classifier takes 0.12 s wall / 0.07 s
+  router**, logged as `classifier cold, regex action path: 'включи свет'`. Warm
+  commands: 0.18-0.34 s.
+
+- **THE DIALOGUE WINDOW OPENED WHILE THE ROOM WAS STILL TALKING — the deafness
+  right after an answer.** `_wait_playback_drain()` returned immediately whenever
+  there was no WebRTC output track, and there almost never is one (the session
+  mostly fails to get an answer from go2rtc, so `_out_track` stayed `None`). So
+  `Follow-up open` was logged **0.07 s after the TTS fetch** while `_speaking_until`
+  — the hard mic mute — ran **4.3 s longer**. For those 4.3 s the window was
+  "open" and the mic was muted, so anything the user said was discarded before
+  it reached Whisper. Measured 05.10.2026; this is the "camera stays deaf after
+  it answers" report, and it made the 10 s statement window feel like it never
+  arrived.
+
+  Without a track the playback end is still known exactly: `_tts_play_end` is
+  written from the clip's own length **after** the POST returns, which is when
+  the camera starts playing. The drain now waits for it, and only when it is
+  still in the future — a stale value from the previous turn must not park the
+  player for the length of a whole reply. Deliberately NOT bounded by
+  `_speaking_until`, which would add the 3 s echo tail on top: the window is for
+  the moment the answer ends, not 3 s into the quiet after it.
+
 - **MEASURE THE SEND QUEUES BEFORE CALLING A BOX DEAD.** `netstat -ant` on the
   camera, one line per connection, is the instrument that settled this:
   `tcp 0 193712 192.168.22.241:554 192.168.22.102:37544 ESTABLISHED` — 193 kB

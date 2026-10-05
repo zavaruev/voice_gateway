@@ -57,7 +57,12 @@ import config
 import history
 import memory
 import weather
-from classifier import Classifier
+from classifier import (
+    Classifier,
+    _WARMUP_ATTEMPTS,
+    _WARMUP_BACKOFF_S,
+    _WARMUP_MAX_S,
+)
 from ha_client import (
     HAClient,
     _area_phrase,
@@ -104,18 +109,50 @@ ha = HAClient()
 async def lifespan(app: FastAPI):
     """Startup/shutdown hook: warm the classifier and the memory collections.
 
-    Warmup failures are deliberately non-fatal — `classify()` retries lazily
-    and the escalation chain (everything -> complex_logic) keeps the service
+    Warmup failures are deliberately non-fatal — `classify()` falls back to the
+    deterministic regex action path and the escalation chain keeps the service
     useful even with Ollama or Qdrant down. On shutdown the embedder session
     and the HA session are closed so uvicorn exits without pending sockets.
+
+    It used to be a single `await classifier.warmup()`. Ollama and Qdrant are
+    containers on the same host that come up in PARALLEL with this one, so at
+    boot "not listening yet" is the normal case; measured 05.10.2026, both
+    restarts failed to connect and the first voice command then paid 22 s to
+    warm a classifier that should have been ready. The warm-up is now started in
+    the BACKGROUND so the port opens immediately, and it retries on its own
+    schedule (~2 min) instead of blocking startup on a dependency that is not
+    there yet.
     """
-    ok = await classifier.warmup()
-    logger.info("classifier warmup: %s", "ok" if ok else "FAILED (escalations active)")
-    mem_ok = await memory.ensure_collections()
+    classifier.start_warmup()
+    logger.info(
+        "classifier warmup: started in background (retrying up to %d attempts)",
+        _WARMUP_ATTEMPTS,
+    )
+    mem_task = asyncio.ensure_future(memory.ensure_collections())
+    mem_ok = await _retry_memory(mem_task)
     logger.info("qdrant collections: %s", "ok" if mem_ok else "FAILED (memory off)")
     yield
     await classifier.embedder.close()
     await ha.close()
+
+
+async def _retry_memory(task) -> bool:
+    """Qdrant has the same startup race as Ollama; give it the same patience.
+
+    Returns whether the collections exist. Never raises: memory is optional and
+    a missing Qdrant must not keep the router down.
+    """
+    for attempt in range(1, _WARMUP_ATTEMPTS + 1):
+        try:
+            return await asyncio.wait_for(asyncio.shield(task), timeout=_WARMUP_MAX_S)
+        except asyncio.TimeoutError:
+            logger.warning("qdrant ensure attempt %d/%d timed out",
+                           attempt, _WARMUP_ATTEMPTS)
+        except Exception as e:
+            logger.warning("qdrant ensure attempt %d/%d failed (%s)",
+                           attempt, _WARMUP_ATTEMPTS, e or type(e).__name__)
+            await asyncio.sleep(min(_WARMUP_BACKOFF_S * attempt, _WARMUP_MAX_S))
+    return False
 
 
 app = FastAPI(title="jev-router", lifespan=lifespan)

@@ -30,6 +30,7 @@ Swap-in point: `Classifier.classify()` is the only entry — a semantic-router b
 could replace the body without touching callers.
 """
 
+import asyncio
 import logging
 import re
 from dataclasses import dataclass, field
@@ -201,6 +202,15 @@ class RouteDecision:
 # past the 30 s client timeout. 8 keeps a chunk near 14 s.
 EMBED_CHUNK = 8
 
+# Warm-up retry schedule. Ollama and Qdrant are containers on the same host that
+# start in PARALLEL with this router, so "not up yet" is the normal case at boot,
+# not an exception — measured 05.10.2026, both router restarts logged
+# `Cannot connect to host 192.168.22.102:11434` and the classifier stayed cold
+# for two hours. Linear backoff over ~2 minutes covers a slow model load.
+_WARMUP_ATTEMPTS = 6
+_WARMUP_BACKOFF_S = 15.0
+_WARMUP_MAX_S = 45.0
+
 
 def chunked(seq: list, size: int = EMBED_CHUNK) -> list[list]:
     """Split `seq` into consecutive chunks of at most `size` (pure)."""
@@ -283,16 +293,29 @@ class Classifier:
         self._matrix: np.ndarray | None = None  # (N, D) normalized utterance embeddings
         self._route_of_row: list[str] = []
         self.warmed = False
+        self._warming = False
+        self._warming_task: asyncio.Task | None = None
 
     async def warmup(self) -> bool:
-        """Embed all route utterances once at startup, with ONE retry.
+        """Embed all route utterances, retrying with a real backoff.
 
-        Failure is not fatal — classify() retries lazily — but a single attempt
-        is not enough in practice: Ollama loads a 639 MB embedding model on the
-        first call and the 30 s client timeout expires while it does, leaving
-        the classifier cold for minutes (field check 03.10.2026 18:38:
-        `classifier warmup failed: ` with an EMPTY message, i.e. a timeout,
-        while Ollama itself was perfectly healthy).
+        Failure is not fatal — classify() falls back to the deterministic regex
+        action path — but the backoff is what makes it non-fatal in practice.
+
+        Measured 05.10.2026: the router started twice while Ollama and Qdrant
+        were still coming up, and BOTH warm-ups failed with
+        `Cannot connect to host 192.168.22.102:11434`. The two attempts were
+        microseconds apart, so both hit a socket that had not opened yet. The
+        classifier then sat cold for two hours and the first voice command paid
+        for it: `включи свет` took **22.35 s** — Whisper finished at 14:52:57.7,
+        `classifier warmed` was logged at 14:53:20.6 inside that request, and the
+        same command took 0.78 s once warm.
+
+        The dependency is a container on the same host that starts in parallel
+        with this one, so the retry has to outlast startup, not just a blip:
+        `_WARMUP_ATTEMPTS` tries over roughly two minutes. And `classify()` no
+        longer awaits the warm-up — it starts it in the background and answers
+        from the regex path, so no user request is ever charged for it.
         """
         texts: list[str] = []
         route_of: list[str] = []
@@ -300,26 +323,63 @@ class Classifier:
             for u in utts:
                 texts.append(u)
                 route_of.append(route)
-        for attempt in (1, 2):
-            try:
-                self._matrix = await self.embedder.embed(texts)
-                self._route_of_row = route_of
-                self.warmed = True
-                logger.info(
-                    "classifier warmed: %d utterances, %d routes%s",
-                    len(texts), len(ROUTES), "" if attempt == 1 else " (retry)",
-                )
-                return True
-            except Exception as e:
-                self.warmed = False
-                if attempt == 2:
+        if self._warming:
+            # One warm-up at a time: startup and a cold first request must not
+            # embed the same 60 utterances concurrently.
+            return self.warmed
+        self._warming = True
+        try:
+            last: Exception | None = None
+            for attempt in range(1, _WARMUP_ATTEMPTS + 1):
+                try:
+                    self._matrix = await self.embedder.embed(texts)
+                    self._route_of_row = route_of
+                    self.warmed = True
+                    logger.info(
+                        "classifier warmed: %d utterances, %d routes (attempt %d)",
+                        len(texts), len(ROUTES), attempt,
+                    )
+                    return True
+                except Exception as e:
                     # An empty str() here IS a timeout — name the type.
-                    logger.error("classifier warmup failed: %s",
-                                 e or type(e).__name__)
-                    return False
-                logger.warning("classifier warmup attempt 1 failed (%s), retrying",
-                               e or type(e).__name__)
-        return False
+                    last = e or type(e).__name__
+                    self.warmed = False
+                    if attempt < _WARMUP_ATTEMPTS:
+                        delay = min(_WARMUP_BACKOFF_S * attempt, _WARMUP_MAX_S)
+                        logger.warning(
+                            "classifier warmup attempt %d/%d failed (%s), "
+                            "retrying in %.0fs",
+                            attempt, _WARMUP_ATTEMPTS, last, delay,
+                        )
+                        await asyncio.sleep(delay)
+            logger.error("classifier warmup gave up after %d attempts: %s",
+                         _WARMUP_ATTEMPTS, last)
+            return False
+        finally:
+            self._warming = False
+
+    def start_warmup(self) -> None:
+        """Kick the warm-up off in the background and return immediately.
+
+        Used instead of awaiting it: a cold classifier used to charge the first
+        voice command 22 s, and nothing about the answer needed the matrix —
+        `_regex_action` is the deterministic path for exactly this case.
+        """
+        if self.warmed or self._warming or self._warming_task is not None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._warming_task = loop.create_task(self._reap_warmup())
+
+    async def _reap_warmup(self) -> None:
+        try:
+            await self.warmup()
+        except Exception as e:  # warmup already logs; never kill the loop
+            logger.debug("background warmup ended: %s", e or type(e).__name__)
+        finally:
+            self._warming_task = None
 
     def _regex_action(self, text: str) -> bool:
         """True for an unambiguous imperative the regex layer recognises.
@@ -343,7 +403,13 @@ class Classifier:
             return RouteDecision("complex_logic", 0.0, reason="empty_text")
 
         if not self.warmed:
-            await self.warmup()
+            # Background, never awaited. Awaiting it here is what made a cold
+            # classifier cost 22 s of the user's first command (measured
+            # 05.10.2026: `включи свет` 14:52:57.7 -> 14:53:20.8, the warm-up
+            # logged from inside that request). Nothing in the answer needs the
+            # matrix, so the cold case goes down the deterministic path below and
+            # the warm-up finishes on its own.
+            self.start_warmup()
         if not self.warmed or self._matrix is None:
             # No embeddings — but the DETERMINISTIC action fast path needs no
             # cosine at all, and app._handle re-runs resolve_action as a

@@ -2001,3 +2001,36 @@ def test_the_seeding_line_cannot_regress_to_the_bytearray_mistake():
         "_vad_process at the first onset — join the chunks first"
     )
     assert 'b"".join(self._preroll)' in src
+
+
+def test_the_noise_suppression_cutoff_is_a_room_setting_not_a_constant():
+    """It was hardcoded `800 if kitchen else 400` in shared code, so no room could
+    be retuned without editing the module — and it cannot be re-measured now that
+    the kitchen's microphone is dead (rms 4, -77.8 dB)."""
+    import inspect
+
+    src = inspect.getsource(CameraSession._preprocess_audio)
+    assert 'if self.stream_name == "kitchen"' not in src, (
+        "a per-room calibration is still baked into shared code"
+    )
+    assert "self._ns_rms_gate" in src, "the cutoff must come from the config"
+    assert CameraConfig(stream_name="x").ns_rms_gate == 0, "0 means the default"
+    assert CameraConfig(stream_name="kitchen", ns_rms_gate=800).ns_rms_gate == 800
+
+
+def test_both_rooms_read_identical_thresholds():
+    """The rooms have the same problems, so they get the same numbers — and the
+    test says so, because 'identical by default' is not the same as 'identical'."""
+    from main import start_camera_sessions  # noqa: F401  (import must succeed)
+
+    living = CameraConfig(stream_name="livingroom")
+    kitchen = CameraConfig(stream_name="kitchen")
+    for field in (
+        "pause_endpoint", "pause_noise_mult", "pause_ratio",
+        "pause_run_frames", "pause_min_speech_frames", "ns_rms_gate",
+        "webrtc", "attention_pip",
+    ):
+        assert getattr(living, field) == getattr(kitchen, field), (
+            f"{field}: livingroom={getattr(living, field)!r} "
+            f"kitchen={getattr(kitchen, field)!r}"
+        )

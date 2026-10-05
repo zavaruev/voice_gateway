@@ -3683,6 +3683,14 @@ async def start_camera_sessions():
                     f"CAMERA_ATTENTION_PIP_{name.upper()}",
                     os.getenv("CAMERA_ATTENTION_PIP", "true"),
                 ).lower() == "true",
+                # SpeexDSP noise-suppression cutoff, per room. Was hardcoded
+                # `800 if kitchen else 400` in the module, so no room could be
+                # retuned without editing shared code. 0 => 400.
+                ns_rms_gate=int(
+                    os.getenv(f"CAMERA_NS_RMS_GATE_{name.upper()}")
+                    or os.getenv("CAMERA_NS_RMS_GATE")
+                    or 0
+                ),
                 # Peak the reply is normalised to before the camera plays it.
                 # 0 => the built-in 20000 (61 % of full scale). Exists for an
                 # unresolved field report of crackling playback (05.10.2026):

@@ -871,6 +871,9 @@ class CameraConfig:
     # because the beep also costs 0.4 s of deafness on every wake and is 60x the
     # room floor in the pause detector's reference.
     attention_pip: bool = True
+    # SpeexDSP noise-suppression cutoff in raw rms. 0 => 400. Was hardcoded per
+    # room (`800 if kitchen else 400`); see _preprocess_audio.
+    ns_rms_gate: int = 0
     # Peak the reply is normalised to before it goes to the camera speaker.
     # 0 => _TTS_TARGET_PEAK_DEFAULT.
     #
@@ -990,6 +993,7 @@ class CameraSession:
         self._play_audio_url = config.play_audio_url
         self.webrtc = config.webrtc
         self._attention_pip = config.attention_pip
+        self._ns_rms_gate = config.ns_rms_gate
         # Pre-built Authorization header: aiohttp.BasicAuth is deprecated in
         # aiohttp 4, and /play_audio is the only place we do HTTP basic auth.
         self._play_audio_headers = {}
@@ -2932,7 +2936,15 @@ class CameraSession:
         # sits above the generic quiet-speech threshold and drowns its distant
         # mic — Whisper returns "взвввв" garbage for that room. Give kitchen
         # NS at a higher rms cutoff so its hum is stripped before STT.
-        ns_rms_gate = 800 if self.stream_name == "kitchen" else 400
+        # Noise-suppression cutoff, per room and identical across rooms by ENV.
+        #
+        # It used to be hardcoded `800 if kitchen else 400`, because the kitchen's
+        # mic AGC lifts its hum and SpeexDSP on that hum returned «взвввв» garbage.
+        # That is a per-room calibration baked into shared code, so no room could
+        # be retuned without editing the module — and it cannot be re-measured
+        # now: the kitchen's microphone is dead (rms 4, -77.8 dB), so the floor
+        # that justified 800 no longer exists to measure. 0 => 400.
+        ns_rms_gate = self._ns_rms_gate or 400
         if rms_raw < ns_rms_gate and len(audio_f) >= 256:
             audio_f, ns_applied = self._apply_ns(audio_f)
 

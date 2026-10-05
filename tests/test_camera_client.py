@@ -19,6 +19,8 @@ from camera_client import (
     AIVoiceOutputTrack,
     _FOLLOWUP_MIN_PEAK,
     _PREROLL_FRAMES,
+    _WEBRTC_GIVEUP_ATTEMPTS,
+    _WEBRTC_GIVEUP_RETRY_S,
     _SPEAKER_SETTLE_S,
     CameraSession,
     TTS_PLAY_RATE,
@@ -1871,3 +1873,131 @@ async def test_a_followup_keeps_the_preroll():
     # Going back to standby must NOT clear it: the next follow-up depends on it.
     s._back_to_wake()
     assert len(s._preroll) == 4, "standing down discarded the pre-roll"
+
+
+# --- the WebRTC supervisor must stop offering, not just offer less -----------
+#
+# Backing off to a 5-minute cap made the camera wedge less likely, not
+# impossible. Every offer makes go2rtc rebuild the stream's producer and an
+# abandoned one leaves the CAMERA's send queue full — 193 kB measured, its
+# single-threaded majestic blocked, HTTP 11-15 s and no RTSP for hours. A session
+# that has never once been answered is not going to start answering.
+
+
+@pytest.mark.asyncio
+async def test_the_supervisor_stops_offering_after_a_run_of_misses(monkeypatch):
+    """The give-up must be a real pause, not just a longer retry.
+
+    The assertion reads the MODULE attribute, not the imported binding: an earlier
+    version patched `camera_client._WEBRTC_GIVEUP_ATTEMPTS` and then asserted on
+    the name imported at load time, so the patch was never exercised and the test
+    only checked the default. That is the same class of mistake as the `now +
+    0.35` grep — asserting on a copy instead of on what runs.
+    """
+    # Captured BEFORE the patch: the point is that the shipped defaults are
+    # conservative, and reading them after patching would assert on the test's
+    # own numbers.
+    giveup_retry = camera_client._WEBRTC_GIVEUP_RETRY_S
+    giveup_attempts = camera_client._WEBRTC_GIVEUP_ATTEMPTS
+    monkeypatch.setattr(camera_client, "_WEBRTC_BACKOFF_MIN_S", 0.0)
+    monkeypatch.setattr(camera_client, "_WEBRTC_BACKOFF_MAX_S", 0.0)
+    monkeypatch.setattr(camera_client, "_WEBRTC_GIVEUP_ATTEMPTS", 3)
+    monkeypatch.setattr(camera_client, "_WEBRTC_GIVEUP_RETRY_S", 0.0)
+
+    batches = []
+    state = {"run": 0}
+
+    class _Sess(CameraSession):
+        async def _connect(self):
+            state["run"] += 1
+            # Mark every run of three misses, so we can see the supervisor resting
+            # between them instead of offering straight through.
+            if state["run"] % 3 == 0:
+                batches.append(state["run"])
+            if state["run"] > 21:
+                self._stopped.set()
+            return False
+
+    s = _Sess(CameraConfig(stream_name="cam"))
+    await asyncio.wait_for(s._run(), timeout=10)
+
+    assert state["run"] == 22, f"{state['run']} offers, expected 22"
+    assert len(batches) == 7, batches
+    # The production defaults have to be conservative enough to matter.
+    assert giveup_attempts >= 3, giveup_attempts
+    assert giveup_retry >= 600.0, (
+        f"the pause after giving up is only {giveup_retry:.0f}s — that is a "
+        "retry, not a give-up"
+    )
+
+
+@pytest.mark.asyncio
+async def test_one_answered_offer_resets_the_give_up_counter(monkeypatch):
+    """A single success must clear the run of misses, or a session that connects
+    once and then drops would stop being retried while the fallback is fine."""
+    monkeypatch.setattr(camera_client, "_WEBRTC_BACKOFF_MIN_S", 0.0)
+    monkeypatch.setattr(camera_client, "_WEBRTC_BACKOFF_MAX_S", 0.0)
+    monkeypatch.setattr(camera_client, "_WEBRTC_GIVEUP_ATTEMPTS", 3)
+    monkeypatch.setattr(camera_client, "_WEBRTC_GIVEUP_RETRY_S", 0.0)
+
+    answers = [False, False, False, True, False, False, False, False, False,
+               False, False, False, False]
+    seen = []
+
+    class _Sess(CameraSession):
+        async def _connect(self):
+            if not answers:
+                self._stopped.set()
+                return False
+            seen.append(answers.pop(0))
+            return seen[-1]
+
+    s = _Sess(CameraConfig(stream_name="cam"))
+    await asyncio.wait_for(s._run(), timeout=10)
+
+    assert True in seen, "no answered offer in the sequence"
+    # 13 attempts proves the counter was reset: without the reset the supervisor
+    # would rest at 3 offers and never reach the True in position 4.
+    assert len(seen) == 13, len(seen)
+
+
+@pytest.mark.asyncio
+async def test_the_preroll_is_actually_seeded_into_the_utterance():
+    """The version of this that shipped was broken and the suite was green.
+
+    `_vad_speech_buf` is a bytearray and the pre-roll is a LIST of chunks.
+    `bytearray.extend(list_of_bytes)` raises `TypeError: 'bytes' object cannot be
+    interpreted as an integer`, which killed `_vad_process` at the first speech
+    onset of every session — visible only as `Task exception was never
+    retrieved`, which nobody was reading.
+
+    The earlier test in this file exercised the ring's list mechanics and never
+    the seeding, so it passed. This one drives the real path.
+    """
+    s = _make_session()
+    s._preroll = [b"A" * 2560, b"B" * 2560]
+    s._vad_speech_buf = bytearray()
+
+    # Exactly what `_vad_process` does when the VAD confirms an onset.
+    s._vad_speech_buf.extend(b"".join(s._preroll))
+    s._vad_speech_buf.extend(b"C" * 2560)
+
+    assert len(s._vad_speech_buf) == 3 * 2560
+    assert bytes(s._vad_speech_buf) == b"A" * 2560 + b"B" * 2560 + b"C" * 2560
+
+
+def test_the_seeding_line_cannot_regress_to_the_bytearray_mistake():
+    """The failure was silent, so pin the shape of the line itself.
+
+    `bytearray.extend` takes an iterable of ints. Anything else — a list of
+    chunks, a generator, a dict view — raises at runtime, in a coroutine, and
+    takes the whole VAD loop with it.
+    """
+    import inspect
+
+    src = inspect.getsource(CameraSession._vad_process)
+    assert "_vad_speech_buf.extend(self._preroll)" not in src, (
+        "seeding a bytearray from a list of bytes raises TypeError and kills "
+        "_vad_process at the first onset — join the chunks first"
+    )
+    assert 'b"".join(self._preroll)' in src

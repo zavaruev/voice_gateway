@@ -164,6 +164,17 @@ _FOLLOWUP_MIN_PEAK = 24000
 _WEBRTC_BACKOFF_MIN_S = 15.0
 _WEBRTC_BACKOFF_MAX_S = 300.0
 
+# After this many CONSECUTIVE unanswered offers the supervisor stops offering for
+# `_WEBRTC_GIVEUP_RETRY_S`. Measured 05.10.2026: the living-room camera wedged
+# because go2rtc's producer was rebuilt per offer and an abandoned one left the
+# camera's send queue at 193 kB, blocking its single-threaded majestic (HTTP
+# 11-15 s, no RTSP). Backing off to a 5-minute cap only made that less likely, not
+# impossible — and a session that has never been answered is not going to start
+# answering. It exists solely as a playback fallback, so its absence costs the
+# fallback and nothing else: audio arrives over RTSP regardless.
+_WEBRTC_GIVEUP_ATTEMPTS = 4
+_WEBRTC_GIVEUP_RETRY_S = 900.0
+
 # How loud a frame must be, relative to the utterance anchor, to count as
 # SPEECH rather than as background. The pause test uses the windowed percentile
 # above (a responsive question: has the speaker stopped?); this one is about
@@ -1299,18 +1310,37 @@ class CameraSession:
         Any connect failure (go2rtc down, camera rebooting, SDP mismatch)
         is logged and retried instead of killing the session.
 
-        The pause between attempts is BACKED OFF, and that is the whole point of
-        this function. `_connect()` returns after 24 s when go2rtc accepts the
-        websocket but never answers the offer, and the supervisor used to call
-        it again immediately: 7 offers in 12 minutes, measured. Every offer makes
-        go2rtc rebuild this stream's producer, and an abandoned one leaves a
-        session that nobody reads — the camera's own send queue then fills
-        (193 kB observed) and blocks majestic, which is the "wedged camera" this
-        was blamed on for hours. Retrying slower costs nothing: the session
-        carries no audio we use, and it did connect within 90 s of a restart.
+        The pause between attempts is BACKED OFF, and after a run of unanswered
+        offers the supervisor STOPS offering for a long while. Both are the fix,
+        and the reason is a measured camera failure rather than tidiness: every
+        `webrtc/offer` makes go2rtc rebuild this stream's producer, and an
+        abandoned one leaves a session nobody reads — the camera's send queue then
+        fills (193 kB observed) and blocks majestic. That is what wedged the
+        living-room camera for hours, and it cost 7 offers in 12 minutes because
+        the supervisor re-entered `_connect()` with no pause at all.
+
+        Backing off is not enough on its own, though: doubling to a 5-minute cap
+        still offers forever, and a session that has never once been answered is
+        not going to start answering — it exists only as a playback fallback, so
+        if it is not there the fallback is simply not there. After
+        `_WEBRTC_GIVEUP_ATTEMPTS` unanswered attempts it stops, says so once, and
+        then only re-checks every `_WEBRTC_GIVEUP_RETRY_S`. Bounded by
+        construction instead of merely unlikely.
         """
         backoff = _WEBRTC_BACKOFF_MIN_S
+        misses = 0
         while not self._stopped.is_set():
+            if misses >= _WEBRTC_GIVEUP_ATTEMPTS:
+                logger.info(
+                    f"[{self.stream_name}] WebRTC gave up after "
+                    f"{misses} unanswered offers — not offering for "
+                    f"{_WEBRTC_GIVEUP_RETRY_S / 60:.0f} min. The camera's audio "
+                    f"comes from the RTSP loop and is unaffected; only the "
+                    f"backchannel playback fallback is missing."
+                )
+                await asyncio.sleep(_WEBRTC_GIVEUP_RETRY_S)
+                misses = 0
+                continue
             connected = False
             try:
                 connected = await self._connect()
@@ -1320,9 +1350,12 @@ class CameraSession:
                 logger.warning(f"[{self.stream_name}] {exc}", exc_info=True)
             if connected:
                 backoff = _WEBRTC_BACKOFF_MIN_S
+                misses = 0
                 continue
+            misses += 1
             logger.info(
-                f"[{self.stream_name}] WebRTC retrying in {backoff:.0f}s"
+                f"[{self.stream_name}] WebRTC retrying in {backoff:.0f}s "
+                f"(miss {misses}/{_WEBRTC_GIVEUP_ATTEMPTS})"
             )
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, _WEBRTC_BACKOFF_MAX_S)
@@ -2182,7 +2215,18 @@ class CameraSession:
                         # silence, but a follow-up spoken right after the answer
                         # arrived with its first word missing and never
                         # transcribed.
-                        self._vad_speech_buf.extend(self._preroll)
+                        #
+                        # Joined, NOT `extend(self._preroll)`: this is a
+                        # bytearray and the pre-roll is a list of chunks, and
+                        # bytearray.extend takes an iterable of INTEGERS — so that
+                        # line raised `TypeError: 'bytes' object cannot be
+                        # interpreted as an integer` and KILLED `_vad_process` at
+                        # the first speech onset of every session. It surfaced only
+                        # as `Task exception was never retrieved`, which nobody
+                        # was reading. The test that was supposed to cover this
+                        # only exercised the list, never the seeding, so a green
+                        # suite shipped a dead VAD task.
+                        self._vad_speech_buf.extend(b"".join(self._preroll))
                         self._vad_speech_buf.extend(chunk)
                 else:
                     self._vad_speech_buf.extend(chunk)

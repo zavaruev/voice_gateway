@@ -478,6 +478,72 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
   `_speaking_until`, which would add the 3 s echo tail on top: the window is for
   the moment the answer ends, not 3 s into the quiet after it.
 
+- **A FOLLOW-UP WINDOW IS NOT THE USER — the room answered its own television six
+  times in two minutes. Measured 05.10.2026 19:24-19:26, and it was in the field
+  log the whole time.**
+  Reported as «после неудавшегося диалога херню несет». What the log showed, in
+  one session, same room:
+
+  | peak | transcript | who |
+  |---|---|---|
+  | **32767** | «выключи свет» | user |
+  | **32767** | «включи свет в гостиной» | user |
+  | 16074 | «музыкант» | television |
+  | 12348 | «распаковываешь» | television |
+  | 10792 | «Другая, пожалуйста, у тебя был шанс, но ты обожался.» | television |
+  | 6021 / 5626 | «Добро пожаловать!» | television |
+  | 4625 | «Мама, ты что? Да, ха-ха-ха.» | television |
+  | 4130 | «Это вот сейчас и не родит, не хранит стресс.» | television |
+
+  Every one of those cost 4-13 s of L2 and then **spoke**, which is what "talks
+  nonsense on its own" is. The separation is not subtle: the user's voice pins the
+  rail at 32767, the room never exceeds 16074.
+
+  **The note in this file that said the window was safe because "TV speech has to
+  contain «компьютер» to open anything" was WRONG.** That is true of a window
+  opened by the wake word, and false of a window opened by our own REPLY: inside
+  it, every utterance was dispatched with no keyword at all. Fixed with
+  `CAMERA_FOLLOWUP_MIN_PEAK[_<NAME>]` (default 24000): a follow-up window accepts
+  an utterance only if it is **loud enough to be the user** — the voice, not a
+  keyword, is what identifies them, because you are close and the television is
+  across the room. Below the gate the room does NOT answer; it logs
+  `follow-up ignored, peak=... ` and goes back to waiting for the wake word, the
+  only unambiguous signal. `self._followup_only` marks the window and is cleared by
+  `_fire_wake` and `_back_to_wake`.
+
+- **THE FOLLOW-UP DID NOT WORK BECAUSE THREE SEPARATE 3-SECOND BLIND WINDOWS ATE
+  THE FIRST WORD. Measured by arithmetic, not by guessing.**
+  The user said «компьютер, включи свет», then «а теперь выключи» with no wake
+  word, and nothing happened. The log:
+  ```
+  19:24:22.178 tts pcm            <- reply starts
+  19:24:24.340 Follow-up open     <- window opens (my earlier drain fix: correct)
+  19:24:33.122 UTTERANCE END dur=5920ms via pause
+  19:24:34.431 Whisper empty       <- the follow-up, gone
+  ```
+  The utterance ran 5.92 s and Whisper got `raw_rms=522` — near-silence. It
+  **started at 19:24:27.2**, and the mic mute ran to 19:24:27.3, so the first
+  ~1.3 s of the sentence was discarded before STT ever saw it. Three independent
+  places added an echo tail on top of the clip:
+  1. `_speak_pcm` set `_speaking_until = now + audio_dur + ECHO_TAIL` (1.5 s for a
+     question, 3 s otherwise). That timestamp is a hard `return` in `_feed_audio`.
+  2. The pre-POST block did the same with `+ 3.0`.
+  3. `GLOBAL_TTS_UNTIL = now + audio_dur + echo_tail` — a **cross-camera** guard
+     that drops a finished transcript outright with `TTS playback active (echo
+     guard)`, so even after the mic unmuted the follow-up was thrown away with a
+     good transcript in hand. This one is why the log looked like the user had
+     said nothing.
+
+  All three now end with the audio (`_SPEAKER_SETTLE_S = 0.3`, which only covers
+  the upload and the duration rounding). **Recognising our own returning voice is
+  not a timer's job and a blind window was never the right instrument for it** —
+  it cannot tell our voice from the user's. Two layers that CAN do it already
+  existed and are untouched: `_is_echo` (cross-correlation against the pcm we
+  stored, applied before the chunk reaches the decoder) and `_echo_of_reply` on
+  the transcript. The WAKE word keeps its own 3 s tail
+  (`_wake_suppress_until`), because a «компьютер» decoded out of our own speaker
+  really is a false wake and is a different failure.
+
 - **MEASURE THE SEND QUEUES BEFORE CALLING A BOX DEAD.** `netstat -ant` on the
   camera, one line per connection, is the instrument that settled this:
   `tcp 0 193712 192.168.22.241:554 192.168.22.102:37544 ESTABLISHED` — 193 kB

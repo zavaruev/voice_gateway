@@ -3662,6 +3662,19 @@ async def start_camera_sessions():
                     or os.getenv("CAMERA_PAUSE_NOISE_MULT")
                     or 0.0
                 ),
+                # Raw peak an utterance must reach inside a follow-up window (one
+                # opened by our reply, no wake word) to count as the user. In a
+                # room with a television this is the only thing that stops the
+                # room answering itself: measured 05.10.2026, the user's commands
+                # peaked at 32767 and six television utterances at 4130-16074.
+                # 0 => the built-in 24000.
+                followup_min_peak=int(
+                    os.getenv(
+                        f"CAMERA_FOLLOWUP_MIN_PEAK_{name.upper()}"
+                    )
+                    or os.getenv("CAMERA_FOLLOWUP_MIN_PEAK")
+                    or 0
+                ),
                 # Peak the reply is normalised to before the camera plays it.
                 # 0 => the built-in 20000 (61 % of full scale). Exists for an
                 # unresolved field report of crackling playback (05.10.2026):

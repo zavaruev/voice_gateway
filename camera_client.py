@@ -115,6 +115,28 @@ _ECHO_TAIL_S = 3.0
 # which is the entire point of having one.
 _WAKE_REARM_DEBOUNCE_S = 1.5
 
+# How long after the clip the camera speaker may still be sounding. /play_audio
+# returns as soon as the body is uploaded and the box then plays it in real
+# time, so the margin only has to cover the upload and the duration rounding.
+#
+# This used to be 3.0 s and it was the reason a follow-up did not work: the mute
+# outlived the answer by three seconds, so the beginning of the user's next
+# sentence was discarded before Whisper ever saw it (measured 05.10.2026 19:24 —
+# utterance started at 19:24:27.2 with the mute ending at 19:24:27.3, Whisper
+# empty). Recognising our own returning audio is `_is_echo`'s and
+# `_echo_of_reply`'s job, not this timer's.
+_SPEAKER_SETTLE_S = 0.3
+
+# Raw peak an utterance must reach to count as the USER inside a follow-up window
+# (one opened by our own reply, with no wake word spoken).
+#
+# Measured 05.10.2026 19:24-19:26 in the living room, same session, same room:
+# the user's own two commands both peaked at 32767 (the rail), while six
+# television utterances peaked at 16074, 12348, 10792, 6021, 5626, 4625 and
+# 4130. 24000 sits in that gap with margin on both sides. 0 disables the gate,
+# which restores the old behaviour of answering anything said in the window.
+_FOLLOWUP_MIN_PEAK = 24000
+
 # Pause before re-offering the WebRTC session, doubling up to the max. This is
 # not politeness, it is the fix: an un-answered offer still makes go2rtc rebuild
 # the stream producer, and the abandoned session is what filled the camera's
@@ -800,6 +822,14 @@ class CameraConfig:
     # the cap on an utterance that carries continuous sound (our own TTS echo),
     # which is the safe direction.
     pause_noise_mult: float = 0.0
+    # Raw peak an utterance must reach to count as the user inside a follow-up
+    # window — one opened by our own reply, with no wake word spoken.
+    #
+    # 0 => _FOLLOWUP_MIN_PEAK. Measured 05.10.2026 in the living room: the
+    # user's two commands both peaked at 32767 while six television utterances
+    # peaked at 4130-16074, so the user's voice is what separates them — not a
+    # keyword. Set 0 to disable the gate entirely (answer anything in the window).
+    followup_min_peak: int = 0
     # Peak the reply is normalised to before it goes to the camera speaker.
     # 0 => _TTS_TARGET_PEAK_DEFAULT.
     #
@@ -887,6 +917,11 @@ class CameraSession:
         self._pause_run_frames = config.pause_run_frames
         self._pause_min_speech_frames = config.pause_min_speech_frames
         self._pause_noise_mult = config.pause_noise_mult
+        self._followup_min_peak = (
+            config.followup_min_peak
+            if config.followup_min_peak > 0
+            else _FOLLOWUP_MIN_PEAK
+        )
         # 0 => the default, so a half-filled override cannot mute the speaker.
         self._tts_target_peak = config.tts_target_peak or _TTS_TARGET_PEAK_DEFAULT
         # 0 => the default, so a half-filled override cannot close the window
@@ -958,6 +993,9 @@ class CameraSession:
         # it must be per-TURN: leftover True from an earlier turn would keep
         # the mic open forever.
         self._followup_open = False
+        # True while the wake window was opened by our own REPLY rather than by a
+        # heard wake word. Such a window must not treat the room as the user.
+        self._followup_only = False
         # Wall clock of the most recent VAD "speech" frame. The greeting
         # asks "is the user talking?", and `_vad_has_speech` answers that
         # wrongly while an utterance is in flight (see _wake_greeting).
@@ -2592,6 +2630,10 @@ class CameraSession:
         self._last_wake_fired_at = time.time()
         self._wake_detected = True
         self._wake_expires = time.time() + self._wake_timeout
+        # A real wake word was HEARD, so the next utterance is the user's whatever
+        # it sounds like. The follow-up window opened by our own reply is the
+        # opposite case and says so here — see _handle_wake_or_command.
+        self._followup_only = False
         self._ww_consec = 0
         self._ww_recent.clear()
         # Reset VAD collection: corridor's permanent noise floor keeps
@@ -3053,6 +3095,34 @@ class CameraSession:
             # No active wake window: nothing to do. (Reached only via stale
             # queued utterances — live utterances are gated earlier.)
             return
+
+        # A follow-up window was opened by our own REPLY, so nobody has said the
+        # wake word and this audio has not been identified as the user. In a room
+        # with a television that is the whole ball game: measured 05.10.2026
+        # 19:24-19:26, the living room dispatched the television to itself SIX
+        # times in two minutes — «музыкант» (peak 16074), «Мама, ты что? Да,
+        # ха-ха-ха.» (4625), «Это вот сейчас и не родит, не хранит стресс.»
+        # (4130), «распаковываешь» (12348), «Добро пожаловать!» (5626),
+        # «Другая, пожалуйста...» (10792) — while the user's own two commands both
+        # hit the rail at peak 32767. Every one of those cost 4-13 s of L2 and
+        # then spoke, which is what "the camera talks nonsense on its own" is.
+        #
+        # The peak separates the two with room to spare (32767 vs <=16074), so
+        # the gate is the USER'S VOICE, not a keyword: saying «а теперь выключи»
+        # works because you are close, and the television does not because it is
+        # across the room. Below the gate the room does NOT answer — it goes back
+        # to waiting for the wake word, which is the only unambiguous signal.
+        if self._followup_only:
+            peak = int(self._last_utt_peak or 0)
+            if peak < self._followup_min_peak:
+                logger.info(
+                    f"[{self.stream_name}] 🔇 follow-up ignored, peak={peak} "
+                    f"< {self._followup_min_peak}: not the user (waiting for the "
+                    f"wake word) — '{txt[:50]}'"
+                )
+                self._back_to_wake()
+                return
+
         self._cancel_wake_greeting()
         # Never forward the wake word itself to nanobot — only the command
         # that follows it. Tolerate Whisper's glued repeats like
@@ -3506,10 +3576,14 @@ class CameraSession:
                         self._wake_detected = True
                         self._wake_expires = time.time() + window
                         self._followup_open = True
+                        # Marked as a follow-up: nobody said the wake word, so this
+                        # window must not treat the room as the user.
+                        self._followup_only = True
                         logger.info(
                             f"[{self.stream_name}] 💬 Follow-up open "
                             f"({'question' if is_q else 'answer'}) "
-                            f"{window:.0f}s until {self._wake_expires:.1f}"
+                            f"{window:.0f}s until {self._wake_expires:.1f} "
+                            f"(no wake word: needs peak>={self._followup_min_peak})"
                         )
                 except Exception as e:
                     logger.warning(f"[{self.stream_name}] TTS sentence failed: {e}")
@@ -3643,6 +3717,7 @@ class CameraSession:
 
     def _back_to_wake(self):
         self._wake_detected = False
+        self._followup_only = False
         _arbiter_clear_owner(self.stream_name)
         # No threshold bump on empty wake windows: the old +0.07 "false-fire
         # penalty" compounded after every missed/empty command (Whisper glitch,
@@ -3887,23 +3962,33 @@ class CameraSession:
         # Remember what we said so we can drop the echoed transcript later.
         self._last_tts_reply = reply.lower().strip().strip(".,!? -") if reply else ""
 
-        # Block mic immediately: TTS request takes seconds over network,
-        # and queued frames may already be playing out of the camera speaker.
-        # With no WebRTC track there are no queued frames, so fall back to the
-        # clip's own length — this guard used to be skipped entirely in that
-        # case, which silently removed the hard mic mute and let the room hear
-        # its own reply.
+        # Block the mic while the speaker is actually sounding, and for NO longer.
+        #
+        # It used to add a 3 s echo tail on top of the clip, and that is what
+        # swallowed the start of a natural follow-up. Measured 05.10.2026
+        # 19:24: the reply «Выключила» finished at 19:24:24.3, the follow-up
+        # window opened then, and the mute ran to 19:24:27.3 — so the utterance
+        # that was collected STARTED at 19:24:27.2, i.e. the first ~1.3 s of
+        # «а теперь выключи» was gone. Whisper got 5.92 s of what was left,
+        # raw_rms=522, and returned EMPTY: the follow-up did not work, and the
+        # log blamed the user for saying nothing.
+        #
+        # The return of our own voice is not this timer's job — it is handled by
+        # two layers that are actually able to recognise it: `_is_echo`
+        # (cross-correlation against the pcm we just stored, applied before the
+        # chunk reaches the decoder) and `_echo_of_reply` on the transcript. The
+        # wake word keeps its own longer tail (`_wake_suppress_until`), because a
+        # decoded «компьютер» out of the speaker really is a false wake.
         queued = self._out_track.queue_seconds() if self._out_track else (
             len(pcm) / (TTS_PLAY_RATE * 2)
         )
-        self._speaking_until = time.time() + queued + 3.0
+        self._speaking_until = time.time() + queued + _SPEAKER_SETTLE_S
         try:
             # Record the audio we are about to play so the mic feed can later
             # be checked for our own echo (cross-correlation in _is_echo).
             self._store_tts_echo(pcm)
 
             audio_dur = len(pcm) / (sr * 2)
-            echo_tail = 1.5 if is_question else 3.0
             played = False
 
             if self._play_audio_url:
@@ -3943,14 +4028,27 @@ class CameraSession:
             # later) is now caught precisely by cross-correlation in _is_echo,
             # so we no longer need a long blind lock that would also swallow
             # the user's answer to a question.
-            ECHO_TAIL = echo_tail
-            # Unconditional, and that is the fix: the hard mic mute in
-            # _feed_audio is keyed on this timestamp, so guarding it on
-            # `self._out_track` removed it entirely for a room playing over
-            # /play_audio. The reply then arrives at the decoder as if the user
-            # had said it.
+            #
+            # THIS is the assignment that actually set the mute, and it carried a
+            # 3 s echo tail (`1.5` for a question). Measured 05.10.2026 19:24:
+            # that tail is why «а теперь выключи» was lost — the utterance that
+            # got collected began at 19:24:27.2 with the mute ending at 19:24:27.3,
+            # so its first second was already gone and Whisper returned empty.
+            # It now ends with the audio. The WAKE word keeps its own tail
+            # (`_wake_suppress_until` below), where a «компьютер» decoded out of
+            # the speaker really would be a false wake; inbound AUDIO is
+            # recognised by _is_echo and _echo_of_reply, which need no blind
+            # window and do not need one to be correct.
+            ECHO_TAIL = _SPEAKER_SETTLE_S
             self._speaking_until = time.time() + audio_dur + ECHO_TAIL
             global GLOBAL_TTS_UNTIL
+            # Was `audio_dur + echo_tail` (up to 3 s), and it is the SECOND place
+            # the same 3 s tail bit: it drops the finished transcript outright with
+            # "TTS playback active (echo guard)", so even after the mic unmuted a
+            # follow-up spoken right after the answer was thrown away. It is a
+            # cross-camera guard, so it cannot use _is_echo (which is per session),
+            # but the transcript-level `_echo_of_reply` check below identifies our
+            # own voice in the text and is what should decide.
             GLOBAL_TTS_UNTIL = time.time() + audio_dur + ECHO_TAIL
             # Suppress the decoder for the playback plus a SHORT tail. This used to be
             # `audio_dur + 15.0`, which is the direct cause of "after the first

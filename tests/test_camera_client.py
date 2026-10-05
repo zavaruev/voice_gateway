@@ -17,6 +17,8 @@ import fractions
 import camera_client
 from camera_client import (
     AIVoiceOutputTrack,
+    _FOLLOWUP_MIN_PEAK,
+    _SPEAKER_SETTLE_S,
     CameraSession,
     TTS_PLAY_RATE,
     _CORRIDOR_STREAMS,
@@ -1309,6 +1311,7 @@ async def test_ambient_utterances_do_not_pollute_the_awake_tally():
 
 
 def _player_session():
+    """A session with just enough state for the playback loop."""
     s = CameraSession.__new__(CameraSession)
     s.stream_name = "cam"
     s._wake_timeout = 60.0
@@ -1319,6 +1322,8 @@ def _player_session():
     # "TTS sentence failed" — which is how a missing attribute in a test helper
     # reads as a playback bug.
     s._followup_open = False
+    s._followup_only = False
+    s._followup_min_peak = _FOLLOWUP_MIN_PEAK
     s._wake_detected = False
     s._dialogue_question_s = 30.0
     s._dialogue_statement_s = 10.0
@@ -1456,3 +1461,170 @@ def test_dialogue_windows_default_to_the_satellite_numbers():
     assert CAMERA_DIALOGUE_STATEMENT_S == 10.0
     cfg = CameraConfig("livingroom")
     assert cfg.dialogue_question_s == 0.0, "unset must stay 0 in the config"
+
+
+# --- a follow-up window is not the user (measured 05.10.2026 19:24-19:26) ----
+#
+# The living room answered its own television six times in two minutes. Nobody
+# had said the wake word; the window had been opened by our own reply, and every
+# utterance inside it was dispatched.
+
+
+# (peak, transcript) exactly as the gateway logged them that session.
+_SESSION = [
+    (32767, "выключи свет"),
+    (32767, "включи свет в гостиной"),
+    (16074, "музыкант"),
+    (4625, "Мама, ты что? Да, ха-ха-ха."),
+    (4130, "Это вот сейчас и не родит, не хранит стресс."),
+    (12348, "распаковываешь"),
+    (5626, "Добро пожаловать!"),
+    (10792, "Другая, пожалуйста, у тебя был шанс, но ты обожался."),
+]
+
+
+def _followup_session():
+    s = _make_session()
+    s._wake_detected = True
+    s._followup_only = True
+    return s
+
+
+@pytest.mark.asyncio
+async def test_a_quiet_followup_is_not_answered_at_all():
+    """The television is across the room, so it is quieter than the user.
+
+    It must not be dispatched, and the room must go back to waiting for the wake
+    word rather than answering noise — that was the "the camera talks nonsense on
+    its own" report.
+    """
+    dispatched = []
+    for peak, text in _SESSION:
+        if peak >= _FOLLOWUP_MIN_PEAK:
+            continue
+        s = _followup_session()
+        s._last_utt_peak = peak
+
+        async def _boom(*a, **kw):
+            dispatched.append(text)
+            return None
+
+        s._call_nanobot = _boom
+        s._cancel_wake_greeting = lambda: None
+        await s._handle_wake_or_command(text, "camera")
+        assert text not in dispatched, (
+            f"answered the room: {text!r} at peak {peak}"
+        )
+        assert s._wake_detected is False, (
+            f"kept the follow-up window open after {text!r} — the room would "
+            "stay in dialogue mode with nobody in it"
+        )
+
+
+@pytest.mark.asyncio
+async def test_the_users_own_followup_still_answers():
+    """The gate must not cost the natural thing it exists to allow: saying
+    «а теперь выключи» with no wake word."""
+    seen = []
+
+    for peak, text in _SESSION:
+        if peak < _FOLLOWUP_MIN_PEAK:
+            continue
+        s = _followup_session()
+        s._last_utt_peak = peak
+
+        async def _ok(txt, uid="camera"):
+            seen.append(txt)
+            return None
+
+        s._call_nanobot = _ok
+        s._cancel_wake_greeting = lambda: None
+        await s._handle_wake_or_command(text, "camera")
+
+    assert seen == ["выключи свет", "включи свет в гостиной"], seen
+
+
+@pytest.mark.asyncio
+async def test_a_window_opened_by_the_wake_word_accepts_anything():
+    """The gate applies ONLY to a window nobody asked for. After a real «компьютер»
+    the next utterance is the user whatever it measures — that is what a wake word
+    is for."""
+    s = _make_session()
+    s._wake_detected = True
+    s._followup_only = False
+    s._last_utt_peak = 4130  # television-level
+    seen = []
+
+    async def _ok(txt, uid="camera"):
+        seen.append(txt)
+        return None
+
+    s._call_nanobot = _ok
+    s._cancel_wake_greeting = lambda: None
+    await s._handle_wake_or_command("а теперь выключи", "camera")
+    assert seen == ["а теперь выключи"], seen
+
+
+@pytest.mark.asyncio
+async def test_the_mic_stops_being_muted_when_the_speaker_stops():
+    """The 3 s tail on top of the clip ate the first 1.3 s of the next sentence.
+
+    Measured 05.10.2026 19:24: reply ended 19:24:24.3, the collected utterance
+    started 19:24:27.2, Whisper returned empty. The mute must now end with the
+    audio, not three seconds after it.
+    """
+    s = _make_http_session()
+    s.http_session = _FakeHttp(200)
+    dur = 2.0
+    pcm = b"\x03\x04" * int(TTS_PLAY_RATE * dur)
+
+    await s._speak_pcm(pcm, "Выключила")
+
+    mute_len = s._speaking_until - s._tts_play_end
+    assert mute_len < 1.0, (
+        f"mic muted {mute_len:.1f}s past the end of the audio"
+    )
+    assert mute_len >= 0, "the mic opens before the speaker has finished"
+    assert _SPEAKER_SETTLE_S <= 0.5, "the settle margin itself grew"
+
+
+@pytest.mark.asyncio
+async def test_the_transcript_of_a_followup_is_not_thrown_away_afterwards():
+    """The second 3 s blocker, which the mic fix alone does not touch.
+
+    `GLOBAL_TTS_UNTIL` drops a finished transcript with "TTS playback active
+    (echo guard)". It was `audio_dur + 3 s`, so a follow-up spoken right after the
+    answer was discarded with a perfectly good transcript in hand — the log then
+    looks like the user said nothing.
+    """
+    import camera_client
+
+    s = _make_http_session()
+    s.http_session = _FakeHttp(200)
+    dur = 2.0
+    pcm = b"\x03\x04" * int(TTS_PLAY_RATE * dur)
+
+    await s._speak_pcm(pcm, "Выключила")
+
+    tail = camera_client.GLOBAL_TTS_UNTIL - s._tts_play_end
+    assert tail < 1.0, (
+        f"transcripts blocked {tail:.1f}s past the end of the audio — the "
+        "follow-up is discarded before it can be answered"
+    )
+
+
+def test_the_gate_default_is_off_and_the_env_is_wired():
+    """Like every other live-audio knob: 0 means "use the built-in default", and
+    the knob itself must be readable or it cannot be turned off per room."""
+    import inspect
+
+    assert CameraConfig(stream_name="x").followup_min_peak == 0
+    sig = inspect.signature(_make_session()._handle_wake_or_command)
+    assert "txt" in sig.parameters
+    src = open(
+        os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "main.py"
+        ),
+        encoding="utf-8",
+    ).read()
+    assert "CAMERA_FOLLOWUP_MIN_PEAK_{name.upper()}" in src

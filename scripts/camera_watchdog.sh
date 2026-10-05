@@ -47,7 +47,8 @@ WEDGE_S="${WEDGE_S:-2.5}"          # camera must answer faster than this
 CONFIRM_N="${CONFIRM_N:-2}"         # consecutive bad samples before acting
 CONFIRM_GAP_S="${CONFIRM_GAP_S:-15}"
 MIN_GAP_S="${MIN_GAP_S:-300}"       # never retry more often than this
-SETTLE_S="${SETTLE_S:-30}"          # wait after restarting majestic
+GW_SETTLE_S="${GW_SETTLE_S:-90}"    # settle time after restarting the gateway
+SETTLE_S="${SETTLE_S:-30}"          # wait after a restart before re-checking
 WAIT_UP_S="${WAIT_UP_S:-150}"       # how long a reboot may take to come back
 
 CAM_LATENCY="?"                     # `set -u` would abort on an unset log value
@@ -168,7 +169,11 @@ claim || { log "  skipped: attempted less than ${MIN_GAP_S}s ago"; exit 0; }
 # time, with the camera untouched.
 log "  step 1: restart $GATEWAY (the side that stopped reading)"
 docker restart "$GATEWAY" >/dev/null 2>&1
-sleep "$SETTLE_S"
+# Longer than the camera settle: the container has to import torch-adjacent
+# deps, build the vosk model, reconnect the RTSP loop and pull the stream's
+# backlog before its audio is real. Sampling too early would call a working
+# restart a failure and climb the ladder for nothing.
+sleep "$GW_SETTLE_S"
 
 if wait_healthy 8 15; then
   log "  RECOVERED by restarting $GATEWAY (http ${CAM_LATENCY}s) — the camera was never at fault"

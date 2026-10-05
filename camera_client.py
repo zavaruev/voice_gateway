@@ -2166,6 +2166,19 @@ class CameraSession:
                     # hypothesis — which is what actually settled the last two
                     # silent-room investigations. Raise it to log a silent room.
                     self._vosk_last_log = now
+                    # `floor` is the room noise level the pause endpoint tests
+                    # against, and `thresh` is what that becomes. Both are here
+                    # because the endpoint's whole behaviour is one number: if the
+                    # room is louder than the threshold, every frame is speech
+                    # and every utterance runs the full 7 s cap — which looks
+                    # exactly like "the endpoint does not work" and is not.
+                    ep = self._endpoint
+                    ep_txt = (
+                        f" floor={self._noise.value:.4f} "
+                        f"thresh={self._noise.value * self._pause_noise_mult:.4f}"
+                        if ep is not None
+                        else f" floor={self._noise.value:.4f} thresh=n/a"
+                    )
                     logger.info(
                         f"[{self.stream_name}] vosk diag: "
                         f"chunks={self._vosk_chunks} suppressed={self._vosk_suppressed} "
@@ -2173,6 +2186,7 @@ class CameraSession:
                         f"triggers={self._vosk_wake.triggers} "
                         f"decodes={self._vosk_wake.decodes} "
                         f"hyp='{self._vosk_wake.last_partial}'"
+                        f"{ep_txt}"
                     )
                     self._vosk_last_peak = 0
                 if got_wake:

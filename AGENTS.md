@@ -383,6 +383,27 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
   for exactly this, and the deterministic refusal is what kept it from getting
   there. The refusal is now noun-aware and returns an error L2 can act on.
 
+- **THE L1 COMMAND PATH IS VERIFIED END-TO-END — measure it before blaming the
+  audio.** 05.10.2026, after a full rebuild of `voice_gateway` + `jev-router` +
+  `smolagents-worker`, driven straight at `POST :8091/route` with the state read
+  back from HA `/api/states` after every call:
+
+  | command | reply | time | state |
+  |---|---|---|---|
+  | выключи свет | Выключила | 0.17 s | **off** |
+  | выключи свет | В гостиной уже выключено. | 0.10 s | off |
+  | включи свет | Включила | 0.17 s | **on** |
+  | включи свет | В гостиной уже включено. | 0.12 s | on |
+  | выключи свет | Выключила | 0.16 s | **off** |
+
+  Two things this establishes, both of which had been argued about: the side
+  effect is REAL (the entity id is `switch.living_room_light_swith_relay` — no
+  extra `switch` — and it actually flips), and the repeat is an honest refusal
+  rather than a second «Выключила». **0.10–0.17 s** is the whole L1 cost, so if
+  a voice turn feels slow, the time is upstream of the router, not in it.
+  `/route` answers **SSE**, not JSON: read every `data:` line and take the last
+  one carrying text, or you will report the `route` event and think the command
+  produced no reply.
 - **AN HONEST `ok` IS NOT A DEVICE THAT MOVED.** The MCP intent answers `{"data":{"success":[...],"failed":[...]}}`, and `success` is full of things that are not a working device. Measured 04.10.2026 on «выключи свет» in the living room: the blind call (`domain:["light"]`, `area:"Living Room"`, **no `name`**) returned `success: [{type:area, id:living_room}, {type:entity, id:light.wled_living_room}]`, `failed: []` — HA matched the ROOM plus a WLED strip that has been `unavailable` since 28.09 — so `ok=True`, the gateway said **«Выключила»**, and the lamp (`switch.*_relay`, which `domain:["light"]` cannot match at all) never changed. Three rules now, each with a test:
   1. `get_states()` returns its **previous snapshot** on failure, and that snapshot is `[]` on a cold cache — so an empty list means "HA did not answer", NOT "no such device". An empty registry and an empty target set both **refuse**; on/off never falls through to the blind intent any more.
   2. `_touched_a_usable_entity()` is required before any `speak_ok`: HA must name at least one entity of `type: "entity"` that is **present in the live registry** and not `unavailable`. An `area` entry means a room matched, not a device. (An id ABSENT from `/api/states` counts as unverified — that mistake was in the first version of this check and its own test caught it.)

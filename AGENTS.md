@@ -383,6 +383,56 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
   for exactly this, and the deterministic refusal is what kept it from getting
   there. The refusal is now noun-aware and returns an error L2 can act on.
 
+- **A CONSUMED SENTINEL IS NOT AN END-OF-STREAM TEST — the camera was deaf for
+  119 s after EVERY reply, and it is the reason «Да?» happens.** Measured
+  05.10.2026 09:54: wake, `UTTERANCE END dur=2080ms via pause`, Whisper OK
+  `'включи свет'`, reply TTS at 09:54:46.149 — then **no `VAD SPEECH START` and
+  no `UTTERANCE END` at all** until 09:56:45, which is
+  `wait_for(player_task, timeout=120.0)` expiring to the second. The user spoke
+  again at 09:54:58, the wake fired, and the utterance was never committed, so
+  the greeting answered instead: «Да?» is this, not a lost command.
+
+  `_nanobot_player_task` reads **two** queue items per pass, and only the
+  `None` at the TOP of the loop counted as end-of-stream. With the queue
+  `[sentence, None]` the sentinel was taken as the "next sentence", the
+  `if nxt is not None` check correctly skipped the prefetch, `sent = nxt` made
+  `sent` None, and the next pass did `sent = await q.get()` on a queue nobody
+  would write to again. It blocked forever. The onset into `_vad_has_speech`
+  requires `not _processing_utterance`, held for the whole of `_call_backend`,
+  so the blocked player took the microphone deaf with it. **A blocked consumer
+  behind a broad `except Exception` is silent** — there is no log line between
+  the reply's TTS and the expiry, which is what makes this so easy to misread as
+  "the wake word is deaf".
+
+  Fixed by flagging the sentinel (`stream_done`), playing the sentence in hand,
+  and exiting **afterwards** — breaking at the sentinel drops the reply, because
+  `sent` has not been synthesised yet. Three tests, all of which fail on the old
+  code on their own 5 s timeout.
+- **A camera must listen after an ANSWER too — it is a separate path from the
+  satellites, and the asymmetry is real.** `main.py::_finalize_turn_followup()`
+  sets a satellite to LISTENING in **both** branches, with
+  `STANDBY_TIMEOUT_QUESTION` 30 s and `STANDBY_TIMEOUT_STATEMENT` 10 s. The
+  camera opened a window only for a question and called `_back_to_wake()` the
+  moment it had answered, so «а теперь выключи» was never heard and every
+  follow-up needed the wake word again — reported 05.10.2026 as "the dialogue
+  setting does not work for cameras the way it does for the ESP32". Both branches
+  now open a window: `CAMERA_DIALOGUE_QUESTION_S[_<NAME>]` 30 s and
+  `CAMERA_DIALOGUE_STATEMENT_S[_<NAME>]` 10 s (0 => those defaults), opened when
+  the reply FINISHES sounding rather than when it is queued, and the player
+  closes the mic from an explicit per-turn `_followup_open` flag — not from
+  `last_q`, which is what made the camera deaf, and not from a flag that could
+  stay True across turns and hold the mic open forever. The statement window is
+  short on purpose: it is for a natural follow-up, not for listening to the
+  television. What makes that safe is that the wake word is DECODED — TV speech
+  has to contain «компьютер» to open anything — plus `_wake_gate_open()` while
+  our own playback is in the air.
+- **THE PAUSE ENDPOINT IS PROVEN IN THE FIELD.** 05.10.2026 09:54:41.346 wake →
+  09:54:43.614 `VAD UTTERANCE END dur=2080ms via pause (rms=0.0121 ref=0.0699
+  floor=0.0067 run=6 speech=8) (awake ends: {'pause': 1})` → 09:54:44.276 Whisper
+  OK `'включи свет'`. **2.93 s from wake to transcript, of which 2.08 s is the
+  utterance** — against 8.0 s and a 7040 ms cap before. The endpoint was worth
+  enabling on its own evidence; note the `ref` is 5.8x the `rms`, i.e. the level
+  dip it fires on is real rather than the room floor moving.
 - **THE L1 COMMAND PATH IS VERIFIED END-TO-END — measure it before blaming the
   audio.** 05.10.2026, after a full rebuild of `voice_gateway` + `jev-router` +
   `smolagents-worker`, driven straight at `POST :8091/route` with the state read

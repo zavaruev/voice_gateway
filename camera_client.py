@@ -996,6 +996,10 @@ class CameraSession:
         # True while the wake window was opened by our own REPLY rather than by a
         # heard wake word. Such a window must not treat the room as the user.
         self._followup_only = False
+        # Where the user's audio goes to die. See _feed_audio.
+        self._drop_muted = 0      # dropped by the speaker-settle mute
+        self._drop_track = 0      # dropped by the WebRTC track's echo guard
+        self._drop_echo = 0       # dropped by cross-correlation with our TTS
         # Wall clock of the most recent VAD "speech" frame. The greeting
         # asks "is the user talking?", and `_vad_has_speech` answers that
         # wrongly while an utterance is in flight (see _wake_greeting).
@@ -1944,11 +1948,20 @@ class CameraSession:
         return best >= self._echo_corr_threshold
 
     async def _feed_audio(self, pcm: bytes, rate: int = 16000):
+        # Both early returns below DROP the user's audio before anything can
+        # recognise it — the wake decoder, the VAD, the utterance buffer, Whisper.
+        # They are counted because on 05.10.2026 a follow-up vanished with nothing
+        # in any log to say where: the collected 7 s buffer had raw_rms=496, i.e.
+        # the room and no user, while the window was open and the user was
+        # speaking. "The user said nothing" and "we threw it away" look identical
+        # from the outside, so the counters are what tell them apart.
         if time.time() < self._speaking_until:
+            self._drop_muted += 1
             return
         # Hard echo guard: while TTS frames are still queued for playback,
         # the camera speaker is (or will be) sounding — do not feed the mic.
         if self._out_track and self._out_track.echo_active():
+            self._drop_track += 1
             return
 
         if self._wake_detected and time.time() >= self._wake_expires:
@@ -1965,6 +1978,7 @@ class CameraSession:
                 # cross-correlation with the recently played audio. This is what
                 # lets the user's real answer through while silencing the echo.
                 if self._is_echo(pcm_16k):
+                    self._drop_echo += 1
                     now = time.time()
                     if now - self._last_echo_log > 2.0:
                         self._last_echo_log = now
@@ -2217,6 +2231,16 @@ class CameraSession:
                         if ep is not None
                         else f" floor={self._noise.value:.4f} thresh=n/a"
                     )
+                    # The three places the user's audio can be discarded before
+                    # anything can recognise it. Read these FIRST when a spoken
+                    # command does not appear: `muted` climbing means the speaker
+                    # timer ate it, `echo` means cross-correlation claimed it was
+                    # our own voice, and both being ~0 with nothing downstream
+                    # means the utterance never opened.
+                    drops = (
+                        f"drop[muted={self._drop_muted} track={self._drop_track} "
+                        f"echo={self._drop_echo}]"
+                    )
                     logger.info(
                         f"[{self.stream_name}] vosk diag: "
                         f"chunks={self._vosk_chunks} suppressed={self._vosk_suppressed} "
@@ -2224,7 +2248,7 @@ class CameraSession:
                         f"triggers={self._vosk_wake.triggers} "
                         f"decodes={self._vosk_wake.decodes} "
                         f"hyp='{self._vosk_wake.last_partial}'"
-                        f"{ep_txt}"
+                        f"{ep_txt} {drops}"
                     )
                     self._vosk_last_peak = 0
                 if got_wake:

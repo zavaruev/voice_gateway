@@ -1628,3 +1628,38 @@ def test_the_gate_default_is_off_and_the_env_is_wired():
         encoding="utf-8",
     ).read()
     assert "CAMERA_FOLLOWUP_MIN_PEAK_{name.upper()}" in src
+
+
+@pytest.mark.asyncio
+async def test_dropped_audio_is_counted_not_silently_discarded():
+    """On 05.10.2026 a follow-up vanished with nothing in the log to say where:
+    the collected 7 s buffer held raw_rms=496 — the room, no user — while the
+    window was open and the user was speaking. "The user said nothing" and "we
+    threw it away" are indistinguishable from outside, so both early returns in
+    _feed_audio now count themselves."""
+    s = _make_session()
+    s._speaking_until = time.time() + 5.0
+    for _ in range(4):
+        await s._feed_audio(b"\x01\x02" * 160)
+    assert s._drop_muted == 4, s._drop_muted
+
+    s._speaking_until = 0.0
+    class _Track:
+        def echo_active(self):
+            return True
+
+    s._out_track = _Track()
+    for _ in range(3):
+        await s._feed_audio(b"\x01\x02" * 160)
+    assert s._drop_track == 3, s._drop_track
+
+
+def test_the_diag_line_carries_the_drop_counters():
+    """A counter nobody logs is the same as no counter."""
+    import inspect
+
+    src = inspect.getsource(CameraSession._vad_process)
+    assert "drop[muted=" in src, (
+        "the diag line must carry the drop counters, or a vanished follow-up is "
+        "undiagnosable again"
+    )

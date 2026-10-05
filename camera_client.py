@@ -533,6 +533,8 @@ class _PauseEndpoint:
         min_speech_frames: int = 5,
         ref_frames: int = 12,
         anchor_frames: int = 4,
+        noise_mult: float = 0.0,
+        noise: "_NoiseFloor | None" = None,
     ):
         # 0 from a config field means "unset" — the env is optional and a
         # half-filled override must not silently zero a threshold.
@@ -543,6 +545,13 @@ class _PauseEndpoint:
         )
         self.ref_frames = ref_frames if ref_frames > 0 else 12
         self.anchor_frames = anchor_frames if anchor_frames > 0 else 4
+        # Noise-based mode. 0 => the trailing-window reference (the original
+        # behaviour); > 0 => test against `noise.value * noise_mult`. Measured on
+        # this room's own saved utterances: 4 of 4 commands ended on the 7 s cap
+        # with the window, and 2.08-2.40 s with mult 2.5 against a ground truth
+        # of 1.28-1.44 s.
+        self.noise_mult = noise_mult
+        self.noise = noise
         self.reset()
 
     def reset(self) -> None:
@@ -552,6 +561,35 @@ class _PauseEndpoint:
         self._run = 0
         self._speech_frames = 0
 
+    def _feed_noise(self, rms: float) -> tuple[str, str]:
+        """Pause = below `noise_mult` x the tracked room floor.
+
+        One threshold, so speech and pause are exact complements and there is no
+        second, independent floor that can disagree about what "quiet" means —
+        the windowed version had both a reference and an anchor floor, and on this
+        room's audio the anchor floor (0.0072) sat BELOW the 0.011 background, so
+        silence counted as speech (`speech=41` on a silent utterance).
+        """
+        floor = self.noise.value
+        thresh = floor * self.noise_mult
+        is_pause = floor > 0.0 and rms < thresh
+        if is_pause:
+            self._run += 1
+        else:
+            self._run = 0
+            self._speech_frames += 1
+        detail = (
+            f"rms={rms:.4f} floor={floor:.4f} thresh={thresh:.4f} "
+            f"run={self._run} speech={self._speech_frames}"
+        )
+        if (
+            self._run >= self.run_frames
+            and self._speech_frames >= self.min_speech_frames
+        ):
+            self.reset()
+            return "end", detail
+        return ("pause" if is_pause else "speech"), detail
+
     def feed(self, rms: float) -> tuple[str, str]:
         """Classify one 160 ms frame.
 
@@ -560,6 +598,8 @@ class _PauseEndpoint:
         field logs instead of from a guess.
         """
         rms = float(rms)
+        if self.noise_mult > 0.0 and self.noise is not None:
+            return self._feed_noise(rms)
         self._ref.append(rms)
         if len(self._ref) > self.ref_frames:
             self._ref.pop(0)
@@ -609,6 +649,65 @@ class _PauseEndpoint:
             self.reset()
             return "end", detail
         return ("pause" if is_pause else "speech"), detail
+
+
+class _NoiseFloor:
+    """Continuously tracked room noise floor: fast down, very slow up.
+
+    Room-scoped on purpose. The first attempt at level-based endpointing used a
+    trailing 12-frame window as its reference, and that reference was unusable in
+    this room for two independent reasons, both measured on the living room
+    05.10.2026 from the real 160 ms envelope of a saved utterance:
+
+      * the attention pip is **0.59 rms against a 0.010 floor** — 60x — so the
+        reference was the pip for the whole first second, and the gap right after
+        it looked like a pause before any word was spoken;
+      * once the pip left the 1.9 s window the reference decayed to the floor
+        itself, and silence is never below 55 % of the reference when it IS the
+        reference. Measured on the real command «включи свет»: `run` stayed 0 for
+        6.88 s and the utterance ended on the 7 s cap. 4 of 4 commands did.
+
+    Tracking the floor instead fixes both at once. It is seeded from the LOW end
+    of the first 12 frames so a transient cannot define it, falls quickly when the
+    room goes quiet and rises very slowly, so sustained noise lifts it only over
+    many seconds. Speech in this room measures 0.037-0.13 against a 0.010-0.011
+    floor — 3.4x to 13x — so `floor * mult` separates the two classes with slack
+    on both sides and the factor is not a tuned-to-death constant.
+
+    When the floor cannot be established the detector reports no pause and the
+    utterance falls back to the duration cap: slower, never chopped.
+    """
+
+    def __init__(self, fast_down: float = 0.4, slow_up: float = 0.003,
+                 seed_frames: int = 12, mult: float = 2.5):
+        self.fast_down = fast_down
+        self.slow_up = slow_up
+        self.seed_frames = seed_frames
+        self.mult = mult
+        self.value = 0.0
+        self._seed: list[float] = []
+
+    def feed(self, rms: float) -> None:
+        if self.value == 0.0:
+            self._seed.append(rms)
+            if len(self._seed) >= self.seed_frames:
+                # Seed with the minimum, NOT the mean or the first frame: the
+                # attention pip would otherwise become the floor.
+                self.value = float(min(self._seed))
+            return
+        # ONLY frames already below the speech threshold may inform the floor.
+        # This is not an optimisation, it is the correctness of the whole idea:
+        # the floor is fed on every frame, so if speech could raise it, a long
+        # utterance would lift its own threshold until the speech itself read as a
+        # pause. Caught by the test for continuous sound — a 7 s stretch at
+        # 0.04-0.06 rms with no gap was cut short because the floor had climbed
+        # to meet it.
+        if rms >= self.value * self.mult:
+            return
+        if rms < self.value:
+            self.value += (rms - self.value) * self.fast_down
+        else:
+            self.value += (rms - self.value) * self.slow_up
 
 
 @dataclass
@@ -690,6 +789,17 @@ class CameraConfig:
     pause_ratio: float = 0.0
     pause_run_frames: int = 0
     pause_min_speech_frames: int = 0
+    # Test the pause against `room noise floor * this` instead of against a
+    # trailing-window reference. 0 => the trailing-window behaviour, unchanged.
+    #
+    # Measured 05.10.2026 on this room's own saved utterances: the windowed
+    # reference never recovered from the attention pip (0.59 rms vs a 0.010
+    # floor) and then decayed to the floor itself, so 4 of 4 commands ran the
+    # full 7 s cap while the command itself was over in 1.28-1.44 s. Against a
+    # tracked floor, mult 2.5 ends them at 2.08-2.40 s, and still falls back to
+    # the cap on an utterance that carries continuous sound (our own TTS echo),
+    # which is the safe direction.
+    pause_noise_mult: float = 0.0
     # Peak the reply is normalised to before it goes to the camera speaker.
     # 0 => _TTS_TARGET_PEAK_DEFAULT.
     #
@@ -769,9 +879,14 @@ class CameraSession:
         # Level-based utterance endpointing for this room (see _PauseEndpoint).
         # Read here because _init_audio_processing() has no CameraConfig.
         self._pause_endpoint_on = config.pause_endpoint
+        # Tracked on every frame and never reset: a property of the room.
+        # The multiplier is shared with the detector — the floor only tracks
+        # frames it considers noise, so the two must agree on the threshold.
+        self._noise = _NoiseFloor(mult=config.pause_noise_mult or 2.5)
         self._pause_ratio = config.pause_ratio
         self._pause_run_frames = config.pause_run_frames
         self._pause_min_speech_frames = config.pause_min_speech_frames
+        self._pause_noise_mult = config.pause_noise_mult
         # 0 => the default, so a half-filled override cannot mute the speaker.
         self._tts_target_peak = config.tts_target_peak or _TTS_TARGET_PEAK_DEFAULT
         # 0 => the default, so a half-filled override cannot close the window
@@ -938,6 +1053,8 @@ class CameraSession:
                 ratio=self._pause_ratio,
                 run_frames=self._pause_run_frames,
                 min_speech_frames=self._pause_min_speech_frames,
+                noise_mult=self._pause_noise_mult,
+                noise=self._noise,
             )
             if self._pause_endpoint_on
             else None
@@ -1918,6 +2035,11 @@ class CameraSession:
             # distant speech.
             if orig_rms < 0.0015:
                 speech = False
+
+            # Room noise floor: fed on EVERY frame, never reset, because it is a
+            # property of the room and not of an utterance. It is what the
+            # noise-based endpoint tests against; see _PauseEndpoint.
+            self._noise.feed(orig_rms)
 
             if now - self._last_rms_log > 2.0:
                 self._last_rms_log = now

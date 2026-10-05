@@ -20,7 +20,12 @@ back to the cap. Slower is recoverable; a chopped command is a wrong command.
 import inspect
 import os
 
-from camera_client import CameraConfig, CameraSession, _PauseEndpoint
+from camera_client import (
+    CameraConfig,
+    CameraSession,
+    _NoiseFloor,
+    _PauseEndpoint,
+)
 
 
 # 160 ms frames, i.e. 6.25/s — the hop _vad_process actually runs at.
@@ -240,3 +245,166 @@ def test_every_end_is_logged_with_its_reason():
         "the per-boot tally is what answers whether the endpoint is working or "
         "everything is still hitting the 7 s cap"
     )
+
+
+# --- the room's noise floor, measured 05.10.2026 ----------------------------
+#
+# The trailing-window reference could not find a pause in this room at all: 4 of
+# 4 real commands ran the full 7 s cap while the command itself was over in
+# 1.28-1.44 s. Two independent reasons, both visible in the envelope below.
+
+
+def test_the_noise_floor_is_not_defined_by_a_transient():
+    """The attention pip is 0.59 rms against a 0.010 floor here.
+
+    Seeded from the first frame, or from the mean, the pip BECOMES the floor and
+    every quiet frame then reads as speech.
+    """
+    nf = _NoiseFloor()
+    for rms in [0.59, 0.018, 0.012, 0.088, 0.038, 0.017] + [0.0108] * 6:
+        nf.feed(rms)
+    assert 0.008 < nf.value < 0.013, f"floor={nf.value:.4f} — a transient won"
+
+
+def test_the_noise_floor_moves_down_fast_and_up_slow():
+    nf = _NoiseFloor()
+    for _ in range(12):
+        nf.feed(0.010)
+    quiet = nf.value
+    nf.feed(0.005)
+    assert nf.value < quiet, "floor must fall when the room goes quiet"
+    dropped = quiet - nf.value
+    for _ in range(20):
+        nf.feed(0.010)
+    assert nf.value - (quiet - dropped) < dropped, (
+        "floor must rise slowly, or one burst of noise redefines the room"
+    )
+
+
+# The measured 160 ms rms envelopes of two real commands, saved by the gateway in
+# /tmp/utterances on 05.10.2026 18:32 UTC. Frames 0-1 are the attention pip
+# (0.59 / 0.48 rms against a 0.010 room floor), the words follow, then the room.
+# `включи свет` is over at frame 10 and `выключи свет` at frame 8.
+_REAL_COMMAND_RMS = [
+    0.5923, 0.4781, 0.0181, 0.0113, 0.0125, 0.0114, 0.0879, 0.0719,
+    0.0377, 0.0423, 0.0174, 0.0111, 0.0108, 0.0123, 0.0113, 0.0100,
+    0.0107, 0.0108, 0.0114, 0.0109, 0.0108, 0.0104, 0.0102, 0.0117,
+]
+_SECOND_COMMAND_RMS = [
+    0.5954, 0.4810, 0.0277, 0.0509, 0.0601, 0.0420, 0.0266, 0.0311,
+    0.0175, 0.0109, 0.0103, 0.0099, 0.0121, 0.0119, 0.0125, 0.0112,
+    0.0109, 0.0104, 0.0119, 0.0115, 0.0121, 0.0123, 0.0099, 0.0115,
+]
+
+
+# The room before the command, so the floor is established the way the live loop
+# has it: tracked on every frame for minutes before anyone speaks. Without this
+# the first 12 frames are spent SEEDING and cannot be classified at all, which is
+# an artefact of replaying an utterance in isolation, not of the room.
+_ROOM = [0.0110, 0.0108, 0.0113, 0.0105, 0.0109, 0.0111, 0.0107, 0.0104,
+         0.0112, 0.0106, 0.0109, 0.0107]
+
+
+def _fire(rms_list, mult=2.5):
+    noise = _NoiseFloor(mult=mult)
+    ep = _PauseEndpoint(noise_mult=mult, noise=noise)
+    for v in _ROOM:
+        noise.feed(v)
+    for i, v in enumerate(rms_list):
+        noise.feed(v)
+        if ep.feed(v)[0] == "end":
+            return i
+    return None
+
+
+def test_a_real_command_ends_on_its_pause_and_not_on_the_cap():
+    """Both commands finished long before the 7 s cap: 2.40 s and 2.08 s, i.e.
+    0.96 s after the last word, which is the run_frames confirmation window."""
+    first, second = _fire(_REAL_COMMAND_RMS), _fire(_SECOND_COMMAND_RMS)
+    assert first is not None, "the pause was never found"
+    assert first * 0.16 == 2.40, f"ended at {first * 0.16:.2f}s, not 2.40s"
+    assert second * 0.16 == 2.08, f"ended at {second * 0.16:.2f}s, not 2.08s"
+    # Never before the last word: the commands end at frames 10 and 8.
+    assert first * 0.16 > 1.60, "cut the command short"
+    assert second * 0.16 > 1.28, "cut the command short"
+
+
+def test_the_windowed_reference_still_cannot_find_that_pause():
+    """Why the noise floor was needed, kept as a guard: same envelopes, shipped
+    detector. The reference is the pip for a second, then decays onto the room,
+    so silence is never below a fraction of it."""
+    for rms in (_REAL_COMMAND_RMS, _SECOND_COMMAND_RMS):
+        ep = _PauseEndpoint()
+        for v in rms:
+            assert ep.feed(v)[0] != "end", (
+                "the windowed reference now finds this pause; if that holds on "
+                "real audio the noise-floor path should be revisited rather than "
+                "kept as the default"
+            )
+
+
+def test_the_room_floor_is_what_it_measures_and_not_the_pip():
+    noise = _NoiseFloor(mult=2.5)
+    for v in _REAL_COMMAND_RMS:
+        noise.feed(v)
+    assert 0.008 < noise.value < 0.013, f"floor={noise.value:.4f} — a transient won"
+
+
+def test_continuous_sound_still_falls_back_to_the_cap():
+    """Our own TTS echo, measured at the same time: an utterance the detector
+    must NOT cut. The safe direction is the cap — slower, never chopped.
+
+    This is also the test that caught the floor being raised by the speech it
+    was supposed to measure against: 7 s at 0.04-0.06 with no gap ended early
+    because the floor had climbed to meet it.
+    """
+    import numpy as np
+
+    noise = _NoiseFloor(mult=2.5)
+    ep = _PauseEndpoint(noise_mult=2.5, noise=noise)
+    for _ in range(12):
+        noise.feed(0.010)
+    rng = np.random.default_rng(7)
+    for _ in range(44):  # 7 s at speech level with no gap at all
+        v = 0.04 + 0.02 * float(rng.random())
+        noise.feed(v)
+        assert ep.feed(v)[0] != "end", "cut an utterance that never paused"
+    assert noise.value < 0.02, (
+        f"floor climbed to {noise.value:.4f} on speech alone — it must only "
+        "track frames it considers noise"
+    )
+
+
+def test_a_raised_background_is_followed_so_the_room_still_works():
+    """The slow upward branch exists for this: a vacuum cleaner or a hood lifts
+    the floor over seconds and the detector keeps working instead of reading all
+    of it as speech."""
+    noise = _NoiseFloor(mult=2.5)
+    for _ in range(12):
+        noise.feed(0.010)
+    for _ in range(400):  # ~64 s of background at 0.018, still below 2.5x
+        noise.feed(0.018)
+    assert 0.015 < noise.value < 0.021, f"floor={noise.value:.4f}"
+    ep = _PauseEndpoint(noise_mult=2.5, noise=noise)
+    fired = None
+    # Four frames of voice, then a gap of six — exactly what run_frames demands.
+    for i in range(40):
+        v = 0.055 if i % 10 < 4 else 0.018
+        noise.feed(v)
+        if ep.feed(v)[0] == "end":
+            fired = i
+            break
+    assert fired is not None, "lost the pause once the room got noisier"
+    # Not frame 10: that gap came after only 4 speech frames, and
+    # min_speech_frames is 5 — the guard that stops a bare «компьютер» plus a
+    # pause from dispatching an empty command. The second gap satisfies it.
+    assert fired == 19, f"ended at frame {fired}, expected 19"
+    assert 10 < fired, "the min_speech_frames guard did not hold"
+
+
+def test_no_floor_means_no_pause():
+    """Frames arrive before the floor is established; that must not read as a
+    pause, and must certainly not end the utterance."""
+    ep = _PauseEndpoint(noise_mult=2.5, noise=_NoiseFloor())
+    verdicts = [ep.feed(0.0001)[0] for _ in range(10)]
+    assert all(v == "speech" for v in verdicts), verdicts

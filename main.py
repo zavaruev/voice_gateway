@@ -3649,6 +3649,19 @@ async def start_camera_sessions():
                     or os.getenv("CAMERA_PAUSE_MIN_SPEECH_FRAMES")
                     or 0
                 ),
+                # 0 => the trailing-window reference. >0 => test the pause
+                # against the continuously tracked room noise floor times this.
+                # The windowed reference cannot work in a room where the
+                # attention pip is 60x the floor: measured 4 of 4 commands on the
+                # 7 s cap against a ground truth of 1.3-1.4 s of speech. See
+                # _NoiseFloor.
+                pause_noise_mult=float(
+                    os.getenv(
+                        f"CAMERA_PAUSE_NOISE_MULT_{name.upper()}"
+                    )
+                    or os.getenv("CAMERA_PAUSE_NOISE_MULT")
+                    or 0.0
+                ),
                 # Peak the reply is normalised to before the camera plays it.
                 # 0 => the built-in 20000 (61 % of full scale). Exists for an
                 # unresolved field report of crackling playback (05.10.2026):

@@ -860,7 +860,13 @@ RE_STATUS_Q = re.compile(
     re.IGNORECASE,
 )
 RE_TIME_Q = re.compile(
-    r"\b(который час|какое (?:сейчас )?время|какое (?:сегодня )?число|какая дата|дата сегодня)\b",
+    # «сколько времени» is how the question is actually asked — measured
+    # 05.10.2026 22:14, the user said «Сколько времени?» and it went to L2 for
+    # 4 s, while «который час» answered in 0.26 s. Both mean the same thing and
+    # the second one was in the list; the first is the more common phrasing and
+    # was simply missing.
+    r"\b(который час|какое (?:сейчас )?время|какое (?:сегодня )?число|какая дата"
+    r"|дата сегодня|сколько (?:сейчас )?времени|времени сколько|час сколько)\b",
     re.IGNORECASE,
 )
 RE_WEATHER_Q = re.compile(r"\bпогод\w*|улице\s+(?:жарко|холодно)", re.IGNORECASE)

@@ -1404,3 +1404,24 @@ def test_history_exposes_the_users_words_not_the_rooms_reply():
     assert history.last_text("s") == "включи свет"
     assert "Включила" not in history.last_text("s")
     assert history.last_text("missing") == ""
+
+
+def test_the_time_question_is_phrased_the_way_people_ask_it():
+    """Measured 05.10.2026 22:14: «Сколько времени?» took 4.2 s through L2 while
+    «который час» took 0.26 s. The second phrasing was in the list and the first,
+    which is the more common one, was not."""
+    from resolver import RE_TIME_Q
+
+    for phrase in (
+        "сколько времени",
+        "Сколько сейчас времени",
+        "времени сколько",
+        "который час",
+        "какое сейчас время",
+        "какое сегодня число",
+        "какая дата",
+    ):
+        assert RE_TIME_Q.search(phrase), f"{phrase!r} is not a time question"
+
+    for phrase in ("какая температура в гостиной", "что сейчас играет", "кто это"):
+        assert not RE_TIME_Q.search(phrase), f"{phrase!r} is not a time question"

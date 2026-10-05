@@ -544,6 +544,59 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
   (`_wake_suppress_until`), because a «компьютер» decoded out of our own speaker
   really is a false wake and is a different failure.
 
+- **STATE AS LEFT FOR FIELD OBSERVATION, 06.10.2026 ~01:50.** Measured on the
+  living room, not asserted. Read this first when a field report arrives: it is
+  the baseline the numbers below are compared against.
+
+  **Working, verified:**
+  * *The camera was answering its own pip.* `attention pip` leaked into the mic at
+    the rail, the VAD opened an utterance ON it, and the buffer was
+    `[1379, 1335, 1596, 32767×4, 2656, 1615, 1614]` — 1.6 s containing **no user
+    speech at all**. Whisper transcribed the beep as «пап» and L2 spent 8 s on it.
+    `_play_attention` muted for `now + 0.35` against a `duration = 0.4` pip, with
+    `now` captured before the POST. Now measured from after playback.
+  * Media transport: five commands in a row, each confirmed by the router's own
+    `_media_moved()` re-read (`moved after an empty reply`) — `media_pause` at
+    21:32 and 21:46, `media_play` at 21:11, 21:48, 21:51. «пауза» ->
+    «Поставила на паузу», «Продолжай»/«Продолжаем воспроизведение» -> «Продолжаю».
+  * Pause endpoint 6 of 7 ends via `pause`; the pause detector's `floor` tracks
+    0.0110-0.0118 with `thresh` ~0.028 against measured speech at 0.037-0.13.
+  * Television refused twice on the follow-up gate (`peak=4507`, `5949`, both
+    below 24000) — and no TV utterance has reached the router since.
+  * Wake: 3-4 triggers in 30 min, `suppressed=0` — no «компьютер» decoded and lost.
+  * Drop counters healthy: `drop[muted=130 track=0 echo=3]`. All mutes fall inside
+    playback; the 48 kHz and generic `_is_echo` paths are both counted now.
+  * A follow-up borrows the previous turn's device and the lamp really moves:
+    «включи свет в гостиной» -> «а теперь выключи» -> `HassTurnOff`, 0.13 s, with
+    HA read back after every call (off -> on -> off).
+
+  **Open, and what each looks like in the log:**
+  1. **Level endpointing cannot separate a voice from a television in this room.**
+     With the TV on, the room sits at raw rms 2800-3300 for six straight seconds
+     while the user is at 4000-8000 — only three of the user's frames clear 2x the
+     television, and `min_speech_frames=5` then blocks the end. Seen as an
+     occasional `via cap 7s` followed by `Whisper empty` (3 in 30 min). Harmless
+     but it spends ~2 s of Whisper on television. A rolling-percentile floor does
+     follow the room (measured: 2940 vs the deployed 2676) and still does not fix
+     it; the wake DECODER is what separates them, which is why this room decodes
+     its wake word instead of scoring it.
+  2. **`floor` is not room-tracking by design** — it only accepts frames it already
+     calls noise, so a loud room cannot raise its own reference. It wandered to
+     0.0164 (`thresh` 0.0409) once while the TV was loud, then recovered. That is
+     the same cause as (1).
+  3. **The 7 s cap still costs Whisper a full-length call on television.** Worth
+     gating on `raw_rms` before calling STT, but not done: it is a change to when
+     audio is discarded in a live path.
+  4. **Two crash-time `except Exception: pass` used to hide real failures**
+     (the activation cue). Both now log.
+  5. **`CAMERA_ATTENTION_PIP_LIVINGROOM=false` is available and NOT set.** The mute
+     is fixed, so the pip is now harmless to STT, but it still costs 0.4 s of
+     deafness per wake and is 60x the room floor in the detector's reference.
+
+  **Not to be re-derived:** the 97 s gap in the router log at 21:52 is a TELEGRAM
+  turn (`stream=tg:543867556`), not a stuck camera utterance — the camera's
+  `Post-wake retry` had produced `Whisper empty` and was dropped, never dispatched.
+
 - **MEASURE THE SEND QUEUES BEFORE CALLING A BOX DEAD.** `netstat -ant` on the
   camera, one line per connection, is the instrument that settled this:
   `tcp 0 193712 192.168.22.241:554 192.168.22.102:37544 ESTABLISHED` — 193 kB

@@ -3675,6 +3675,14 @@ async def start_camera_sessions():
                     or os.getenv("CAMERA_FOLLOWUP_MIN_PEAK")
                     or 0
                 ),
+                # The attention beep on the wake word. Set false to remove it:
+                # measured 05.10.2026, a leaked pip frame became the whole
+                # utterance (Whisper read it as «пап») and the user's command was
+                # not in the buffer at all.
+                attention_pip=os.getenv(
+                    f"CAMERA_ATTENTION_PIP_{name.upper()}",
+                    os.getenv("CAMERA_ATTENTION_PIP", "true"),
+                ).lower() == "true",
                 # Peak the reply is normalised to before the camera plays it.
                 # 0 => the built-in 20000 (61 % of full scale). Exists for an
                 # unresolved field report of crackling playback (05.10.2026):

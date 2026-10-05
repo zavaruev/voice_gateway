@@ -173,6 +173,28 @@ async def test_delayed_attention_exception():
 import numpy as np
 
 
+_PIP_WAV = None
+
+
+def _write_pip_wav():
+    """A real 48 kHz mono wav so the activation-cue test needs no /app file."""
+    import tempfile
+    import wave
+
+    global _PIP_WAV
+    if _PIP_WAV:
+        return _PIP_WAV
+    fd, path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    with wave.open(path, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(48000)
+        w.writeframes(b"\x00\x10" * int(48000 * 0.25))
+    _PIP_WAV = path
+    return path
+
+
 def _make_session():
     s = CameraSession(CameraConfig(stream_name="test_stream", go2rtc_host="127.0.0.1", go2rtc_port=1984))
     return s
@@ -1760,3 +1782,92 @@ def test_a_question_marks_its_own_followup_window():
     s._back_to_wake()
     assert s._followup_is_question is False
     assert s._followup_only is False
+
+
+# --- our own pip must never become the utterance (measured 05.10.2026 21:06) --
+#
+# The user's command came in loud and clear (raw_rms=13660, peak=32767) and
+# Whisper returned «пик». The buffer it was given was:
+#
+#     peak: [1379, 1335, 1596, 32767, 32767, 32767, 32767, 2656, 1615, 1614]
+#            \___ silence ___/ \____ our own pip ____/ \__ silence __/
+#
+# 1.6 s containing no user speech whatsoever, so the router escalated a one-word
+# turn to L2 and spent 8 s on it. Cause: `_play_attention` muted the mic for
+# `now + 0.35` while the pip is `duration = 0.4`, and `now` was captured BEFORE
+# the /play_audio call.
+
+
+@pytest.mark.asyncio
+async def test_the_pip_mute_outlives_the_pip():
+    """0.35 s of mute for a 0.4 s pip leaks the tail at the rail.
+
+    Exercised, not grepped: an earlier version of this test searched the source
+    for `now + 0.35` and matched the COMMENT explaining the bug — the same
+    mistake AGENTS.md warns about, where the rule is written in its own
+    justification and the search finds the counter-example.
+    """
+    s = _make_http_session()
+    s.http_session = _FakeHttp(200)
+
+    before = time.time()
+    await s._play_attention("vosk")
+    after = time.time()
+
+    pip_dur = 0.4
+    # Measured from the playback moment, so the whole POST duration is covered.
+    assert s._speaking_until >= after + pip_dur - 0.05, (
+        f"mute ends {s._speaking_until - after:.2f}s after playback, pip is "
+        f"{pip_dur}s — the tail reaches the decoder at the rail"
+    )
+    assert before <= s._speaking_until
+
+
+@pytest.mark.asyncio
+async def test_the_activation_cue_guards_the_mic_too():
+    """It registered the duration on the track but never opened the guard, so it
+    played with no mute at all while the room listened for a command."""
+    s = _make_http_session()
+    s.http_session = _FakeHttp(200)
+    s._activation_wav_path = _write_pip_wav()
+    before = s._speaking_until
+
+    await s._play_activation_sound()
+
+    dur = 0.25  # what _write_pip_wav writes
+    assert s._speaking_until > time.time() + dur - 0.05, (
+        f"cue mute ends in {s._speaking_until - time.time():.2f}s, cue is {dur}s"
+    )
+    assert s._speaking_until > before, "the cue played without muting the mic"
+    assert s._tts_play_end > time.time(), "playback end not recorded"
+
+
+@pytest.mark.asyncio
+async def test_the_wake_word_clears_the_preroll():
+    """After a wake word the utterance starts AT the wake, which is what makes
+    that path immune to the confirmation latency the pre-roll covers. Keeping
+    pre-wake audio would put room noise in front of every command."""
+    s = _make_session()
+    s._preroll = [b"x" * 2560] * 4
+    s._vad_speech_buf.extend(b"y" * 2560)
+    s._vad_has_speech = True
+
+    await CameraSession._fire_wake(s, "vosk")
+
+    assert s._preroll == [], "pre-wake audio survived into the command"
+    assert not s._vad_has_speech
+
+
+@pytest.mark.asyncio
+async def test_a_followup_keeps_the_preroll():
+    """The other half of the rule: a follow-up has no wake word to cut at, and
+    the pre-roll is the whole reason it starts where the speech did."""
+    s = _make_session()
+    s._preroll = [b"x" * 2560] * 4
+    s._wake_detected = True
+    s._followup_only = True
+    s._followup_is_question = False
+
+    # Going back to standby must NOT clear it: the next follow-up depends on it.
+    s._back_to_wake()
+    assert len(s._preroll) == 4, "standing down discarded the pre-roll"

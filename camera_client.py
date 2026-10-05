@@ -848,6 +848,18 @@ class CameraConfig:
     # peaked at 4130-16074, so the user's voice is what separates them — not a
     # keyword. Set 0 to disable the gate entirely (answer anything in the window).
     followup_min_peak: int = 0
+    # Play the attention beep on the wake word. True by default so existing rooms
+    # keep the cue they are used to.
+    #
+    # Measured case for turning it off (05.10.2026 21:06): our own pip leaked into
+    # the microphone at the rail, the VAD read that as speech and opened an
+    # utterance, and the buffer it produced was [silence, PIP, silence] — 1.6 s in
+    # which Whisper transcribed the beep as «пап» and the user's command was not
+    # present at all. The router then escalated a one-word turn to L2 and spent
+    # 8 s on it. The mute bug behind that is fixed independently; this flag exists
+    # because the beep also costs 0.4 s of deafness on every wake and is 60x the
+    # room floor in the pause detector's reference.
+    attention_pip: bool = True
     # Peak the reply is normalised to before it goes to the camera speaker.
     # 0 => _TTS_TARGET_PEAK_DEFAULT.
     #
@@ -966,6 +978,7 @@ class CameraSession:
         self._rate_starved = 0
         self._play_audio_url = config.play_audio_url
         self.webrtc = config.webrtc
+        self._attention_pip = config.attention_pip
         # Pre-built Authorization header: aiohttp.BasicAuth is deprecated in
         # aiohttp 4, and /play_audio is the only place we do HTTP basic auth.
         self._play_audio_headers = {}
@@ -2718,11 +2731,21 @@ class CameraSession:
         # slate.
         self._vad_has_speech = False
         self._vad_speech_buf.clear()
+        # Drop the pre-roll too. After a WAKE WORD the utterance starts at the
+        # wake — that is what makes this path immune to the confirmation latency
+        # the pre-roll exists to cover — so audio from BEFORE the wake word is not
+        # part of the command. It is also the noise the pre-roll is made of.
+        #
+        # For a follow-up the pre-roll must survive, because nothing is cleared:
+        # that window has no wake word to cut at, and its whole point is to start
+        # the utterance where the speech did.
+        self._preroll.clear()
         self._vad_speech_consecutive = 0
         if getattr(self, "_endpoint", None) is not None:
             self._endpoint.reset()
         self._vad_silence_frames = 0
-        asyncio.create_task(self._play_attention(reason))
+        if self._attention_pip:
+            asyncio.create_task(self._play_attention(reason))
         # Bare 'компьютер' with no follow-up used to end in eternal silence (pip
         # only). After a short pause greet so the user knows they were heard.
         # Cap ownership: if nobody responds to pip + greeting, release other
@@ -3874,8 +3897,22 @@ class CameraSession:
             self._wake_suppress_until = max(
                 self._wake_suppress_until, time.time() + _ECHO_TAIL_S
             )
-            # Only extend speaking_until if not already blocked longer by KWS
-            delay = now + 0.35
+            # Mute the mic for the WHOLE pip, measured from AFTER the POST.
+            #
+            # It was `now + 0.35`, and both halves of that were wrong: the pip is
+            # `duration = 0.4` s, and `now` was captured at the top of this
+            # function, before /play_audio was even called. Measured 05.10.2026
+            # 21:06: the last frames of our own pip leaked into the mic at the rail
+            # (32767), the VAD read that as speech and opened an utterance, and the
+            # buffer it built was [silence, PIP, silence] — Whisper transcribed the
+            # beep as «пап», the router escalated a 1-word turn to L2 and spent 8 s
+            # on it, and the user's actual command was not in the buffer at all.
+            # So the room did not "fail to try": it was handed a beep.
+            played_at = time.time()
+            self._tts_play_end = max(
+                getattr(self, "_tts_play_end", 0.0), played_at + duration
+            )
+            delay = played_at + duration + _SPEAKER_SETTLE_S
             if delay > self._speaking_until:
                 self._speaking_until = delay
         except Exception as exc:
@@ -3887,17 +3924,34 @@ class CameraSession:
         The wav is normalised to 48 kHz mono s16le (the track's contract,
         TTS_PLAY_RATE) and its duration is registered so the echo guard stays
         closed for exactly as long as the cue sounds.
+
+        It registered the duration on the track but NEVER opened the mic guard —
+        so this cue had exactly the failure the pip had, and worse: it played with
+        no mute at all while the room was listening for a command.
         """
         try:
             seg = AudioSegment.from_file(self._activation_wav_path)
             seg = seg.set_frame_rate(TTS_PLAY_RATE).set_channels(1).set_sample_width(2)
             pcm = seg.raw_data
+            duration = len(pcm) / (2 * TTS_PLAY_RATE)
             if self._out_track:
-                self._out_track._last_play_duration = len(pcm) / (2 * TTS_PLAY_RATE)
+                self._out_track._last_play_duration = duration
+            played_at = time.time()
             if not await self._play_audio_http(pcm) and self._out_track:
                 await self._out_track.queue_frame(pcm, TTS_PLAY_RATE)
-        except Exception:
-            pass
+            self._tts_play_end = max(
+                getattr(self, "_tts_play_end", 0.0), played_at + duration
+            )
+            delay = time.time() + duration + _SPEAKER_SETTLE_S
+            if delay > self._speaking_until:
+                self._speaking_until = delay
+        except Exception as exc:
+            # Was `except Exception: pass`, which made this path untestable and
+            # hid a real failure: a missing cue file left the mic open with no
+            # trace at all. A cue that cannot play must be visible, not silent.
+            logger.warning(
+                f"[{self.stream_name}] activation cue failed: {exc or type(exc).__name__}"
+            )
 
     async def _wait_playback_drain(self) -> None:
         """Block until the reply has actually STOPPED sounding.

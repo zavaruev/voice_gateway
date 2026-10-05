@@ -3215,64 +3215,75 @@ class CameraSession:
             )
         return _n_sent
 
+    async def _prefetch_next(self, q: asyncio.Queue):
+        """Wait for the NEXT sentence and synthesise it, concurrently with the
+        playback of the current one.
+
+        Returns (sentence, pcm), or None at the end-of-stream sentinel.
+
+        This exists because playback used to be gated on the NEXT sentence
+        arriving. Measured 05.10.2026 with a producer that emits a sentence
+        every 1.5 s (an L2 turn does exactly this): the reply played at
+        t=0.00, the next sentence at t=1.50 — a 1.50 s hole — and the
+        following one at t=1.50 as well. The gap equalled the LLM's think
+        time, because `nxt = await q.get()` sat BEFORE `_speak_pcm`.
+
+        Words that do not exist yet cannot be spoken, so part of that gap is
+        irreducible — but the CURRENT sentence never has to wait for the next
+        one, and the next one's synthesis can overlap this one's playback
+        instead of starting after it. That is what this coroutine buys: the
+        text is picked up the moment the model emits it and Edge-TTS runs
+        while the speaker is still busy.
+        """
+        nxt = await q.get()
+        if nxt is None:
+            return None
+        return nxt, await self._tts_fetch(nxt)
+
     async def _nanobot_player_task(self, q: asyncio.Queue) -> None:
         last_q = False
-        # Per turn: a window opened by an EARLIER turn must not make this turn's
-        # finally block believe it may leave the mic open forever.
+        # Per turn: a window opened by an EARLIER turn must not make this
+        # turn's finally block believe it may leave the mic open forever.
         self._followup_open = False
-        # Pipeline TTS: while sentence N is PLAYING, sentence
-        # N+1 is already being synthesized. Without this overlap
-        # the playback queue runs dry between sentences (each
-        # Edge-TTS call takes 1-3s) and the speaker stutters
-        # with silence gaps. Chain: text -> fetch(N) starts ->
-        # wait text(N+1) -> fetch(N+1) starts -> play(N) pcm ->
-        # play(N+1) pcm ... The prefetch of N+1 hides its whole
-        # synthesis latency behind N's playback.
-        pending: asyncio.Task | None = None  # prefetched pcm for `sent`
+        pending: asyncio.Task | None = None  # (sentence, pcm) for the NEXT turn
         sent: str | None = None
+        pcm: bytes | None = None
         try:
             while True:
                 if sent is None:
-                    sent = await q.get()
-                    if sent is None:
+                    if pending is None:
+                        pending = asyncio.create_task(self._prefetch_next(q))
+                    got = await pending
+                    pending = None
+                    if got is None:
+                        # End of stream: the sentinel, consumed where it is seen.
+                        #
+                        # It used to be read as the "next sentence" by a loop
+                        # whose only end-of-stream test sat at the TOP, so the
+                        # sentinel went into `nxt`, `sent = nxt` made sent None,
+                        # and the next pass blocked on `q.get()` for a write
+                        # that would never come. `_call_backend` then sat on
+                        # `wait_for(player_task, 120.0)` and, because the
+                        # utterance onset requires `not _processing_utterance`,
+                        # the room was deaf for 120 s after every reply —
+                        # measured 09:54:46 -> 09:56:45, and the reason «Да?»
+                        # appears at all.
                         break
-                # Reuse the prefetched result if it matches this
-                # sentence, otherwise synthesize now.
-                if pending is not None:
-                    tts_task, pending = pending, None
-                else:
-                    tts_task = asyncio.create_task(self._tts_fetch(sent))
-                # Pull the NEXT sentence while ours synthesizes,
-                # then start its TTS immediately too — its
-                # latency hides behind our playback as well.
-                nxt = await q.get()
-                # The sentinel is END OF STREAM and it was just consumed as the
-                # "next sentence". Before this was handled, `nxt` held it, the
-                # `if nxt is not None` check correctly skipped the prefetch, and
-                # then `sent = nxt` made `sent` None — so the loop came back
-                # around to its own exit test and did `sent = await q.get()` on a
-                # queue nobody would ever write to again. It blocked forever.
-                # `_call_backend` then sat on `wait_for(player_task, 120.0)`, and
-                # because the utterance onset requires
-                # `not _processing_utterance`, THE ROOM WAS DEAF FOR THE WHOLE
-                # 120 s after every single reply.
-                #
-                # Measured 05.10.2026 09:54:46 -> 09:56:45: one reply, then 119 s
-                # with no VAD SPEECH START at all, and a command spoken in that
-                # window got the greeting instead, because the utterance was
-                # never committed and nothing reached Whisper.
-                #
-                # NOTE the sentinel must NOT break out HERE: `sent` has not been
-                # played yet, so breaking early would drop the reply on the
-                # floor. Flag it, play, and stop AFTER the playback.
-                stream_done = nxt is None
-                if not stream_done:
-                    pending = asyncio.create_task(self._tts_fetch(nxt))
+                    sent, pcm = got
+                elif pcm is None:
+                    pcm = await self._tts_fetch(sent)
+
+                # Ask the queue for the following sentence BEFORE speaking this
+                # one, so its synthesis overlaps this one's playback.
+                if pending is None:
+                    pending = asyncio.create_task(self._prefetch_next(q))
+
                 try:
-                    pcm = await asyncio.wait_for(tts_task, timeout=90.0)
                     self._wake_expires = time.time() + self._wake_timeout
                     is_q = (
-                        await asyncio.wait_for(self._speak_pcm(pcm, sent), timeout=90.0)
+                        await asyncio.wait_for(
+                            self._speak_pcm(pcm, sent), timeout=90.0
+                        )
                         if pcm
                         else False
                     )
@@ -3283,12 +3294,12 @@ class CameraSession:
                     #
                     # BOTH branches open it, and that is the whole point: a
                     # camera that closes the mic the instant it has answered
-                    # cannot hear "а теперь выключи", so the user must repeat the
-                    # wake word for every follow-up. main.py's
+                    # cannot hear "а теперь выключи", so the user must repeat
+                    # the wake word for every follow-up. main.py's
                     # `_finalize_turn_followup()` does exactly this for
                     # satellites (status LISTENING in both branches) and the
-                    # windows are its numbers: 30 s after a question, 10 s after
-                    # a statement.
+                    # windows are its numbers: 30 s after a question, 10 s
+                    # after a statement.
                     window = (
                         self._dialogue_question_s
                         if is_q
@@ -3304,15 +3315,13 @@ class CameraSession:
                             f"({'question' if is_q else 'answer'}) "
                             f"{window:.0f}s until {self._wake_expires:.1f}"
                         )
-                    sent = nxt
-                    if stream_done:
-                        break
-                    nxt = None
                 except Exception as e:
                     logger.warning(f"[{self.stream_name}] TTS sentence failed: {e}")
                     break
+                # Consumed: the next pass must take its sentence from `pending`.
+                sent, pcm = None, None
         finally:
-            if pending:
+            if pending is not None:
                 pending.cancel()
             # Close the window only when we did NOT open one. Deciding from
             # `last_q` alone is what made the camera deaf after every answer: a

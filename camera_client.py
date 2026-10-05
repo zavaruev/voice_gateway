@@ -3520,7 +3520,16 @@ class CameraSession:
             # Log the numbers, not the decision: whether the crackle is
             # overdrive has to be settled by ear, so the log's job is to say
             # what was ACTUALLY sent.
-            logger.debug(
+            #
+            # INFO, not DEBUG, and this used to be DEBUG — which made the whole
+            # lever unreadable in the field. The logger runs at INFO (see the
+            # `logger.setLevel(logging.INFO)` at the top of this module), so a
+            # DEBUG line is not emitted at all. The entire point of an ENV knob
+            # is that it is tuned from what the log actually prints; hiding its
+            # numbers behind a level nobody enables is the same bug as shipping
+            # the knob with no output. One line per synthesised sentence, which
+            # is a handful per voice command.
+            logger.info(
                 f"[{self.stream_name}] tts pcm peak={peak:.0f} target={target} "
                 f"gain={gain:.2f} applied={applied} "
                 f"out_peak={int(np.max(np.abs(np.frombuffer(pcm, dtype=np.int16)))) if len(pcm) else 0}"

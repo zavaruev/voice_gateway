@@ -76,6 +76,11 @@ _CORRIDOR_STREAMS = frozenset({"corridor", "corridor1", "corridor2"})
 # playback rate. Note this is the rate of OUR track: go2rtc re-encodes to
 # whatever the camera negotiated on its backchannel (PCMU/8000 here).
 TTS_PLAY_RATE = 48000
+# Peak a synthesised reply is normalised to before it is POSTed to the camera
+# speaker. 20000 of 32767 is 61 % of full scale. Overridable per room via
+# CAMERA_TTS_TARGET_PEAK[_<NAME>] — see CameraConfig.tts_target_peak for why
+# that has to be an ENV rather than a constant.
+_TTS_TARGET_PEAK_DEFAULT = 20000
 
 # How long the wake decoder stays deaf AFTER a clip we played ourselves.
 # Only the direct acoustic return needs a timer: `_is_echo` removes the delayed
@@ -646,6 +651,24 @@ class CameraConfig:
     pause_ratio: float = 0.0
     pause_run_frames: int = 0
     pause_min_speech_frames: int = 0
+    # Peak the reply is normalised to before it goes to the camera speaker.
+    # 0 => _TTS_TARGET_PEAK_DEFAULT.
+    #
+    # Exists because of an UNRESOLVED field report of crackling playback
+    # (05.10.2026). Everything on this side of the wire was measured clean:
+    # the PCM peaks at 17091 (52 % of full scale) with 0 samples at the rail,
+    # the 24 kHz -> 48 kHz resample really resamples, and the camera hears
+    # exactly 1000 Hz from a 1 kHz tone whatever rate is declared. So the
+    # remaining suspect is the camera's own output stage, and the microphone
+    # cannot measure it: input peaks of 20000, 10000 and 4000 were all
+    # captured as rms ~26 300, peak 32768, ~40 % of samples pinned at the
+    # rail — the captured level does not follow the input at all.
+    #
+    # The default drives a small speaker at 61 % of full scale, which is a
+    # plausible way to clip a cheap amplifier. Making it a per-room ENV means
+    # the level is found by listening and restarting, with no rebuild per
+    # iteration — the same rule the pause endpoint follows.
+    tts_target_peak: int = 0
 
 
 class CameraSession:
@@ -704,6 +727,8 @@ class CameraSession:
         self._pause_ratio = config.pause_ratio
         self._pause_run_frames = config.pause_run_frames
         self._pause_min_speech_frames = config.pause_min_speech_frames
+        # 0 => the default, so a half-filled override cannot mute the speaker.
+        self._tts_target_peak = config.tts_target_peak or _TTS_TARGET_PEAK_DEFAULT
         # Always defined so _vad_process() can test it without a hasattr guard,
         # and so tests that build a session via __new__ cannot trip over it.
         self._vosk_wake = None
@@ -3475,12 +3500,31 @@ class CameraSession:
             pcm = seg.raw_data
             pcm_arr = np.frombuffer(pcm, dtype=np.int16)
             peak = float(np.max(np.abs(pcm_arr))) if len(pcm_arr) else 0.0
-            if peak > 0:
-                target = 20000
-                gain = min(target / peak, 4.0)
-                if gain > 1.2:
-                    pcm_arr = np.clip(pcm_arr * gain, -32768, 32767).astype(np.int16)
-                    pcm = pcm_arr.tobytes()
+            target = self._tts_target_peak
+            gain = min(target / peak, 4.0) if peak > 0 else 1.0
+            # Apply the gain in BOTH directions. The condition used to be
+            # `gain > 1.2`, which can only ever BOOST: set the target below
+            # the TTS's natural peak and the gain drops to e.g. 0.70, the
+            # branch does not run, and the lever does NOTHING — which reads
+            # from the field as "lowering the level did not fix the crackle"
+            # rather than "the knob is broken". Half a percent of nothing is
+            # the worst possible outcome for a diagnostic control.
+            #
+            # The dead band is 0.85..1.2, so behaviour at the default target is
+            # bit-identical to before: measured 05.10.2026 peak 17091,
+            # gain 1.17 => untouched, the TTS already sat at 52 % of full scale.
+            applied = peak > 0 and (gain > 1.2 or gain < 0.85)
+            if applied:
+                pcm_arr = np.clip(pcm_arr * gain, -32768, 32767).astype(np.int16)
+                pcm = pcm_arr.tobytes()
+            # Log the numbers, not the decision: whether the crackle is
+            # overdrive has to be settled by ear, so the log's job is to say
+            # what was ACTUALLY sent.
+            logger.debug(
+                f"[{self.stream_name}] tts pcm peak={peak:.0f} target={target} "
+                f"gain={gain:.2f} applied={applied} "
+                f"out_peak={int(np.max(np.abs(np.frombuffer(pcm, dtype=np.int16)))) if len(pcm) else 0}"
+            )
             return pcm
         except Exception as e:
             logger.warning(f"[{self.stream_name}] TTS decode failed: {e}")

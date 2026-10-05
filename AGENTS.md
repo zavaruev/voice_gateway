@@ -199,6 +199,15 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
   What is left is the camera's own output stage (speaker/amp overdrive), which
   is exactly what the saturated microphone cannot distinguish — so the cheap
   next step is one quiet daytime phrase at reduced level and the user's ear.
+
+  **The lever now exists**: `CAMERA_TTS_TARGET_PEAK[_<NAME>]` (0 => 20000, i.e.
+  61 % of full scale) normalises the reply to a chosen peak per room, and
+  `_tts_fetch` logs `peak/target/gain/applied/out_peak` at DEBUG. It applies
+  the gain in BOTH directions — the original `gain > 1.2` could only ever
+  boost, so a target below the TTS's natural peak produced gain ~0.70, took
+  the dead band by accident and did nothing at all, which from the field
+  reads as "lowering the level did not fix it". Start at 12000 (37 %).
+
   Meanwhile the log-only suspect is the SENTENCE PREFETCH: the reply is
   synthesised one sentence at a time and each sentence is a separate
   `/play_audio` POST, so a gap between sentences would stutter rather than
@@ -436,6 +445,7 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
 | `TELEGRAM_MAX_VOICE_S` / `TELEGRAM_TURN_TIMEOUT` / `TELEGRAM_COOLDOWN_S` | `60` / `120` / `1.5` | Voice length cap, per-turn cap, spacing between turn starts in one chat |
 | `WAKE_VOSK_MODEL_<NAME>` | `""` | Per-room vosk model dir. Set => that room DECODES the wake word and the acoustic head is skipped. Empty => openWakeWord (corridor/kitchen) |
 | `CAMERA_PAUSE_ENDPOINT[_<NAME>]` | `false` | Per-room level-based utterance endpointing (removes the 7 s wait). **Off by default** — it changes WHEN a command is dispatched; enable only after reading that room's `UTTERANCE END` lines on real audio |
+| `CAMERA_TTS_TARGET_PEAK[_<NAME>]` | `0` (=> 20000) | Peak a reply is normalised to before the camera plays it, per room. 0 => built-in 20000 (61 % of full scale). Exists for the **unresolved** crackling playback report of 05.10.2026 — the gateway's own audio is measured clean, so the camera's output stage is the remaining suspect and the level has to be found by ear. Applies in **both** directions (dead band 0.85..1.2), so lowering it is actually audible |
 
 ## Gotchas
 

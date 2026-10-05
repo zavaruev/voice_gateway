@@ -3635,6 +3635,20 @@ async def start_camera_sessions():
                     or os.getenv("CAMERA_PAUSE_MIN_SPEECH_FRAMES")
                     or 0
                 ),
+                # Peak the reply is normalised to before the camera plays it.
+                # 0 => the built-in 20000 (61 % of full scale). Exists for an
+                # unresolved field report of crackling playback (05.10.2026):
+                # our PCM measured clean (peak 17091, 0 samples at the rail),
+                # resampling and the declared rate both check out, and the
+                # microphone is too saturated to measure the speaker — so the
+                # camera's output stage is the remaining suspect and the level
+                # has to be found by ear. An ENV makes that a restart per
+                # attempt instead of a rebuild.
+                tts_target_peak=int(
+                    os.getenv(f"CAMERA_TTS_TARGET_PEAK_{name.upper()}")
+                    or os.getenv("CAMERA_TTS_TARGET_PEAK")
+                    or 0
+                ),
                 http_session=http,
                 nanobot_url=NANOBOT_WS_URL,
                 nanobot_token=NANOBOT_TOKEN,

@@ -622,6 +622,136 @@ async def test_accounting_is_a_noop_inside_the_window():
 
 
 
+
+
+# --- the reply LEVEL is a per-room lever, and it must move BOTH ways -----
+# Reported as crackling playback on 05.10.2026. The microphone cannot settle
+# it -- it is saturated (input peaks 20000/10000/4000 all captured as rms
+# ~26300, peak 32768) -- so the level has to be found by LISTENING. That only
+# works if the knob actually moves the signal, and the original condition
+# "gain > 1.2" could only ever boost: with the target below the TTS's own peak
+# the gain falls to ~0.70, the branch does not run, and the lever does
+# nothing, which from the field reads as "lowering it did not help".
+
+
+class _TtsFakeSeg:
+    def __init__(self, raw):
+        self.raw_data = raw
+
+    def set_frame_rate(self, _r):
+        return self
+
+    def set_channels(self, _c):
+        return self
+
+    def set_sample_width(self, _w):
+        return self
+
+
+class _TtsFakeResp:
+    status = 200
+
+    def __init__(self, raw):
+        self._raw = raw
+
+    async def read(self):
+        return self._raw
+
+
+class _TtsFakePost:
+    def __init__(self, raw):
+        self._raw = raw
+
+    async def __aenter__(self):
+        return _TtsFakeResp(self._raw)
+
+    async def __aexit__(self, *_a):
+        return False
+
+
+class _TtsFakeSession:
+    def __init__(self, raw):
+        self._raw = raw
+
+    def post(self, *_a, **_k):
+        return _TtsFakePost(self._raw)
+
+
+def _tts_session(target):
+    from camera_client import _TTS_TARGET_PEAK_DEFAULT
+
+    s = CameraSession.__new__(CameraSession)
+    s.stream_name = "cam"
+    s.tts_api_key = ""
+    s.tts_url = "http://tts"
+    s.tts_voice = "v"
+    # 0 => default, exactly as __init__ resolves it.
+    s._tts_target_peak = target or _TTS_TARGET_PEAK_DEFAULT
+    return s
+
+
+# The peak measured on a real reply on 05.10.2026. Chosen so the default
+# target lands in the dead band and the reply is left untouched, which is what
+# was measured: gain 1.17, i.e. the boost never even applied.
+MEASURED_PEAK = 17091
+
+
+def _raw_with_peak(peak):
+    n = 4800
+    return (np.sin(np.linspace(0, 40, n)) * peak).astype(np.int16).tobytes()
+
+
+def _out_peak(raw):
+    return int(np.max(np.abs(np.frombuffer(raw, dtype=np.int16))))
+
+
+@pytest.mark.asyncio
+async def test_tts_level_lever_leaves_the_default_reply_untouched():
+    """At the default target, behaviour must be bit-identical to before."""
+    raw = _raw_with_peak(MEASURED_PEAK)
+    s = _tts_session(0)
+    s.http_session = _TtsFakeSession(raw)
+    with patch("camera_client.AudioSegment.from_file", return_value=_TtsFakeSeg(raw)):
+        out = await s._tts_fetch("x")
+    assert _out_peak(out) == _out_peak(raw), (
+        "the default must not touch a reply that already sits at 52 % of"
+        " full scale -- measured 05.10.2026 as gain 1.17, not applied"
+    )
+
+
+@pytest.mark.asyncio
+async def test_tts_level_lever_actually_attenuates():
+    """The whole point: a target BELOW the natural peak must be heard."""
+    raw = _raw_with_peak(MEASURED_PEAK)
+    s = _tts_session(12000)
+    s.http_session = _TtsFakeSession(raw)
+    with patch("camera_client.AudioSegment.from_file", return_value=_TtsFakeSeg(raw)):
+        out = await s._tts_fetch("x")
+    got = _out_peak(out)
+    assert got < MEASURED_PEAK, "a lower target did nothing: peak stayed at %d" % got
+    assert abs(got - 12000) < 600, "expected ~12000, got %d" % got
+
+
+@pytest.mark.asyncio
+async def test_tts_level_lever_still_boosts_a_quiet_clip():
+    """Pre-existing behaviour: a quiet TTS is lifted toward the target."""
+    raw = _raw_with_peak(4000)
+    s = _tts_session(0)
+    s.http_session = _TtsFakeSession(raw)
+    with patch("camera_client.AudioSegment.from_file", return_value=_TtsFakeSeg(raw)):
+        out = await s._tts_fetch("x")
+    assert abs(_out_peak(out) - 16000) < 400, "expected ~16000, got %d" % _out_peak(out)
+
+
+def test_zero_target_means_the_default_not_silence():
+    """0 is 'unset' everywhere in this config; it must never mute a room."""
+    from camera_client import _TTS_TARGET_PEAK_DEFAULT
+
+    cfg = CameraConfig("livingroom")
+    assert cfg.tts_target_peak == 0, "unset must stay 0 in the config"
+    assert _tts_session(0)._tts_target_peak == _TTS_TARGET_PEAK_DEFAULT
+    assert _tts_session(12000)._tts_target_peak == 12000
+
 # --- the greeting must not talk over the command it is waiting for ------
 # Field case 04.10.2026: «компьютер, включи свет» -> the camera answered «Да?».
 # `_vad_has_speech` was False for the whole window (the onset requires

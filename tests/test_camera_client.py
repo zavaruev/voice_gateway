@@ -1706,3 +1706,57 @@ def test_the_echo_counter_is_on_both_call_sites():
         "both the 48 kHz and the generic-rate path must count, or the counter "
         "under-reports and cannot be trusted"
     )
+
+
+@pytest.mark.asyncio
+async def test_an_answer_to_our_own_question_is_always_heard():
+    """The camera asked, so whatever is said next is meant for us.
+
+    Measured 05.10.2026 20:29: the camera asked something, the user answered
+    «звисит», and the answer was DISCARDED with `follow-up ignored, peak=3145 <
+    24000`. No threshold fixes it — the television produced peaks of 1694 and
+    10760 in the same session, so the user's 3145 sits inside its range. A dead
+    dialogue is worse than the occasional answer to the telly.
+    """
+    seen = []
+    s = _followup_session()
+    s._followup_is_question = True
+    s._last_utt_peak = 3145  # exactly what the field log recorded
+
+    async def _ok(txt, uid="camera"):
+        seen.append(txt)
+        return None
+
+    s._call_nanobot = _ok
+    s._cancel_wake_greeting = lambda: None
+    await s._handle_wake_or_command("звисит", "camera")
+
+    assert seen == ["звисит"], f"the answer to our own question was dropped: {seen}"
+
+
+@pytest.mark.asyncio
+async def test_the_statement_gate_still_holds():
+    """Nothing is expected after a statement, so the voice is still the test."""
+    s = _followup_session()
+    s._followup_is_question = False
+    s._last_utt_peak = 4130  # television
+    seen = []
+
+    async def _ok(txt, uid="camera"):
+        seen.append(txt)
+        return None
+
+    s._call_nanobot = _ok
+    s._cancel_wake_greeting = lambda: None
+    await s._handle_wake_or_command("Добро пожаловать", "camera")
+    assert seen == [], seen
+
+
+def test_a_question_marks_its_own_followup_window():
+    """The flag has to be set where the window is opened and cleared on both
+    exits, or a later statement window would inherit the exemption."""
+    s = _make_session()
+    s._followup_is_question = True
+    s._back_to_wake()
+    assert s._followup_is_question is False
+    assert s._followup_only is False

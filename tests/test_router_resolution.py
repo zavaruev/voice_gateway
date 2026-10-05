@@ -16,6 +16,7 @@ sys.path.insert(0, _ROUTER)
 
 import classifier as clf  # noqa: E402
 from resolver import (  # noqa: E402
+    device_hint_from,
     area_of,
     resolve_action,
     resolve_query,
@@ -1337,3 +1338,69 @@ def test_a_genuinely_absent_device_still_refuses_without_escalating():
     )
     assert sentence == "Не нашла такого устройства. Может, уточните название?"
     assert err is None
+
+
+# --- a follow-up carries the action but not the target (05.10.2026) ----------
+#
+# After «включи свет», «а теперь выключи» is a verb with nothing to apply it to.
+# `resolve_action` returns None, the room escalates to L2, and the dialogue looks
+# broken because the room does not remember what it was just talking about.
+
+
+def test_a_followup_borrows_the_device_from_the_previous_turn():
+    prev = "включи свет"
+    follow = "а теперь выключи"
+    hint = device_hint_from(prev)
+    assert hint == "свет", hint
+
+    assert resolve_action(follow, "livingroom") is None, (
+        "the bare follow-up must NOT resolve on its own — that is the whole gap"
+    )
+    call = resolve_action(f"{follow} {hint}", "livingroom")
+    assert call is not None, "the follow-up did not resolve with the device"
+    assert call.tool == "intent__HassTurnOff", call.tool
+
+
+def test_borrowing_the_device_never_borrows_the_verb():
+    """Appending the previous text whole inverts the command.
+
+    Measured: `resolve_action("а теперь выключи включи свет")` returns
+    HassTurn**On**, because the resolver scans for any verb and finds «включи» in
+    the borrowed words. So the helper must strip the verb, not just trim words.
+    """
+    assert resolve_action("а теперь выключи включи свет", "livingroom").tool == (
+        "intent__HassTurnOn"
+    ), "if this ever becomes TurnOff the borrowing needs re-checking, not copying"
+
+    assert device_hint_from("включи свет") == "свет"
+    assert device_hint_from("выключи свет в гостиной") == "свет гостиной"
+    assert device_hint_from("ну выключи свет") == "свет"
+
+
+def test_stacked_fillers_are_all_stripped():
+    """«а теперь выключи» has two fillers and one pass stripped only «а», leaving
+    «теперь» as the device."""
+    assert device_hint_from("а теперь выключи") == ""
+    assert device_hint_from("а теперь включи") == ""
+    assert device_hint_from("включи") == "", "no device named, nothing to borrow"
+
+
+def test_the_room_is_kept_when_it_was_named():
+    """The referent is the device AND its room: «включи свет на кухне» then
+    «а теперь выключи» must act on the kitchen, not the satellite's own room."""
+    hint = device_hint_from("включи свет на кухне")
+    assert "кухн" in hint, hint
+    call = resolve_action(f"а теперь выключи {hint}", "kitchen")
+    assert call is not None and call.args.get("area"), call
+
+
+def test_history_exposes_the_users_words_not_the_rooms_reply():
+    """The block is prose for the LLM and contains our own REPLY too; feeding
+    that to a deterministic resolver would act on what the room said."""
+    import history
+
+    history.reset()
+    history.push("s", "включи свет", "Включила")
+    assert history.last_text("s") == "включи свет"
+    assert "Включила" not in history.last_text("s")
+    assert history.last_text("missing") == ""

@@ -746,6 +746,48 @@ def _hint_sim(a: str, b: str) -> float:
     return best
 
 
+def device_hint_from(text: str, max_words: int = 3) -> str:
+    """The DEVICE a previous turn talked about, with its verb removed.
+
+    Exists because a follow-up carries the action but not the target: «включи
+    свет» then «а теперь выключи» leaves `resolve_action` with a verb and nothing
+    to apply it to, so it returns None and the turn escalates. Measured 05.10.2026:
+    the user said exactly that and the router answered `resolver_ambiguous`
+    after 6 s of L2 — the dialogue looks broken because the room does not
+    remember what it was just talking about.
+
+    Only the noun survives. Appending the whole previous text instead is unsafe
+    and was measured to be: `resolve_action("а теперь выключи включи свет")`
+    returns **HassTurnOn**, because the resolver scans for any verb and finds
+    «включи» in the borrowed text. The verb is the part we must NOT inherit; the
+    device is the part we must.
+
+    Returns "" when there is nothing noun-shaped to take, which is the case for
+    «включи» on its own and for a turn that named no device.
+    """
+    t = (text or "").strip().lower()
+    if not t:
+        return ""
+    # Drop a leading action/filler prefix: «а теперь выключи свет» -> «свет».
+    # Repeated, because the fillers stack: «а теперь выключи» has two of them and
+    # a single pass stripped only «а», leaving «теперь» as the device.
+    t = re.sub(
+        r"^(?:\s*(?:и|а|ну|так|теперь|да|вот|"
+        r"пожалуйста|please)\b[\s,]*)+",
+        "",
+        t,
+        flags=re.IGNORECASE,
+    )
+    for rx in (RE_ON, RE_OFF, RE_BRIGHTER, RE_DIMMER):
+        t = rx.sub(" ", t, count=1)
+    t = re.sub(r"\b(?:в|во|на|у|для|мне|мне\s+пожалуйста|все|всё|там|тут)\b", " ", t)
+    t = re.sub(r"[^\w\s-]", " ", t).strip()
+    words = [w for w in t.split() if w]
+    if not words or len(words) > max_words:
+        return ""
+    return " ".join(words)
+
+
 def unresolved_hint(text: str) -> str:
     """RU hint for L2 when the fast path could not name the device, else "".
 

@@ -84,6 +84,7 @@ from ha_client import (
 from resolver import (
     area_of as resolver_area_of,
     RE_MEDIA_NOUN,
+    device_hint_from,
     resolve_action,
     resolve_query,
     unresolved_hint,
@@ -702,6 +703,28 @@ async def _handle(req: RouteRequest):
     area_hint = req.room or req.stream_name
     if route == "easy_action":
         call = resolve_action(text, area_hint)
+        if call is None:
+            # A follow-up carries the ACTION but not the TARGET: after «включи
+            # свет», «а теперь выключи» is a verb with nothing to apply it to, and
+            # resolve_action returns None — so the room escalated a perfectly
+            # clear command. Measured 05.10.2026: exactly that sentence, answered
+            # with `resolver_ambiguous` after 6 s of L2. Retry once with the
+            # DEVICE the previous turn was about, and only the device.
+            #
+            # Only the noun is borrowed, never the verb: appending the previous
+            # text whole makes `resolve_action("а теперь выключи включи свет")`
+            # return HassTurn**On**, because the resolver scans for any verb and
+            # finds «включи» in the borrowed words. Measured, not assumed.
+            hint = device_hint_from(history.last_text(req.stream_name or req.session_id))
+            if hint:
+                borrowed = f"{text} {hint}".strip()
+                retry = resolve_action(borrowed, area_hint)
+                if retry is not None:
+                    logger.info(
+                        "resolver used the previous turn's device %r: %r -> %s",
+                        hint, text[:60], retry.tool,
+                    )
+                    text, call = borrowed, retry
         if call is None:
             logger.info("resolver ambiguous -> complex_logic: %r", text[:80])
             route, reason = "complex_logic", "resolver_ambiguous"

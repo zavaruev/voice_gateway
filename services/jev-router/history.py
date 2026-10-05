@@ -71,6 +71,28 @@ def push(key: str, text: str, reply: str) -> None:
     dq.append((time.time(), (text or "").strip(), (reply or "").strip()))
 
 
+def last_text(key: str) -> str:
+    """The most recent finished turn's USER text, or "".
+
+    Separate from `block()` on purpose: the block is prose for the LLM, and
+    feeding it to a deterministic resolver would be both lossy and dangerous — it
+    contains the previous REPLY too, so a resolver scanning it for verbs would
+    act on what the room said rather than on what the user asked. Only the
+    user's own words belong in a deterministic decision.
+    """
+    if not key:
+        return ""
+    dq = _store.get(key)
+    if not dq:
+        return ""
+    now = time.time()
+    _prune(dq, now)
+    for _ts, t, _r in reversed(dq):
+        if t:
+            return t
+    return ""
+
+
 def block(key: str) -> str:
     """Recent turns as `- пользователь: «…» — ответ: «…»` lines, or "".
 

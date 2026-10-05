@@ -1014,6 +1014,8 @@ class CameraSession:
         # True while the wake window was opened by our own REPLY rather than by a
         # heard wake word. Such a window must not treat the room as the user.
         self._followup_only = False
+        # True when that window was opened by a QUESTION we asked.
+        self._followup_is_question = False
         # Where the user's audio goes to die. See _feed_audio.
         self._drop_muted = 0      # dropped by the speaker-settle mute
         self._drop_track = 0      # dropped by the WebRTC track's echo guard
@@ -2702,6 +2704,7 @@ class CameraSession:
         self._last_wake_fired_at = time.time()
         self._wake_detected = True
         self._wake_expires = time.time() + self._wake_timeout
+        self._followup_is_question = False
         # A real wake word was HEARD, so the next utterance is the user's whatever
         # it sounds like. The follow-up window opened by our own reply is the
         # opposite case and says so here — see _handle_wake_or_command.
@@ -3184,7 +3187,22 @@ class CameraSession:
         # works because you are close, and the television does not because it is
         # across the room. Below the gate the room does NOT answer — it goes back
         # to waiting for the wake word, which is the only unambiguous signal.
-        if self._followup_only:
+        #
+        # EXCEPT after we asked a QUESTION. Then there is nothing to gate: the
+        # room asked, so whatever is said next is meant for us, and refusing it
+        # leaves the question hanging forever. Measured 05.10.2026 20:29 — the
+        # camera asked, the user answered «звисит», and the answer was DISCARDED
+        # with `follow-up ignored, peak=3145 < 24000`. And no threshold fixes it:
+        # in that same session the television produced peaks of 1694 and 10760,
+        # so the user's 3145 sits inside the television's range. A dead dialogue
+        # is worse than the occasional answer to the telly, and an answer that
+        # does not resolve to anything is refused downstream anyway.
+        if self._followup_only and self._followup_is_question:
+            logger.info(
+                f"[{self.stream_name}] 💬 follow-up answer accepted after our "
+                f"question, peak={int(self._last_utt_peak or 0)} — '{txt[:50]}'"
+            )
+        elif self._followup_only:
             peak = int(self._last_utt_peak or 0)
             if peak < self._followup_min_peak:
                 logger.info(
@@ -3651,6 +3669,7 @@ class CameraSession:
                         # Marked as a follow-up: nobody said the wake word, so this
                         # window must not treat the room as the user.
                         self._followup_only = True
+                        self._followup_is_question = bool(is_q)
                         logger.info(
                             f"[{self.stream_name}] 💬 Follow-up open "
                             f"({'question' if is_q else 'answer'}) "
@@ -3790,6 +3809,7 @@ class CameraSession:
     def _back_to_wake(self):
         self._wake_detected = False
         self._followup_only = False
+        self._followup_is_question = False
         _arbiter_clear_owner(self.stream_name)
         # No threshold bump on empty wake windows: the old +0.07 "false-fire
         # penalty" compounded after every missed/empty command (Whisper glitch,

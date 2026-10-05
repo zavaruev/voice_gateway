@@ -383,6 +383,66 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
   for exactly this, and the deterministic refusal is what kept it from getting
   there. The refusal is now noun-aware and returns an error L2 can act on.
 
+- **THE LIVING-ROOM CAMERA'S AUDIO DRIVER IS DYING — measured repeatedly on
+  05.10.2026, and it is hardware, not software.** The full sequence, measured:
+  * `majestic` restart restores audio COMPLETELY with NO power cycle: audio
+    "none" -> **100 % of real time**, box uptime unchanged at 8 min. So the
+    user's instinct was right — a service hangs, not the whole system.
+  * **But it recurs within minutes.** A reboot bought 5–15 min, a `majestic`
+    restart 3–5 min. Two full runs of the recovery ladder, each ending in
+    `NOT RECOVERED`, the second time even after a real reboot.
+  * The box is IDLE through all of it: 70–89 % idle, 32 MB of memory free. It is
+    not CPU or memory pressure.
+  * `ai0_P0_MAIN` sits in `D` with `wchan=CamOsTcondTimedWait` **whether the
+    audio works or not** — it was present during a 100 %-of-real-time capture.
+    **Not a symptom**; the earlier note naming it as the culprit is withdrawn.
+  * Restarting `majestic` also kills the go2rtc producer: it then shows a bare
+    `recv=None` with zero consumers, so any recovery MUST re-register the
+    stream or the room stays mute on a perfectly healthy camera.
+  * `HTTP latency alone is not a health signal`: the camera measured 0.066 s
+    while its RTSP stream was already dead. The watchdog checks BOTH.
+  **Consequence:** `scripts/camera_watchdog.sh` is a MITIGATION, not a fix. It
+  cuts the outage from "until a human notices" to ~1 min, but the camera needs
+  repair or replacement. Do not spend more time tuning software on it.
+- **THE CAMERA IS REACHABLE OVER SSH (root@192.168.22.241, dropbear), and two
+  "symptoms" in this file are measurement errors, not faults.** Added 05.10.2026 so
+  that nobody re-derives them:
+  * **`/proc/loadavg` is a constant on this box, not a symptom.** Measured
+    11.3–11.6 with **55.5 % idle** and 1 runnable task of 69. Eleven vendor kernel
+    threads sit in `D` with `wchan=msleep`/`CamOsTcondTimedWait`; D-state tasks
+    count toward loadavg but burn no CPU. **The load average here means nothing** —
+    so the earlier "load average 11.5" evidence for a wedged camera is withdrawn.
+  * **`aio_dma` in `/proc/interrupts` is the PLAYBACK dma, not capture.** With
+    `audio.outputEnabled: true` it sits near zero while audio streams at 100 % of
+    real time. The "41/s is this camera's healthy audio-DMA rate" note above is
+    **wrong for this firmware** and must not be used as a health signal.
+  * **There is no separate audio service.** `/etc/init.d` has only `S70vendor`
+    and `S95majestic`; capture and playback both live inside `majestic`, so the
+    only cheaper-than-a-reboot lever is `/etc/init.d/S95majestic restart`, and it
+    costs the video stream too. `reboot` and `/proc/sysrq-trigger` both exist.
+  * **The cheapest reliable health signal is HTTP latency to the camera**:
+    7.38 / 7.44 / 7.45 s across three tries while wedged, 0.016–0.050 s when
+    healthy, with no overlap. A trivial `GET /` is enough; no stream capture
+    needed. Real-time audio was also measured directly at 100 % when healthy.
+* **CAMERA WATCHDOG: `scripts/camera_watchdog.sh`, written 05.10.2026, NOT yet
+  installed or tested.** One-shot, meant for `*/3 * * * *`. Key-based SSH is
+  already in place (`~/.ssh/voice_watchdog_ed25519`, authorised on the camera)
+  so no password lives in a script. Design decisions worth keeping:
+  * signal = HTTP latency above `WEDGE_S` (2.5 s) **confirmed
+    `CONFIRM_N` times `CONFIRM_GAP_S` apart** — one slow sample is a busy CPU or
+    a go2rtc re-register, not a wedge;
+  * **UNREACHABLE is not WEDGED and is deliberately never acted upon.** No answer
+    means the network, and rebooting a camera you cannot reach costs a boot cycle
+    and fixes nothing; go2rtc and the gateway's own heal already cover it;
+  * recovery is a ladder, cheapest first: restart `majestic` → re-check →
+    only then `reboot`, with everything before and after measured and logged,
+    because "it recovered" is worthless without knowing WHICH step did it;
+  * `MIN_GAP_S` (600) rate-limits attempts so a flapping camera cannot be
+    reboot-looped.
+  **Status: the healthy path was verified (silent exit 0). The recovery ladder is
+  untested, because testing it means deliberately wedging the camera.** It needs
+  `bash -n`, the two dry runs below, and then a cron entry — all of which need a
+  shell this session no longer has.
 - **A FAST TELEGRAM VOICE TURN IS NOT EVIDENCE THAT THE VOICE PATH IS FAST —
   Telegram never touches the camera.** Measured 05.10.2026 09:53:19.447 voice
   note in, 09:53:20.844 voice reply out: **1.397 s for the whole turn** (Whisper

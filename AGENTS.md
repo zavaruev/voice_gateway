@@ -383,6 +383,29 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
   for exactly this, and the deterministic refusal is what kept it from getting
   there. The refusal is now noun-aware and returns an error L2 can act on.
 
+- **A FAST TELEGRAM VOICE TURN IS NOT EVIDENCE THAT THE VOICE PATH IS FAST —
+  Telegram never touches the camera.** Measured 05.10.2026 09:53:19.447 voice
+  note in, 09:53:20.844 voice reply out: **1.397 s for the whole turn** (Whisper
+  + L1 + one TTS). Two structural reasons it cannot be compared with a camera
+  turn: `telegram_client.py` synthesises **once for the entire reply** (one
+  `_tts_mp3(excerpt)` at the end, while the text is edited into the message live
+  as it streams), and it has no wake word, no VAD endpoint and no speaker. So a
+  voice turn that "feels fast in Telegram" says nothing about the room — the
+  comparison removes the camera rather than improving the pipeline. For the
+  camera path, measured on the same day: speech start 09:54:39.753 -> utterance
+  end 09:54:43.614 -> Whisper 09:54:44.276 (+0.66 s) -> L1 09:54:45.054 (0.17 s)
+  -> reply TTS 09:54:46.149 (+1.10 s). **The two big costs are the utterance
+  collection and the single Edge-TTS round trip, not the L1 router** (0.17 s).
+* **A wedged camera makes confirmation stutter, and its HTTP latency is the
+  cheapest tell.** 05.10.2026 10:38: the gateway logged `🔴 CAMERA AUDIO DEAD
+  (0% of real time)`, go2rtc reported the producer with `recv=None` and **zero
+  consumers**, and a trivial `GET http://192.168.22.241/` took a consistent
+  **7.4 s across three tries** (a healthy OpenIPC answers in tens of ms) —
+  while an EMPTY `POST /play_audio` took 4.7 s. Capture and playback both go
+  through that box, so every confirmation stutters, and the mic stops feeding
+  Vosk. Do not chase this in the audio pipeline: check the camera's HTTP latency
+  first, and remember that only a power cycle clears it (ONVIF `Reboot` is not
+  implemented on OpenIPC, per the watchdog section above).
 - **A CONSUMED SENTINEL IS NOT AN END-OF-STREAM TEST — the camera was deaf for
   119 s after EVERY reply, and it is the reason «Да?» happens.** Measured
   05.10.2026 09:54: wake, `UTTERANCE END dur=2080ms via pause`, Whisper OK

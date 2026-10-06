@@ -170,6 +170,12 @@ _WAKE_MIN_PEAK = 3000
 # ceiling does not move at all (2316). ~1.9 s, which covers the whole word.
 _WAKE_PEAK_WINDOW = 12
 
+# Bounds for telling the wake word's own audio from the command after it. All
+# three are measured on 06.10.2026; see _is_wake_word_alone for the numbers.
+_WAKE_ALONE_MAX_ONSET_S = 0.9   # wake word alone began 0.73 s after the wake
+_WAKE_ALONE_MAX_SINCE_S = 2.5   # ...and had stopped by 1.85 s
+_WAKE_ALONE_MAX_DUR_S = 1.5     # 1.12 s for the word, 1.68 s for a command
+
 # Raw peak an utterance must reach to count as the USER inside a follow-up window
 # (one opened by our own reply, with no wake word spoken).
 #
@@ -884,6 +890,22 @@ class CameraConfig:
     # peaked at 4130-16074, so the user's voice is what separates them — not a
     # keyword. Set 0 to disable the gate entirely (answer anything in the window).
     followup_min_peak: int = 0
+    # Open a free-form listening window after our OWN reply, so «а теперь
+    # выключи» needs no wake word.
+    #
+    # DEFAULT FALSE, chosen by the user on 06.10.2026 after the measurement that
+    # made the alternative untenable: in the living room the user's own voice
+    # measured peak 4725 and 9124 while the television and the appliances measured
+    # 13197, 16074 and 32522. The noise is LOUDER than the user, so there is no
+    # threshold that separates them — `followup_min_peak` refused the user twice
+    # ('ключ', 'Выключить свет.') and let noise through twice ('атака',
+    # 'пиздец') in the same twenty minutes. The wake word is the only discriminator
+    # measured to work: decoded, and 0 false accepts in 99 windows of television.
+    #
+    # Kept as a flag rather than a `0` window, because `0` means "unset, use the
+    # built-in default" throughout this file — setting the window to 0 would have
+    # silently produced a 30 s window instead of none.
+    followup_window: bool = False
     # Play the attention beep on the wake word. True by default so existing rooms
     # keep the cue they are used to.
     #
@@ -994,6 +1016,7 @@ class CameraSession:
         self._pause_run_frames = config.pause_run_frames
         self._pause_min_speech_frames = config.pause_min_speech_frames
         self._pause_noise_mult = config.pause_noise_mult
+        self._followup_window = bool(config.followup_window)
         self._followup_min_peak = (
             config.followup_min_peak
             if config.followup_min_peak > 0
@@ -1194,6 +1217,8 @@ class CameraSession:
         # Raw (pre-AGC) chunk peaks, proximity proxy for cross-camera arbitration.
         self._recent_peaks: list[int] = []
         self._last_utt_peak = 0
+        self._last_utt_dur = 0.0
+        self._last_utt_end_ts = 0.0
         self._skipped_noise = 0
         # Adaptive wake threshold (false-wake immunity for the noisy corridor).
         #
@@ -3095,6 +3120,11 @@ class CameraSession:
         uid_task.add_done_callback(_uid_done)
         txt = await stt_task
         self._last_utt_peak = int(stats.get("peak_raw") or 0)
+        # How long this utterance was, and when it ended. Both are needed to tell
+        # the wake word's OWN audio from a command that followed it, by TIME
+        # rather than by what Whisper happened to write — see _is_wake_word_alone.
+        self._last_utt_dur = float(duration_s)
+        self._last_utt_end_ts = time.time()
         uid = (
             uid_task.result() if uid_task.done() and not uid_task.exception() else None
         )
@@ -3231,6 +3261,43 @@ class CameraSession:
         if uid and uid != "unknown":
             logger.info(f"[{self.stream_name}] 👤 Speaker: {uid} | '{txt[:60]}'")
         await self._handle_wake_or_command(txt, uid or "camera")
+
+    def _is_wake_word_alone(self) -> bool:
+        """Is this utterance the wake word's OWN audio rather than a command?
+
+        Asked by TIME, not by transcript, because the transcript is not reliable
+        here. Measured 06.10.2026 12:39 on the living room: the wake fired at
+        12:39:56.340 and the utterance that followed was 1.12 s long and ended
+        1.85 s after the wake — Whisper wrote the wake word out as «1000 свят»,
+        which contains no «компьютер» for the strip to remove, so it was
+        DISPATCHED as a command and the router answered «Включила».
+
+        Both halves are measured, and the margins are on opposite sides:
+          * wake word alone : onset 0.73 s after the wake, duration 1.12 s
+          * a real command  : «включи кофеварку» 1.68 s, «Выключить свет» 1.84 s
+
+        **The error this can make is safe in the direction it can make it.** If a
+        real short command is mistaken for the wake word, the utterance is
+        re-opened rather than dispatched — the next pause then commits «компьютер
+        <command>» together and the strip removes the wake word, so the command
+        still runs, one pause later. The reverse error (dispatching the wake word)
+        is what sent garbage to the router today. So these bounds are set to
+        catch the wake word, not to be clever about the command.
+        """
+        if self._last_wake_fired_at <= 0.0 or self._last_utt_end_ts <= 0.0:
+            return False
+        dur = self._last_utt_dur
+        if dur <= 0.0:
+            return False
+        # How long after the wake did this utterance STOP? An utterance that ran
+        # for seconds is a command plus whatever followed it.
+        since_wake = self._last_utt_end_ts - self._last_wake_fired_at
+        onset = since_wake - dur
+        return (
+            onset <= _WAKE_ALONE_MAX_ONSET_S
+            and since_wake <= _WAKE_ALONE_MAX_SINCE_S
+            and dur <= _WAKE_ALONE_MAX_DUR_S
+        )
 
     def _reopen_utterance(self) -> None:
         """Re-open the utterance after a wake-word-only transcript.
@@ -3420,6 +3487,19 @@ class CameraSession:
             # я не ехать ночью?» — each dispatched as a command and each answered
             # aloud. That is the "strangely reacts to a command" report, and it is
             # caused by closing on the wake word rather than by the wake word.
+            self._wake_only_pending = True
+            return
+        if self._is_wake_word_alone():
+            # The transcript carries no «компьютер», so the strip above could not
+            # see it — but the AUDIO is the wake word's own. Measured 06.10.2026
+            # 12:39: Whisper wrote it as «1000 свят», it was dispatched as a
+            # command, and the router answered «Включила» to a wake word.
+            logger.info(
+                f"[{self.stream_name}] 🎯 that was the wake word itself "
+                f"({self._last_utt_dur:.2f}s ending "
+                f"{self._last_utt_end_ts - self._last_wake_fired_at:.2f}s after the "
+                f"wake) — not a command"
+            )
             self._wake_only_pending = True
             return
         logger.info(f"[{self.stream_name}] 🗣 Post-wake command: '{cmd[:60]}'")
@@ -3851,7 +3931,13 @@ class CameraSession:
                         if is_q
                         else self._dialogue_statement_s
                     )
-                    if window > 0:
+                    if window > 0 and not self._followup_window:
+                        logger.info(
+                            f"[{self.stream_name}] 💬 no free-form window: the "
+                            f"wake word is required again after our reply "
+                            f"(CAMERA_FOLLOWUP is off)"
+                        )
+                    if window > 0 and self._followup_window:
                         await self._wait_playback_drain()
                         self._wake_detected = True
                         self._wake_expires = time.time() + window

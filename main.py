@@ -3668,6 +3668,16 @@ async def start_camera_sessions():
                 # room answering itself: measured 05.10.2026, the user's commands
                 # peaked at 32767 and six television utterances at 4130-16074.
                 # 0 => the built-in 24000.
+                # Open a free-form listening window after our own reply, so a
+                # follow-up needs no wake word. OFF by default: measured
+                # 06.10.2026, the user's own voice peaks at 4725/9124 in the
+                # living room while the television and appliances peak at
+                # 13197-32522, so no level threshold separates them. 1 => on.
+                followup_window=(
+                    os.getenv(f"CAMERA_FOLLOWUP_{name.upper()}")
+                    or os.getenv("CAMERA_FOLLOWUP")
+                    or ""
+                ).strip().lower() in ("1", "true", "yes", "on"),
                 followup_min_peak=int(
                     os.getenv(
                         f"CAMERA_FOLLOWUP_MIN_PEAK_{name.upper()}"

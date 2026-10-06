@@ -1348,6 +1348,15 @@ def _player_session():
     # reads as a playback bug.
     s._followup_open = False
     s._followup_only = False
+    # These tests are about the window's BEHAVIOUR, so they opt in explicitly.
+    # `CAMERA_FOLLOWUP` is off by default since 06.10.2026 (the user's voice
+    # peaks at 4725-9124 in the living room, the television at 13197-32532, so
+    # no level threshold separates them and the wake word is required again
+    # after every reply). Omitting this attribute does not fail loudly — the
+    # player's broad `except Exception` turns it into "TTS sentence failed",
+    # which is the failure mode this helper's own comment warns about, and it is
+    # what happened the first time.
+    s._followup_window = True
     s._followup_min_peak = _FOLLOWUP_MIN_PEAK
     s._wake_detected = False
     s._dialogue_question_s = 30.0
@@ -2110,3 +2119,150 @@ async def test_a_bare_wake_word_alone_never_dispatches_anything():
     s._call_nanobot = _boom
     await s._handle_wake_or_command("Компьютер.", "camera")
     assert dispatched == []
+
+
+# --- the wake word's OWN audio must not be dispatched as a command (06.10.2026) --
+#
+# Measured on the living room at 12:39: the wake fired at 12:39:56.340 and the
+# utterance that followed was 1.12 s long, ending 1.85 s after the wake. Whisper
+# wrote the wake word out as «1000 свят» — no «компьютер» for the strip to find —
+# so it was dispatched, and the router answered «Включила» to a wake word.
+#
+# The fix asks by TIME, because the transcript is what failed. Measured margins on
+# both sides: the wake word alone began 0.73 s after the wake and ran 1.12 s;
+# real commands run 1.68 s («включи кофеварку») and 1.84 s («Выключить свет»).
+
+
+def _wake_then_utterance(end_after_wake: float, dur: float) -> CameraSession:
+    s = _make_session()
+    s._wake_detected = True
+    s._wake_only_pending = False
+    s._last_wake_fired_at = 1000.0
+    s._last_utt_end_ts = 1000.0 + end_after_wake
+    s._last_utt_dur = dur
+    return s
+
+
+def test_the_wake_words_own_audio_is_recognised_by_time():
+    """The measured shape: onset 0.73 s after the wake, 1.12 s long."""
+    s = _wake_then_utterance(end_after_wake=1.85, dur=1.12)
+    assert s._is_wake_word_alone() is True
+
+
+def test_a_real_command_is_not_mistaken_for_the_wake_word():
+    """«включи кофеварку» is 1.68 s and «Выключить свет» 1.84 s — both longer
+    than the wake word, both dispatched on the same run."""
+    assert _wake_then_utterance(end_after_wake=2.39, dur=1.68)._is_wake_word_alone() is False
+    assert _wake_then_utterance(end_after_wake=3.10, dur=1.84)._is_wake_word_alone() is False
+
+
+def test_a_utterance_that_ends_long_after_the_wake_is_a_command():
+    """A cap-length utterance full of television that began after the wake."""
+    assert _wake_then_utterance(end_after_wake=9.0, dur=7.04)._is_wake_word_alone() is False
+
+
+@pytest.mark.asyncio
+async def test_a_transcript_without_the_wake_word_can_still_be_the_wake_word():
+    """The regression itself: «1000 свят» must not reach the router."""
+    dispatched = []
+    s = _wake_then_utterance(end_after_wake=1.85, dur=1.12)
+
+    async def _boom(*a, **kw):
+        dispatched.append(a)
+        raise AssertionError("the wake word was dispatched as a command")
+
+    s._call_nanobot = _boom
+    await s._handle_wake_or_command("1000 свят", "camera")
+
+    assert dispatched == [], "«1000 свят» was sent to the router as a command"
+    assert s._wake_only_pending is True, "the utterance must be re-opened"
+
+
+@pytest.mark.asyncio
+async def test_a_normal_command_after_the_wake_word_is_still_dispatched():
+    dispatched = []
+    s = _wake_then_utterance(end_after_wake=2.39, dur=1.68)
+
+    async def _ok(*a, **kw):
+        dispatched.append(a)
+        return None
+
+    s._call_nanobot = _ok
+    s._cancel_wake_greeting = lambda: None
+    await s._handle_wake_or_command("включи кофеварку", "camera")
+
+    assert dispatched, "the real command was swallowed by the wake-word rule"
+    assert s._wake_only_pending is False
+
+
+# --- after our own reply the wake word is required again (user's decision) -----
+#
+# `CAMERA_FOLLOWUP` is OFF by default. Measured 06.10.2026 in twenty minutes:
+# the user's own voice peaked at 4725 and 9124, while the television and the
+# appliances peaked at 13197, 16074 and 32522 — the noise is louder than the user,
+# so `followup_min_peak` refused the user twice ('ключ', 'Выключить свет.') and
+# admitted noise twice ('атака', 'пиздец'). No level threshold separates them.
+
+
+def test_the_free_form_followup_window_is_off_by_default():
+    assert CameraConfig(stream_name="x").followup_window is False
+    assert CameraSession(
+        CameraConfig(stream_name="x", go2rtc_host="127.0.0.1")
+    )._followup_window is False
+
+
+def test_the_followup_window_can_be_switched_on_explicitly():
+    s = CameraSession(
+        CameraConfig(stream_name="x", go2rtc_host="127.0.0.1", followup_window=True)
+    )
+    assert s._followup_window is True
+
+
+def test_a_zero_window_is_not_the_same_as_no_window():
+    """`0` means "unset, use the built-in default" everywhere in this file, so a
+    window of 0 would have produced a 30 s window rather than none. The gate is a
+    boolean for exactly that reason."""
+    s = CameraSession(
+        CameraConfig(stream_name="x", go2rtc_host="127.0.0.1", dialogue_question_s=0.0)
+    )
+    assert s._dialogue_question_s > 0, "0 falls back to the default, by design"
+    assert s._followup_window is False, "and it still does not open a window"
+
+
+@pytest.mark.asyncio
+async def test_no_followup_window_opens_after_a_reply_by_default():
+    """The user's decision on 06.10.2026: after the camera answers, the wake word
+    is required again. Measured reason: the user's own voice peaked at 4725 and
+    9124 in the living room while the television and appliances peaked at
+    13197-16074 and 32522, so `followup_min_peak` refused the user twice
+    ('ключ', 'Выключить свет.') and admitted noise twice ('атака', 'пиздец') in
+    the same twenty minutes. The wake word is the only discriminator measured to
+    work: decoded, and 0 false accepts across 99 windows of television."""
+    s = _dialogue_session(question=True)
+    s._followup_window = False
+    q: asyncio.Queue = asyncio.Queue()
+    q.put_nowait("Что именно?")
+    q.put_nowait(None)
+
+    await asyncio.wait_for(s._nanobot_player_task(q), timeout=5.0)
+
+    assert s._followup_open is False, (
+        "a free-form window opened although the wake word is required again"
+    )
+    assert s._wake_detected is False, "the mic was left open without a wake word"
+
+
+@pytest.mark.asyncio
+async def test_the_window_still_opens_when_it_is_asked_for():
+    """The flag must not be a one-way door: the dialogue behaviour stays reachable
+    and tested, it is just not the default."""
+    s = _dialogue_session(question=True)
+    s._followup_window = True
+    q: asyncio.Queue = asyncio.Queue()
+    q.put_nowait("Что именно?")
+    q.put_nowait(None)
+
+    await asyncio.wait_for(s._nanobot_player_task(q), timeout=5.0)
+
+    assert s._followup_open is True
+    assert s._followup_only is True

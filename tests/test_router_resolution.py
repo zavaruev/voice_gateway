@@ -9,6 +9,8 @@ import contextlib
 import os
 import sys
 
+import pytest
+
 _ROUTER = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "services", "jev-router")
 )
@@ -1534,3 +1536,149 @@ def test_the_escalation_note_tells_l2_not_to_guess_the_direction():
     assert "спроси" in src
     # It must gate on route == complex_logic, or it would fire on resolved actions.
     assert 'route == "complex_logic"' in src
+
+
+# --- «ok» is not a device that moved, on the FAST path either (06.10.2026) ----
+#
+# Measured 06.10.2026 18:21 UTC on the kitchen:
+#
+#     router route=easy_action conf=0.92 text='включи кофеварку'
+#     router speaking: 'Включила'
+#     switch.coffemaker  off  last_changed=2026-10-06T13:14:53Z   <- hours old
+#
+# `switch.coffemaker` was `off`, the resolver produced it as the single target,
+# HA accepted the call, and the room spoke a success. The verification
+# `_touched_a_usable_entity()` existed — and existed precisely because of the
+# measured lie of 04.10.2026 — but it was only wired into the BLIND path. The
+# per-entity on/off fast path returned `call.speak_ok` on `ok and not fatal`
+# without ever re-reading a state.
+
+
+def test_the_onoff_fast_path_verifies_before_claiming_success():
+    """The hole was one missing call, not a missing idea: the same rule already
+    guarded the other path."""
+    import app as jev_router_app
+    import inspect
+
+    src = inspect.getsource(jev_router_app._execute_action)
+    # The success return must be behind the verification, not adjacent to it.
+    assert src.count("_confirm_on_off_moved") >= 1, (
+        "the on/off fast path still returns speak_ok on HA's `ok` alone"
+    )
+    idx_call = src.index("_confirm_on_off_moved")
+    idx_return = src.index("return call.speak_ok, None", idx_call)
+    assert idx_return > idx_call, "speak_ok is returned before the verification"
+    # And there must be an unverified branch, so a still-false claim escalates
+    # with the real blocker instead of speaking it.
+    assert "unverified_side_effect" in src
+
+
+@pytest.mark.asyncio
+async def test_a_device_that_did_not_move_is_reported_as_moved(monkeypatch):
+    """The verification itself, against the measured failure: HA accepts, the
+    relay stays exactly as it was."""
+    import app as jev_router_app
+
+    class _HA:
+        def __init__(self, seq):
+            self.seq = list(seq)
+            self.calls = 0
+
+        async def get_states(self, force=False):
+            self.calls += 1
+            return self.seq[min(self.calls - 1, len(self.seq) - 1)]
+
+    still_off = [{"entity_id": "switch.coffemaker", "state": "off"}]
+    monkeypatch.setattr(jev_router_app, "ha", _HA([still_off, still_off, still_off]))
+
+    moved, unmoved = await jev_router_app._confirm_on_off_moved(
+        ["switch.coffemaker"], {"switch.coffemaker": "off"}, want_on=True
+    )
+    assert moved == [], "a relay that stayed off was reported as moved"
+    assert unmoved == ["switch.coffemaker"]
+
+
+@pytest.mark.asyncio
+async def test_a_relay_that_answers_on_the_second_read_counts(monkeypatch):
+    """A relay is not instantaneous, which is the whole reason for the retry —
+    and a single instant read-back would have produced a false refusal."""
+    import app as jev_router_app
+
+    class _HA:
+        def __init__(self, seq):
+            self.seq = list(seq)
+            self.calls = 0
+
+        async def get_states(self, force=False):
+            self.calls += 1
+            return self.seq[min(self.calls - 1, len(self.seq) - 1)]
+
+    monkeypatch.setattr(
+        jev_router_app, "ha",
+        _HA([[{"entity_id": "switch.coffemaker", "state": "off"}],
+             [{"entity_id": "switch.coffemaker", "state": "on"}]]),
+    )
+
+    moved, unmoved = await jev_router_app._confirm_on_off_moved(
+        ["switch.coffemaker"], {"switch.coffemaker": "off"}, want_on=True
+    )
+    assert moved == ["switch.coffemaker"]
+    assert unmoved == []
+
+
+@pytest.mark.asyncio
+async def test_a_device_that_went_the_OTHER_way_is_not_moved(monkeypatch):
+    """The hole in the first version of the check, found by probing the LIVE
+    router rather than trusting the unit tests: `before != now` was accepted as
+    evidence of movement. For a binary on/off a change means the OPPOSITE of what
+    was asked, and an entity missing from the registry reads as an empty state
+    that therefore also "changed" — so both of these reported `moved`."""
+    import app as jev_router_app
+
+    class _HA:
+        def __init__(self, states):
+            self.states = states
+
+        async def get_states(self, force=False):
+            return self.states
+
+    # Asked to turn OFF, still on: not reached.
+    monkeypatch.setattr(jev_router_app, "ha", _HA(
+        [{"entity_id": "switch.coffemaker", "state": "on"}]))
+    moved, _ = await jev_router_app._confirm_on_off_moved(
+        ["switch.coffemaker"], {"switch.coffemaker": "off"}, want_on=False)
+    assert moved == [], "a device left in the opposite state was called moved"
+
+    # Absent from the registry entirely: nothing there could have moved.
+    monkeypatch.setattr(jev_router_app, "ha", _HA(
+        [{"entity_id": "switch.что-то_другое", "state": "on"}]))
+    moved, unmoved = await jev_router_app._confirm_on_off_moved(
+        ["switch.coffemaker"], {"switch.coffemaker": "off"}, want_on=True)
+    assert moved == [], "an entity absent from the registry was called moved"
+    assert unmoved == ["switch.coffemaker"]
+
+    # unavailable and unknown are equally not-reached.
+    for bad in ("unavailable", "unknown"):
+        monkeypatch.setattr(jev_router_app, "ha", _HA(
+            [{"entity_id": "switch.coffemaker", "state": bad}]))
+        moved, _ = await jev_router_app._confirm_on_off_moved(
+            ["switch.coffemaker"], {"switch.coffemaker": "off"}, want_on=True)
+        assert moved == [], f"a {bad} device was called moved"
+
+
+@pytest.mark.asyncio
+async def test_a_device_already_in_the_requested_state_counts_as_reached(monkeypatch):
+    """The user asked for a state, not for an event — «включи свет» with the lamp
+    already on is satisfied, and the caller says so before ever reaching here."""
+    import app as jev_router_app
+
+    class _HA:
+        async def get_states(self, force=False):
+            return [{"entity_id": "switch.entrance_light_switch_relay", "state": "on"}]
+
+    monkeypatch.setattr(jev_router_app, "ha", _HA())
+    moved, _ = await jev_router_app._confirm_on_off_moved(
+        ["switch.entrance_light_switch_relay"],
+        {"switch.entrance_light_switch_relay": "off"}, want_on=True,
+    )
+    assert moved == ["switch.entrance_light_switch_relay"]

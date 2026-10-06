@@ -123,6 +123,24 @@ _ECHO_TAIL_S = 3.0
 # guard has to cover the word, not a fixed short moment.
 _WAKE_REARM_DEBOUNCE_S = 3.0
 
+# Minimum gap between two attention pips. It was 15 s and it produced a measurable
+# cascade, measured 06.10.2026 18:21 UTC on the kitchen:
+#
+#     18:21:16 VOSK WAKE   attention pip skipped: 3.2s left of the limit
+#     18:21:19 VOSK WAKE   attention pip skipped: 0.0s left of the limit
+#     18:21:23 VOSK WAKE   attention pip
+#
+# The user repeated the wake word because the room gave NO confirmation, three
+# wakes fired in nine seconds, and the third utterance collected «Почему ты
+# пиздишь, что не включил кофеварку?» and sent THAT to the router as a command.
+# **A limit on the confirmation is a limit on the user's retries.**
+#
+# What 15 s was really protecting against — two pips from one utterance — is
+# already blocked upstream by `_WAKE_REARM_DEBOUNCE_S`, at the decoder, where the
+# second wake is refused instead of its beep being hidden. So the pip limit only
+# has to sit above that, and **every distinct wake gets feedback.**
+_ATTENTION_MIN_GAP_S = 3.5
+
 # How long after the clip the camera speaker may still be sounding. /play_audio
 # returns as soon as the body is uploaded and the box then plays it in real
 # time, so the margin only has to cover the upload and the duration rounding.
@@ -4156,15 +4174,16 @@ class CameraSession:
 
     async def _play_attention(self, reason: str = ""):
         now = time.time()
-        if now - self._last_attention < 15.0:
+        if now - self._last_attention < _ATTENTION_MIN_GAP_S:
             # Was silent, and that is user-visible: the wake fires, the camera
             # answers nothing, and there is no line anywhere explaining it.
             # Measured 06.10.2026 14:36: a wake at 14:36:48.964 produced NO pip
             # because the previous one was at 14:36:37.847, 11.1 s earlier.
             logger.info(
                 f"[{self.stream_name}] 🔇 attention pip skipped: "
-                f"{15.0 - (now - self._last_attention):.1f}s left of the 15 s limit "
-                f"(wake fired anyway — the user gets silence)"
+                f"{_ATTENTION_MIN_GAP_S - (now - self._last_attention):.1f}s left "
+                f"of the {_ATTENTION_MIN_GAP_S:g}s limit (a wake fired anyway — "
+                f"the user gets silence, and silence makes them repeat)"
             )
             return
         self._last_attention = now

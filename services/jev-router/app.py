@@ -487,6 +487,11 @@ async def _execute_action(call, text_hint: str = "") -> tuple[str | None, dict |
             if todo:
                 todo.sort(key=_target_rank)
                 ok: list[str] = []
+                # State BEFORE the calls, so the read-back can tell a device that
+                # moved from one that merely accepted the call.
+                before: dict[str, str] = {
+                    ent["entity_id"]: str(ent.get("state", "")).lower() for ent in todo
+                }
                 fatal: list[str] = []
                 skipped: list[str] = []
                 for ent in todo:
@@ -519,10 +524,32 @@ async def _execute_action(call, text_hint: str = "") -> tuple[str | None, dict |
                         logger.info("target not exposed to assistant: %s", eid)
                     else:
                         fatal.append(f"{eid}: {et}")
-                # Confirmed success with no fatal error = success; entities
-                # merely not exposed to the assistant were skipped, not failed.
+                # `ok` is HA saying the CALL was accepted, not that a device moved — and
+                # on this path nothing re-read the state, so «включи кофеварку» answered
+                # «Включила» with `switch.coffemaker` untouched (measured 06.10.2026
+                # 18:21 UTC, `last_changed` still hours old). The same verification
+                # exists on the BLIND path below and was never added here: the same
+                # class of lie this file already documents for the other one.
                 if ok and not fatal:
-                    return call.speak_ok, None
+                    moved, _unmoved = await _confirm_on_off_moved(ok, before, want_on)
+                    if moved:
+                        return call.speak_ok, None
+                    # Nothing moved. Claiming it did is worse than an honest refusal, so
+                    # this escalates with the real blocker instead of speaking a success the
+                    # user can plainly see is false.
+                    logger.error(
+                        "HA accepted %s for %s but no entity reached the requested "
+                        "state: before=%s",
+                        call.tool, ok, before,
+                    )
+                    return None, {
+                        "ok": False,
+                        "error": (
+                            "unverified_side_effect: Home Assistant принял вызов "
+                            f"{call.tool} для {', '.join(ok)}, но состояние не изменилось"
+                        ),
+                        "raw": {"claimed": ok, "before": before},
+                    }
                 if not ok and not fatal and skipped:
                     # Every entity that NEEDED a change was an unexposed facet
                     # (the "Network led switch" of the Sonoff relays), while
@@ -571,6 +598,58 @@ async def _execute_action(call, text_hint: str = "") -> tuple[str | None, dict |
             "raw": res.get("claimed"),
         }
     return None, res
+
+
+async def _confirm_on_off_moved(
+    ids: list[str], before: dict[str, str], want_on: bool
+) -> tuple[list[str], list[str]]:
+    """Which of these entities actually reached the state that was asked for?
+
+    Measured 06.10.2026 18:21 UTC: `switch.coffemaker` was `off`, «включи
+    кофеварку» resolved to it, HA accepted the call, the room said «Включила» —
+    and the relay's `last_changed` was hours old. `ok` from HA means the CALL was
+    accepted; a relay that does not answer, or a device that ignores the command,
+    looks identical from here.
+
+    **Read-back with a short retry**, because a relay is not instantaneous: the
+    first attempt covers the common case in well under a second and the retries
+    only cost time on a device that genuinely is not going to move.
+
+    **`reached` means exactly `state == target`, and nothing else.** The first
+    version also accepted `before != now` "as evidence it moved", which is how a
+    safeguard becomes a no-op: for a BINARY on/off a state change means the device
+    went the OTHER way, and an entity missing from the registry reads as an empty
+    state that therefore also "changed". Probed live against the running router
+    before it was trusted:
+
+        кофеварка on -> off, не сдвинулась  ->  moved=['switch.coffemaker']   (wrong)
+        несуществующее устройство             ->  moved=['switch.нет_такого']   (wrong)
+
+    So the first version would have accepted the very lie it was written to catch.
+    An entity absent from the registry, `unavailable` or `unknown` is never
+    reached — there is nothing there that could have moved.
+    """
+    target = "on" if want_on else "off"
+    moved: list[str] = []
+    for delay in (0.0, 0.25, 0.5):
+        if delay:
+            await asyncio.sleep(delay)
+        fresh = await ha.get_states(force=True)
+        by_id = {x.get("entity_id"): x for x in (fresh or [])}
+        if not by_id:
+            continue
+        for eid in ids:
+            if eid in moved:
+                continue
+            ent = by_id.get(eid)
+            if not ent:
+                continue          # not in the registry: nothing to have moved
+            st = str(ent.get("state", "")).lower()
+            if st == target:
+                moved.append(eid)
+        if moved:
+            break
+    return moved, [e for e in ids if e not in moved]
 
 
 def _touched_a_usable_entity(res: dict, states: list[dict] | None) -> bool:

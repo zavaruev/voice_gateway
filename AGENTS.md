@@ -842,6 +842,30 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
   `/route` answers **SSE**, not JSON: read every `data:` line and take the last
   one carrying text, or you will report the `route` event and think the command
   produced no reply.
+- **THE ON/OFF FAST PATH NEVER VERIFIED, AND A 15-SECOND PIP LIMIT TURNED ONE LIE INTO A CASCADE. Measured 06.10.2026 18:21 UTC, kitchen, in one report.** The whole chain, in order:
+
+  ```
+  18:21:04 VOSK WAKE → 'включи кофеварку' → router conf 0.92 → speaking: 'Включила'
+  18:21:16 VOSK WAKE → 🔇 attention pip skipped: 3.2s left of the 15 s limit
+  18:21:19 VOSK WAKE → 🔇 attention pip skipped: 0.0s left of the 15 s limit
+  18:21:23 VOSK WAKE → 🔔 attention pip
+  18:21:26 Whisper OK: 'Почему ты пиздишь, что не включил кофеварку?'  → dispatched
+  18:21:51 Whisper OK: 'включи блядь кофеварку уже'  → speaking: 'Включила' again
+  18:22:06 VOSK WAKE → 🔔 attention pip
+  18:22:08 Whisper OK: 'снова пиздишь'  → dispatched
+  ```
+
+  `switch.coffemaker` ended at **`off`, `last_changed` 13:14 UTC** — it never moved, across both claims. The user's two replies were spoken AT the room and dispatched as commands, and on both the router produced **no sentence at all**: a lie, then silence, then silence.
+
+  **1. The verification existed and was wired into the wrong path.** `_touched_a_usable_entity()` was added on 04.10.2026 precisely because «включи свет» answered «Сделала» with the lamp untouched — and it is called only on the **blind** path (line ~558). The per-entity on/off path returned `call.speak_ok` on `ok and not fatal` **without ever re-reading a state**. Same class of lie, one path guarded and one not.
+  * `_confirm_on_off_moved(ids, before, want_on)` now gates that return: snapshot the states before the calls, then read back with a short retry (0/0.25/0.5 s — a relay is not instantaneous, and a single instant read would produce a false refusal). Nothing reached the requested state → `unverified_side_effect` escalation carrying the real blocker, never a spoken success.
+  * **`reached` means `state == target` and nothing else.** The first version also accepted `before != now` "as evidence it moved", and probing it against the **running** router before trusting it showed both holes: a device left in the opposite state reported `moved`, and an entity **absent from the registry** reported `moved` (it reads as an empty state, which therefore "changed"). **The first version would have accepted the very lie it was written to catch.** A unit test that only exercised "stayed exactly off" passed over both holes — a check that looks like a safeguard and is a no-op is worse than none, and only a live probe found it.
+  * Verified live afterwards: reached → `moved`; went the other way → `unmoved`; absent from the registry → `unmoved`; `unavailable`/`unknown` → `unmoved`; already in the requested state → `moved` (the user asked for a state, not an event).
+  * **The relay itself was not permanently broken**: after the deploy «включи кофеварку» moved it (`last_changed=18:37:27`, state `on`) and the room said «Включила» in 0.5 s. So the 18:21 failure was real but transient, which is exactly the case a verification exists for.
+
+  **2. A limit on the confirmation is a limit on the user's retries.** Two of three wake words got **no beep**, because `_play_attention` opened with `now - _last_attention < 15.0`. The silence is what made the user repeat, the repeats fired three wakes in nine seconds, and the third utterance collected the complaint. What 15 s was really protecting against — two pips from one utterance — is already blocked upstream by `_WAKE_REARM_DEBOUNCE_S` (3.0 s), at the decoder, where the second wake is *refused* rather than its beep *hidden*. **`_ATTENTION_MIN_GAP_S` is now 3.5 s**, just above that, so every distinct wake gets feedback.
+  * A hardcoded `11.1 s` in a test stopped being a skip the moment the limit moved, which is why the test now derives its offset from the constant: **a test that pins a log line must not pin the value behind it.**
+
 - **AN HONEST `ok` IS NOT A DEVICE THAT MOVED.** The MCP intent answers `{"data":{"success":[...],"failed":[...]}}`, and `success` is full of things that are not a working device. Measured 04.10.2026 on «выключи свет» in the living room: the blind call (`domain:["light"]`, `area:"Living Room"`, **no `name`**) returned `success: [{type:area, id:living_room}, {type:entity, id:light.wled_living_room}]`, `failed: []` — HA matched the ROOM plus a WLED strip that has been `unavailable` since 28.09 — so `ok=True`, the gateway said **«Выключила»**, and the lamp (`switch.*_relay`, which `domain:["light"]` cannot match at all) never changed. Three rules now, each with a test:
   1. `get_states()` returns its **previous snapshot** on failure, and that snapshot is `[]` on a cold cache — so an empty list means "HA did not answer", NOT "no such device". An empty registry and an empty target set both **refuse**; on/off never falls through to the blind intent any more.
   2. `_touched_a_usable_entity()` is required before any `speak_ok`: HA must name at least one entity of `type: "entity"` that is **present in the live registry** and not `unavailable`. An `area` entry means a room matched, not a device. (An id ABSENT from `/api/states` counts as unverified — that mistake was in the first version of this check and its own test caught it.)

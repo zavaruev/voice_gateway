@@ -2428,12 +2428,39 @@ class _RecordingLog:
 
 
 @pytest.mark.asyncio
+async def test_the_pip_limit_must_not_be_longer_than_the_user_patience():
+    """Measured 06.10.2026 18:21 UTC: a 15 s pip limit produced silence on two of
+    three consecutive wake words, the user repeated themselves, three wakes fired
+    in nine seconds, and the third utterance captured «Почему ты пиздишь, что не
+    включил кофеварку?» and sent THAT to the router as a command.
+
+    What the 15 s limit was protecting against — two pips from one utterance — is
+    already blocked upstream by the rearm debounce, at the decoder. So the limit
+    only has to exceed that, and a distinct wake must always get a beep."""
+    import camera_client as cc
+
+    assert cc._ATTENTION_MIN_GAP_S <= 5.0, (
+        f"the pip limit is {cc._ATTENTION_MIN_GAP_S}s, which is long enough for "
+        "the user to give up and repeat"
+    )
+    # Above the rearm debounce, or a single word could pip twice.
+    assert cc._ATTENTION_MIN_GAP_S >= cc._WAKE_REARM_DEBOUNCE_S, (
+        "the pip limit must exceed the rearm debounce, which is what actually "
+        "stops one word from waking twice"
+    )
+
+
+@pytest.mark.asyncio
 async def test_the_pip_must_not_disappear_without_saying_so():
     """A pip skipped by the 15 s rate limit is silence the user cannot explain:
     the wake fires, the room answers nothing, and no line records why. The wake
     at 14:36:48.964 produced no pip because the previous one was 11.1 s earlier."""
     s = _make_session()
-    s._last_attention = time.time() - 11.1
+    # Just inside the limit, whatever the limit is: this test pins the LOG LINE,
+    # not the value. The value has its own test, and it was 15 s when this was
+    # written — which is exactly the point, since a hardcoded 11.1 stopped being
+    # a skip the moment the limit moved.
+    s._last_attention = time.time() - (camera_client._ATTENTION_MIN_GAP_S - 1.0)
     s._out_track = None
     s._wake_suppress_until = 0.0
     s._store_tts_echo = lambda pcm: None
@@ -2447,6 +2474,7 @@ async def test_the_pip_must_not_disappear_without_saying_so():
     assert "attention pip skipped" in log.text, (
         f"the pip was skipped without a log line; got: {log.text!r}"
     )
+    assert "silence" in log.text, "the line must say what the user experienced"
 
 
 def test_the_rearm_guard_must_cover_the_wake_words_own_tail():

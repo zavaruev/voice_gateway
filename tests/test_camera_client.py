@@ -11,6 +11,8 @@ import os
 import time
 import pytest
 import inspect
+from unittest.mock import patch
+
 import av
 import fractions
 
@@ -2266,3 +2268,116 @@ async def test_the_window_still_opens_when_it_is_asked_for():
 
     assert s._followup_open is True
     assert s._followup_only is True
+
+
+# --- the echo suppression must not crawl (06.10.2026 12:40) -------------------
+#
+# Reported: "after a confirmation both cameras take a long time to react to
+# «компьютер»". The log said why, three times in a row:
+#
+#     12:40:24.025 VOSK wake heard but not fired: echo_tail=+19.6s (suppressed=1)
+#     12:40:26.274 VOSK wake heard but not fired: echo_tail=+17.4s (suppressed=2)
+#     12:40:28.911 VOSK wake heard but not fired: echo_tail=+14.7s (suppressed=3)
+#
+# `min(now + 20, ...)` was a SLIDING deadline. While the reply was sounding, every
+# chunk correlating with it pushed the block 20 s past the current moment, so the
+# last echo chunk of a reply left the room deaf for 20 s after the reply ended.
+# The user was told the wake word was heard, while it was blocked.
+
+
+def _echo_session():
+    """A session with the mic OPEN, which is the only way the echo branch is
+    reachable at all: `_feed_audio` returns on `_speaking_until` before it."""
+    s = _make_session()
+    s._speaking_until = 0.0
+    s._out_track = None
+    s._wake_detected = False
+    s._last_echo_log = 0.0
+    s._is_echo = lambda pcm, *a, **k: True
+    s._resample_generic = lambda pcm, rate: pcm
+    return s
+
+
+@pytest.mark.asyncio
+async def test_echo_suppression_is_anchored_to_when_playback_ends():
+    """Playback ends at T; our own voice arrives in the mic a moment later, which
+    is the only moment the echo branch runs at all (the hard mute covers the rest).
+
+    Before the fix the block landed at `now + 20`, i.e. 20 s after the reply — the
+    user's «компьютер» was decoded, reported as heard, and dropped.
+    """
+    from camera_client import _ECHO_TAIL_S
+
+    t_end = 1000.0
+    s = _echo_session()
+    s._tts_play_end = t_end
+
+    with patch.object(camera_client.time, "time", lambda: t_end + 0.5):
+        await s._feed_audio(b"\x01\x02" * 160)
+
+    assert s._drop_echo == 1, "the echo branch did not run at all"
+    after_reply = s._wake_suppress_until - t_end
+    assert after_reply == pytest.approx(_ECHO_TAIL_S + 0.5), (
+        f"the block runs {after_reply:.1f}s past the end of the reply, "
+        "which is the delay that was reported"
+    )
+    assert after_reply < 5.0, "20 s of deafness after every reply"
+
+
+@pytest.mark.asyncio
+async def test_a_long_echo_tail_cannot_deafen_the_room_for_twenty_seconds():
+    """`min(now + 20, ...)` slid the deadline on EVERY echoing chunk, so a reply
+    whose own voice kept correlating deafened the room for twenty seconds more.
+    The anchor is now playback end plus `_ECHO_TAIL_S`, so the total deafness is
+    bounded by the tail plus however long the echo itself lasted.
+
+    The assertion is "bounded", not "fixed": the deadline does still move with
+    each chunk, because `now + _ECHO_TAIL_S` is a deliberate floor — a stale
+    `_tts_play_end` from a previous turn must not park the block for the length
+    of a whole reply. What must not happen is the 20 s slide.
+    """
+    from camera_client import _ECHO_TAIL_S
+
+    t_end = 1000.0
+    last_echo_at = t_end + 0.5 + 9 * 0.16      # 1.94 s of tail
+    s = _echo_session()
+    s._tts_play_end = t_end
+    with patch.object(camera_client.time, "time", lambda: last_echo_at):
+        for _ in range(10):
+            await s._feed_audio(b"\x01\x02" * 160)
+
+    deaf_for = s._wake_suppress_until - t_end
+    assert s._drop_echo == 10, "the echo branch did not run on every chunk"
+    assert deaf_for <= (last_echo_at - t_end) + _ECHO_TAIL_S + 0.01, (
+        f"{deaf_for:.1f}s of deafness after the reply: the deadline slid again"
+    )
+    assert deaf_for < 6.0, (
+        f"{deaf_for:.1f}s of deafness after every reply — this is the reported bug"
+    )
+    # The old arithmetic, for the record: min(now + 20, play_end + 45).
+    old = min(last_echo_at + 20.0, t_end + 45.0) - t_end
+    assert old > deaf_for * 3, "the assertion no longer distinguishes the fix"
+
+
+@pytest.mark.asyncio
+async def test_the_wake_word_is_accepted_once_the_echo_tail_is_over():
+    """The end of the chain: the user waits a moment after the reply, says
+    «компьютер», and the gate lets it through. Before the fix this was refused
+    for another 20 s — three times in a row in the 12:40 log."""
+    from camera_client import _ECHO_TAIL_S, _WAKE_REARM_DEBOUNCE_S
+
+    t_end = 1000.0
+    echo_at = t_end + 0.5
+    s = _echo_session()
+    s._tts_play_end = t_end
+    with patch.object(camera_client.time, "time", lambda: echo_at):
+        await s._feed_audio(b"\x01\x02" * 160)
+
+    assert s._wake_gate_open(echo_at) is False, (
+        "our own voice is still in the mic, so the gate must be shut"
+    )
+    s._last_wake_fired_at = 0.0          # not the same breath
+    assert s._wake_gate_open(echo_at + _ECHO_TAIL_S + 0.2) is True, (
+        "the wake word was still blocked long after the reply and its echo were over"
+    )
+    assert _WAKE_REARM_DEBOUNCE_S < _ECHO_TAIL_S + 0.2

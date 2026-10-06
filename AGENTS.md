@@ -515,6 +515,34 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
   `_back_to_wake`, and below a gate the room logs `follow-up ignored, peak=... ` and
   goes back to waiting for the wake word.
 
+- **THE ECHO SUPPRESSION WAS A SLIDING DEADLINE, SO EVERY REPLY DEAFENED THE ROOM FOR 20 s MORE. Measured 06.10.2026 12:40, reported as "both cameras take a long time to react to «компьютер» after a confirmation".** The log said it three times in a row:
+
+  ```
+  12:40:24.025 VOSK wake heard but not fired: echo_tail=+19.6s (suppressed=1)
+  12:40:26.274 VOSK wake heard but not fired: echo_tail=+17.4s (suppressed=2)
+  12:40:28.911 VOSK wake heard but not fired: echo_tail=+14.7s (suppressed=3)
+  ```
+
+  The user said «компьютер» three times and was **told the wake word was heard** while it was blocked. The arithmetic was `min(now + 20.0, _tts_play_end + 45.0)`, applied on **every** chunk that correlated with our own playback — so while a reply was sounding, each echo chunk pushed the block 20 s past the *current* moment, and the last one left 20 s of deafness after the reply ended.
+  * Now anchored to when playback ends: `max(now + _ECHO_TAIL_S, _tts_play_end + _ECHO_TAIL_S)`. Both call sites — the 48 kHz path and the generic resampler.
+  * **The `+20 s` existed for the ONVIF backchannel, which returns our own speech 3-40 s late. That path is gone**: both rooms play over `/play_audio` (`CAMERA_WEBRTC` off) and `_tts_play_end` is written after the POST returns, which is when the camera actually starts playing. So `play_end + tail` covers the tail and **does not move as more echo arrives**.
+  * `now + _ECHO_TAIL_S` is a deliberate FLOOR, not an oversight: a stale `_tts_play_end` from a previous turn must not park the block for the length of a whole reply. So the deadline still slides with each echo chunk — bounded by the tail plus however long the echo itself lasted, which is under 6 s over the measured 1.9 s tail. The test asserts that bound and records what the old arithmetic gave, rather than asserting immobility it would be wrong to demand.
+  * **A wake must never be reported as heard while it is blocked.** `VOSK wake heard but not fired` is the instrument that showed this, and it is the reason to keep the reason string on that line.
+- **THE KITCHEN HEARS THE WAKE WORD ~11 dB WORSE IN THE SPEECH BAND, AND IT IS NOT THE APPLIANCE HUM AND NOT A LEVEL.** Measured 06.10.2026 by playing one identical phrase through each camera's own `/play_audio` at the normal reply level (`POST /api/camera/tts`, basic auth — **it returns 401 without it**) and capturing each microphone:
+  * The decoder's own hypotheses are the evidence, and they are unambiguous:
+
+    ```
+    livingroom  5.12 s → 'компьютер'                     trigger=1
+    kitchen     НЕТ    → 'как' → 'как я' → 'как театр' → 'как театр включи свет в гостиной'
+    ```
+
+    The kitchen heard the whole sentence and mis-heard **only the wake word**, as «как театр».
+  * Per-band SNR of the phrase against the room: **speech band 1-4 kHz is +15.4 dB in the living room and +4.4 dB in the kitchen — 11 dB worse** — while the 50-200 Hz hum band is *better* on the kitchen (+15.9 vs +10.9). That is why «компьютер» goes: its consonants /k/, /pʲ/, /tʃ/ live in the band the kitchen has least of.
+  * **The high-pass filter is not the answer, and this was measured rather than assumed**: sweeping a 4th-order Butterworth at 0/80/120/160/200/300 Hz changes the kitchen from not firing to not firing, at every cutoff.
+  * **Gain is not the answer either**: scaling the kitchen capture +3/+6/+9/+12 dB does not make it fire, and *removing* −3…−18 dB does not either — and at +6 dB **the living room stops firing too**. Neither direction touches detection, because level does not change SNR. The kitchen's phrase reaches only ~10x its own ambient where the living room's reaches ~33x.
+  * **So the gap is the kitchen's own noise, and it is 11 dB of broadband speech-band noise.** A high-pass cannot remove broadband noise and no gain can create SNR. What would close it is not in this repository: switch off whatever is making it (an extractor fan is the usual candidate) and re-measure the per-band SNR. Until then the kitchen's wake word is genuinely less reliable than the living room's, and the fix is a measurement of the room, not a threshold.
+- **AN ABSOLUTE LEVEL PROBE AND A RELATIVE ONE ANSWER DIFFERENT QUESTIONS.** Recorded here because the kitchen investigation ran into it: vosk fires at 0, +3, −3, −6, −9, −12 and −18 dB in the living room and at **no level at all** in the kitchen, so "make it louder" and "make it quieter" are both refuted by the same experiment, and the informative number is the per-band SNR (11 dB apart) rather than any single peak.
+
 - **THE PEAK CANNOT TELL THE USER FROM THE TELEVISION IN THIS ROOM, SO AFTER A REPLY THE WAKE WORD IS REQUIRED AGAIN. Measured, and decided by the user 06.10.2026.** Twenty minutes, both directions, the same window:
 
   | utterance | peak | who | `followup_min_peak=24000` verdict |

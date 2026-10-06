@@ -2130,10 +2130,29 @@ class CameraSession:
                     # deadline forward indefinitely and muted the mic for
                     # minutes after every dialogue (user: перестала
                     # реагировать на компьютер).
-                    bound = getattr(self, "_tts_play_end", 0.0) + 45.0
+                    # Anchored to when playback ENDS, not to now.
+                    #
+                    # `min(now + 20, ...)` was a sliding deadline: while the reply
+                    # was still sounding, every chunk that correlated with it pushed
+                    # the block 20 s past the CURRENT moment, so the last echo chunk
+                    # of a reply left the room deaf for 20 s after the reply ended.
+                    # Measured 06.10.2026 12:40 as three consecutive refusals reading
+                    # `echo_tail=+19.6s / +17.4s / +14.7s` — the user said
+                    # «компьютер» three times and was told it was heard while it
+                    # was blocked. Reported as "both cameras take a long time to
+                    # react to «компьютер» after a confirmation".
+                    #
+                    # The old `+20 s` existed because the ONVIF backchannel returns
+                    # our own speech 3-40 s late. That path is gone: both rooms
+                    # play over `/play_audio` (`CAMERA_WEBRTC` off), and
+                    # `_tts_play_end` is written after the POST returns, which is
+                    # when the camera actually starts playing. So playback_end plus
+                    # the same `_ECHO_TAIL_S` covers the tail, and it does not move
+                    # as more echo arrives.
                     self._wake_suppress_until = max(
                         self._wake_suppress_until,
-                        min(now + 20.0, bound),
+                        now + _ECHO_TAIL_S,
+                        getattr(self, "_tts_play_end", 0.0) + _ECHO_TAIL_S,
                     )
                     continue
                 self._vad_buf.extend(pcm_16k)
@@ -2150,10 +2169,11 @@ class CameraSession:
                 if now - self._last_echo_log > 2.0:
                     self._last_echo_log = now
                     logger.info(f"[{self.stream_name}] 🔁 Echo chunk dropped (corr)")
-                bound = getattr(self, "_tts_play_end", 0.0) + 45.0
+                # Same anchoring as the 48 kHz path above — see the comment there.
                 self._wake_suppress_until = max(
                     self._wake_suppress_until,
-                    min(now + 20.0, bound),
+                    now + _ECHO_TAIL_S,
+                    getattr(self, "_tts_play_end", 0.0) + _ECHO_TAIL_S,
                 )
                 return
             self._vad_buf.extend(pcm_16k)

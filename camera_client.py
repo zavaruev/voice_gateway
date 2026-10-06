@@ -44,6 +44,7 @@ import os
 import re
 import struct
 import time
+from collections import deque
 from dataclasses import dataclass
 from math import gcd
 
@@ -145,11 +146,29 @@ _SPEAKER_SETTLE_S = 0.3
 # chopping sentences (measured 04.10.2026).
 _PREROLL_FRAMES = 8
 
-# A wake word decoded from a chunk quieter than this is a decoder artefact.
-# See CameraConfig.wake_min_peak for the measurement; 3000 sits an order of
-# magnitude below the user's own commands (8000-32767) and an order of magnitude
-# above a dead microphone's ceiling (388).
+# A wake word decoded without this much energy anywhere near it is a decoder
+# artefact. See CameraConfig.wake_min_peak for the measurement.
+#
+# Measured 06.10.2026 on BOTH sides, which is what makes the number defensible:
+# 60 s of living-room ambient with nobody in the room gives chunk peak median
+# 1148, p99 1660, MAX 2316; real speech from the recorded utterances gives
+# (per 1.9 s window) p10 1579, p25 5024, median 11250. The four ambient decodes
+# the gate refused measured 1106/1452/2076/2324 — i.e. every one of them was the
+# loudest ambient chunk there is. So 3000 clears the measured ambient ceiling by
+# 30 % and sits well under speech.
+#
+# The error this is allowed to make is asymmetric and deliberately so: a refused
+# real wake is recoverable (the user says it again), while a false wake opens a
+# 60 s window in which the room answers its own television. Do not lower it
+# toward the ambient ceiling without a new measurement of both sides.
 _WAKE_MIN_PEAK = 3000
+
+# The gate reads the LOUDEST chunk of the last N, not the trigger chunk alone.
+# «компьютер» spans ~10 chunks at the 160 ms hop, so a single chunk is a sample
+# from an arbitrary point in the word. Measured effect of the window on the same
+# recordings: speech median 5259 -> 11250 (p25 2912 -> 5024) while the ambient
+# ceiling does not move at all (2316). ~1.9 s, which covers the whole word.
+_WAKE_PEAK_WINDOW = 12
 
 # Raw peak an utterance must reach to count as the USER inside a follow-up window
 # (one opened by our own reply, with no wake word spoken).
@@ -1008,6 +1027,7 @@ class CameraSession:
         self.webrtc = config.webrtc
         self._attention_pip = config.attention_pip
         self._ns_rms_gate = config.ns_rms_gate
+        self._vosk_peak_win: deque = deque(maxlen=_WAKE_PEAK_WINDOW)
         self._wake_min_peak = (
             config.wake_min_peak if config.wake_min_peak > 0 else _WAKE_MIN_PEAK
         )
@@ -2318,6 +2338,7 @@ class CameraSession:
                 self._vosk_last_peak = max(
                     self._vosk_last_peak, int(np.abs(s16).max())
                 )
+                self._vosk_peak_win.append(int(np.abs(s16).max()))
                 got_wake = await asyncio.to_thread(self._vosk_wake.feed, chunk)
                 if got_wake:
                     # A wake word that HEARD always re-arms the interaction,
@@ -2341,7 +2362,7 @@ class CameraSession:
                             f"(suppressed={self._vosk_suppressed})"
                         )
                         got_wake = False
-                    elif int(np.abs(s16).max()) < self._wake_min_peak:
+                    elif max(self._vosk_peak_win) < self._wake_min_peak:
                         # A decoder run on near-silence returns its most likely
                         # phrase, and «компьютер» is that phrase. Measured
                         # 06.10.2026 08:55 on the kitchen, whose microphone is
@@ -2358,8 +2379,9 @@ class CameraSession:
                         self._vosk_suppressed += 1
                         logger.info(
                             f"[{self.stream_name}] VOSK wake heard but not "
-                            f"fired: peak={int(np.abs(s16).max())} < "
-                            f"{self._wake_min_peak} — that is silence, not a "
+                            f"fired: peak={int(np.abs(s16).max())} "
+                            f"window={max(self._vosk_peak_win)}/{len(self._vosk_peak_win)} "
+                            f"< {self._wake_min_peak} — that is silence, not a "
                             f"voice (suppressed={self._vosk_suppressed})"
                         )
                         got_wake = False

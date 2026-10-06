@@ -19,6 +19,7 @@ this module only runs inside the Docker image (see AGENTS/README).
 import asyncio
 import contextlib
 import time
+from collections import deque
 from unittest.mock import AsyncMock, patch
 
 import numpy as np
@@ -293,6 +294,45 @@ async def test_a_wake_decoded_from_silence_does_not_fire():
         "a wake word decoded out of near-silence fired the room"
     )
     assert s._vosk_wake.resets >= 1, "the decoder must be rolled over, not left armed"
+
+
+@pytest.mark.asyncio
+async def test_the_gate_reads_a_window_not_the_trigger_chunk():
+    """«компьютер» spans ~10 chunks at the 160 ms hop, so the trigger chunk is a
+    sample from an arbitrary point inside the word. Measured on the recorded
+    utterances: a 1.9 s window lifts speech median 5259 -> 11250 (p25 2912 ->
+    5024) while the living-room ambient ceiling does not move at all (2316).
+
+    Here the wake is decoded on a quiet chunk (300) preceded by a loud one
+    (12000) — a real word does exactly this, and a single-chunk gate would
+    refuse it.
+    """
+    s = _make_session()
+    s._vosk_wake = _StubVosk()
+    s._vosk_peak_win = deque([12000, 9000, 6000, 3000], maxlen=camera_client._WAKE_PEAK_WINDOW)
+
+    fire = await _feed_quiet(s, peak=300)
+
+    assert fire.await_count == 1, (
+        "a real word whose loudest chunk is not the trigger chunk was refused"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_loud_utterance_cannot_launder_a_silent_room():
+    """The window is bounded, so it cannot remember a loud moment from long ago
+    and wave a later silence through. Feeding the loud chunk first and then
+    pushing the window past its length must put the gate back to refusing."""
+    s = _make_session()
+    s._vosk_wake = _StubVosk()
+    s._vosk_peak_win = deque([12000], maxlen=camera_client._WAKE_PEAK_WINDOW)
+
+    for _ in range(camera_client._WAKE_PEAK_WINDOW):
+        await s._vad_process(_chunk(400))
+    fire = await _feed_quiet(s, peak=400, rounds=0)
+
+    assert fire.await_count == 0, "the window outlived its own length"
+    assert max(s._vosk_peak_win) < s._wake_min_peak
 
 
 @pytest.mark.asyncio

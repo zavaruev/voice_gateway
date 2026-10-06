@@ -502,14 +502,38 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
   **The note in this file that said the window was safe because "TV speech has to
   contain «компьютер» to open anything" was WRONG.** That is true of a window
   opened by the wake word, and false of a window opened by our own REPLY: inside
-  it, every utterance was dispatched with no keyword at all. Fixed with
-  `CAMERA_FOLLOWUP_MIN_PEAK[_<NAME>]` (default 24000): a follow-up window accepts
-  an utterance only if it is **loud enough to be the user** — the voice, not a
-  keyword, is what identifies them, because you are close and the television is
-  across the room. Below the gate the room does NOT answer; it logs
-  `follow-up ignored, peak=... ` and goes back to waiting for the wake word, the
-  only unambiguous signal. `self._followup_only` marks the window and is cleared by
-  `_fire_wake` and `_back_to_wake`.
+  it, every utterance was dispatched with no keyword at all. It was first "fixed"
+  with `CAMERA_FOLLOWUP_MIN_PEAK[_<NAME>]` (default 24000), on the reasoning that
+  the voice — not a keyword — identifies the user, because you are close and the
+  television is across the room. **That reasoning was measured on 06.10.2026 and it
+  is wrong: the user's own voice peaks at 4725 and 9124 while the television and the
+  appliances peak at 13197-32522.** The threshold refused the user twice and admitted
+  noise twice in twenty minutes, and it cannot be re-tuned, because the two
+  distributions overlap — see "THE PEAK CANNOT TELL THE USER FROM THE TELEVISION"
+  below. What survives from the old attempt is the mechanism: `self._followup_only`
+  marks a window opened by our reply and is cleared by `_fire_wake` and
+  `_back_to_wake`, and below a gate the room logs `follow-up ignored, peak=... ` and
+  goes back to waiting for the wake word.
+
+- **THE PEAK CANNOT TELL THE USER FROM THE TELEVISION IN THIS ROOM, SO AFTER A REPLY THE WAKE WORD IS REQUIRED AGAIN. Measured, and decided by the user 06.10.2026.** Twenty minutes, both directions, the same window:
+
+  | utterance | peak | who | `followup_min_peak=24000` verdict |
+  |---|---|---|---|
+  | 'ключ' | **4725** | the user | rejected as "not the user" |
+  | 'Выключить свет.' | **9124** | the user, a follow-up | rejected as "not the user" |
+  | 'атака' | 32522 | noise | accepted |
+  | 'пиздец' | 13197 | noise | accepted |
+  | television, earlier session | 4130-16074 | television | accepted |
+
+  **The noise is LOUDER than the user.** 24000 was calibrated from one sample of the user at 32767; today the same user measured 4725 and 9124 — a 3.6x spread — so the threshold sat inside the overlap with nothing to gain on either side. **Do not re-tune `CAMERA_FOLLOWUP_MIN_PEAK`: there is no value that separates these two distributions.** The user's voice is quieter than the television's because the television is a speaker two metres away and the user is a person in the room.
+  * `CAMERA_FOLLOWUP[_<NAME>]` (**default OFF**) opens a free-form window after our own reply, so «а теперь выключи» needs no wake word. Off means the wake word is required again, which is the only discriminator measured to work — the decoder, 0 false accepts across 99 windows of held-out television.
+  * **It is a boolean and not `dialogue_question_s=0` on purpose.** `0` means "unset, use the built-in default" throughout this file, so a window of 0 would have produced a **30 s window** instead of none — the opposite of the intent. `test_a_zero_window_is_not_the_same_as_no_window` pins that.
+  * The dialogue behaviour stays reachable and tested behind the flag: `test_no_followup_window_opens_after_a_reply_by_default` pins the off state, `test_the_window_still_opens_when_it_is_asked_for` the on state.
+- **THE WAKE WORD'S OWN AUDIO MUST NOT BE DISPATCHED AS A COMMAND, AND THE TRANSCRIPT IS NOT THE WAY TO ASK.** Measured 06.10.2026 12:39 on the living room: the wake fired at 12:39:56.340, the next utterance was **1.12 s** long and ended **1.85 s after the wake**, and Whisper wrote the wake word out as **«1000 свят»**. There is no «компьютер» in that string for the strip to remove, so the wake word was dispatched as a command and the router answered **«Включила»** to it.
+  * `_is_wake_word_alone()` asks by TIME — onset within `_WAKE_ALONE_MAX_ONSET_S` (0.9 s), stopped within `_WAKE_ALONE_MAX_SINCE_S` (2.5 s), shorter than `_WAKE_ALONE_MAX_DUR_S` (1.5 s). Measured on both sides: the wake word alone began 0.73 s after the wake and ran 1.12 s; real commands run **1.68 s** («включи кофеварку») and **1.84 s** («Выключить свет»).
+  * **The error can only be made in the safe direction.** A real short command mistaken for the wake word is re-opened, not dispatched — the next pause commits «компьютер <command>» together and the strip removes the wake word, so the command still runs, one pause later. The reverse error is what shipped.
+  * **A chained comparison is not two bounds.** `(A <= onset <= B and ...)` bounds one value by both constants instead of bounding `onset` and `since_wake` separately. The first version of this read the wake word as a command, and its own test caught it.
+- **A TEST HELPER THAT BUILDS A SESSION BY HAND CONVERTS A MISSING ATTRIBUTE INTO A PLAYBACK BUG.** `_player_session()` uses `CameraSession.__new__` and assigns fields by hand, so a new config attribute simply does not exist there. The player's broad `except Exception` turns that into `TTS sentence failed`, which reads as a TTS fault rather than a helper fault — the failure mode the helper's own comment warns about, walked into the moment the field was added. Every attribute the loop touches belongs in that helper, and the opt-in must be explicit (`s._followup_window = True`), because those tests are about the window's behaviour while the flag itself defaults off.
 
 - **THE FOLLOW-UP DID NOT WORK BECAUSE THREE SEPARATE 3-SECOND BLIND WINDOWS ATE
   THE FIRST WORD. Measured by arithmetic, not by guessing.**

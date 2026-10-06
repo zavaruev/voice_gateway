@@ -1425,3 +1425,112 @@ def test_the_time_question_is_phrased_the_way_people_ask_it():
 
     for phrase in ("какая температура в гостиной", "что сейчас играет", "кто это"):
         assert not RE_TIME_Q.search(phrase), f"{phrase!r} is not a time question"
+
+
+# --- Whisper mangles the OFF verb and L2 reverses the action (06.10.2026) ------
+#
+# Measured end to end, `stream=livingroom`, against the live router:
+#
+#     'куча свет'             -> L2 conf 0.75 -> «Включила свет»
+#     'куча свет в гостиной'  -> L2 conf 0.72 -> «Включила свет в гостиной»
+#     'кучи свет'             -> L2 conf 0.74
+#     'выкл юч свет'          -> L2 conf 0.86 resolver_ambiguous
+#
+# Asked to turn the light OFF, the room turned it ON. Whisper writes «выключи» as
+# «куча», «ключи» or «выкл юч»; `RE_OFF` matches none of those, the deterministic
+# path is skipped, confidence falls under 0.85 and an LLM is handed the garbled text
+# with nothing said about the verb — so it picks a direction, and picks it backwards.
+
+def test_the_measured_stt_spellings_of_the_off_verb_resolve():
+    """Only the spellings that were actually observed go in. Nothing here is a
+    general fuzzy matcher: an unmeasured guess about what Whisper 'might' produce
+    is exactly how a wrong action reaches a lamp."""
+    from resolver import resolve_action, normalize_stt_verbs
+
+    assert normalize_stt_verbs("куча свет") == "выключи свет"
+    assert normalize_stt_verbs("КУЧА свет в гостиной") == "выключи свет в гостиной"
+    assert normalize_stt_verbs("кучи свет") == "выключи свет"
+    assert normalize_stt_verbs("ключи свет") == "выключи свет"
+    assert normalize_stt_verbs("выкл юч свет") == "выключи свет"
+
+    for text in ("куча свет", "куча свет в гостиной", "кучи свет",
+                 "ключи свет", "выкл юч свет"):
+        call = resolve_action(text, "livingroom")
+        assert call is not None, f"{text!r} still escalates"
+        assert "TurnOff" in call.tool, f"{text!r} -> {call.tool}, expected TurnOff"
+        assert call.args.get("area") == "Living Room", (
+            f"{text!r} lost the room: {call.args}"
+        )
+
+
+def test_ordinary_words_that_merely_look_like_the_misheard_verb_are_left_alone():
+    """«куча» and «ключи» are ordinary Russian words, which is why the mapping is
+    gated on a device noun. Without the gate «куча чая» would switch a lamp off."""
+    from resolver import normalize_stt_verbs, resolve_action
+
+    for text in ("куча чая", "ключи от машины", "куча всего"):
+        assert normalize_stt_verbs(text) == text, f"{text!r} was rewritten"
+    assert resolve_action("куча чая", "livingroom") is None
+
+
+def test_the_on_verb_is_left_exactly_as_it_is():
+    """No ON entry exists because nothing has been observed mangling it — the log
+    holds 'включи', 'Включи', 'включи свет'. Adding one would be inventing a rule
+    from no measurement, and a wrong ON entry flips a real lamp."""
+    from resolver import normalize_stt_verbs
+
+    for text in ("включи свет", "Включи свет в гостиной", "включи свет"):
+        assert normalize_stt_verbs(text) == text
+
+
+def test_a_device_command_with_no_verb_is_flagged_for_the_escalation():
+    """`resolve_action` returning None is not protection enough: today's case went
+    out through the classifier's `low_confidence`, which never calls the resolver.
+    The note has to be attachable for that path too."""
+    from resolver import action_verb_missing
+
+    # A MEASURED mangle returns False: normalisation already restored the verb, so
+    # the turn does not escalate and there is nothing to warn about. The net is for
+    # the mangles nobody has observed yet.
+    assert action_verb_missing("куча свет") is False
+    assert action_verb_missing("выключи свет") is False
+    assert action_verb_missing("что с светом") is True, (
+        "a device noun with no verb at all is exactly what must reach L2 as a question"
+    )
+    assert action_verb_missing("включи свет в гостиной") is False
+    assert action_verb_missing("сколько сейчас времени") is False, (
+        "no device noun, nothing to be uncertain about"
+    )
+
+
+def test_the_stt_repair_happens_before_the_classifier_decides():
+    """Normalising inside the resolver was not enough, and the failure is
+    instructive: «куча свет» scored 0.75 (below the 0.85 gate, straight to L2, the
+    resolver never consulted) while «выкл юч свет» scored 0.86 and took the
+    deterministic path. The same defect, opposite outcome, decided by how close to
+    the threshold the embedding happened to land. So the repair has to sit where
+    the transcript enters, ahead of the classifier."""
+    import app as jev_router_app
+    import inspect
+
+    src = inspect.getsource(jev_router_app._handle)
+    repair_at = src.index("normalize_stt_verbs(text)")
+    classify_at = src.index("classifier.classify(text)")
+    assert repair_at < classify_at, (
+        "the transcript is classified before it is repaired, so a mangled verb is "
+        "judged on its mangled spelling"
+    )
+
+
+def test_the_escalation_note_tells_l2_not_to_guess_the_direction():
+    """The note is the whole fix for the unmeasured cases, so its wording is
+    load-bearing: it has to forbid the action, not merely mention the ambiguity."""
+    import app as jev_router_app
+    import inspect
+
+    src = inspect.getsource(jev_router_app._handle)
+    assert "action_verb_missing" in src, "the guard is not wired into _handle"
+    assert "НЕ угадывай направление" in src
+    assert "спроси" in src
+    # It must gate on route == complex_logic, or it would fire on resolved actions.
+    assert 'route == "complex_logic"' in src

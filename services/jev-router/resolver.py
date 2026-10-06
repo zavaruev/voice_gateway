@@ -155,6 +155,84 @@ RE_OFF = re.compile(
     r"\b(выключи|выключить|погаси|погасить|отключи|отключить|сруби|опусти|опустить)\b",
     re.IGNORECASE,
 )
+# --- STT variants of the on/off verbs -----------------------------------------
+#
+# Measured 06.10.2026, and the damage is not a mis-heard word, it is a REVERSED
+# ACTION. Whisper writes «выключи» as:
+#
+#     'куча свет'              -> L2, conf 0.75 -> «Включила свет»     (asked to turn OFF)
+#     'куча свет в гостиной'   -> L2, conf 0.72 -> «Включила свет в гостиной»
+#     'ключи свет'             -> L2, conf 0.74
+#     'выкл юч свет'           -> L2, conf 0.86, resolver_ambiguous
+#
+# Below the classifier's 0.85 the turn is escalated, and **an LLM handed «куча
+# свет» guesses the direction and gets it backwards**, executing the opposite
+# action on a real device. `RE_OFF` matches none of those spellings, so the
+# deterministic path is skipped entirely.
+#
+# ONLY the observed spellings are listed. Nothing here is a general fuzzy
+# matcher: an unmeasured guess about what Whisper "might" produce is exactly how
+# a wrong action reaches a lamp. The ON verb has not been observed mangled — the
+# log holds 'включи', 'Включи', 'включи свет' — so there is no ON entry, and
+# adding one would be inventing a rule from no measurement.
+#
+# The gate is a device noun, because «куча» and «ключи» are ordinary Russian
+# words. With no device in the sentence these are ignored, so «куча чая» cannot
+# reach a switch. See normalize_stt_verbs().
+_STT_OFF_VARIANTS: tuple[tuple[re.Pattern[str], str], ...] = (
+    # 'куча свет', 'куча свет в гостиной'
+    (re.compile(r"\bкуч[аеуыи]\b", re.IGNORECASE), "выключи"),
+    # 'ключи свет'
+    (re.compile(r"\bключи\b", re.IGNORECASE), "выключи"),
+    # 'выкл юч свет' — Whisper split the word
+    (re.compile(r"\bвыкл\s*юч\b", re.IGNORECASE), "выключи"),
+    # 'выкл свет' — the truncated stem, which RE_OFF's \b...\b misses
+    (re.compile(r"\bвыкл\b", re.IGNORECASE), "выключи"),
+)
+
+
+def normalize_stt_verbs(text: str) -> str:
+    """Rewrite observed STT spellings of the off verb into the canonical one.
+
+    Returns the text unchanged unless it carries a device noun AND one of the
+    measured variants. Gating on the device noun is what makes a mapping of two
+    common Russian words safe: without it «куча чая» would switch a lamp off.
+    """
+    t = (text or "").strip()
+    if not t or not _DEVICE_NOUN.search(t):
+        return t
+    for pattern, canonical in _STT_OFF_VARIANTS:
+        t = pattern.sub(canonical, t, count=1)
+    if t.strip() != (text or "").strip():
+        logger.info("STT off-verb normalised: %r", text[:80])
+    return t
+
+
+def action_verb_missing(text: str) -> bool:
+    """Does this sentence name a device but carry NO action verb we recognise?
+
+    Measured 06.10.2026 as the shape that reversed a real action: «куча свет»
+    (Whisper for «выключи свет») has a device and no verb, confidence falls under
+    0.85, and L2 — handed the garbled text with no statement about the verb —
+    answered «Включила свет». So the escalation has to SAY that the verb is
+    missing, because silence reads as "the direction is yours to pick".
+
+    **It normalises first, so a measured mangle returns False** — after
+    `normalize_stt_verbs` the verb is present and the turn never escalates, so
+    there is nothing to warn about. This is the net for the mangles nobody has
+    observed yet; the measured ones are fixed at source instead of warned about.
+    """
+    t = normalize_stt_verbs(text)
+    if not _DEVICE_NOUN.search(t):
+        return False
+    for pattern in (RE_ON, RE_OFF, RE_BRIGHTER, RE_DIMMER):
+        if pattern.search(t):
+            return False
+    if RE_TIMERS.search(t):
+        return False
+    return True
+
+
 RE_BRIGHTER = re.compile(r"\b(ярче|яркость|светлее|прибавь свет)\b", re.IGNORECASE)
 RE_DIMMER = re.compile(
     r"\b(тусклее|темнее|приглуши|убавь|уменьши свет|потемнее)\b", re.IGNORECASE
@@ -436,7 +514,7 @@ def resolve_action(text: str, stream_name: str) -> ResolvedCall | None:
     modulation -> plain on/off, so a sentence matching several families
     resolves to the most specific intent.
     """
-    t = (text or "").strip()
+    t = normalize_stt_verbs(text)
     if not t:
         return None
     if RE_NEGATION.search(t):

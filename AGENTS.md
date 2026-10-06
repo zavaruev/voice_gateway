@@ -545,6 +545,22 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
   * The kitchen's ambient is genuinely higher — **rms 525-590 against the living room's 388-414** — and that is the only stable difference between the rooms. If the kitchen still feels worse in daily use, the cause is not here: it is the geometry of a human voice at the distance the user actually stands, which this test cannot reproduce, and the log lines to read are `VOSK WAKE ... peak=` on a fire and `VOSK wake heard but not fired: <reason>` on a refusal.
   * **`POST /api/camera/tts` returns 401 without the admin credentials**, which cost one wasted round of the first attempt.
 
+- **WHISPER MANGLES «ВЫКЛЮЧИ», AND AN LLM HANDED THE GARBLED TEXT TURNS THE LAMP ON. Measured 06.10.2026, and the damage was a REVERSED ACTION on a real device.** «выключи свет» reached the router as:
+
+  | heard | router | system did |
+  |---|---|---|
+  | «куча свет» | L2, conf **0.75** | **«Включила свет»** |
+  | «куча свет в гостиной» | L2, conf **0.72** | **«Включила свет в гостиной»** |
+  | «кучи свет» | L2, conf 0.83 | «Включила свет в гостиной» |
+  | «ключи свет» | L2, conf 0.74 | «Не удалось найти свет в комнате ключи…» |
+  | «выкл юч свет» | L2, conf 0.86, `resolver_ambiguous` | «В какой комнате выключить свет?» |
+
+  Asked to turn a lamp OFF, the room turned it ON, and the room name in the answer was invented — the router with the correct spelling answers «В гостиной уже выключено», so the entrance-hall report was the LLM guessing, not a resolver default. `RE_OFF` matches none of those spellings, so the deterministic path is skipped entirely.
+  * **Fix 1 — repair the transcript where it ENTERS, not inside the resolver.** `normalize_stt_verbs()` maps only the observed spellings (`куч[аеуыи]`, `ключи`, `выкл\s*юч`, bare `выкл`) and **only when a device noun is present**, which is what makes mapping two ordinary Russian words safe: without the gate «куча чая» switches a lamp off. No ON entry exists because nothing has been observed mangling it — the log holds «включи», «Включи», «включи свет» — and inventing one would flip a real lamp on no evidence.
+  * **The placement was the whole bug, and the first attempt proved it.** Normalising in `resolve_action` fixed only «выкл юч свет», because that one happened to score **0.86**, just over the 0.85 gate. «куча свет» scored **0.75** and went to L2 **without the resolver ever being called**. Same defect, opposite outcome, decided by how close to the threshold the embedding happened to land. **A transcription repair is not a routing concern and must not sit behind a confidence score.** Verified live after the move: all five variants route `easy_action` at confidence 1.0, resolve to the living room, and no other relay moves.
+  * **Fix 2 — the net for mangles nobody has observed yet.** `action_verb_missing(text)` fires when a device noun is present and no verb of any family matches; `_handle` then attaches a note to every `complex_logic` escalation: *do not guess the direction, do not call `ha_action`, ask.* It must be attached for **all** escalations and not only the resolver's, because today's case went out through the classifier's `low_confidence`, which never calls the resolver. It returns **False** for a measured mangle, because after normalisation the verb is present and the turn never escalates — measured mangles are fixed at source, not warned about.
+  * **Two of my own errors on the way, both caught by their tests:** `[аеуы]` does not contain `и`, so «кучи» was not covered; and the first version of the test asserted `action_verb_missing("куча свет") is True`, which was my wrong expectation of the semantics rather than a code fault.
+
 - **THE PEAK CANNOT TELL THE USER FROM THE TELEVISION IN THIS ROOM, SO AFTER A REPLY THE WAKE WORD IS REQUIRED AGAIN. Measured, and decided by the user 06.10.2026.** Twenty minutes, both directions, the same window:
 
   | utterance | peak | who | `followup_min_peak=24000` verdict |

@@ -88,6 +88,8 @@ from resolver import (
     resolve_action,
     resolve_query,
     unresolved_hint,
+    action_verb_missing,
+    normalize_stt_verbs,
 )
 
 # stdout logging: uvicorn does not configure root logging by default, and the
@@ -678,6 +680,25 @@ async def _handle(req: RouteRequest):
         return
 
     # --- L0: semantic classification -------------------------------------
+    # Repair the transcription BEFORE anything decides anything.
+    #
+    # Measured 06.10.2026: Whisper writes «выключи» as «куча», «кучи», «ключи»
+    # or «выкл юч». Normalising inside `resolve_action` was NOT enough, because
+    # the classifier runs first and its confidence decides the route: «куча свет»
+    # scored 0.75, fell under the 0.85 gate and went to L2 with the resolver never
+    # consulted at all, while «выкл юч свет» happened to score 0.86 and took the
+    # deterministic path. Same defect, opposite outcome, decided by how close to the
+    # threshold the embedding happened to land.
+    #
+    # So the repair belongs where the transcript ENTERS. **A transcription fix is
+    # not a routing concern and must not sit behind a confidence score.**
+    repaired = normalize_stt_verbs(text)
+    if repaired != text:
+        logger.info(
+            "STT repaired before routing: %r -> %r", text[:60], repaired[:60]
+        )
+        text = repaired
+
     decision = await classifier.classify(text)
     route, confidence, reason = decision.route, decision.confidence, decision.reason
     logger.info(
@@ -744,6 +765,25 @@ async def _handle(req: RouteRequest):
             f"Комната в Home Assistant называется «{_room}» — используй это "
             "имя, не переводи."
         )
+
+    # A device command with no verb we recognise is NOT an action for L2 to
+    # interpret. Measured 06.10.2026: Whisper wrote «выключи свет» as «куча
+    # свет», confidence fell to 0.75, and L2 — handed that with nothing said
+    # about the verb — answered «Включила свет». It turned the lamp ON when asked
+    # to turn it off, which is the worst thing this system can do to a room.
+    #
+    # `resolve_action` returning None is not enough protection on its own: this
+    # note has to be attached for every escalation, including the classifier's
+    # `low_confidence` path, which never calls the resolver at all. **Silence
+    # about a missing verb reads as "the direction is yours to choose".**
+    if route == "complex_logic" and action_verb_missing(text):
+        ctx = (ctx + " " if ctx else "") + (
+            "В фразе есть название устройства, но глагол действия не распознан "
+            f"(в исходном виде: {text[:60]!r}). НЕ угадывай направление действия и "
+            "не вызывай ha_action: спроси, что нужно сделать — включить или "
+            "выключить. Если действие нельзя определить, это вопрос, а не команда."
+        )
+        reason = (reason + "+verb_missing").strip("+")
 
     # The (usually single) route event: emitted before any execution so the
     # caller can log/telemetry the verdict immediately.

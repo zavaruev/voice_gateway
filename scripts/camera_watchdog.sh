@@ -339,7 +339,11 @@ for item in $STILL; do
   log "$CUR_NAME step 3: restart majestic, then re-register"
   reregister
   sleep "$SETTLE_S"
-  [ "$DRY_RUN" = "1" ] || cam_ssh '/etc/init.d/S95majestic restart >/dev/null 2>&1'
+  # Through `act`, like every other action. The two steps below are the only ones
+  # that touch the PHYSICAL camera, and they were the only ones DRY_RUN stayed
+  # silent about — so the one capability worth verifying (restarting majestic on
+  # a room that just got its SSH key) produced no evidence at all in a dry run.
+  act cam_ssh '/etc/init.d/S95majestic restart >/dev/null 2>&1'
   reregister
   if wait_healthy 6 15; then
     log "  $CUR_NAME RECOVERED by majestic restart + stream re-register (http ${CAM_LATENCY}s)"
@@ -350,7 +354,7 @@ for item in $STILL; do
   # Step 4: reboot. Reached only when restarting the service did not help.
   # ONVIF Reboot is not implemented on OpenIPC, so this is SSH or nothing.
   log "$CUR_NAME step 4: reboot over SSH — last resort, and probably wrong"
-  [ "$DRY_RUN" = "1" ] || cam_ssh 'nohup sh -c "sleep 1; reboot" >/dev/null 2>&1 &'
+  act cam_ssh 'nohup sh -c "sleep 1; reboot" >/dev/null 2>&1 &'
   wait_healthy $((WAIT_UP_S / 15)) 15 || { log "  $CUR_NAME did not come back"; continue; }
   sleep 20
   reregister

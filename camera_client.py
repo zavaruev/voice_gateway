@@ -114,7 +114,14 @@ _ECHO_TAIL_S = 3.0
 # away the command being collected. This replaces `_wake_detected` as the
 # firing guard — a wake word must always be able to re-arm the interaction,
 # which is the entire point of having one.
-_WAKE_REARM_DEBOUNCE_S = 1.5
+# Measured 06.10.2026 14:36: the wake fired at 14:36:48.964 and the decoder
+# decoded «компьютер» AGAIN from the same word's tail at 14:36:51.582 — 2.62 s
+# later — because the trigger lands in the middle of the word and the tail is fed
+# to the fresh recogniser. 1.5 s did not cover it; the second fire would have run
+# `_fire_wake` again and cleared the command being collected, which is the exact
+# failure this guard exists to prevent. The word's tail is up to ~2.7 s, so the
+# guard has to cover the word, not a fixed short moment.
+_WAKE_REARM_DEBOUNCE_S = 3.0
 
 # How long after the clip the camera speaker may still be sounding. /play_audio
 # returns as soon as the body is uploaded and the box then plays it in real
@@ -571,6 +578,14 @@ async def _arbiter_submit(
 # Global: while any TTS playback is running (ESP32 or camera), neither path
 # may send to nanobot — kills echo cascade (camera hears ESP32 TTS, resends).
 GLOBAL_TTS_UNTIL = 0.0
+# Who set it, from what, and for how long. Added 06.10.2026 after a correctly
+# recognised command was lost to this guard and the log could not say why: the
+# only setter is `_speak_pcm`, the reply in that window was the single word
+# «Включила», and the arithmetic puts the guard's expiry 14 s BEFORE the refusal —
+# so something in the log was not telling the truth and guessing which layer was
+# the only alternative. Set next to GLOBAL_TTS_UNTIL and printed by the refusal.
+_GLOBAL_TTS_BY = "—"
+_GLOBAL_TTS_DUR = 0.0
 
 
 class _PauseEndpoint:
@@ -3659,7 +3674,11 @@ class CameraSession:
         if self._ww_thresh > base_thresh:
             self._ww_thresh = base_thresh
         if time.time() < GLOBAL_TTS_UNTIL:
-            logger.info(f"[{self.stream_name}] Ignoring '{txt[:40]}' — TTS playback active (echo guard)")
+            logger.info(
+                f"[{self.stream_name}] Ignoring '{txt[:40]}' — TTS playback active "
+                f"(echo guard), {GLOBAL_TTS_UNTIL - time.time():.1f}s left, "
+                f"set by {_GLOBAL_TTS_BY}"
+            )
             return
         try:
             q: asyncio.Queue = asyncio.Queue()
@@ -3696,7 +3715,9 @@ class CameraSession:
             self._ww_thresh = base_thresh
         if time.time() < GLOBAL_TTS_UNTIL:
             logger.info(
-                f"[{self.stream_name}] Ignoring '{txt[:40]}' — TTS playback active (echo guard)"
+                f"[{self.stream_name}] Ignoring '{txt[:40]}' — TTS playback active "
+                f"(echo guard), {GLOBAL_TTS_UNTIL - time.time():.1f}s left, "
+                f"set by {_GLOBAL_TTS_BY}"
             )
             return
         try:
@@ -4125,6 +4146,15 @@ class CameraSession:
     async def _play_attention(self, reason: str = ""):
         now = time.time()
         if now - self._last_attention < 15.0:
+            # Was silent, and that is user-visible: the wake fires, the camera
+            # answers nothing, and there is no line anywhere explaining it.
+            # Measured 06.10.2026 14:36: a wake at 14:36:48.964 produced NO pip
+            # because the previous one was at 14:36:37.847, 11.1 s earlier.
+            logger.info(
+                f"[{self.stream_name}] 🔇 attention pip skipped: "
+                f"{15.0 - (now - self._last_attention):.1f}s left of the 15 s limit "
+                f"(wake fired anyway — the user gets silence)"
+            )
             return
         self._last_attention = now
         logger.info(f"[{self.stream_name}] 🔔 attention pip ({reason})")
@@ -4469,6 +4499,12 @@ class CameraSession:
             # but the transcript-level `_echo_of_reply` check below identifies our
             # own voice in the text and is what should decide.
             GLOBAL_TTS_UNTIL = time.time() + audio_dur + ECHO_TAIL
+            global _GLOBAL_TTS_BY, _GLOBAL_TTS_DUR
+            _GLOBAL_TTS_DUR = audio_dur
+            _GLOBAL_TTS_BY = (
+                f"{self.stream_name} '{reply[:40]}' pcm={len(pcm)}B "
+                f"dur={audio_dur:.2f}s sr={sr}"
+            )
             # Suppress the decoder for the playback plus a SHORT tail. This used to be
             # `audio_dur + 15.0`, which is the direct cause of "after the first
             # trigger the word stops working": a reply finished at T blocked

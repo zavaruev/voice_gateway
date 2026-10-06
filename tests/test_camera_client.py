@@ -1070,12 +1070,23 @@ def test_a_wake_is_muted_only_while_our_own_audio_is_in_the_air():
 
 def test_the_same_breath_cannot_fire_twice():
     """A second `_fire_wake()` clears `_vad_speech_buf` and destroys the command
-    being collected."""
+    being collected.
+
+    The bound was 1.5 s and is now 3.0 s: measured 06.10.2026 14:36, the decoder
+    decoded «компьютер» again **2.62 s** after the trigger, from the tail of the
+    same word, because the trigger lands mid-word and the tail goes to the fresh
+    recogniser. At 1.5 s the guard had already expired, so the second fire would
+    have cleared the command. 2.0 s below is what this test used to assert was
+    OPEN — that assertion was the bug, not the code."""
     s = _gate_session()
     s._last_wake_fired_at = 1000.0
     assert s._wake_gate_open(1000.8) is False
     assert "same_breath" in s._wake_gate_reason(1000.8)
-    assert s._wake_gate_open(1002.0) is True
+    assert s._wake_gate_open(1002.0) is False, (
+        "2.0 s was asserted open while the measured re-trigger came at 2.62 s"
+    )
+    assert s._wake_gate_open(1002.62) is False, "the measured re-trigger got through"
+    assert s._wake_gate_open(1003.2) is True
 
 
 def test_an_open_dialogue_window_does_not_close_the_gate():
@@ -2381,3 +2392,114 @@ async def test_the_wake_word_is_accepted_once_the_echo_tail_is_over():
         "the wake word was still blocked long after the reply and its echo were over"
     )
     assert _WAKE_REARM_DEBOUNCE_S < _ECHO_TAIL_S + 0.2
+
+
+# --- measured 06.10.2026 14:36 on the living room -----------------------------
+#
+# One «компьютер», and the log reads:
+#
+#     14:36:48.964 VOSK WAKE peak=1654          <- fired, and NO pip
+#     14:36:51.582 VOSK wake heard but not fired: echo_tail=+1.7s  <- the same word, again
+#     14:36:54.367 VOSK WAKE peak=1251
+#     14:36:54.376 attention pip (vosk)          <- the pip arrives 5.4 s late
+#     14:36:57.403 Whisper OK: 'куча свет'       <- the command, recognised correctly
+#     14:36:58.004 Ignoring 'куча свет' — TTS playback active (echo guard)
+
+
+class _RecordingLog:
+    """`camera_client` logs through loguru, which does not propagate to stdlib,
+    so `caplog` sees nothing. Record the messages instead — an assertion that
+    silently passes because the capture is empty is worse than no assertion."""
+
+    def __init__(self):
+        self.records = []
+
+    def _rec(self, level):
+        def emit(msg, *a, **kw):
+            self.records.append(str(msg))
+        return emit
+
+    def __getattr__(self, name):
+        return self._rec(name)
+
+    @property
+    def text(self):
+        return "\n".join(self.records)
+
+
+@pytest.mark.asyncio
+async def test_the_pip_must_not_disappear_without_saying_so():
+    """A pip skipped by the 15 s rate limit is silence the user cannot explain:
+    the wake fires, the room answers nothing, and no line records why. The wake
+    at 14:36:48.964 produced no pip because the previous one was 11.1 s earlier."""
+    s = _make_session()
+    s._last_attention = time.time() - 11.1
+    s._out_track = None
+    s._wake_suppress_until = 0.0
+    s._store_tts_echo = lambda pcm: None
+    s._play_audio_http = _never_played
+
+    log = _RecordingLog()
+    with patch.object(camera_client, "logger", log):
+        await _noop_run(s._play_attention("vosk"))
+
+    assert log.records, "nothing was logged at all, so this test would pass wrongly"
+    assert "attention pip skipped" in log.text, (
+        f"the pip was skipped without a log line; got: {log.text!r}"
+    )
+
+
+def test_the_rearm_guard_must_cover_the_wake_words_own_tail():
+    """The decoder decoded «компьютер» again 2.62 s after the trigger, from the
+    tail of the same word — the trigger lands mid-word and the tail is fed to the
+    fresh recogniser. A 1.5 s guard let it through, and the second fire would have
+    cleared the command being collected."""
+    from camera_client import _WAKE_REARM_DEBOUNCE_S
+
+    assert _WAKE_REARM_DEBOUNCE_S >= 3.0, (
+        f"the guard is {_WAKE_REARM_DEBOUNCE_S}s and the measured re-trigger was "
+        "2.62 s after the trigger"
+    )
+
+    s = _make_session()
+    s._last_wake_fired_at = 1000.0
+    s._wake_suppress_until = 0.0
+    assert s._wake_gate_open(1000.0 + 2.62) is False, (
+        "the same word's tail could fire a second wake"
+    )
+    assert s._wake_gate_open(1000.0 + _WAKE_REARM_DEBOUNCE_S + 0.2) is True
+
+
+async def _noop_run(coro):
+    await coro
+
+
+async def _never_played(pcm):
+    return True
+
+
+@pytest.mark.asyncio
+async def test_the_global_tts_guard_says_who_set_it_and_for_how_long():
+    """A command was lost to this guard and the log could not say why: the only
+    setter is `_speak_pcm`, the reply was the single word «Включила», and the
+    arithmetic puts the expiry 14 s BEFORE the refusal. A guard that silently eats
+    a correctly recognised command is the worst kind of guard, so the refusal now
+    prints the setter and the time remaining — this test pins that it does."""
+    import camera_client as cc
+
+    cc.GLOBAL_TTS_UNTIL = time.time() + 30.0
+    cc._GLOBAL_TTS_BY = "livingroom 'Включила' pcm=1000000B dur=20.80s sr=48000"
+
+    s = _make_session()
+    s.backend = None            # force the nanobot path, which owns this check
+    log = _RecordingLog()
+    with patch.object(camera_client, "logger", log):
+        await s._call_nanobot("включи свет")
+
+    refusals = [ln for ln in log.records if "echo guard" in ln]
+    assert refusals, f"no refusal logged; got: {log.text!r}"
+    line = refusals[0]
+    assert "Включила" in line, f"the refusal does not say who set it: {line!r}"
+    assert "dur=" in line, f"the refusal does not say for how long: {line!r}"
+    assert "s left" in line, f"the refusal does not say how long is left: {line!r}"
+    cc.GLOBAL_TTS_UNTIL = 0.0

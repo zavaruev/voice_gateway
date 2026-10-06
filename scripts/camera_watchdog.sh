@@ -58,9 +58,18 @@ LOG="${LOG:-/tmp/camera_watchdog.log}"
 STAMP_DIR="${STAMP_DIR:-/tmp}"
 GATEWAY="${GATEWAY:-voice_gateway}"
 
-WEDGE_S="${WEDGE_S:-2.5}"          # camera must answer faster than this
-CONFIRM_N="${CONFIRM_N:-2}"         # consecutive bad samples before acting
-CONFIRM_GAP_S="${CONFIRM_GAP_S:-15}"
+# Above the measured HEALTHY band by ~3.5x. It was 2.5 s, derived when ONE room
+# was polled and a healthy OpenIPC answered in 0.016-0.050 s. With both rooms the
+# healthy band MEASURED 0.154-1.724 s (median 0.54) and transient spikes to 5.3 s
+# happen in normal operation — so 2.5 s fired on healthy cameras and restarted the
+# gateway **17 times**. The wedge it was built for measured 7.4 s across three
+# tries, and 11.9-15 s otherwise, so 6 s keeps the margin on both sides.
+WEDGE_S="${WEDGE_S:-6.0}"
+# A camera must stay slow for a minute before anything disruptive happens. A
+# restart is not free: it drops every model, every RTSP loop and any turn in
+# flight, so it must not be reachable by a single transient sample.
+CONFIRM_N="${CONFIRM_N:-3}"
+CONFIRM_GAP_S="${CONFIRM_GAP_S:-20}"
 MIN_GAP_S="${MIN_GAP_S:-300}"       # per camera: never retry more often
 GW_SETTLE_S="${GW_SETTLE_S:-90}"    # settle time after restarting the gateway
 SETTLE_S="${SETTLE_S:-30}"
@@ -70,6 +79,24 @@ CUR_NAME="?"; CUR_IP="?"; CUR_STREAM="?"
 CAM_LATENCY="?"; STATE="?"
 
 log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$LOG" 2>/dev/null || true; }
+
+# `DRY_RUN=1` decides what it WOULD do and touches nothing.
+#
+# Added because testing this script the hard way restarted the gateway: the
+# ladder's first step is `docker restart voice_gateway`, and a script whose
+# first action is "restart the thing you are trying to protect" cannot be
+# exercised against a fault at all. Everything is still measured and logged, so
+# a dry run says exactly which step would have fired.
+DRY_RUN="${DRY_RUN:-0}"
+mkdir -p "$STAMP_DIR" 2>/dev/null || true
+
+act() {
+  if [ "$DRY_RUN" = "1" ]; then
+    log "  [dry-run] would: $*"
+    return 0
+  fi
+  "$@"
+}
 
 # go2rtc's own listing is the source of the source URL. It reports the bare
 # `rtsp://<ip>/stream=0` with credentials stripped — lossy, already noted in
@@ -140,24 +167,44 @@ reregister() {
     log "  $CUR_STREAM: no registered URL in go2rtc to re-register from"
     return 1
   fi
+  if [ "$DRY_RUN" = "1" ]; then
+    log "  [dry-run] would: re-register $CUR_STREAM -> $url"
+    return 0
+  fi
   curl -s -m 10 -X DELETE "$GO2RTC/api/streams?src=$CUR_STREAM" -o /dev/null 2>/dev/null
   sleep 2
   curl -s -m 15 -X PUT "$GO2RTC/api/streams?src=$CUR_STREAM" \
        --data-urlencode "$url" -o /dev/null 2>/dev/null
 }
 
+# Four states, because two independent signals are measured: how fast the camera
+# answers HTTP, and whether go2rtc holds a producer with a consumer on it.
+#
+#   healthy      fast AND streaming          nothing to do
+#   slow-only    slow AND streaming          a busy box — logged, never acted on
+#   dead-stream  fast AND not streaming      our reader or go2rtc; the gateway step
+#   wedged       slow AND not streaming      both, which is what a real outage looks like
+#
+# HTTP latency ALONE decides nothing. Measured both ways on this network: the room
+# answered in 0.066 s while its RTSP was dead, and two polled rooms measure
+# 0.154-1.724 s with spikes to 5.3 s while completely healthy.
 classify() {
-  local lat
+  local lat fast=0 up=0
   lat="$(cam_latency)"
   CAM_LATENCY="${lat:-?}"
-  if [ -z "$lat" ]; then
-    STATE="unreachable"
-  elif ! awk -v l="$lat" -v t="$WEDGE_S" 'BEGIN{exit !(l+0 < t+0)}'; then
-    STATE="wedged"
-  elif go2rtc_up "$CUR_STREAM"; then
+  [ -z "$lat" ] && { STATE="unreachable"; return 0; }
+  if awk -v l="$lat" -v t="$WEDGE_S" 'BEGIN{exit !(l+0 < t+0)}'; then
+    fast=1
+  fi
+  go2rtc_up "$CUR_STREAM" && up=1
+  if [ "$fast" = 1 ] && [ "$up" = 1 ]; then
     STATE="healthy"
-  else
+  elif [ "$fast" = 1 ]; then
     STATE="dead-stream"
+  elif [ "$up" = 1 ]; then
+    STATE="slow-only"
+  else
+    STATE="wedged-slow"
   fi
 }
 
@@ -219,7 +266,12 @@ for entry in $CAMERAS; do
       # cannot reach costs a boot cycle and fixes nothing.
       log "$CUR_NAME UNREACHABLE $CUR_IP — network, not the box; not rebooting"
       ;;
-    *)
+    slow-only|wedged-slow)
+      # Latency without a dead stream. Logged, never acted on.
+      log "$CUR_NAME slow but stream alive (http $(cam_latency)s) — watching, not acting"
+      ;;
+    dead-stream|wedged)
+      # The stream itself is broken, or the camera is slow AND not streaming.
       SICK="$SICK $CUR_STREAM"
       log "$CUR_NAME UNHEALTHY state=$STATE http=$(cam_latency)s stream=$CUR_STREAM"
       ;;
@@ -252,7 +304,7 @@ done
 # The reader that stopped draining the cameras. Measured working: HTTP 14.34 s ->
 # 0.021 s and audio back to 100 % of real time, with the cameras untouched.
 log "step 1: restart $GATEWAY once for all rooms —$BAD"
-docker restart "$GATEWAY" >/dev/null 2>&1
+act docker restart "$GATEWAY"
 sleep "$GW_SETTLE_S"
 
 RECOVERED=""; STILL=""
@@ -287,7 +339,7 @@ for item in $STILL; do
   log "$CUR_NAME step 3: restart majestic, then re-register"
   reregister
   sleep "$SETTLE_S"
-  cam_ssh '/etc/init.d/S95majestic restart >/dev/null 2>&1'
+  [ "$DRY_RUN" = "1" ] || cam_ssh '/etc/init.d/S95majestic restart >/dev/null 2>&1'
   reregister
   if wait_healthy 6 15; then
     log "  $CUR_NAME RECOVERED by majestic restart + stream re-register (http ${CAM_LATENCY}s)"
@@ -298,7 +350,7 @@ for item in $STILL; do
   # Step 4: reboot. Reached only when restarting the service did not help.
   # ONVIF Reboot is not implemented on OpenIPC, so this is SSH or nothing.
   log "$CUR_NAME step 4: reboot over SSH — last resort, and probably wrong"
-  cam_ssh 'nohup sh -c "sleep 1; reboot" >/dev/null 2>&1 &'
+  [ "$DRY_RUN" = "1" ] || cam_ssh 'nohup sh -c "sleep 1; reboot" >/dev/null 2>&1 &'
   wait_healthy $((WAIT_UP_S / 15)) 15 || { log "  $CUR_NAME did not come back"; continue; }
   sleep 20
   reregister

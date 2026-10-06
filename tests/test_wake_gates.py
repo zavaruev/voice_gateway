@@ -219,3 +219,105 @@ async def test_open_stt_confirm_opens_a_fresh_window():
         assert _confirm_open(s)
         assert expiry.call_count == 1
         await asyncio.sleep(0)
+
+
+# --- the wake gate cascade's sibling: ENERGY, not keywords --------------------
+#
+# Measured 06.10.2026 08:55 on the kitchen, whose microphone is dead
+# (rms 4, -77.8 dB, peak 135-388 over ten seconds):
+#
+#     VOSK WAKE trig='компьютер'
+#     Whisper IN: 1.15s raw_rms=77  peak=388  dB=-52.6  gain=20.0x
+#     Whisper OK: 'Выключи.'
+#
+# A decoder run on near-silence returns its most likely phrase, and for this
+# system that phrase is «компьютер». The room woke itself, Whisper invented a
+# command out of the same silence, and the camera spoke the invention — which is
+# the whole of the "answered unintelligibly and did nothing" report.
+
+
+class _StubVosk:
+    """A vosk matcher that always decodes the wake word.
+
+    Carries the three counters `vosk diag` reads, because that log line runs on
+    the same chunk as the decision under test and an incomplete stub fails on the
+    logging rather than on the gate.
+    """
+
+    active = True
+    triggers = 0
+    decodes = 0
+    last_partial = ""
+    last_text = "компьютер"
+    last_trigger_text = "компьютер"
+
+    def __init__(self):
+        self.fed = 0
+        self.resets = 0
+
+    def begin(self):
+        self.active = True
+
+    def feed(self, chunk):
+        self.fed += 1
+        self.triggers += 1
+        return True
+
+    def reset(self):
+        self.resets += 1
+
+
+async def _feed_quiet(session: CameraSession, peak: int, rounds: int = 1):
+    with (
+        patch("camera_client._arbiter_submit", new=AsyncMock(return_value=(True, (), "t"))),
+        patch.object(session, "_play_attention", new=AsyncMock()),
+        patch.object(session, "_schedule_wake_greeting"),
+        patch.object(session, "_fire_wake", new=AsyncMock()) as fire,
+    ):
+        for _ in range(rounds):
+            await session._vad_process(_chunk(peak))
+        await asyncio.sleep(0)
+    return fire
+
+
+@pytest.mark.asyncio
+async def test_a_wake_decoded_from_silence_does_not_fire():
+    """A dead microphone cannot contain a word. The kitchen measured a peak of
+    388 while its decoder reported «компьютер» with full confidence."""
+    s = _make_session()
+    s._vosk_wake = _StubVosk()
+
+    fire = await _feed_quiet(s, peak=388)
+
+    assert fire.await_count == 0, (
+        "a wake word decoded out of near-silence fired the room"
+    )
+    assert s._vosk_wake.resets >= 1, "the decoder must be rolled over, not left armed"
+
+
+@pytest.mark.asyncio
+async def test_the_energy_gate_does_not_swallow_a_real_command():
+    """The user's own commands measure 8000-32767 at the rail in the living room,
+    so the threshold must sit far below them — this is the failure a fix here
+    would cause, not just the one it prevents."""
+    s = _make_session()
+    s._vosk_wake = _StubVosk()
+
+    fire = await _feed_quiet(s, peak=12000)
+
+    assert fire.await_count == 1, "a genuine command peak was refused"
+
+
+@pytest.mark.asyncio
+async def test_the_energy_gate_is_per_room_and_off_by_default_for_zero():
+    """`0` must mean "use the built-in default", never "refuse everything" — a
+    half-filled override that zeroed the threshold would silence the whole house
+    and read as a dead wake word."""
+    assert CameraConfig(stream_name="x").wake_min_peak == 0
+    s = _make_session()
+    assert s._wake_min_peak == camera_client._WAKE_MIN_PEAK > 0
+
+    s2 = CameraSession(
+        CameraConfig(stream_name="y", go2rtc_host="127.0.0.1", wake_min_peak=800)
+    )
+    assert s2._wake_min_peak == 800

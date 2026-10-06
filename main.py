@@ -3691,6 +3691,16 @@ async def start_camera_sessions():
                     or os.getenv("CAMERA_NS_RMS_GATE")
                     or 0
                 ),
+                # A wake word decoded from a chunk quieter than this is refused.
+                # A decoder on near-silence returns its most likely phrase, and
+                # for this system that is «компьютер» — measured 06.10.2026 on the
+                # kitchen, whose mic is dead: the room woke itself and then spoke
+                # a command Whisper invented from the same silence. 0 => 3000.
+                wake_min_peak=int(
+                    os.getenv(f"CAMERA_WAKE_MIN_PEAK_{name.upper()}")
+                    or os.getenv("CAMERA_WAKE_MIN_PEAK")
+                    or 0
+                ),
                 # Peak the reply is normalised to before the camera plays it.
                 # 0 => the built-in 20000 (61 % of full scale). Exists for an
                 # unresolved field report of crackling playback (05.10.2026):

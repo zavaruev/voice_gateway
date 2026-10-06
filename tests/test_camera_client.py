@@ -2034,3 +2034,79 @@ def test_both_rooms_read_identical_thresholds():
             f"{field}: livingroom={getattr(living, field)!r} "
             f"kitchen={getattr(kitchen, field)!r}"
         )
+
+
+# --- the utterance must not close on the wake word alone (06.10.2026 13:25) ---
+#
+# Measured on the living room: the pause endpoint committed a 2.56 s utterance
+# containing only «компьютер» — the wake word's own frames satisfied
+# `min_speech_frames` (speech=7) and the gap after it read as a pause. The command
+# was orphaned into the next utterance, and that one ran to the 7 s cap with
+# television in it: «Числят.», «Часок на один. Это дождь.»,
+# «Что ты думаешь, что я не ехать ночью?» — three commands answered aloud that
+# nobody gave.
+
+
+@pytest.mark.asyncio
+async def test_a_wake_only_transcript_keeps_the_utterance_open():
+    s = _make_session()
+    s._wake_detected = True
+    s._wake_only_pending = False
+    s._vad_has_speech = False
+
+    await s._handle_wake_or_command("компьютер", "camera")
+
+    assert s._wake_only_pending is True, (
+        "a wake-only transcript must ask for the utterance to be re-opened, "
+        "otherwise the command lands in a slot the television can take"
+    )
+    assert s._wake_detected is True, "the wake window must survive"
+
+
+@pytest.mark.asyncio
+async def test_a_wake_only_transcript_does_not_apply_to_a_real_command():
+    s = _make_session()
+    s._wake_detected = True
+    s._wake_only_pending = False
+
+    async def _ok(*a, **kw):
+        return None
+
+    s._call_nanobot = _ok
+    s._cancel_wake_greeting = lambda: None
+    await s._handle_wake_or_command("компьютер включи свет", "camera")
+
+    assert s._wake_only_pending is False
+
+
+def test_reopening_restores_the_preroll():
+    """Without the pre-roll the utterance resumes at the reopen and can still lose
+    the first syllable of the command — which is the bug the pre-roll fixed."""
+    s = _make_session()
+    s._vad_speech_buf = bytearray(b"stale")
+    s._vad_has_speech = False
+    s._preroll = [b"A" * 2560, b"B" * 2560]
+
+    s._reopen_utterance()
+
+    assert s._vad_has_speech is True
+    assert bytes(s._vad_speech_buf) == b"A" * 2560 + b"B" * 2560
+    assert s._vad_silence_frames == 0
+
+
+@pytest.mark.asyncio
+async def test_a_bare_wake_word_alone_never_dispatches_anything():
+    """The regression that matters: nothing must reach the router when the only
+    thing said was the wake word."""
+    dispatched = []
+    s = _make_session()
+    s._wake_detected = True
+    s._wake_only_pending = False
+
+    async def _boom(*a, **kw):
+        dispatched.append(a)
+        raise AssertionError("a bare wake word was dispatched as a command")
+
+    s._call_nanobot = _boom
+    await s._handle_wake_or_command("Компьютер.", "camera")
+    assert dispatched == []

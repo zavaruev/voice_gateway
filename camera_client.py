@@ -145,6 +145,12 @@ _SPEAKER_SETTLE_S = 0.3
 # chopping sentences (measured 04.10.2026).
 _PREROLL_FRAMES = 8
 
+# A wake word decoded from a chunk quieter than this is a decoder artefact.
+# See CameraConfig.wake_min_peak for the measurement; 3000 sits an order of
+# magnitude below the user's own commands (8000-32767) and an order of magnitude
+# above a dead microphone's ceiling (388).
+_WAKE_MIN_PEAK = 3000
+
 # Raw peak an utterance must reach to count as the USER inside a follow-up window
 # (one opened by our own reply, with no wake word spoken).
 #
@@ -874,6 +880,14 @@ class CameraConfig:
     # SpeexDSP noise-suppression cutoff in raw rms. 0 => 400. Was hardcoded per
     # room (`800 if kitchen else 400`); see _preprocess_audio.
     ns_rms_gate: int = 0
+    # Minimum raw peak a chunk must reach for a decoded wake word to count.
+    #
+    # A decoder fed near-silence returns its most likely phrase, and for this
+    # system that phrase is «компьютер». Measured 06.10.2026 on the kitchen, whose
+    # microphone is dead (rms 4, -77.8 dB, peak 135-388): the room woke itself and
+    # then answered a command Whisper invented from the same silence. The user's
+    # own commands measure 8000-32767 at the rail. 0 => _WAKE_MIN_PEAK.
+    wake_min_peak: int = 0
     # Peak the reply is normalised to before it goes to the camera speaker.
     # 0 => _TTS_TARGET_PEAK_DEFAULT.
     #
@@ -994,6 +1008,9 @@ class CameraSession:
         self.webrtc = config.webrtc
         self._attention_pip = config.attention_pip
         self._ns_rms_gate = config.ns_rms_gate
+        self._wake_min_peak = (
+            config.wake_min_peak if config.wake_min_peak > 0 else _WAKE_MIN_PEAK
+        )
         # Pre-built Authorization header: aiohttp.BasicAuth is deprecated in
         # aiohttp 4, and /play_audio is the only place we do HTTP basic auth.
         self._play_audio_headers = {}
@@ -1044,6 +1061,8 @@ class CameraSession:
         self._followup_only = False
         # True when that window was opened by a QUESTION we asked.
         self._followup_is_question = False
+        # A wake-only transcript was committed; the command has not arrived yet.
+        self._wake_only_pending = False
         # Where the user's audio goes to die. See _feed_audio.
         self._drop_muted = 0      # dropped by the speaker-settle mute
         self._drop_track = 0      # dropped by the WebRTC track's echo guard
@@ -2322,6 +2341,28 @@ class CameraSession:
                             f"(suppressed={self._vosk_suppressed})"
                         )
                         got_wake = False
+                    elif int(np.abs(s16).max()) < self._wake_min_peak:
+                        # A decoder run on near-silence returns its most likely
+                        # phrase, and «компьютер» is that phrase. Measured
+                        # 06.10.2026 08:55 on the kitchen, whose microphone is
+                        # dead (rms 4, -77.8 dB): `VOSK WAKE trig='компьютер'`,
+                        # then Whisper given 1.15 s of rms 77 and answering
+                        # «Выключи.» — a wake word and a command both invented out
+                        # of nothing, and the room spoke the invention.
+                        #
+                        # The guard is energy, not keywords: the user's own commands
+                        # measure 8000-32767 at the rail in the living room, while
+                        # this room's peak never exceeds 388. There is no way to
+                        # hear a word in a peak of 135.
+                        self._vosk_wake.reset()
+                        self._vosk_suppressed += 1
+                        logger.info(
+                            f"[{self.stream_name}] VOSK wake heard but not "
+                            f"fired: peak={int(np.abs(s16).max())} < "
+                            f"{self._wake_min_peak} — that is silence, not a "
+                            f"voice (suppressed={self._vosk_suppressed})"
+                        )
+                        got_wake = False
                 if now - self._vosk_last_log > 300.0:
                     # Deliberately rare: this is a debug aid for "the room is
                     # mute again", not a health line. It reports chunks fed,
@@ -2363,10 +2404,20 @@ class CameraSession:
                     )
                     self._vosk_last_peak = 0
                 if got_wake:
+                    # `peak` is the raw peak of THIS chunk — the one the decoder
+                    # confirmed on — and it is the only direct measurement of what
+                    # the wake word itself sounded like. Without it the energy
+                    # gate above can only be tuned against ambient statistics
+                    # (measured: living room 77.8 % of chunks under 3000 peak,
+                    # median 1393), which says nothing about the word. Logged on
+                    # every wake so the threshold is set from a measurement and
+                    # not argued from a plausible story.
                     logger.info(
                         f"[{self.stream_name}] VOSK WAKE "
                         f"trig='{self._vosk_wake.last_trigger_text}' "
                         f"conf='{self._vosk_wake.last_text}' "
+                        f"peak={int(np.abs(s16).max())} "
+                        f"min_peak={self._wake_min_peak} "
                         f"triggers={self._vosk_wake.triggers} "
                         f"decodes={self._vosk_wake.decodes}"
                     )
@@ -3159,6 +3210,22 @@ class CameraSession:
             logger.info(f"[{self.stream_name}] 👤 Speaker: {uid} | '{txt[:60]}'")
         await self._handle_wake_or_command(txt, uid or "camera")
 
+    def _reopen_utterance(self) -> None:
+        """Re-open the utterance after a wake-word-only transcript.
+
+        Restores the state an onset would have created, so the command that
+        follows lands in the SAME utterance as the wake word and the next pause
+        ends the pair. The pre-roll is restored with it: without it the utterance
+        would resume at the moment of the reopen and could still lose the first
+        syllable of the command.
+        """
+        self._vad_has_speech = True
+        self._vad_silence_frames = 0
+        self._vad_speech_consecutive = 0
+        self._vad_speech_buf = bytearray(b"".join(self._preroll))
+        if getattr(self, "_endpoint", None) is not None:
+            self._endpoint.reset()
+
     def _end_utterance(self, reason: str) -> None:
         """Close the current utterance and hand its audio to Whisper.
 
@@ -3237,6 +3304,16 @@ class CameraSession:
 
             self._last_utt_rms_raw = float((stats or {}).get("rms_raw", 0.0))
             await self._handle_stt_result(txt, uid)
+            if self._wake_only_pending:
+                # Keep the utterance open across the gap between «компьютер» and
+                # the command, so the next pause commits them together and the
+                # television cannot take the empty slot in between.
+                self._wake_only_pending = False
+                self._reopen_utterance()
+                logger.info(
+                    f"[{self.stream_name}] 🔁 utterance kept open after the wake "
+                    f"word alone — awaiting the command"
+                )
         finally:
             self._processing_utterance = False
 
@@ -3310,6 +3387,18 @@ class CameraSession:
             logger.info(
                 f"[{self.stream_name}] 🎯 Wake-only utterance, awaiting command"
             )
+            # The command is still coming, so the utterance must NOT be closed.
+            #
+            # Measured 06.10.2026 13:25 on the living room: the pause endpoint
+            # committed a 2.56 s utterance containing only «компьютер» — the wake
+            # word's own frames satisfied `min_speech_frames` (speech=7) and the
+            # natural gap after it read as a pause. The command was orphaned into
+            # the NEXT utterance, and that one ran to the 7 s cap with television
+            # in it: «Числят.», «Часок на один. Это дождь.», «Что ты думаешь, что
+            # я не ехать ночью?» — each dispatched as a command and each answered
+            # aloud. That is the "strangely reacts to a command" report, and it is
+            # caused by closing on the wake word rather than by the wake word.
+            self._wake_only_pending = True
             return
         logger.info(f"[{self.stream_name}] 🗣 Post-wake command: '{cmd[:60]}'")
         # Overlapping wake windows: several cameras hear the same answer —

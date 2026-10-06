@@ -545,6 +545,21 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
   * The kitchen's ambient is genuinely higher — **rms 525-590 against the living room's 388-414** — and that is the only stable difference between the rooms. If the kitchen still feels worse in daily use, the cause is not here: it is the geometry of a human voice at the distance the user actually stands, which this test cannot reproduce, and the log lines to read are `VOSK WAKE ... peak=` on a fire and `VOSK wake heard but not fired: <reason>` on a refusal.
   * **`POST /api/camera/tts` returns 401 without the admin credentials**, which cost one wasted round of the first attempt.
 
+- **A WAKE THE DECODER MISSED LEAVES NO TRACE, AND THAT IS THE MOST EXPENSIVE SILENCE IN THE FILE.** Measured 06.10.2026: a second speaker said «компьютер» in the living room and the room ignored her for twenty minutes. What the log actually said:
+
+  ```
+  chunks=112058 suppressed=0 peak_max=32767 triggers=7 decodes=7 hyp=''  drop[muted=395 track=0 echo=69]
+  ```
+
+  `suppressed=0` — **the gate refused nothing**; the mic was muted for 395 chunks and 69 were claimed as echo, which is normal over 45 minutes; the wake decoder simply never fired. And `triggers` had been at 7 for four consecutive five-minute diagnostics while the VAD counted **412 `VAD SPEECH START`** events and chunk peaks reached 6128 against an ambient median of ~1393. **The room heard speech and the decoder produced nothing.** Two explanations remain and **both are silent**:
+  * the model did not decode the word at all, or
+  * it decoded a spelling outside `WAKE_TOKENS` — which allows exactly five (`компьютер`, `комп`, `компютер`, `компъютер`, `компьытер`) because five were OBSERVED — and `transcript_has_wake` dropped it on the floor without a line.
+  **A different voice lands outside a list built from one voice's observations, by construction.** The first version of this finding blamed the decoder; the counters do not support that, they only narrow it to these two.
+  * `wake_near_miss()` now reports a decoded word that ALMOST matched: a 3-character shared prefix plus a length delta of at most 3, which is cheap enough to run on every hypothesis. It is a **diagnostic and never a match** — `transcript_has_wake` stays exact, because widening it to a prefix admits «компот» and «компания». Counted in `near=` on `vosk diag` and logged outright, since the two explanations need different fixes: heard-and-discarded versus not-heard.
+  * **A prefix is a truncation, not a misspelling.** The first version reported every allowed spelling as its own near miss, because «комп» is a prefix of every other entry. Both an exact hit and a prefix relation are excluded.
+  * **A stub that mirrors a class has to track the class.** `_StubVosk` in `tests/test_wake_gates.py` raised `AttributeError` on the new counter — inside the live audio path, which is the worst place to find out a test-only shortcut exists. The real class therefore also carries **class-level defaults**, so an instance built with `__new__` (which `tests/test_vosk_wake.py` does to avoid an 88 MB model) cannot miss the attribute.
+  * **Next occurrence of a silent wake is now diagnosable instead of arguable.** Read `near=` on `vosk diag` and `vosk: wake NEAR MISS` in the log. `near>0` means the allowlist threw the word away and the fix is one more measured spelling; `near=0` means the model did not hear it and no threshold will help.
+
 - **WHISPER MANGLES «ВЫКЛЮЧИ», AND AN LLM HANDED THE GARBLED TEXT TURNS THE LAMP ON. Measured 06.10.2026, and the damage was a REVERSED ACTION on a real device.** «выключи свет» reached the router as:
 
   | heard | router | system did |

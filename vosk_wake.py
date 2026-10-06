@@ -41,6 +41,7 @@ CPU (per room, measured)
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 import time
@@ -53,6 +54,8 @@ SR = 16000
 # the plausible misspellings. An ALLOWLIST, not a prefix match: "компот" starts
 # with "комп" and woke the matcher in a test, which is exactly the kind of false
 # activation this whole exercise exists to remove.
+_log = logging.getLogger("vosk_wake")
+
 WAKE_TOKENS = frozenset({
     "компьютер", "комп", "компютер", "компъютер", "компьытер",
 })
@@ -80,6 +83,45 @@ def get_model(path: str):
         return m
 
 
+def wake_near_miss(text: str) -> str:
+    """The token this text almost was, or "".
+
+    **The single most useful line in this file, and it did not exist.** Measured
+    06.10.2026: a second speaker said «компьютер» in the living room and the room
+    ignored her for twenty minutes. The log said `suppressed=0` and
+    `drop[muted=395 echo=69]` — so the gate never refused, the mic never muted,
+    and the decoder simply never fired. **Both remaining explanations are silent**:
+    either it did not decode the word, or it decoded a spelling outside
+    `WAKE_TOKENS` and `transcript_has_wake` dropped it on the floor. Five
+    spellings are allowed because five were OBSERVED, which means a different
+    voice lands outside the list by construction.
+
+    The check is deliberately cheap: a shared 3-character prefix rejects almost
+    every hypothesis in the room, and only survivors are compared. It is a
+    diagnostic, never a match — `transcript_has_wake` stays an exact test,
+    because widening it to a prefix admits «компот» and «компания».
+    """
+    t = (text or "").lower().replace("ё", "е")
+    if not t.strip():
+        return ""
+    for tok in t.split():
+        bare = tok.strip(".,!?;:")
+        if bare in WAKE_TOKENS:
+            # Already allowed — reporting it would be noise. The first version
+            # missed this and every allowed spelling came back as its own near
+            # miss, because «комп» is a prefix of every other entry in the list.
+            continue
+        for cand in WAKE_TOKENS:
+            if cand.startswith(bare) or bare.startswith(cand):
+                # A prefix is a truncation, not a misspelling: «комп» and
+                # «компю» are on the allowlist's own reasoning, not near misses.
+                continue
+            n = min(len(bare), len(cand), 3)
+            if n and bare[:n] == cand[:n] and abs(len(bare) - len(cand)) <= 3:
+                return bare
+    return ""
+
+
 def transcript_has_wake(text: str) -> bool:
     """Exact-token match against the observed spellings of the wake word.
 
@@ -95,6 +137,14 @@ def transcript_has_wake(text: str) -> bool:
 
 
 class VoskWakeMatcher:
+    # Class-level defaults, because tests and any future caller may build an
+    # instance with `__new__` and skip `__init__` — `tests/test_vosk_wake.py`
+    # does exactly that to avoid loading an 88 MB model. A missing attribute on
+    # this counter would raise inside `feed()`, i.e. inside the live audio path,
+    # which is the worst place to discover a test-only shortcut.
+    near_misses = 0
+    last_near_miss = ""
+
     """Per-stream wake-word matcher built on a FREE (unconstrained) decoder.
 
     NOT thread-safe by itself. One instance per camera session; feed raw 16 kHz
@@ -159,6 +209,11 @@ class VoskWakeMatcher:
         self._fired = False
         self._fed = 0
         self._t0 = time.time()
+        # A lifetime counter like `triggers`, deliberately NOT cleared by reset().
+        # Reported because it is otherwise the most expensive silence in this
+        # file: the room ignores a person and every counter reads clean.
+        self.near_misses = 0
+        self.last_near_miss = ""
 
     @property
     def active(self) -> bool:
@@ -205,6 +260,18 @@ class VoskWakeMatcher:
         # the only evidence of what it actually hears
         self.last_partial = text
         if not transcript_has_wake(text):
+            near = wake_near_miss(text)
+            if near:
+                self.near_misses += 1
+                self.last_near_miss = near
+                # Rare by construction and decisive when it happens: a decoded word
+                # that ALMOST matched means the model heard it and the allowlist
+                # threw it away, which is a different fault from a model that did
+                # not hear it, and they need different fixes.
+                _log.warning(
+                    "vosk: wake NEAR MISS #%d — decoded %r, not in WAKE_TOKENS %s",
+                    self.near_misses, near, sorted(WAKE_TOKENS),
+                )
             return False
 
         self.triggers += 1

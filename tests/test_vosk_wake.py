@@ -280,3 +280,80 @@ def test_reset_keeps_lifetime_counters(matcher):
     assert matcher.triggers == 5
     assert matcher.decodes == 3
     assert matcher.active is False
+
+# --- a second speaker's «компьютер» left no trace at all (06.10.2026) --------
+#
+# Measured: a second voice said the wake word in the living room and the room
+# ignored her for twenty minutes. The log read `suppressed=0` and
+# `drop[muted=395 echo=69]` — the gate never refused and the mic never muted — so
+# the decoder simply never fired, and BOTH remaining explanations are silent:
+# it did not decode the word, or it decoded a spelling outside WAKE_TOKENS and
+# transcript_has_wake dropped it. Five spellings are allowed because five were
+# observed, so a different voice lands outside the list by construction.
+
+
+def test_a_near_miss_is_reported_and_never_matched():
+    """The distinction that needs different fixes: heard-and-discarded by the
+    allowlist, versus not heard at all."""
+    from vosk_wake import wake_near_miss, transcript_has_wake, WAKE_TOKENS
+
+    # Outside the list but unmistakably the word. NOT «компьытер» — that one is
+    # already allowed, which is exactly how the list got its five entries.
+    for spelling in ("компъюта", "компьютэ", "компютера", "компьытеро"):
+        assert transcript_has_wake(spelling) is False, (
+            f"{spelling!r} must not match — the allowlist is exact on purpose"
+        )
+    assert wake_near_miss("компъюта") == "компъюта"
+    assert wake_near_miss("компьютэ") == "компьютэ"
+    assert wake_near_miss("датте включи свет") == "", (
+        "ordinary speech must not raise the near-miss alarm"
+    )
+    # Every allowed spelling stays allowed, and never reports itself.
+    for tok in WAKE_TOKENS:
+        assert transcript_has_wake(tok) is True
+        assert wake_near_miss(tok) == ""
+
+
+def test_the_near_miss_counter_survives_until_it_is_read():
+    """It has to be visible in `vosk diag` as well as in the log, because the log
+    is rare and the diag is what gets read after a silent room."""
+    import json
+    import numpy as np
+
+    # Built the way tests/test_vosk_wake.py builds one — via __new__, so no 88 MB
+    # model is loaded — which is also the case the class-level defaults exist for.
+    import vosk_wake
+
+    m = vosk_wake.VoskWakeMatcher.__new__(vosk_wake.VoskWakeMatcher)
+    m.model_path = "fake"
+    m.max_secs = 1.0
+    m._model = object()
+    m.triggers = 0
+    m.decodes = 0
+    m.near_misses = 0
+    m.last_near_miss = ""
+    m.reset()
+    # No begin(): it would call vosk.KaldiRecognizer against the fake model. The
+    # recogniser is stubbed below, which is the whole point of this test.
+    # Drive it with a hypothesis that is close but not allowed: the thing under
+    # test is the counter and the report, not the model.
+    class _Rec:
+        def __init__(self):
+            self.n = 0
+
+        def AcceptWaveform(self, pcm):
+            self.n += 1
+            return self.n > 1
+
+        def Result(self):
+            return json.dumps({"text": "компъюта"})
+
+        def PartialResult(self):
+            return json.dumps({"partial": ""})
+
+    m._rec = _Rec()
+    chunk = np.zeros(2560, dtype=np.int16).tobytes()
+    assert m.feed(chunk) is False, "a near miss must not fire the wake"
+    assert m.feed(chunk) is False
+    assert m.near_misses >= 1
+    assert m.last_near_miss == "компъюта"

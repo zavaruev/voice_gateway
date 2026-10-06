@@ -251,6 +251,12 @@ class _StubVosk:
     last_partial = ""
     last_text = "компьютер"
     last_trigger_text = "компьютер"
+    # A stub that mirrors the class has to track the class. `vosk diag` reads these
+    # and adding them to the real class without adding them here raised
+    # AttributeError inside the live audio path — which is the same reason the real
+    # class carries class-level defaults for both.
+    near_misses = 0
+    last_near_miss = ""
 
     def __init__(self):
         self.fed = 0

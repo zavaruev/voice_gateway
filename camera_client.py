@@ -2475,6 +2475,16 @@ class CameraSession:
                         f"drop[muted={self._drop_muted} track={self._drop_track} "
                         f"echo={self._drop_echo}]"
                     )
+                    # The near-miss suffix, built first: mixing a conditional
+                    # expression into a chain of implicitly concatenated f-strings
+                    # leaves the following literal with no operator, which is a
+                    # SyntaxError I introduced once already.
+                    near_txt = (
+                        f" near={self._vosk_wake.near_misses}"
+                        f"(last {self._vosk_wake.last_near_miss!r})"
+                        if self._vosk_wake.near_misses
+                        else ""
+                    )
                     logger.info(
                         f"[{self.stream_name}] vosk diag: "
                         f"chunks={self._vosk_chunks} suppressed={self._vosk_suppressed} "
@@ -2482,6 +2492,7 @@ class CameraSession:
                         f"triggers={self._vosk_wake.triggers} "
                         f"decodes={self._vosk_wake.decodes} "
                         f"hyp='{self._vosk_wake.last_partial}'"
+                        f"{near_txt} "
                         f"{ep_txt} {drops}"
                     )
                     self._vosk_last_peak = 0

@@ -66,6 +66,7 @@ import kodi
 from concurrent.futures import ThreadPoolExecutor
 from ha_match import (
     MEDIA_DOMAIN,
+    claimed_a_usable_entity,
     confirm_delays,
     has_data,
     media_fingerprint,
@@ -326,6 +327,8 @@ def _raw_registry() -> tuple[list | None, dict | None]:
         return _RAW_STATES, _RAW_AREAS
 
 
+
+
 def _action_ok(text: str) -> bool:
     """True only for an intent answer that CONFIRMED its side effect.
 
@@ -513,6 +516,49 @@ def ha_action(tool_name: str, arguments_json: str) -> str:
             )
         # Zero successes: the ORIGINAL error stands — it is what actually
         # happened, and the model must report that instead of a guess.
+
+    # --- AN `ok` THAT NAMED A ROOM IS NOT A DEVICE THAT MOVED -------------------
+    # Field case 07.10.2026 11:39, living room: «Выключи свет в гостиной» was
+    # transcribed «Выключиться в гостиной», escalated to L2, and L2 called
+    #
+    #     ha_action("intent__HassTurnOff", {"area": "Living Room", "domain": ["light"]})
+    #
+    # which answered, with HTTP 200 and `failed: []`:
+    #
+    #     {"response_type": "action_done",
+    #      "data": {"success": [{"type": "area",   "id": "living_room"},
+    #                            {"type": "entity", "id": "light.wled_living_room"}],
+    #               "failed": []}}
+    #
+    # and the room SAID «Выключила свет в гостиной.» The lamp did not move: it is
+    # `switch.living_room_light_swith_relay`, and `domain: ["light"]` cannot match
+    # a `switch` at all. The only entity named was `light.wled_living_room`, which
+    # has been `unavailable` since 28.09, and the other entry is the ROOM.
+    #
+    # `_action_ok` above accepted it because the list is non-empty, `has_data` then
+    # recorded `ok=True`, which DISARMS the honesty veto, and the model was free to
+    # speak as done. The router has refused this exact shape since 04.10.2026 via
+    # `_touched_a_usable_entity` — one path was guarded and the other was not, the
+    # same asymmetry already documented for the on/off fast path vs the blind one.
+    # Applied HERE as well, and deliberately only to the on/off intents: an area-only
+    # match is provably not a lamp for those, whereas a vacuum `CleanArea` may
+    # legitimately report a room.
+    if tool_name in ("intent__HassTurnOn", "intent__HassTurnOff"):
+        states, _areas = _raw_registry()
+        if not claimed_a_usable_entity(result, states):
+            result = (
+                "Тул вернул ошибку: intent__Hass"
+                + ("TurnOn" if tool_name.endswith("TurnOn") else "TurnOff")
+                + " ответил успехом, но не назвал ни одного рабочего устройства"
+                " — в списке только комната и/или недоступные сущности "
+                "(проверено по живому реестру HA). Устройство НЕ переключено. "
+                "Не говори, что включила или выключила: назови настоящую "
+                "причину."
+            )
+            logger.warning(
+                "on/off intent claimed only areas/unavailable entities -> %s",
+                result[:120],
+            )
     _record_action(tool_name, result)
     return result
 

@@ -498,3 +498,106 @@ def test_a_wrong_title_is_reported_with_both_names():
                                _FAIL_WRONG_TITLE)
     assert replaced is True
     assert out == "Включилось «The Simpsons» вместо «Black Mirror»."
+
+
+# --- an `ok` that named a ROOM is not a device that moved (07.10.2026 11:39) ---
+#
+# Living room, «Выключи свет в гостиной» transcribed as «Выключиться в гостиной»
+# and escalated to L2. L2 called:
+#
+#     ha_action("intent__HassTurnOff", {"area": "Living Room", "domain": ["light"]})
+#
+# which answered HTTP 200, `failed: []`:
+#
+#     {"response_type": "action_done",
+#      "data": {"success": [{"type": "area",   "id": "living_room"},
+#                           {"type": "entity", "id": "light.wled_living_room"}],
+#               "failed": []}}
+#
+# and the room said «Выключила свет в гостиной.». The lamp is
+# `switch.living_room_light_swith_relay`; `domain: ["light"]` cannot match a
+# `switch` at all, and the only entity named has been `unavailable` since 28.09.
+#
+# `_action_ok` accepted it because the list is non-empty, `has_data` recorded
+# `ok=True`, which DISARMS the veto. The router has refused this exact shape since
+# 04.10.2026 — one path was guarded and the other was not.
+
+
+def _worker_registry():
+    import os
+    import sys
+
+    _WORKER = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "services", "smolagents-worker")
+    )
+    if _WORKER not in sys.path:
+        sys.path.insert(0, _WORKER)
+
+
+def test_a_success_list_holding_only_a_room_is_not_a_device():
+    """The exact payload HA returned, against the exact registry state."""
+    _worker_registry()
+    import json
+
+    from ha_match import claimed_a_usable_entity
+
+    payload = json.dumps({
+        "speech": {}, "response_type": "action_done",
+        "data": {
+            "success": [
+                {"name": "Living Room", "type": "area", "id": "living_room"},
+                {"name": "WLED_living_room", "type": "entity",
+                 "id": "light.wled_living_room"},
+            ],
+            "failed": [],
+        },
+    })
+    states = [
+        {"entity_id": "light.wled_living_room", "state": "unavailable"},
+        {"entity_id": "switch.living_room_light_swith_relay", "state": "on"},
+    ]
+    assert claimed_a_usable_entity(payload, states) is False, (
+        "a room and an unavailable strip were accepted as a device that moved"
+    )
+
+
+def test_a_real_available_entity_does_verify():
+    _worker_registry()
+    import json
+
+    from ha_match import claimed_a_usable_entity
+
+    payload = json.dumps({
+        "response_type": "action_done",
+        "data": {"success": [{"type": "entity",
+                              "id": "switch.entrance_light_switch_relay"}],
+                 "failed": []},
+    })
+    states = [{"entity_id": "switch.entrance_light_switch_relay", "state": "on"}]
+    assert claimed_a_usable_entity(payload, states) is True
+
+
+def test_no_registry_means_unverified_rather_than_assumed():
+    """Absent from `/api/states` is not evidence of availability, and an empty
+    registry means 'HA did not answer', never 'nothing to check'."""
+    _worker_registry()
+    import json
+
+    from ha_match import claimed_a_usable_entity
+
+    payload = json.dumps({
+        "data": {"success": [{"type": "entity", "id": "switch.whatever"}],
+                 "failed": []},
+    })
+    assert claimed_a_usable_entity(payload, []) is False
+    assert claimed_a_usable_entity(payload, None) is False
+
+
+def test_an_unparseable_result_verifies_nothing():
+    _worker_registry()
+
+    from ha_match import claimed_a_usable_entity
+
+    states = [{"entity_id": "switch.x", "state": "on"}]
+    assert claimed_a_usable_entity("Выполнено", states) is False
+    assert claimed_a_usable_entity("", states) is False

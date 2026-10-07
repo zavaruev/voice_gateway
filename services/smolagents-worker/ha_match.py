@@ -960,3 +960,56 @@ def resolve_media_targets(
         key=lambda e: (_MEDIA_ORDER.get(str(e.get("state", "")).lower(), 9),
                        str(e.get("entity_id", ""))),
     )
+
+
+def claimed_a_usable_entity(text: str, states: list[dict] | None) -> bool:
+    """True only if an intent answer named at least one real, available entity.
+
+    The same rule as the router's `_touched_a_usable_entity`, kept as a second
+    copy rather than imported: the two services are deployed as separate images
+    (the same reason the media tables are duplicated and held together by
+    `tests/test_hint_sync.py`).
+
+    It lives HERE, not in tools.py, because tools.py imports `smolagents` at
+    module level and the gateway's test image does not ship it — a function that
+    cannot be imported by the suite is a function nobody tests, and the thing it
+    guards is a spoken lie.
+
+    `{"type": "area"}` in HA's success list means the intent matched a ROOM, not
+    a device — with no `entity` entry nothing was addressed at all. An entity that
+    is `unavailable` cannot have changed either, and an entity ABSENT from the live
+    registry is not evidence of availability: HA happily names entities filtered
+    out of `/api/states` or living in an integration we cannot read, so absent
+    means unverified.
+    """
+    try:
+        payload = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        # Not a parseable intent payload: nothing was claimed, so nothing verified.
+        return False
+    if not isinstance(payload, dict):
+        return False
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return False
+    claimed = data.get("success") or data.get("claimed") or []
+    ids = {
+        row.get("id")
+        for row in claimed
+        if isinstance(row, dict) and row.get("type") == "entity" and row.get("id")
+    }
+    if not ids:
+        return False
+    if not states:
+        # No live registry to check against: refuse rather than assume.
+        return False
+    live = {
+        str(e.get("entity_id")): str(e.get("state", "")).lower()
+        for e in states
+        if isinstance(e, dict)
+    }
+    return any(
+        live.get(eid) is not None
+        and live.get(eid) not in ("unavailable", "unknown", "none", "")
+        for eid in ids
+    )

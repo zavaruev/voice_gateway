@@ -935,6 +935,22 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
   * **Fixed in the same pass:** the generous `max(20, 8×audio)` budget went to `_fetch_transcription` instead of `_play_audio_http`, where `pcm` and `TTS_PLAY_RATE` really are in scope. Both are now correct, and a test asserts each function carries its own budget by inspecting the two sources.
   * **Three tests, all of which fail on the broken code alone:** the request path must attempt a real POST with a stub that RECORDS the call (a `NameError` on the way there fails it instead of being absorbed); a failing call must be logged; and each of the two budgets must belong to its own function. 558 passed, 5 skipped.
 
+- **L2 SAID «ВЫКЛЮЧИЛА» AND THE LAMP NEVER MOVED — the honesty guard existed on one path and not the other. Measured 07.10.2026 11:39, living room.** «Выключи свет в гостиной» transcribed as «Выключиться в гостиной» (a mangle not in the `normalize_stt_verbs` list), went L2 at `conf 0.50`, and L2 called:
+  ```
+  ha_action("intent__HassTurnOff", {"area": "Living Room", "domain": ["light"]})
+  -> {"response_type": "action_done",
+      "data": {"success": [{"type": "area",   "id": "living_room"},
+                           {"type": "entity", "id": "light.wled_living_room"}],
+               "failed": []}}
+  -> final_answer("Выключила свет в гостиной.")
+  ```
+  The lamp is `switch.living_room_light_swith_relay`. `domain: ["light"]` **cannot match a `switch` at all**; the only entity named was `light.wled_living_room`, `unavailable` since 28.09; the other entry is the **room**. So `success` was non-empty, `failed` was empty, HTTP 200 — and nothing happened.
+  * **WHY IT REACHED THE SPEAKER.** `_action_ok` accepted it because the list is non-empty, then `has_data` recorded `ok=True`, and **`ok=True` DISARMS the honesty veto** — the model was then free to speak as done. The veto was never consulted; it was switched off by a payload that looked like success.
+  * **The guard was ALREADY THERE, one path over.** `services/jev-router/app.py::_touched_a_usable_entity` has refused exactly this shape since 04.10.2026. L2's `ha_action` in `smolagents-worker/tools.py` had no equivalent — the same asymmetry documented above for the on/off fast path vs the blind one, now closed. The check is applied to the on/off intents only: an area-only match is provably not a lamp for those, whereas a vacuum `CleanArea` may legitimately report a room.
+  * **A refusal, not a second attempt.** When nothing usable was claimed the result is rewritten to say the device was NOT switched, with the real reason. Rewriting rather than retrying is deliberate: the on/off resolver fallback only fires on `MatchFailedReason.*` and HA raised none here, so there is no matcher miss to rescue — the intent simply matched a room.
+  * **It lives in `ha_match.py`, not `tools.py`,** because `tools.py` imports `smolagents` at module level and the gateway's test image does not ship it. A function the suite cannot import is a function nobody tests, and this one guards a spoken lie. Verified in the worker container against the exact payload above.
+  * Also visible in the same turn: «Просил включить свет в гостиной» answered «Включила» and the relay did move (`last_changed 11:42:29`), so the fast path is honest; only the escalated path lied.
+
 - **`CAMERA_FOLLOWUP` IS A THREE-STATE MODE, AND ITS DEFAULT IS `question`.** The user, 06.10.2026: **when the camera asks a question it must listen to the answer immediately, no wake word** — that is the "asks a question and then ignores the answer" complaint. An answer to OUR OWN question is the one follow-up that needs no keyword.
   * `none` | `question` (default) | `all`. `all` is not the default because a **statement** window is 10 s of open microphone in a room whose television is louder than its occupant, and it was measured accepting noise («атака» 32522, «пиздец» 13197) while refusing the user (4725, 9124). A question window is short and something is expected to be said in it.
   * **It is a mode and not a duration because `0` means "unset, use the default" throughout this file** — a window of 0 would produce a 30 s window, not none. There is no numeric value for "no window at all" here. An unrecognised value falls back to `question`, so a typo in the env var cannot close the microphone for a question.

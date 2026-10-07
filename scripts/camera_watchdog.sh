@@ -71,6 +71,20 @@ WEDGE_S="${WEDGE_S:-6.0}"
 CONFIRM_N="${CONFIRM_N:-3}"
 CONFIRM_GAP_S="${CONFIRM_GAP_S:-20}"
 MIN_GAP_S="${MIN_GAP_S:-300}"       # per camera: never retry more often
+
+# Audio-starvation detection. The gateway logs one `AUDIO STARVED` line per 20 s
+# window while a room's delivered audio is below its threshold, so a room that has
+# been running at a fraction of real time for a while produces a run of them.
+# 3 hits in a 300 s window is ~60 s of sustained starvation: enough that a single
+# hiccup right after a restart cannot trigger a camera action, which is the same
+# discipline CONFIRM_N applies to latency.
+#
+# MIN_GAP_S (300 s) alone is NOT enough on its own — it rate-limits actions after
+# one has been taken, but the first action still needs a threshold that a brief
+# dip cannot cross. Measured on 07.10.2026: the living room sat at 1.46-1.93
+# chunks/s against 6.25/s for over 15 minutes, producing a line every 20 s.
+STARVE_WINDOW_S="${STARVE_WINDOW_S:-300}"
+STARVE_MIN_HITS="${STARVE_MIN_HITS:-3}"
 GW_SETTLE_S="${GW_SETTLE_S:-90}"    # settle time after restarting the gateway
 SETTLE_S="${SETTLE_S:-30}"
 WAIT_UP_S="${WAIT_UP_S:-150}"       # how long a reboot may take to come back
@@ -177,19 +191,55 @@ reregister() {
        --data-urlencode "$url" -o /dev/null 2>/dev/null
 }
 
-# Four states, because two independent signals are measured: how fast the camera
-# answers HTTP, and whether go2rtc holds a producer with a consumer on it.
+# FIVE states, because THREE independent signals are measured: how fast the camera
+# answers HTTP, whether go2rtc holds a producer with a consumer on it, and — the
+# one that actually caught the 07.10.2026 outage — HOW FAST THE AUDIO ARRIVES.
 #
-#   healthy      fast AND streaming          nothing to do
-#   slow-only    slow AND streaming          a busy box — logged, never acted on
-#   dead-stream  fast AND not streaming      our reader or go2rtc; the gateway step
-#   wedged       slow AND not streaming      both, which is what a real outage looks like
+#   healthy        fast AND streaming AND audio at real time   nothing to do
+#   slow-only      slow AND streaming                          a busy box — logged, never acted on
+#   dead-stream    fast AND not streaming                      our reader or go2rtc; the gateway step
+#   wedged         slow AND not streaming                      both, which is what a real outage looks like
+#   audio-starved  STREAMING but the audio runs at a           the mic is alive and useless (below)
+#                  fraction of real time
 #
 # HTTP latency ALONE decides nothing. Measured both ways on this network: the room
 # answered in 0.066 s while its RTSP was dead, and two polled rooms measure
 # 0.154-1.724 s with spikes to 5.3 s while completely healthy.
+#
+# `audio-starved` exists because on 07.10.2026 the living room failed in a way
+# invisible to the other two signals, and it cost a whole morning of "the camera
+# does not answer «компьютер»": HTTP answered in 0.24 s (so `fast`) while go2rtc
+# held a producer with a consumer on it (so `streaming`), yet the gateway's own
+# chunk counter ran at 1.46/s against an expected 6.25/s — a quarter of real time.
+# That IS a stream carrying audio, so the old classifier called it `healthy` and
+# did nothing. Meanwhile vosk reported `triggers=0 decodes=0 hyp=''` with
+# `peak_max=27607`: loud audio that no decoder can recognise, because it arrives
+# stretched. A gate that cannot hear «компьютер» and a gate that is refusing it
+# look identical from the outside, and `hyp=''` is what distinguishes them.
+#
+# The rate is deliberately NOT measured here. Adding an ffmpeg consumer to find
+# out was tried and is the wrong move twice over: this watchdog exists to avoid
+# perturbing what it watches, and a second reader on a single-threaded majestic is
+# a large perturbation. The gateway already accounts delivered audio against wall
+# clock every 20 s and logs `AUDIO STARVED: NN% of real time` below its threshold —
+# the correct instrument, already in production, with the room name in the line.
+# Read it from there rather than taking a second measurement.
+audio_starved_hits() {
+  local since="${1:-$STARVE_WINDOW_S}" lines
+  lines="$(docker logs voice_gateway --since "${since}s" 2>&1 \
+    | grep -E "\[$CUR_STREAM\] .*(AUDIO STARVED|audio rate recovered)" || true)"
+  # The LAST signal for this room decides, not the count. The gateway logs
+  # `audio rate recovered: NN%` when the rate comes back, so a window that holds
+  # both is a room that got WORSE, and the count alone would call a room healthy
+  # again since 10:22 still starved and would have its camera restarted for a
+  # fault that ended minutes ago — the same "acted on a stale signal" mistake this
+  # script already made once with latency.
+  [ -n "$lines" ] || { echo 0; return 0; }
+  printf '%s\n' "$lines" | tail -1 | grep -q "AUDIO STARVED" || { echo 0; return 0; }
+  printf '%s\n' "$lines" | grep -c "AUDIO STARVED" 2>/dev/null || echo 0
+}
 classify() {
-  local lat fast=0 up=0
+  local lat fast=0 up=0 hits
   lat="$(cam_latency)"
   CAM_LATENCY="${lat:-?}"
   [ -z "$lat" ] && { STATE="unreachable"; return 0; }
@@ -197,6 +247,17 @@ classify() {
     fast=1
   fi
   go2rtc_up "$CUR_STREAM" && up=1
+  CAM_STARVED_HITS=0
+  # Only meaningful while the stream is up: with no stream there is no audio to be
+  # slow, and dead-stream/wedged already route to the gateway step first.
+  if [ "$up" = 1 ]; then
+    hits="$(audio_starved_hits)"
+    CAM_STARVED_HITS="${hits:-0}"
+    if [ "${CAM_STARVED_HITS}" -ge "$STARVE_MIN_HITS" ]; then
+      STATE="audio-starved"
+      return 0
+    fi
+  fi
   if [ "$fast" = 1 ] && [ "$up" = 1 ]; then
     STATE="healthy"
   elif [ "$fast" = 1 ]; then
@@ -270,17 +331,18 @@ for entry in $CAMERAS; do
       # Latency without a dead stream. Logged, never acted on.
       log "$CUR_NAME slow but stream alive (http $(cam_latency)s) — watching, not acting"
       ;;
-    dead-stream|wedged)
-      # The stream itself is broken, or the camera is slow AND not streaming.
+    dead-stream|wedged|audio-starved)
+      # The stream itself is broken, the camera is slow AND not streaming, or the
+      # audio is arriving at a fraction of real time while the stream looks fine.
       SICK="$SICK $CUR_STREAM"
-      log "$CUR_NAME UNHEALTHY state=$STATE http=$(cam_latency)s stream=$CUR_STREAM"
+      log "$CUR_NAME UNHEALTHY state=$STATE http=$(cam_latency)s stream=$CUR_STREAM${CAM_STARVED_HITS:+ starved=${CAM_STARVED_HITS}/${STARVE_WINDOW_S}s}"
       ;;
   esac
 done
 [ -n "$SICK" ] || exit 0
 
 # --- confirm before acting ---------------------------------------------------
-BAD=""
+BAD=""; STARVED_ONLY=""
 for entry in $CAMERAS; do
   select_camera "$entry" || continue
   case " $SICK " in *" $CUR_STREAM "*) ;; *) continue ;; esac
@@ -297,27 +359,49 @@ for entry in $CAMERAS; do
   done
   [ "$STATE" = "healthy" ] && { log "$CUR_NAME recovered on its own"; continue; }
   BAD="$BAD $CUR_NAME:$CUR_IP:$CUR_STREAM"
+  # A room whose audio runs at a fraction of real time while its stream is alive
+  # is a CAMERA fault, and it is the one fault restarting the gateway cannot fix:
+  # the gateway's own remedy for it is an ffmpeg restart plus a stream re-register,
+  # and on 07.10.2026 it ran that three times and then declared `CAMERA AUDIO DEAD`
+  # while the room stayed deaf. `majestic` restart fixed it every time. So these
+  # rooms skip step 1 entirely and go straight to the camera.
+  [ "$STATE" = "audio-starved" ] && STARVED_ONLY="$STARVED_ONLY $CUR_NAME:$CUR_IP:$CUR_STREAM"
 done
 [ -n "$BAD" ] || exit 0
 
-# --- step 1: OUR side, once for all rooms ------------------------------------
+# --- step 1: OUR side, once, and only for rooms that are NOT camera faults ------
 # The reader that stopped draining the cameras. Measured working: HTTP 14.34 s ->
 # 0.021 s and audio back to 100 % of real time, with the cameras untouched.
-log "step 1: restart $GATEWAY once for all rooms —$BAD"
-act docker restart "$GATEWAY"
-sleep "$GW_SETTLE_S"
-
-RECOVERED=""; STILL=""
+# Restarts the shared container, so it must exclude audio-starved rooms — for
+# those the camera is the fault and this step costs a full model reload for nothing.
+OURSIDE=""
 for item in $BAD; do
-  IFS=: read -r CUR_NAME CUR_IP CUR_STREAM <<<"$item"
-  if wait_healthy 8 15; then
-    log "  $CUR_NAME RECOVERED by restarting $GATEWAY (http ${CAM_LATENCY}s) — the camera was never at fault"
-    RECOVERED="$RECOVERED $CUR_NAME"
-  else
-    log "  $CUR_NAME still $STATE after restarting $GATEWAY"
-    STILL="$STILL $item"
-  fi
+  case " $STARVED_ONLY " in *" $item "*) ;; *) OURSIDE="$OURSIDE $item" ;; esac
 done
+
+RECOVERED=""
+if [ -n "$OURSIDE" ]; then
+  log "step 1: restart $GATEWAY once for all rooms —$OURSIDE"
+  act docker restart "$GATEWAY"
+  sleep "$GW_SETTLE_S"
+  STILL=""
+  for item in $OURSIDE; do
+    IFS=: read -r CUR_NAME CUR_IP CUR_STREAM <<<"$item"
+    if wait_healthy 8 15; then
+      log "  $CUR_NAME RECOVERED by restarting $GATEWAY (http ${CAM_LATENCY}s) — the camera was never at fault"
+      RECOVERED="$RECOVERED $CUR_NAME"
+    else
+      log "  $CUR_NAME still $STATE after restarting $GATEWAY"
+      STILL="$STILL $item"
+    fi
+  done
+else
+  log "step 1 skipped: every sick room is audio-starved, which is the camera's audio stage, not our reader"
+  STILL="$OURSIDE"
+fi
+# Audio-starved rooms were never candidates for step 1; carry them forward.
+STILL="$STILL $STARVED_ONLY"
+STILL="$(echo $STILL | tr ' ' '\n' | sort -u | tr '\n' ' ')"
 
 # --- step 2 and 3: per camera, and only if we can reach it --------------------
 for item in $STILL; do

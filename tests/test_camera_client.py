@@ -2697,3 +2697,40 @@ async def test_a_failed_post_does_not_claim_a_fallback_that_does_not_exist():
     assert "falling back" not in joined, (
         f"the log promised a backchannel that does not exist: {joined!r}"
     )
+
+
+# --- "CAMERA AUDIO DEAD" named the wrong lever first (07.10.2026) ----------
+#
+# Both rooms hit exactly this state on 07.10.2026 — capture stuck at 0.04x-0.66x
+# of real time, three starve attempts, then DEAD — and `/etc/init.d/S95majestic
+# restart` fixed BOTH: the living room's `/play_audio` went 17.0 s -> 3.5 s for
+# 1 s of audio, the kitchen's capture 0.66x -> 1.00x. The log told the operator to
+# power-cycle instead, i.e. it named the expensive lever as the only one.
+#
+# Capture and playback both live inside `majestic` on this firmware (there is no
+# separate audio service), so it is the cheapest step and costs only the video
+# stream for a few seconds. A power cycle is the fallback and stays named as one.
+
+
+def test_the_dead_audio_message_names_the_cheapest_recovery_first():
+    """An error message that sends the reader to the expensive lever when a cheap
+    one exists is a documentation bug with an operational cost."""
+    import inspect
+
+    import camera_client as cc
+
+    src = inspect.getsource(cc.CameraSession._account_audio_rate)
+
+    assert "S95majestic restart" in src, (
+        "the DEAD message does not name the cheapest lever, and it is the one "
+        "measured to work on this hardware"
+    )
+    assert src.index("S95majestic") < src.index("power-cycle"), (
+        "the cheap lever must come first in the message the operator reads"
+    )
+    assert "Reboot {self.stream_name} manually" not in src, (
+        "the old text named a manual reboot as the only cure, which was measured "
+        "false twice on the same day"
+    )
+    # The power cycle stays available, and the reason it is manual is still stated.
+    assert "power-cycle" in src and "ONVIF Reboot" in src

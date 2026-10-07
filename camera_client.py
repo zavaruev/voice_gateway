@@ -1745,16 +1745,31 @@ class CameraSession:
             f"{self._rate_starved}/{self._starve_restarts}"
         )
         if self._rate_starved >= self._starve_restarts:
-            # ffmpeg restarts and stream re-registration did not help. Measured
-            # root cause on this hardware: the camera's ai0_P0_MAIN thread
-            # wedges in CamOsTcondTimedWait and aio_dma drops to ~40/s, and only
-            # a CAMERA REBOOT recovers it (ONVIF Reboot is not implemented on
-            # OpenIPC). Say so instead of sitting silent.
+            # ffmpeg restarts and stream re-registration did not help.
+            #
+            # The old text here said a manual REBOOT was the only cure. That was
+            # measured twice on this hardware and is wrong as a first step: on
+            # 07.10.2026 both rooms hit exactly this state (capture stuck at
+            # 0.04x-0.66x real time) and `/etc/init.d/S95majestic restart` fixed
+            # BOTH — the living room's `/play_audio` went 17.0 s -> 3.5 s for
+            # 1 s of audio and the kitchen's capture went 0.66x -> 1.00x.
+            # Capture and playback both live inside `majestic` (there is no
+            # separate audio service on this firmware), so restarting it is the
+            # cheapest lever and it costs the video stream for a few seconds.
+            # The gateway re-registers the go2rtc producer by itself afterwards
+            # — measured, unaided: `AUDIO STARVED -> DELETE -> re-registered ->
+            # audio rate recovered`.
+            #
+            # A reboot is named only as the next step, and `Reboot` is not
+            # implemented over ONVIF on OpenIPC, so it is a power cycle.
             logger.error(
                 f"[{self.stream_name}] 🔴 CAMERA AUDIO DEAD — ffmpeg restart and "
                 f"stream re-register did not help ({ratio*100:.0f}% of real "
-                f"time). Reboot {self.stream_name} manually; the mic driver "
-                f"wedges and only a power cycle clears it."
+                f"time). Run `/etc/init.d/S95majestic restart` on the camera "
+                f"(capture and playback both live inside majestic); this "
+                f"recovered it on 07.10.2026 in both rooms. Only if that fails, "
+                f"power-cycle {self.stream_name} — ONVIF Reboot is not "
+                f"implemented on OpenIPC."
             )
             self._rate_starved = 0
             return False

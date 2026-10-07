@@ -4123,7 +4123,18 @@ class CameraSession:
                 async with self.http_session.post(
                     self.whisper_url,
                     data=form,
-                    timeout=aiohttp.ClientTimeout(total=30),
+                    # Generous, because the measurement says a slow camera is not a
+                  # dead one: 07.10.2026, HTTP 200 every time, 1 s of audio took
+                  # 3.5 s on the kitchen and 21.4 s once on the living room, 3 s
+                  # took 8.7 s and 37.0 s. A tight budget would declare a working
+                  # speaker dead mid-reply and log "the reply was NOT spoken" while
+                  # it is in fact playing slowly. The floor (20 s) sits above every
+                  # sample measured on a 1 s clip; the cap bounds a genuinely dead
+                  # camera. Nothing downstream waits on this response — `sent_at`
+                  # is what the playback guards use — so it only bounds how long a
+                  # silent camera occupies the playback loop.
+                  timeout=aiohttp.ClientTimeout(total=min(
+                      90.0, max(20.0, 8.0 * (len(pcm) / (TTS_PLAY_RATE * 2))))),
                 ) as r:
                     if r.status == 200:
                         data = await r.json()
@@ -4497,15 +4508,37 @@ class CameraSession:
             self._store_tts_echo(pcm)
 
             audio_dur = len(pcm) / (sr * 2)
+            # When the POST was SENT, not when it answered. Measured 07.10.2026:
+            # `/play_audio` returns HTTP 200 but takes 3-5x the audio length on the
+            # kitchen and 5x, 12x and >60 s on the living room (1 s -> 5.0 s,
+            # 3 s -> 37.0 s, 6 s -> no answer within 60 s). Timing the post-playback
+            # guards from the RESPONSE therefore added that whole latency to them:
+            # `GLOBAL_TTS_UNTIL` and `_wake_suppress_until` below are computed from
+            # this stamp, so a 30 s response muted the cross-room guard for 30 s
+            # AFTER the reply had finished playing. A real report on 07.10.2026
+            # 08:50 — the reply POST timed out at 30 s and the room never spoke it.
+            sent_at = time.time()
             played = False
 
             if self._play_audio_url:
                 # Preferred path: straight to the speaker at the right rate.
                 played = await self._play_audio_http(pcm)
-                if not played:
+                if not played and self._out_track:
                     logger.warning(
                         f"[{self.stream_name}] falling back to the go2rtc "
                         f"backchannel — expect a ~6x pitch shift"
+                    )
+                elif not played:
+                    # Do NOT promise a fallback that does not exist. With
+                    # `CAMERA_WEBRTC=false` there is no backchannel, so the reply
+                    # is simply not spoken — and the log used to say it would be
+                    # replayed, which sent the reader looking for audio that was
+                    # never going to arrive. Measured 07.10.2026 08:50 on the
+                    # kitchen: `play_audio failed` after 30 s, then exactly this
+                    # line, then silence.
+                    logger.warning(
+                        f"[{self.stream_name}] /play_audio failed and no backchannel "
+                        f"exists (CAMERA_WEBRTC off) — the reply was NOT spoken"
                     )
 
             if not played:
@@ -4548,7 +4581,17 @@ class CameraSession:
             # recognised by _is_echo and _echo_of_reply, which need no blind
             # window and do not need one to be correct.
             ECHO_TAIL = _SPEAKER_SETTLE_S
-            self._speaking_until = time.time() + audio_dur + ECHO_TAIL
+            # `sent_at`, not `time.time()`. This one was the last of the three and
+            # the worst: `_speaking_until` is the HARD mic mute in `_feed_audio`
+            # (`if time.time() < self._speaking_until: return`), so a POST that
+            # answers 30 s late did not just delay a timestamp — it muted the
+            # microphone for 30 s AFTER the reply had finished playing, which is
+            # exactly the "camera stops hearing me" report and it would have broken
+            # the question window (07.10.2026) on the very turn it was added for.
+            # Caught by measuring it rather than by reading it: a 2 s clip with a
+            # 30 s response produced `_speaking_until = 1032.3` against an audio
+            # end of 1002.0.
+            self._speaking_until = sent_at + audio_dur + ECHO_TAIL
             global GLOBAL_TTS_UNTIL
             # Was `audio_dur + echo_tail` (up to 3 s), and it is the SECOND place
             # the same 3 s tail bit: it drops the finished transcript outright with
@@ -4557,7 +4600,10 @@ class CameraSession:
             # cross-camera guard, so it cannot use _is_echo (which is per session),
             # but the transcript-level `_echo_of_reply` check below identifies our
             # own voice in the text and is what should decide.
-            GLOBAL_TTS_UNTIL = time.time() + audio_dur + ECHO_TAIL
+            # `sent_at`, not `time.time()`: see the measurement above. The response
+            # can arrive many seconds after the speaker started, and the guard has
+            # to describe the AUDIO, not the HTTP round trip.
+            GLOBAL_TTS_UNTIL = sent_at + audio_dur + ECHO_TAIL
             global _GLOBAL_TTS_BY, _GLOBAL_TTS_DUR
             _GLOBAL_TTS_DUR = audio_dur
             _GLOBAL_TTS_BY = (
@@ -4572,7 +4618,7 @@ class CameraSession:
             # timer's job — `_is_echo` drops it by cross-correlation in
             # `_feed_audio` (and extends suppression by up to 20 s when, and
             # only when, a correlation actually matches).
-            self._wake_suppress_until = time.time() + audio_dur + _ECHO_TAIL_S
+            self._wake_suppress_until = sent_at + audio_dur + _ECHO_TAIL_S
         except Exception as e:
             logger.warning(f"[{self.stream_name}] playback error: {e}")
 

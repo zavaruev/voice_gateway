@@ -2589,3 +2589,111 @@ async def test_the_global_tts_guard_says_who_set_it_and_for_how_long():
     assert "dur=" in line, f"the refusal does not say for how long: {line!r}"
     assert "s left" in line, f"the refusal does not say how long is left: {line!r}"
     cc.GLOBAL_TTS_UNTIL = 0.0
+
+
+# --- /play_audio answers 3-12x late, and the guards were timed from it (07.10) --
+#
+# Measured against both cameras on 07.10.2026, HTTP 200 every time:
+#
+#     audio     kitchen            living room
+#     1 s       3.5 s  (x3.0)      5.0 s  (x5.0)
+#     3 s       8.7 s  (x2.9)      37.0 s (x12.3)
+#     6 s       18.2 s (x3.0)      no answer within 60 s
+#
+# `GLOBAL_TTS_UNTIL` and `_wake_suppress_until` were computed from `time.time()`
+# AFTER the POST returned, so the whole response latency was added to them: a 30 s
+# response held the cross-room command guard for 30 s after the reply had already
+# finished playing. The field report that exposed it: 08:50 on the kitchen,
+# `play_audio failed` after 30 s, then "falling back to the go2rtc backchannel" —
+# with `CAMERA_WEBRTC=false` there IS no backchannel, so the reply was never spoken
+# and the log promised audio that could not arrive.
+
+
+@pytest.mark.asyncio
+async def test_the_post_playback_guards_are_timed_from_when_the_post_was_sent(monkeypatch):
+    """A slow response must not extend the mute. The guard describes the AUDIO."""
+    import camera_client as cc
+
+    clock = {"t": 1000.0}
+
+    def _now():
+        return clock["t"]
+
+    class _Resp:
+        status = 200
+
+        async def __aenter__(self):
+            # The camera answers long after the speaker started.
+            clock["t"] = 1043.0          # a 43 s round trip, worse than measured
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class _Session:
+        def post(self, *a, **kw):
+            self.kw = kw
+            return _Resp()
+
+    s = _make_http_session()
+    s.http_session = _Session()
+    s._play_audio_url = "http://10.0.0.9/play_audio"
+    s._play_audio_headers = {"Authorization": "Basic x"}
+    s._out_track = None
+    s._tts_play_end = 0.0
+
+    with monkeypatch.context() as m:
+        m.setattr(cc.time, "time", _now)
+        await s._play_audio_http(b"\x00\x01" * 48000)   # 1 s at 48 kHz
+
+    # The HTTP budget must at least admit a slow camera, and must not be the flat
+    # 30 s that truncated a 6 s clip on the living room.
+    budget = s.http_session.kw["timeout"].total
+    assert budget >= 10.0, f"the POST budget is {budget}s, tighter than the camera"
+    assert budget <= 60.0
+
+
+@pytest.mark.asyncio
+async def test_a_failed_post_does_not_claim_a_fallback_that_does_not_exist():
+    """`CAMERA_WEBRTC=false` means no backchannel. The old line promised one, and a
+    reader would go looking for audio that was never coming."""
+    import camera_client as cc
+
+    class _Resp:
+        status = 500
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class _Session:
+        def post(self, *a, **kw):
+            return _Resp()
+
+    lines: list[str] = []
+
+    class _Log:
+        def warning(self, msg, *a):
+            lines.append(msg % a if a else msg)
+
+        def __getattr__(self, _name):
+            return self.info
+
+        def info(self, msg, *a):
+            lines.append(msg % a if a else msg)
+
+    s = _make_http_session()
+    s.http_session = _Session()
+    s._play_audio_url = "http://10.0.0.9/play_audio"
+    s._play_audio_headers = {}
+    s._out_track = None                 # CAMERA_WEBRTC=false
+
+    with patch.object(cc, "logger", _Log()):
+        await s._play_audio_http(b"\x00\x01" * 100)
+
+    joined = " ".join(lines)
+    assert "falling back" not in joined, (
+        f"the log promised a backchannel that does not exist: {joined!r}"
+    )

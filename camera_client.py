@@ -2476,6 +2476,20 @@ class CameraSession:
                         # measure 8000-32767 at the rail in the living room, while
                         # this room's peak never exceeds 388. There is no way to
                         # hear a word in a peak of 135.
+                        #
+                        # The decision is `max(self._vosk_peak_win)` — the LOUDEST
+                        # chunk of the last 1.9 s — NOT the trigger chunk, because
+                        # «компьютер» spans ~10 chunks at the 160 ms hop and the
+                        # trigger lands at an arbitrary point inside the word.
+                        # The `VOSK WAKE` line used to print only the TRIGGER
+                        # chunk's peak, so a real wake read as
+                        # `peak=997 min_peak=3000` and looked exactly like a gate
+                        # that had failed when it had passed on the window. It now
+                        # prints `window=<window max>/<threshold>`, so the number in
+                        # the log is the number the decision was made on. Read that
+                        # line on 07.10.2026 12:18 and it produced a false alarm for
+                        # precisely this reason — the instrument was showing a
+                        # different number than the one being judged.
                         self._vosk_wake.reset()
                         self._vosk_suppressed += 1
                         logger.info(
@@ -2551,7 +2565,8 @@ class CameraSession:
                         f"trig='{self._vosk_wake.last_trigger_text}' "
                         f"conf='{self._vosk_wake.last_text}' "
                         f"peak={int(np.abs(s16).max())} "
-                        f"min_peak={self._wake_min_peak} "
+                        f"window={int(max(self._vosk_peak_win))}"
+                        f"/{self._wake_min_peak} "
                         f"triggers={self._vosk_wake.triggers} "
                         f"decodes={self._vosk_wake.decodes}"
                     )

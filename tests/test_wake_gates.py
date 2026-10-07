@@ -367,3 +367,62 @@ async def test_the_energy_gate_is_per_room_and_off_by_default_for_zero():
         CameraConfig(stream_name="y", go2rtc_host="127.0.0.1", wake_min_peak=800)
     )
     assert s2._wake_min_peak == 800
+
+
+# --- the VOSK WAKE log printed a DIFFERENT number than the gate judged (07.10) ---
+#
+# The energy gate is `max(self._vosk_peak_win)` — the loudest chunk of the last
+# 1.9 s — because «компьютер» spans ~10 chunks and the trigger lands at an
+# arbitrary point inside the word. The `VOSK WAKE` line printed only the TRIGGER
+# chunk. Read on 07.10.2026 12:18 in the living room it showed
+# `peak=997 min_peak=3000`, which reads as a gate that had failed; the gate had
+# passed on the window. An instrument that shows a different number than the one
+# being judged is the failure mode this whole file keeps rediscovering.
+
+
+def test_the_wake_log_reports_the_peak_the_gate_actually_judged():
+    """Both numbers belong in the line: the chunk that triggered, and the window
+    the decision was made on.
+
+    This test reads the SOURCE of the log line rather than the emitted text,
+    which is the wrong instrument for a format check but the only one available
+    for a branch that needs a live decoder to reach. Three earlier versions of it
+    each asserted against a COMMENT quoting the old line verbatim, because a
+    comment in that file quotes `peak=997 min_peak=3000` as the false alarm. The
+    lesson is recorded here because it is the file's recurring failure: an
+    instrument that cannot fail is not a check."""
+    import inspect
+
+    import camera_client as cc
+
+    # Only the f-string ARGUMENTS of that one logger call. Three earlier versions
+    # sliced the source and every one of them matched a COMMENT quoting the old
+    # log line, or cut the call short — the same failure as the one being
+    # guarded, one level down. So: find the call, then read forward to the
+    # closing paren at this indentation, ignoring comments entirely.
+    src = inspect.getsource(cc.CameraSession._vad_process)
+    lines = src.split("\n")
+    # The first hit is a COMMENT that quotes the line verbatim (that is what made
+    # the earlier three versions assert against prose), so pick the hit that is
+    # itself inside a f-string.
+    start = next(i for i, ln in enumerate(lines)
+                 if "VOSK WAKE " in ln and ln.strip().startswith("f\""))
+    open_at = max(i for i in range(start + 1)
+                  if lines[i].strip().startswith("logger.info("))
+    indent = len(lines[open_at]) - len(lines[open_at].lstrip())
+    body = []
+    for ln in lines[open_at + 1:]:
+        if ln.strip() and (len(ln) - len(ln.lstrip())) <= indent:
+            break
+        if ln.strip().startswith("#"):
+            continue
+        body.append(ln.strip())
+    wake_line = "\n".join(body)
+
+    assert "max(self._vosk_peak_win)" in wake_line, (
+        f"the VOSK WAKE log does not report the window peak: {wake_line!r}"
+    )
+    assert "min_peak=" not in wake_line, (
+        f"the threshold is now logged as window=<max>/<threshold>, and the old "
+        f"label invites reading it against the trigger chunk: {wake_line!r}"
+    )

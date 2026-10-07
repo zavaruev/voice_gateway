@@ -1369,6 +1369,7 @@ def _player_session():
     # player's broad `except Exception` turns it into "TTS sentence failed",
     # which is the failure mode this helper's own comment warns about, and it is
     # what happened the first time.
+    s._followup_mode = "all"
     s._followup_window = True
     s._followup_min_peak = _FOLLOWUP_MIN_PEAK
     s._wake_detected = False
@@ -2217,59 +2218,116 @@ async def test_a_normal_command_after_the_wake_word_is_still_dispatched():
 # admitted noise twice ('атака', 'пиздец'). No level threshold separates them.
 
 
-def test_the_free_form_followup_window_is_off_by_default():
-    assert CameraConfig(stream_name="x").followup_window is False
-    assert CameraSession(
-        CameraConfig(stream_name="x", go2rtc_host="127.0.0.1")
-    )._followup_window is False
+def test_a_question_is_answered_without_the_wake_word_by_default():
+    """The user's decision 06.10.2026: when the camera asks, it must listen to
+    the answer immediately. An answer to OUR OWN question is the one follow-up that
+    needs no keyword — and refusing it is the "asks a question and then ignores
+    the answer" complaint."""
+    cfg = CameraConfig(stream_name="x")
+    assert cfg.followup_window == "question"
+    s = CameraSession(CameraConfig(stream_name="x", go2rtc_host="127.0.0.1"))
+    assert s._followup_mode == "question"
+    assert s._followup_window is True, "a question must still open a window"
 
 
-def test_the_followup_window_can_be_switched_on_explicitly():
-    s = CameraSession(
-        CameraConfig(stream_name="x", go2rtc_host="127.0.0.1", followup_window=True)
+def test_a_statement_does_not_open_a_window_by_default():
+    """A statement window is 10 s of open microphone in a room whose television is
+    louder than its occupant, and it was measured accepting noise ('атака' 32522,
+    'пиздец' 13197) while refusing the user (4725, 9124)."""
+    s = CameraSession(CameraConfig(stream_name="x", go2rtc_host="127.0.0.1"))
+    assert s._followup_mode == "question", (
+        "the default must not open a window after a statement"
     )
-    assert s._followup_window is True
+
+
+def test_the_window_mode_has_three_states_and_a_bad_value_is_not_silent():
+    """A typo in the env var must not turn the microphone off for a question."""
+    for mode in ("none", "question", "all"):
+        s = CameraSession(
+            CameraConfig(stream_name="x", go2rtc_host="127.0.0.1",
+                         followup_window=mode)
+        )
+        assert s._followup_mode == mode
+    assert CameraSession(
+        CameraConfig(stream_name="x", go2rtc_host="127.0.0.1",
+                     followup_window="да")
+    )._followup_mode == "question", "an unknown value fell back to 'question'"
+
+
+def test_followup_none_is_the_only_mode_that_closes_the_mic():
+    s = CameraSession(
+        CameraConfig(stream_name="x", go2rtc_host="127.0.0.1", followup_window="none")
+    )
+    assert s._followup_window is False
 
 
 def test_a_zero_window_is_not_the_same_as_no_window():
     """`0` means "unset, use the built-in default" everywhere in this file, so a
-    window of 0 would have produced a 30 s window rather than none. The gate is a
-    boolean for exactly that reason."""
+    window of 0 would have produced a 30 s window rather than none. That is why the
+    gate is an explicit MODE and not a duration: "no window at all" has no numeric
+    value here, because every number means "substitute a default"."""
     s = CameraSession(
         CameraConfig(stream_name="x", go2rtc_host="127.0.0.1", dialogue_question_s=0.0)
     )
     assert s._dialogue_question_s > 0, "0 falls back to the default, by design"
-    assert s._followup_window is False, "and it still does not open a window"
-
-
+    assert s._followup_mode == "question", (
+        "the mode still opens a window for a QUESTION — that is what an explicit "
+        "mode says, and it is not the same as 0 having disabled it"
+    )
+    off = CameraSession(
+        CameraConfig(stream_name="x", go2rtc_host="127.0.0.1", followup_window="none")
+    )
+    assert off._followup_window is False, "'none' is how you actually say none"
 @pytest.mark.asyncio
-async def test_no_followup_window_opens_after_a_reply_by_default():
-    """The user's decision on 06.10.2026: after the camera answers, the wake word
-    is required again. Measured reason: the user's own voice peaked at 4725 and
-    9124 in the living room while the television and appliances peaked at
-    13197-16074 and 32522, so `followup_min_peak` refused the user twice
-    ('ключ', 'Выключить свет.') and admitted noise twice ('атака', 'пиздец') in
-    the same twenty minutes. The wake word is the only discriminator measured to
-    work: decoded, and 0 false accepts across 99 windows of television."""
-    s = _dialogue_session(question=True)
-    s._followup_window = False
+@pytest.mark.asyncio
+async def test_no_followup_window_opens_after_a_STATEMENT_by_default():
+    """The measurement behind keeping this closed, 06.10.2026: the user's own voice
+    peaked at 4725 and 9124 in the living room while the television and the
+    appliances peaked at 13197-16074 and 32522, so `followup_min_peak` refused the
+    user twice ('ключ', 'Выключить свет.') and admitted noise twice ('атака',
+    'пиздец') in the same twenty minutes. A statement window is 10 s of open
+    microphone in exactly that room.
+
+    The QUESTION case is deliberately the opposite and has its own test: when the
+    camera asks, the user must be able to answer without the wake word."""
+    s = _dialogue_session(question=False)
+    s._followup_mode = "question"          # the default
+    s._followup_window = True
     q: asyncio.Queue = asyncio.Queue()
-    q.put_nowait("Что именно?")
+    q.put_nowait("Включила")
     q.put_nowait(None)
 
     await asyncio.wait_for(s._nanobot_player_task(q), timeout=5.0)
 
     assert s._followup_open is False, (
-        "a free-form window opened although the wake word is required again"
+        "a free-form window opened after a statement, although the default is to "
+        "require the wake word again"
     )
     assert s._wake_detected is False, "the mic was left open without a wake word"
+@pytest.mark.asyncio
+async def test_the_window_still_opens_when_it_is_asked_for():
+    """The mode must not be a one-way door: opening a window after a STATEMENT is
+    still reachable and tested, it is just not the default."""
+    s = _dialogue_session(question=False)
+    s._followup_mode = "all"
+    s._followup_window = True
+    q: asyncio.Queue = asyncio.Queue()
+    q.put_nowait("Включила")
+    q.put_nowait(None)
+
+    await asyncio.wait_for(s._nanobot_player_task(q), timeout=5.0)
+
+    assert s._followup_open is True, (
+        "CAMERA_FOLLOWUP=all no longer opens a statement window"
+    )
 
 
 @pytest.mark.asyncio
-async def test_the_window_still_opens_when_it_is_asked_for():
-    """The flag must not be a one-way door: the dialogue behaviour stays reachable
-    and tested, it is just not the default."""
+async def test_a_question_window_opens_without_any_mode_override():
+    """The path that answers the user's complaint, driven end to end through the
+    player: a reply that is a question must leave the mic open, by default."""
     s = _dialogue_session(question=True)
+    s._followup_mode = "question"          # the default, stated explicitly
     s._followup_window = True
     q: asyncio.Queue = asyncio.Queue()
     q.put_nowait("Что именно?")

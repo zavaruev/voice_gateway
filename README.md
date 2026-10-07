@@ -1,6 +1,6 @@
 # Voice Gateway
 
-![version](https://img.shields.io/badge/version-v2.36-blue)
+![version](https://img.shields.io/badge/version-v2.37-blue)
 [![tests](https://github.com/zavaruev/voice_gateway/actions/workflows/tests.yml/badge.svg)](https://github.com/zavaruev/voice_gateway/actions/workflows/tests.yml)
 ![python](https://img.shields.io/badge/python-3.12%2B-3776AB?logo=python&logoColor=white)
 ![backend](https://img.shields.io/badge/AI%20backend-Cascade-orange)
@@ -28,7 +28,7 @@ Home Assistant's own voice stack (Wyoming + ESPHome satellites) is the right ans
 | Who is speaking | — | CAMP++ speaker embeddings, cross-device speaker lock |
 | False-wake protection | per-device threshold | an 8-gate cascade (echo ring, appliance noise, distance, clipping, crest factor, …) with a Whisper confirm-rescue band instead of silence |
 
-The camera subsystem is **in test operation** since 04.10.2026, living room first: the wake word there is detected by **decoding** it with a local vosk model (`vosk_wake.py`, 88 MB, CPU-only) rather than by scoring it acoustically — a head trained on 27 recordings of the word learned the envelope instead of the word and fired 114–229 times per hour on the television. Measured: 5/5 live detections, 0 false accepts over 7 minutes of TV. Set `WAKE_VOSK_MODEL_<NAME>` to enable per room; without it a room keeps the acoustic path. See [`docs/REFERENCE.md`](docs/REFERENCE.md) → *Known Issues & Current Problems*.
+The camera subsystem is **in test operation** since 04.10.2026 — living room first, kitchen joined 06.10.2026 once its `audio.volume` was raised from 30 to 100 (it read `rms 4`, −77.4 dB, and the decoder had nothing to decode): the wake word there is detected by **decoding** it with a local vosk model (`vosk_wake.py`, 88 MB, CPU-only) rather than by scoring it acoustically — a head trained on 27 recordings of the word learned the envelope instead of the word and fired 114–229 times per hour on the television. Measured: 5/5 live detections, 0 false accepts over 7 minutes of TV. Set `WAKE_VOSK_MODEL_<NAME>` to enable per room; without it a room keeps the acoustic path. See [`docs/REFERENCE.md`](docs/REFERENCE.md) → *Known Issues & Current Problems*.
 
 ### Numbers from the production log
 
@@ -86,11 +86,11 @@ Full environment table, backend variants, REST API and OTA: [`docs/REFERENCE.md`
 | **`audio_utils.py`** (~220 lines) | `pack_ogg()` (Opus → Ogg for Whisper) and `is_valid_text()` (drops hallucinations and mic echoes of our own TTS) | Shared by both device paths |
 | **`services/jev-router/`** | **L1** — intent classifier, offline slot resolver, direct Home Assistant calls, weather, chat/expert proxy | ~0.1 s for a simple command, no LLM in the loop |
 | **`services/smolagents-worker/`** | **L2** — smolagents `CodeAgent` with HA / Qdrant / Hermes / weather tools, plus honesty vetoes | Multi-step tasks that must not lie about side effects |
-| **`tests/`** | 437 tests across 18 files | Pins the wake-gate bands, the protocol, the cascade contract, the Telegram source and the utterance endpointing |
+| **`tests/`** | 549 tests across 19 files | Pins the wake-gate bands, the protocol, the cascade contract, the Telegram source, the utterance endpointing and the side-effect verification |
 
-> Production (`docker-compose.yml`) runs `LLM_BACKEND=cascade` with **one camera enabled** (`CAMERA_STREAMS=livingroom`, `DISABLE_CAMERAS=false`) — cameras entered test operation on 04.10.2026; the ESP32 path remains the main one.
+> Production (`docker-compose.yml`) runs `LLM_BACKEND=cascade` with **two cameras enabled** (`CAMERA_STREAMS=livingroom,kitchen`, `DISABLE_CAMERAS=false`), both decoding the wake word with vosk and playing replies over `/play_audio`; the ESP32 path remains the main one.
 
-### Utterance endpointing (off by default)
+### Utterance endpointing (off by default, on in both test rooms)
 
 The living-room VAD never reports silence — Silero said `speech=True` for a whole
 capture (0 `speech=False` in 15 live minutes) — so every command used to wait out
@@ -99,7 +99,7 @@ utterance on a dip in the **level** envelope instead, which happens between word
 whatever the VAD thinks. Lowering the cap is not the fix: it is load-bearing for
 long commands.
 
-    CAMERA_PAUSE_ENDPOINT[_<NAME>]=true      # off by default, per room
+    CAMERA_PAUSE_ENDPOINT[_<NAME>]=true      # default false; true in both test rooms
     CAMERA_PAUSE_RATIO[_<NAME>]              # dip depth, default 0.55
     CAMERA_PAUSE_RUN_FRAMES[_<NAME>]         # dip run before the end, default 6 (0.96 s)
     CAMERA_PAUSE_MIN_SPEECH_FRAMES[_<NAME>]  # speech before a pause may end, default 5

@@ -390,11 +390,31 @@ MEDIA_SERVICES: dict[str, str] = {
 # its target with a pronoun the registry can answer. Non-exclusive words
 # («приглуши», «заглуши») are shared with the light/TV families and need an
 # object.
+# Media services whose bare form is RELATIVE to a listener rather than about a
+# named player — the only ones where a camera's room must not stand in for the
+# device. Transport verbs are not here: «пауза» said in a room means that room.
+_MEDIA_RELATIVE = frozenset({
+    "volume_up", "volume_down", "volume_mute", "volume_set",
+})
+
 RE_MEDIA: tuple[tuple[re.Pattern[str], str, bool], ...] = (
+    # RESUME FIRST. Measured 06.10.2026 20:10: «сними из паузы» resolved to
+    # `media__media_pause` — the router PAUSED when the user asked it to unpause,
+    # and then failed with `media_target_ambiguous_or_absent` because the player
+    # was already paused and a pause has no target to move. Cause: `\bпауз\w*`
+    # sits first, matches the bare stem in «паузы», and the loop breaks on the
+    # first hit. Order IS the semantics here — every phrase that means "resume"
+    # contains the word «паузы» and must therefore be matched before "pause".
+    #
+    # «с|из» because the user says both: the log has «сними из паузы» and
+    # «сними с паузы гостиной», and the old pattern only allowed «с».
+    (re.compile(r"\bпродолж\w*|\bвозобнов\w*|\bдоигр\w*|"
+                r"\b(?:сними|убери|снимите)\s+(?:с|из)\s+паузы|"
+                r"\b(?:снять|сня)\s+(?:с|из)\s+паузы|\bотмени\s+паузу",
+                re.IGNORECASE),
+     "media_play", True),
     (re.compile(r"\bпауз\w*|\bприостанов\w*|\bзамороз\w*", re.IGNORECASE),
      "media_pause", True),
-    (re.compile(r"\bпродолж\w*|\bвозобнов\w*|\bдоигр\w*|сними\s+с\s+паузы",
-                re.IGNORECASE), "media_play", True),
     # «трек/песня» only, NOT «серию/эпизод»: those are LIBRARY items, and a
     # transport next_track on the wrong box is a wrong side effect — «включай
     # следующую серию "Темного зеркала" в гостиной» must go to L2's
@@ -656,10 +676,26 @@ def resolve_action(text: str, stream_name: str) -> ResolvedCall | None:
         if not re.search(r"громкост|звук", t, re.IGNORECASE):
             return None
     if media_service:
-        if area_src == "default" and not media_noun and not thing_stem:
+        if (
+            area_src == "default"
+            and not media_noun
+            and not thing_stem
+            and media_service in _MEDIA_RELATIVE
+        ):
             # «громче» said in the kitchen satellite with no device word: the
             # default area is a speaker LOCATION, not a claim about which
             # player the user means.
+            #
+            # **Transport verbs keep it.** Measured 06.10.2026 20:10: a bare
+            # «поставь на паузу» from the living-room camera reached the router as
+            # `media__media_pause` with `args={'service_data': {}}` — no area at
+            # all — so `_execute_media` guessed among four boxes and picked
+            # `media_player.le_vlada`, and the user was asked where to pause. The
+            # lights take the default area in the same breath
+            # (`{'domain': ['light'], 'area': 'Living Room'}`), so the asymmetry
+            # was in this branch alone. "Pause whatever is playing near me" is a
+            # claim about exactly one player, which is the case the original
+            # reasoning excludes.
             area, area_src = None, "none"
         args: dict = {}
         if area:

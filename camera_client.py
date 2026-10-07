@@ -938,7 +938,21 @@ class CameraConfig:
     # Kept as a flag rather than a `0` window, because `0` means "unset, use the
     # built-in default" throughout this file — setting the window to 0 would have
     # silently produced a 30 s window instead of none.
-    followup_window: bool = False
+    #
+    # Three states, not two:
+    #   "question" (default) — listen only when WE asked a question. The user said
+    #     on 06.10.2026: when the camera asks, it must listen to the answer
+    #     immediately, no wake word. An answer to our own question is the one
+    #     follow-up that needs no keyword to be recognised.
+    #   "none"             — the wake word is required again after any reply.
+    #   "all"              — also listen after a plain statement.
+    #
+    # "all" is not the default and the earlier measurement says why: a statement
+    # window is 10 s of open microphone in a room whose television is louder than
+    # its occupant, and it accepted noise ('атака' 32522, 'пиздец' 13197) while
+    # refusing the user (4725, 9124). A question window does not have that
+    # problem: it is short, and something is expected to be said in it.
+    followup_window: str = "question"
     # Play the attention beep on the wake word. True by default so existing rooms
     # keep the cue they are used to.
     #
@@ -1049,7 +1063,16 @@ class CameraSession:
         self._pause_run_frames = config.pause_run_frames
         self._pause_min_speech_frames = config.pause_min_speech_frames
         self._pause_noise_mult = config.pause_noise_mult
-        self._followup_window = bool(config.followup_window)
+        # `bool` kept as a derived value so existing callers and tests that set it
+        # directly still mean "any window at all".
+        self._followup_mode = str(config.followup_window or "question").strip().lower()
+        if self._followup_mode not in ("none", "question", "all"):
+            logger.warning(
+                f"[{self.stream_name}] unknown CAMERA_FOLLOWUP="
+                f"{config.followup_window!r}, using 'question'"
+            )
+            self._followup_mode = "question"
+        self._followup_window = self._followup_mode != "none"
         self._followup_min_peak = (
             config.followup_min_peak
             if config.followup_min_peak > 0
@@ -4001,13 +4024,19 @@ class CameraSession:
                         if is_q
                         else self._dialogue_statement_s
                     )
-                    if window > 0 and not self._followup_window:
+                    # A QUESTION window is opened by default; a statement window
+                    # is not, and the mode says which.
+                    want_window = window > 0 and (
+                        self._followup_mode == "all"
+                        or (self._followup_mode == "question" and is_q)
+                    )
+                    if window > 0 and not want_window:
                         logger.info(
                             f"[{self.stream_name}] 💬 no free-form window: the "
                             f"wake word is required again after our reply "
-                            f"(CAMERA_FOLLOWUP is off)"
+                            f"(CAMERA_FOLLOWUP={self._followup_mode})"
                         )
-                    if window > 0 and self._followup_window:
+                    if want_window:
                         await self._wait_playback_drain()
                         self._wake_detected = True
                         self._wake_expires = time.time() + window

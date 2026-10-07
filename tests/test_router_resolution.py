@@ -1682,3 +1682,71 @@ async def test_a_device_already_in_the_requested_state_counts_as_reached(monkeyp
         {"switch.entrance_light_switch_relay": "off"}, want_on=True,
     )
     assert moved == ["switch.entrance_light_switch_relay"]
+
+
+# --- «сними с паузы» was PAUSING, and «пауза» had no room (06.10.2026 20:10) ---
+#
+# Measured on the living-room camera, two commands in a row:
+#
+#     20:10:20 'иметь паузу'   -> media_pause on media_player.le_vlada  «Поставила на паузу»
+#     20:10:40 'сними из паузы' -> media_target_ambiguous_or_absent — escalating
+#
+# Two separate faults, and the user described both: the router PAUSED when asked
+# to unpause, and it picked a box in somebody else's bedroom and then asked where
+# to pause.
+
+
+def test_removing_the_pause_is_not_a_pause():
+    """`\\bпауз\\w*` sat FIRST in RE_MEDIA, matched the bare stem inside «паузы», and
+    the loop breaks on the first hit — so every unpause phrasing became a pause.
+    Order IS the semantics here: resume phrases contain the word «паузы»."""
+    from resolver import resolve_action
+
+    for text in ("сними с паузы", "сними из паузы", "Сними с паузы гостиной",
+                 "продолжай", "возобнови"):
+        call = resolve_action(text, "livingroom")
+        assert call is not None, f"{text!r} does not resolve at all"
+        assert call.tool == "media__media_play", (
+            f"{text!r} -> {call.tool}: the router PAUSED when asked to unpause"
+        )
+
+
+def test_a_bare_pause_still_pauses():
+    """The reorder must not swallow the verb it was protecting."""
+    from resolver import resolve_action
+
+    for text in ("поставь на паузу", "пауза", "приостанови", "заморозь"):
+        call = resolve_action(text, "livingroom")
+        assert call is not None, f"{text!r} does not resolve at all"
+        assert call.tool == "media__media_pause", f"{text!r} -> {call.tool}"
+
+
+def test_a_bare_pause_carries_the_room_the_camera_is_in():
+    """Measured: a bare «поставь на паузу» reached the router with
+    `args={'service_data': {}}` — no area at all — so `_execute_media` guessed
+    among four boxes and chose `media_player.le_vlada`, and the user was asked
+    where to pause. The lights take the default area in the same breath
+    (`{'domain': ['light'], 'area': 'Living Room'}`), so the asymmetry was here
+    alone. "Pause whatever is playing near me" names exactly one player."""
+    from resolver import resolve_action
+
+    for room, area in (("livingroom", "Living Room"), ("kitchen", "Kitchen")):
+        call = resolve_action("поставь на паузу", room)
+        assert call is not None
+        assert call.args.get("area") == area, (
+            f"{room}: {call.args} — the camera's room was dropped, so the router "
+            "guessed a player in someone else's bedroom"
+        )
+
+
+def test_the_relative_volume_case_still_drops_the_room():
+    """The original reason for dropping it: «громче» said in a room is about a
+    listener, not a claim about which player. That reasoning is untouched — the
+    change is scoped to transport verbs."""
+    from resolver import resolve_action
+
+    call = resolve_action("громче", "kitchen")
+    assert call is not None
+    assert "area" not in call.args, (
+        f"«громче» must not inherit the room as a player claim: {call.args}"
+    )

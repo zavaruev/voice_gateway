@@ -3676,8 +3676,8 @@ async def start_camera_sessions():
                 followup_window=(
                     os.getenv(f"CAMERA_FOLLOWUP_{name.upper()}")
                     or os.getenv("CAMERA_FOLLOWUP")
-                    or ""
-                ).strip().lower() in ("1", "true", "yes", "on"),
+                    or "question"
+                ),
                 followup_min_peak=int(
                     os.getenv(
                         f"CAMERA_FOLLOWUP_MIN_PEAK_{name.upper()}"

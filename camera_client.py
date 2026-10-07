@@ -1426,6 +1426,8 @@ class CameraSession:
             try:
                 await pc.close()
             except Exception:
+                # Closing a peer connection that is already gone is routine; the
+                # reconnect supervisor in _run() owns any real recovery.
                 pass
 
     async def _run(self):
@@ -4153,26 +4155,38 @@ class CameraSession:
                 async with self.http_session.post(
                     self.whisper_url,
                     data=form,
-                    # Generous, because the measurement says a slow camera is not a
-                  # dead one: 07.10.2026, HTTP 200 every time, 1 s of audio took
-                  # 3.5 s on the kitchen and 21.4 s once on the living room, 3 s
-                  # took 8.7 s and 37.0 s. A tight budget would declare a working
-                  # speaker dead mid-reply and log "the reply was NOT spoken" while
-                  # it is in fact playing slowly. The floor (20 s) sits above every
-                  # sample measured on a 1 s clip; the cap bounds a genuinely dead
-                  # camera. Nothing downstream waits on this response — `sent_at`
-                  # is what the playback guards use — so it only bounds how long a
-                  # silent camera occupies the playback loop.
-                  timeout=aiohttp.ClientTimeout(total=min(
-                      90.0, max(20.0, 8.0 * (len(pcm) / (TTS_PLAY_RATE * 2))))),
+                    # 30 s for a clip that is at most 7 s long. Nothing here waits
+                    # on the audio. This is NOT the /play_audio endpoint, whose
+                    # measured latency (3-12x the audio length, sometimes no answer
+                    # at all) is a separate problem, handled in _play_audio_http.
+                    #
+                    # A per-clip budget was once written HERE by mistake: `pcm` is
+                    # not in scope in this function — the argument is `wav` — so the
+                    # expression raised NameError on EVERY call, the `except
+                    # Exception: pass` below swallowed it, and every camera command
+                    # returned an empty transcript, which the caller logs as
+                    # `Whisper empty`: exactly what a silent room produces. Measured
+                    # 07.10.2026, 0 successful transcriptions in either room over
+                    # ~2 h, caught only because the room's own levels (rms 2326,
+                    # -23 dB) made the silence explanation wrong. See
+                    # test_the_whisper_post_carries_no_name_out_of_scope.
+                    timeout=aiohttp.ClientTimeout(total=30),
                 ) as r:
                     if r.status == 200:
                         data = await r.json()
                         text = (data.get("text") or "").strip()
                         if text:
                             return text
-            except Exception:
-                pass
+            except Exception as e:
+                # Logged, not swallowed. A bare `pass` here makes a PROGRAMMING
+                # error indistinguishable from a quiet room — the caller logs the
+                # empty return as `Whisper empty`, which is exactly what silence
+                # produces. That ambiguity is what hid a NameError in this very
+                # function for two hours on 07.10.2026: 0 successful transcriptions
+                # in either room, and no line anywhere saying a request had failed.
+                logger.warning(
+                    f"[{self.stream_name}] whisper call failed: {e!r}"
+                )
         return ""
 
     async def _fetch_speaker_id(self, wav: bytes) -> str:
@@ -4492,7 +4506,19 @@ class CameraSession:
                 self._play_audio_url,
                 data=pcm,
                 headers=headers,
-                timeout=aiohttp.ClientTimeout(total=30),
+                # Generous, because the measurement says a slow camera is not a
+                # dead one: 07.10.2026, HTTP 200 every time, 1 s of audio took
+                # 3.5 s on the kitchen and 21.4 s once on the living room, 3 s took
+                # 8.7 s and 37.0 s, and a 6 s clip got no answer at all within 60 s.
+                # A flat 30 s is below several of those samples. The floor (20 s)
+                # sits above every sample measured on a 1 s clip; the cap bounds a
+                # genuinely silent camera.
+                #
+                # Nothing downstream waits on this response — the playback guards
+                # read `sent_at`, captured before the POST — so this only bounds how
+                # long a dead camera occupies the playback loop.
+                timeout=aiohttp.ClientTimeout(total=min(
+                    90.0, max(20.0, 8.0 * (len(pcm) / (TTS_PLAY_RATE * 2))))),
             ) as r:
                 if r.status == 200:
                     return True

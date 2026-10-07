@@ -2734,3 +2734,126 @@ def test_the_dead_audio_message_names_the_cheapest_recovery_first():
     )
     # The power cycle stays available, and the reason it is manual is still stated.
     assert "power-cycle" in src and "ONVIF Reboot" in src
+
+
+# --- I broke Whisper for two hours with a name that was not in scope (07.10) ----
+#
+# `_fetch_transcription` builds the multipart POST inside a try/except that ends in
+# `pass`, and the caller logs an empty return as `Whisper empty` — the same line a
+# SILENT room produces. I replaced the flat `total=30` there with a per-clip budget
+# that referenced `pcm`, which is `_play_audio_http`'s argument; this function's is
+# `wav`. Every call raised NameError, the except swallowed it, and both rooms
+# returned empty transcripts for ~2 h: 0 successful in 24 h, while the room's own
+# levels (rms 2326, -23 dB) said the silence explanation was wrong.
+#
+# Two independent causes, both guarded below: a name from another scope, and an
+# exception handler that cannot tell a bug from a quiet room.
+
+
+@pytest.mark.asyncio
+async def test_the_whisper_post_carries_no_name_out_of_scope():
+    """Every name in the request-construction path must exist in that scope.
+
+    A stub session that RECORDS the call rather than faking a response: the point
+    is that a request is actually attempted, so any NameError on the way there
+    fails the test instead of being absorbed by the caller's except.
+    """
+    import camera_client as cc
+
+    seen: list[dict] = []
+
+    class _Resp:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def json(self):
+            return {"text": "включи свет"}
+
+    class _Session:
+        def post(self, url, **kw):
+            seen.append(kw)
+            return _Resp()
+
+    s = _make_http_session()
+    s.http_session = _Session()
+    s.whisper_url = "http://10.0.0.9/v1/audio/transcriptions"
+    s.whisper_model = "test-model"
+
+    out = await s._fetch_transcription(b"RIFF....wavfmt ", temperature="0.0")
+
+    assert seen, (
+        "no Whisper request was attempted — the transcript is empty because the "
+        "request was never sent, which is what a NameError in this path does"
+    )
+    assert out == "включи свет", f"a real response was ignored: {out!r}"
+
+
+@pytest.mark.asyncio
+async def test_a_broken_whisper_call_is_logged_not_swallowed():
+    """A bare `except: pass` makes a programming error indistinguishable from an
+    empty room. The caller logs `Whisper empty` for both, and that ambiguity is
+    what hid the NameError for two hours."""
+    import camera_client as cc
+
+    class _Boom:
+        def post(self, *a, **kw):
+            raise RuntimeError("kaboom")
+
+    lines: list[str] = []
+
+    class _Log:
+        def warning(self, msg, *a):
+            lines.append(msg % a if a else msg)
+
+        def __getattr__(self, _name):
+            return self.info
+
+        def info(self, msg, *a):
+            lines.append(msg % a if a else msg)
+
+    s = _make_http_session()
+    s.http_session = _Boom()
+    s.whisper_url = "http://10.0.0.9/v1/audio/transcriptions"
+    s.whisper_model = "test-model"
+
+    with patch.object(cc, "logger", _Log()):
+        out = await s._fetch_transcription(b"RIFF....wavfmt ", temperature="0.0")
+
+    assert out == ""
+    joined = " ".join(lines)
+    assert "whisper call failed" in joined and "kaboom" in joined, (
+        f"a failed Whisper call was swallowed, so it is indistinguishable from a "
+        f"quiet room: {joined!r}"
+    )
+
+
+def test_the_two_http_budgets_belong_to_their_own_functions():
+    """The bug above was a wrong-function edit that `str.count` reported as
+    unique: the play_audio line had 2 spaces less indentation, so an 18-space
+    pattern matched the whisper line as a substring and `count == 1` passed.
+
+    So assert on the values each function actually carries, not on the file.
+    """
+    import inspect
+
+    import camera_client as cc
+
+    whisper = inspect.getsource(cc.CameraSession._fetch_transcription)
+    play = inspect.getsource(cc.CameraSession._play_audio_http)
+
+    assert "len(pcm)" not in whisper, (
+        "the Whisper path must not size a budget from `pcm` — its argument is "
+        "`wav`, so that expression is a NameError on every call"
+    )
+    assert "total=30" in whisper, f"the Whisper budget is wrong: {whisper[-400:]}"
+
+    assert "len(pcm)" in play, (
+        "the play_audio budget was meant to scale with the clip, and it was "
+        "written into the Whisper call instead"
+    )
+    assert "TTS_PLAY_RATE" in play

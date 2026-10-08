@@ -109,6 +109,16 @@ _TTS_TARGET_PEAK_DEFAULT = 20000
 # decoded and dropped before the third one got through 28 s later.
 _ECHO_TAIL_S = 3.0
 
+# How long after playback END our own voice could still be coming back at the
+# microphone. `_is_echo` refuses to believe a correlation past this, which is
+# what stops room noise from being counted as our own speech out of a stale
+# ring buffer (see the docstring there). Both rooms play over /play_audio with
+# the WebRTC session off, so the echo is immediate; the 3-40 s late return
+# that once justified a wide lag sweep belonged to the ONVIF backchannel, which
+# is no longer in the path. 8 s is deliberately generous for that immediate
+# return rather than tight.
+_ECHO_HORIZON_S = 8.0
+
 # Same-breath debounce: «...компьютер, да, компьютер, выключи свет» must fire
 # ONCE, because a second `_fire_wake()` clears `_vad_speech_buf` and throws
 # away the command being collected. This replaces `_wake_detected` as the
@@ -2125,10 +2135,39 @@ class CameraSession:
             pass
 
     def _is_echo(self, pcm_16k: bytes) -> bool:
-        """Return True if the 16 kHz mic chunk is our own TTS echoed back."""
+        """Return True if the 16 kHz mic chunk is our own TTS echoed back.
+
+        **Bounded by an actual playback horizon, and this bound is the fix.**
+        Measured 07.10.2026 15:21, living room, silent room and nothing playing:
+        `drop[muted=230 track=0 echo=32]` climbing to `echo=163` over 25 minutes
+        with `Echo chunk dropped (corr)` every 2-4 s, and the wake gate refusing
+        the user's word every single time with `echo_tail=+1.9s / +0.8s / +0.0s`.
+        The word was HEARD (`window=24286/3000`) and blocked anyway.
+
+        Cause: the ring buffer is never cleared, and the lag sweep reaches 46 s
+        back through it. So long after any echo is possible, a speech clip from a
+        previous turn is still in the ring, 44 chances at 2-46 s of lag are tried
+        per chunk, and room noise matches one of them by chance often enough to
+        count as our own voice. Each match then pushed the wake block 3 s further
+        out (see the `now + _ECHO_TAIL_S` floor at the call sites), so the block
+        never expired: `echo` climbing while `muted` stayed frozen at 230 is the
+        signature — nothing was playing, so nothing could have been muted.
+
+        Both rooms play over `/play_audio` with `CAMERA_WEBRTC=false`, so the ONVIF
+        backchannel whose 3-40 s late return motivated that wide sweep is gone;
+        our own voice comes back essentially at once. A horizon of
+        `_ECHO_HORIZON_S` is therefore generous rather than tight, and past it a
+        correlation is coincidence, not echo.
+        """
         x = np.frombuffer(pcm_16k, dtype=np.int16).astype(np.float32)
         n = len(x)
         if n == 0:
+            return False
+        play_end = float(getattr(self, "_tts_play_end", 0.0) or 0.0)
+        if play_end <= 0.0 or time.time() - play_end > _ECHO_HORIZON_S:
+            # Nothing of ours could still be in the air. A match now would be a
+            # coincidence against a stale reference, and believing it is what
+            # muted the room for half an hour.
             return False
         if self._tts_total < n + 2 * 16000:
             return False
@@ -2222,10 +2261,17 @@ class CameraSession:
                     # when the camera actually starts playing. So playback_end plus
                     # the same `_ECHO_TAIL_S` covers the tail, and it does not move
                     # as more echo arrives.
+                    # Anchored to playback END only — no `now + _ECHO_TAIL_S`
+                    # floor. The floor existed so a stale `_tts_play_end` could not
+                    # park the block for a whole reply, but it also meant ANY
+                    # correlation pushed the deadline out by 3 s, so a run of false
+                    # echoes held the wake gate shut indefinitely. Now that
+                    # `_is_echo` only believes a correlation inside
+                    # `_ECHO_HORIZON_S` of real playback, this cannot accumulate.
                     self._wake_suppress_until = max(
                         self._wake_suppress_until,
-                        now + _ECHO_TAIL_S,
-                        getattr(self, "_tts_play_end", 0.0) + _ECHO_TAIL_S,
+                        float(getattr(self, "_tts_play_end", 0.0) or 0.0)
+                        + _ECHO_TAIL_S,
                     )
                     continue
                 self._vad_buf.extend(pcm_16k)
@@ -2243,10 +2289,10 @@ class CameraSession:
                     self._last_echo_log = now
                     logger.info(f"[{self.stream_name}] 🔁 Echo chunk dropped (corr)")
                 # Same anchoring as the 48 kHz path above — see the comment there.
+                # Same anchoring as the 48 kHz path above — see the comment there.
                 self._wake_suppress_until = max(
                     self._wake_suppress_until,
-                    now + _ECHO_TAIL_S,
-                    getattr(self, "_tts_play_end", 0.0) + _ECHO_TAIL_S,
+                    float(getattr(self, "_tts_play_end", 0.0) or 0.0) + _ECHO_TAIL_S,
                 )
                 return
             self._vad_buf.extend(pcm_16k)

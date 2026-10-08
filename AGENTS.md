@@ -951,6 +951,32 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
   * **It lives in `ha_match.py`, not `tools.py`,** because `tools.py` imports `smolagents` at module level and the gateway's test image does not ship it. A function the suite cannot import is a function nobody tests, and this one guards a spoken lie. Verified in the worker container against the exact payload above.
   * Also visible in the same turn: «Просил включить свет в гостиной» answered «Включила» and the relay did move (`last_changed 11:42:29`), so the fast path is honest; only the escalated path lied.
 
+- **THE STUTTER AND THE DEAD WAKE WERE THE SAME BUG: ROOM NOISE WAS COUNTED AS OUR OWN ECHO. Measured 07.10.2026 15:21, living room, reported as «стало хуже компьютер распознавать».** The user said the word and the log said it was heard and refused:
+  ```
+  12:19:32  VOSK wake heard but not fired: echo_tail=+1.9s (suppressed=3)
+  12:19:34  VOSK WAKE trig='компьютер' window=24286/3000   <- через 2.0 с
+  12:19:44  heard but not fired: echo_tail=+0.8s
+  12:19:48  VOSK WAKE ... window=18363/3000                <- через 4.4 с
+  12:19:58  heard but not fired: echo_tail=+0.0s
+  12:20:00  VOSK WAKE ... window=16934/3000                <- через 2.0 с
+  ```
+  `window=24286/3000` is the loudest chunk of the last 1.9 s against a 3000
+  threshold — the word arrived with an 8x margin and was dropped anyway. The
+  counters say why, and only they do:
+  ```
+  drop[muted=230 track=0 echo=32] -> 82 -> 101 -> 123 -> 158 -> 163
+  Echo chunk dropped (corr) every 2-4 s, continuously
+  ```
+  **`muted` frozen at 230 for 25 minutes is the proof: nothing was playing, so
+  nothing could have been our echo — while `echo` climbed.** A frozen mute
+  counter beside a rising echo counter IS the signature of this fault; neither
+  number alone would have shown it.
+  * **Two causes, and the second is what made it last hours.** `_is_echo` sweeps the lag window `d in range(2, 46)` against a ring buffer **that is never cleared**, so a clip from an earlier turn is still there and 44 chances per chunk are tried — room noise matches one of them often enough to be believed. Each match then set `_wake_suppress_until = max(..., now + _ECHO_TAIL_S, ...)`, so the block moved 3 s into the future on every chunk and could never expire.
+  * **The `now + _ECHO_TAIL_S` floor was not a bug in itself** — it was added so a stale `_tts_play_end` could not park the block for a whole reply. But it turns ONE false positive into an unbounded block, so the real fix had to be upstream: `_is_echo` now returns False outright when `time.time() - _tts_play_end > _ECHO_HORIZON_S` (8 s). The floor is gone, because with the horizon in place it cannot accumulate.
+  * **8 s is not a guess about `/play_audio`.** It comes from the measurement above that the ONVIF backchannel's 3-40 s late return — the only reason for a wide sweep — is **no longer in the path**: both rooms play over `/play_audio` with `CAMERA_WEBRTC=false`. Measured 08.10.2026 on both cameras, 1 s of audio, HTTP 200: **kitchen 0.106 s, living room 0.060 s** (four consecutive probes 0.050-0.068 s). The endpoint answers in a fraction of the audio length; yesterday's ×3…×17 readings were the wedged state, not a property of the camera, which is why they moved 3.5 s -> 0.06 s after a `majestic` restart.
+  * **Verified after the fix:** `drop[muted=0 track=0 echo=0]` and zero `Echo chunk dropped (corr)` lines, i.e. the false echoes are gone rather than merely harmless.
+  * **The morning-specific part is NOT reproduced and is still open.** Both cameras run one cron entry, `0 3 * * * /usr/sbin/fw-autoupdate` (identical md5 on both), and on 08.10 the living room recorded `au_result="started" au_target="nightly-20261007-c31fe75"` with **no completion record and no `sysupgrade` line in syslog**, while the kitchen recorded `au_result="nocheck"`. That asymmetry is real and worth watching, but the firmware/boot theory is **unconfirmed**: at 09:40 UTC the living room's playback was 0.06 s and its capture 1.0x, i.e. healthy, so whatever the nightly update does does not reproduce on demand from where it stands. Do not assert it — read `/etc/webui/fw-autoupdate.last` and the two counters together on the next bad morning.
+
 - **`CAMERA_FOLLOWUP` IS A THREE-STATE MODE, AND ITS DEFAULT IS `question`.** The user, 06.10.2026: **when the camera asks a question it must listen to the answer immediately, no wake word** — that is the "asks a question and then ignores the answer" complaint. An answer to OUR OWN question is the one follow-up that needs no keyword.
   * `none` | `question` (default) | `all`. `all` is not the default because a **statement** window is 10 s of open microphone in a room whose television is louder than its occupant, and it was measured accepting noise («атака» 32522, «пиздец» 13197) while refusing the user (4725, 9124). A question window is short and something is expected to be said in it.
   * **It is a mode and not a duration because `0` means "unset, use the default" throughout this file** — a window of 0 would produce a 30 s window, not none. There is no numeric value for "no window at all" here. An unrecognised value falls back to `question`, so a typo in the env var cannot close the microphone for a question.

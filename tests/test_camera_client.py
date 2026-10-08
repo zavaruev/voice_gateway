@@ -602,8 +602,15 @@ async def test_is_echo_detects_own_tts():
     sig_8k = (rng.integers(-3000, 3000, size=1280, dtype=np.int16))
     sig_16k = np.repeat(sig_8k, 2)  # what _store_tts_echo upsamples to
     s._store_tts_echo(sig_8k.tobytes(), rate=8000)
-    # total is now 2560; simulate 10s passing (echo returns later)
-    s._tts_total += 10 * 16000
+    # total is now 2560; simulate the echo returning. 3 s, not the 10 s this
+    # test used: `_is_echo` now refuses to believe a correlation more than
+    # `_ECHO_HORIZON_S` after playback ended, because room noise matching a
+    # stale ring buffer is what muted the living room for half an hour on
+    # 07.10.2026. A delay the detector must NOT accept cannot be asserted as
+    # detected — and the «must NOT be echo» tests below would have passed for
+    # the wrong reason if they kept it.
+    s._tts_total += 3 * 16000   # within _ECHO_HORIZON_S, see below
+    s._tts_play_end = time.time()   # playback just ended
     # The echoed chunk (same content) must be detected as echo
     assert s._is_echo(sig_16k.tobytes()) is True
 
@@ -620,7 +627,8 @@ async def test_is_echo_detects_own_tts_at_playback_rate():
     sig_16k = sig_48k[::3].copy()
     assert TTS_PLAY_RATE == 48000
     s._store_tts_echo(sig_48k.tobytes())  # default rate = playback rate
-    s._tts_total += 10 * 16000
+    s._tts_total += 3 * 16000   # within _ECHO_HORIZON_S, see below
+    s._tts_play_end = time.time()   # playback just ended
     assert s._is_echo(sig_16k.tobytes()) is True
 
 
@@ -644,7 +652,8 @@ async def test_is_echo_rejects_other_speech():
     other_8k = (rng.integers(-3000, 3000, size=1280, dtype=np.int16))
     other_16k = np.repeat(other_8k, 2)
     s._store_tts_echo(sig_8k.tobytes(), rate=8000)
-    s._tts_total += 10 * 16000
+    s._tts_total += 3 * 16000   # within _ECHO_HORIZON_S, see below
+    s._tts_play_end = time.time()   # playback just ended
     # Different speech must NOT be flagged as echo
     assert s._is_echo(other_16k.tobytes()) is False
 
@@ -656,7 +665,8 @@ async def test_is_echo_rejects_silence():
     sig_8k = (rng.integers(-3000, 3000, size=1280, dtype=np.int16))
     silence = np.zeros(2560, dtype=np.int16)
     s._store_tts_echo(sig_8k.tobytes(), rate=8000)
-    s._tts_total += 10 * 16000
+    s._tts_total += 3 * 16000   # within _ECHO_HORIZON_S, see below
+    s._tts_play_end = time.time()   # playback just ended
     assert s._is_echo(silence.tobytes()) is False
 
 
@@ -2386,7 +2396,14 @@ async def test_echo_suppression_is_anchored_to_when_playback_ends():
 
     assert s._drop_echo == 1, "the echo branch did not run at all"
     after_reply = s._wake_suppress_until - t_end
-    assert after_reply == pytest.approx(_ECHO_TAIL_S + 0.5), (
+    # Exactly `_ECHO_TAIL_S` past the END of playback. This used to assert
+    # `_ECHO_TAIL_S + 0.5`, i.e. the `now + _ECHO_TAIL_S` floor — the sliding
+    # deadline, since removed on 07.10.2026 because a run of false echoes pushed
+    # it forward forever and held the wake gate shut in a silent room. The echo
+    # arrived 0.5 s after playback ended and the block still ends at
+    # `t_end + tail`: the floor added nothing that the anchor does not already
+    # cover, and it was the mechanism that made the block unbounded.
+    assert after_reply == pytest.approx(_ECHO_TAIL_S), (
         f"the block runs {after_reply:.1f}s past the end of the reply, "
         "which is the delay that was reported"
     )
@@ -2857,3 +2874,96 @@ def test_the_two_http_budgets_belong_to_their_own_functions():
         "written into the Whisper call instead"
     )
     assert "TTS_PLAY_RATE" in play
+
+
+# --- Room noise was counted as our own echo, and the block never expired --------
+#
+# Living room, 07.10.2026 15:21, a silent room with nothing playing:
+#
+#     drop[muted=230 track=0 echo=32] -> 82 -> 101 -> 123 -> 158 -> 163
+#     Echo chunk dropped (corr) every 2-4 s, continuously
+#     VOSK wake heard but not fired: echo_tail=+1.9s / +0.8s / +0.0s
+#
+# `muted` frozen at 230 for 25 minutes proves nothing was playing, so nothing
+# could have been our echo; `echo` climbing proves the correlation was firing.
+# The user's word WAS heard (window=24286/3000) and blocked anyway — which is
+# exactly the "стало хуже компьютер распознавать" report.
+#
+# Two causes: `_is_echo` searched a ring buffer that is never cleared, so stale
+# speech from earlier turns matched ambient noise at one of 44 lags; and each
+# match pushed `_wake_suppress_until` to `now + _ECHO_TAIL_S`, so the block slid
+# forward faster than it could expire.
+
+
+def _session_with_playback_ended_ago(seconds: float):
+    s = _make_http_session()
+    s._tts_play_end = time.time() - seconds
+    return s
+
+
+def test_a_correlation_is_not_believed_when_nothing_of_ours_is_in_the_air():
+    """Past the horizon a match is coincidence, not echo — however well it fits."""
+    import numpy as np
+
+    import camera_client as cc
+
+    # A ring full of our own speech, as a room that has spoken before would have.
+    s = _session_with_playback_ended_ago(cc._ECHO_HORIZON_S + 5.0)
+    s._tts_ring_len = 16000 * 60
+    s._tts_ring = np.zeros(s._tts_ring_len, dtype=np.float32)
+    s._tts_total = s._tts_ring_len
+    s._echo_corr_threshold = 0.3
+
+    speech = (np.sin(np.arange(16000) * 0.05) * 8000).astype(np.int16).tobytes()
+    assert s._is_echo(speech) is False, (
+        "audio was matched against our own voice long after playback ended, so "
+        "room noise can be claimed as an echo and the wake gate held shut"
+    )
+
+
+def test_a_correlation_inside_the_horizon_is_still_believed():
+    """The guard must not blind the detector to a real echo of a reply in flight."""
+    import numpy as np
+
+    import camera_client as cc
+
+    s = _session_with_playback_ended_ago(1.0)
+    s._tts_ring_len = 16000 * 60
+    s._tts_ring = np.zeros(s._tts_ring_len, dtype=np.float32)
+    s._tts_total = s._tts_ring_len
+    s._echo_corr_threshold = 0.9
+
+    rng = np.random.default_rng(0)
+    sig_16k = rng.integers(-3000, 3000, size=16000, dtype=np.int16)  # 1 s
+    s._store_tts_echo(sig_16k.tobytes(), rate=16000)
+    s._tts_total += 3 * 16000   # inside the sweep (d starts at 2) and the horizon
+    s._echo_corr_threshold = 0.9
+    echo = sig_16k.tobytes()
+    assert s._is_echo(echo) is True, (
+        "a real echo of our own playback inside the horizon was not recognised — "
+        "the fix must remove false echoes, not the detector"
+    )
+
+
+def test_the_wake_block_no_longer_slides_forward_on_every_echo():
+    """The `now + _ECHO_TAIL_S` floor is what turned one false positive into a
+    permanent block: each match pushed the deadline 3 s past the current moment,
+    so a run of false echoes held the gate shut indefinitely."""
+    import inspect
+
+    import camera_client as cc
+
+    # Comments stripped first: a test grepping the source finds the very
+    # counter-example it looks for, because each rule is written IN its comment
+    # as the mistake it prevents. Three versions of this assertion have matched
+    # prose instead of code.
+    src = "\n".join(
+        ln for ln in inspect.getsource(cc.CameraSession._feed_audio).split("\n")
+        if not ln.lstrip().startswith("#")
+    )
+
+    assert "now + _ECHO_TAIL_S" not in src, (
+        "the wake block still carries a sliding floor; a correlation arriving "
+        "while nothing is playing must not move the deadline"
+    )
+    assert "_ECHO_TAIL_S" in src, "the real tail must still apply"

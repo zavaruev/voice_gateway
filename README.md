@@ -1,6 +1,6 @@
 # Voice Gateway
 
-![version](https://img.shields.io/badge/version-v2.37-blue)
+![version](https://img.shields.io/badge/version-v2.38-blue)
 [![tests](https://github.com/zavaruev/voice_gateway/actions/workflows/tests.yml/badge.svg)](https://github.com/zavaruev/voice_gateway/actions/workflows/tests.yml)
 ![python](https://img.shields.io/badge/python-3.12%2B-3776AB?logo=python&logoColor=white)
 ![backend](https://img.shields.io/badge/AI%20backend-Cascade-orange)
@@ -39,7 +39,7 @@ The camera subsystem is **in test operation** since 04.10.2026 — living room f
 | L2 turn with a verified side effect | **3.2–4.0 s** |
 | Wake debounce | ~240 ms (2 of 3 chunks); a single chunk ≥ 0.68 fires immediately |
 | Wake window / watchdog | 15 s / 90 s |
-| Test suite | 262 tests, 14 files, ~3,550 lines |
+| Test suite | 565 tests, 19 files, ~10,100 lines |
 
 ---
 
@@ -79,14 +79,14 @@ Full environment table, backend variants, REST API and OTA: [`docs/REFERENCE.md`
 | File | Responsibility | Why it is separate |
 |---|---|---|
 | **`main.py`** (~3,600 lines) | Core: ESP32 WebSocket protocol, REST API, OTA, web UI, camera session startup | Single entry point for everything |
-| **`camera_client.py`** (~2,800 lines) | One `CameraSession` per stream: RTSP mic feed, wake word, cross-camera arbitration, replies into the WebRTC track | Cameras have their own transport and their own hard problem — echo arriving 3–40 s late |
+| **`camera_client.py`** (~3,300 lines) | One `CameraSession` per stream: RTSP mic feed, wake word, cross-camera arbitration, replies over the camera's `/play_audio` | Cameras have their own transport and their own hard problem — the mic hears its own speaker |
 | **`engine.py`** (~480 lines) | Silero VAD + openWakeWord scoring — the "science" part, pure ONNX calls | Testable without a network, without a camera |
 | **`backends.py`** (~590 lines) | Who answers: `NanobotBackend` / `HermesBackend` / `CascadeBackend` | One interface — the brain is swappable with a single env var |
 | **`telegram_client.py`** (~1,180 lines) | Third request source: Telegram long-polling, chat allowlist, voice note → Whisper → the same backend → text reply (+ optional voice note) | No bot framework — three Bot API calls over the `aiohttp` the process already has; all main.py helpers injected (no import cycle) |
 | **`audio_utils.py`** (~220 lines) | `pack_ogg()` (Opus → Ogg for Whisper) and `is_valid_text()` (drops hallucinations and mic echoes of our own TTS) | Shared by both device paths |
 | **`services/jev-router/`** | **L1** — intent classifier, offline slot resolver, direct Home Assistant calls, weather, chat/expert proxy | ~0.1 s for a simple command, no LLM in the loop |
 | **`services/smolagents-worker/`** | **L2** — smolagents `CodeAgent` with HA / Qdrant / Hermes / weather tools, plus honesty vetoes | Multi-step tasks that must not lie about side effects |
-| **`tests/`** | 549 tests across 19 files | Pins the wake-gate bands, the protocol, the cascade contract, the Telegram source, the utterance endpointing and the side-effect verification |
+| **`tests/`** | 565 tests across 19 files | Pins the wake-gate bands, the protocol, the cascade contract, the Telegram source, the utterance endpointing and the side-effect verification |
 
 > Production (`docker-compose.yml`) runs `LLM_BACKEND=cascade` with **two cameras enabled** (`CAMERA_STREAMS=livingroom,kitchen`, `DISABLE_CAMERAS=false`), both decoding the wake word with vosk and playing replies over `/play_audio`; the ESP32 path remains the main one.
 
@@ -110,6 +110,71 @@ endpoint is doing anything without an argument. `0` means "unset, use the defaul
 so a half-filled override cannot silently disable a threshold. Enable it per room
 only after reading that room's `UTTERANCE END` lines on real audio;
 `bash scripts/verify_endpoint.sh` runs the whole check in one command.
+
+### Answering a question without the wake word
+
+    CAMERA_FOLLOWUP[_<NAME>]=question   # none | question (default) | all
+
+A camera that asks a question must be able to hear the answer, so the default is
+`question`: the microphone stays open for `CAMERA_DIALOGUE_QUESTION_S` (30 s)
+after **our own question** and a reply needs no keyword. It is a mode and not a
+duration because `0` means "unset, use the built-in default" throughout the
+configuration — a window of `0` would produce a 30 s window instead of none — and
+an unrecognised value falls back to `question`, so a typo in the environment
+cannot close the microphone for a question.
+
+`all` also opens the 10 s statement window and is not the default, on a
+measurement: in a room whose television is louder than its occupant a statement
+window accepted noise while refusing the user, and **no peak threshold separates
+them** (user 4725 / 9124, television and appliances 13197–32522). The wake word is
+the only discriminator measured to work. `none` requires the wake word again after
+every reply.
+
+### Two instruments that decide whether the wake word is broken
+
+Both are the reason a mute room can be told apart from a deaf one:
+
+| | Where | Answers |
+|---|---|---|
+| `vosk diag` | every 300 s per room | `chunks` advancing, `triggers`/`decodes`, the decoder's own `hyp=`, and `drop[muted=… echo=…]` |
+| `CAMERA_WAKE_MIN_PEAK[_<NAME>]` | `0` → 3000 | Refuses a decoded wake word on silence, so a dead mic cannot invent both the word and the command |
+
+`vosk diag` is deliberately rare rather than a health line — it is the debug aid
+that settles a silent room, not something to read every turn. Two readings matter
+more than the rest:
+
+- **`muted` frozen while `echo` climbs** is the signature of room noise being
+  counted as our own echo. Nothing was playing, so nothing could have been our
+  echo, and yet the correlator kept firing.
+- **`chunks` advancing at a fraction of its expected rate** means the camera is
+  delivering audio slower than real time. A stretched signal contains no word for
+  any decoder, so the wake word "not recognised" and the wake word "refused" look
+  identical from the outside.
+
+The gate reads the **loudest chunk of the last 1.9 s**, not the chunk that
+triggered it — «компьютер» spans about ten 160 ms chunks and the trigger lands at
+an arbitrary point inside the word. `VOSK WAKE` logs both numbers
+(`peak=` and `window=<window max>/<threshold>`) so the number in the log is the
+number the decision was made on.
+
+### The camera watchdog
+
+    */3 * * * * voice_gateway/scripts/camera_watchdog.sh
+
+Five states, because three independent signals are measured: HTTP latency, whether
+go2rtc holds a producer with a consumer, and **how fast the audio arrives**.
+`audio-starved` is the one that matters in practice — a stream that is alive and
+carrying audio at a fraction of real time is invisible to latency and to
+`producers/consumers`, and it is not fixable by restarting the gateway, so those
+rooms skip that step and go straight to restarting `majestic` on the camera (the
+cheapest lever; a power cycle is the fallback, because ONVIF `Reboot` is not
+implemented on OpenIPC).
+
+The rate is read from the gateway's own log rather than measured by a second
+consumer: a watchdog must not perturb the single-threaded `majestic` it watches.
+`DRY_RUN=1` decides and logs what it would do and touches nothing — the ladder's
+first step restarts the gateway, so testing it the hard way is what once made it
+restart a healthy container seventeen times in a day.
 
 ---
 
@@ -136,10 +201,10 @@ Everything here exists to avoid listening to garbage.
 ![the wake gate cascade](docs/images/wake-gates.svg)
 
 - **Transport** — `ffmpeg` pulls `rtsp://go2rtc:8554/<stream>?audio=copy` → raw L16 @ 16 kHz (no μ-law, which would degrade recognition).
-- **Two echo guards** — a hard one (while TTS frames are queued, the mic is not fed at all) and a correlational one, `_is_echo()`, which cross-checks the incoming mic chunk against a ring buffer of recently played audio: the RTSP backchannel returns our own speech **3–40 s after playback**, so fixed suppression windows never work.
+- **Two echo guards** — a hard one (while TTS frames are queued, the mic is not fed at all) and a correlational one, `_is_echo()`, which cross-checks the incoming mic chunk against a ring buffer of recently played audio. The correlator is **bounded by `_ECHO_HORIZON_S`** (8 s after playback ends): the 3–40 s late return that once justified a wide lag sweep belonged to the ONVIF backchannel, which is no longer in the path. Unbounded, it did not just miss echoes — it counted room noise as our own voice and held the wake gate shut for as long as the noise lasted.
 - **Wake-gate cascade** (before any wake fires): own-playback guard → appliance hold (sustained background like a vacuum demands a confident score) → quiet-source hold → distant-source veto (a through-wall copy must not beat the real room) → clipping-bang / crest-factor gates → debounce (2 qualifying chunks out of the last 3) → STT-confirm → **cross-camera arbiter** (the first detector becomes the interaction owner; a room ≥5× louder may steal a not-yet-dispatched wake).
 - **Whisper only inside a wake window.** Ambient speech from a TV never reaches STT — this is the main defence against false bills and wasted latency.
-- **Answer** goes into the camera's WebRTC sendonly track → go2rtc backbridge → camera speaker.
+- **Answer** goes to the camera's `/play_audio` endpoint as raw mono s16le with the rate in the `Content-Type` header (`;rate=48000`). The ONVIF/go2rtc backchannel is a **fallback only** and it is pitch-broken — the camera advertises PCMU/8000 and then plays it at 48 kHz, so replies come out ~6× too fast. Set `CAMERA_WEBRTC[_<NAME>]=false` for a room that has `/play_audio`: the session carries no audio this gateway uses, and every `webrtc/offer` makes go2rtc rebuild the producer, which fills the **camera's** send queue and blocks it.
 
 ---
 
@@ -172,7 +237,7 @@ Two valves keep L2 honest: the **honesty veto** (a reply claiming success after 
 1. **Queue of sentences, not tokens** — TTS is sentence-granular; token-by-token synthesis produces audible gaps.
 2. **TTS prefetch hides latency** — the first played audio (usually the ack) cancels the 90 s watchdog, which is what makes 48–120 s L2 turns possible.
 3. **`engine.last_score` must be written by `check_wakeword()`** — camera sessions read it after every call; a missing write silently kills all wake detection (this bug has shipped once).
-4. **Echo is the main enemy** — RTSP backchannel delays of 3–40 s mean suppression is derived from correlation and extended to `play_end + 45 s`, never a fixed window.
+4. **Echo is the main enemy, and a correlation without a playback horizon is worse than no correlator** — suppression is derived from correlation against recent playback, and every correlation is only believed within `_ECHO_HORIZON_S` of playback actually ending. A wide sweep over a ring buffer that is never cleared will eventually claim room noise as our own voice, and then the block it opens can be extended indefinitely. (Shipped, measured, fixed — 07.10.2026.)
 5. **`network_mode: host` is mandatory** — ESP32 satellites cannot reach an unpublished bridge container (this misconfiguration already caused a total satellite outage).
 6. **Every gate threshold is room-calibrated** — wake scores, hold levels and background medians were tuned against three specific rooms; a new room needs recalibration or it will get false fires or deafness.
 
@@ -192,13 +257,13 @@ voice_gateway/
 ├── services/
 │   ├── jev-router/         # cascade L1
 │   └── smolagents-worker/  # cascade L2
-├── tests/                  # 299 tests / 15 files
+├── tests/                  # 565 tests / 19 files
 └── docs/
     └── REFERENCE.md        # full config tables, REST API, known issues, changelog
 ```
 
 - **Configuration, REST API, environment variables, known issues and the full changelog:** [`docs/REFERENCE.md`](docs/REFERENCE.md)
-- **Tests:** 299 tests across 15 files covering engine scoring and wake gates, the camera audio track and its echo guards, the ESP32 protocol, cascade streaming, honesty vetoes, HA entity matching, router resolution, dialogue memory and the Telegram source (allowlist, ack vs final text, turn timeout, voice turns, `/room`). Run them inside the container — see [`docs/REFERENCE.md`](docs/REFERENCE.md#tests), the host Python usually lacks `opuslib` / `onnxruntime`. CI (`.github/workflows/tests.yml`) runs the same recipe on every push and PR.
+- **Tests:** 565 tests across 19 files covering engine scoring and wake gates, the camera audio track and its echo guards, the ESP32 protocol, cascade streaming, honesty vetoes, HA entity matching, router resolution, dialogue memory and the Telegram source (allowlist, ack vs final text, turn timeout, voice turns, `/room`). Run them inside the container — see [`docs/REFERENCE.md`](docs/REFERENCE.md#tests), the host Python usually lacks `opuslib` / `onnxruntime`. CI (`.github/workflows/tests.yml`) runs the same recipe on every push and PR.
 
 ---
 

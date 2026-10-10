@@ -653,9 +653,8 @@ async def _confirm_on_off_moved(
     accepted; a relay that does not answer, or a device that ignores the command,
     looks identical from here.
 
-    **Read-back with a short retry**, because a relay is not instantaneous: the
-    first attempt covers the common case in well under a second and the retries
-    only cost time on a device that genuinely is not going to move.
+    **Read-back with a short retry**, because a relay is not instantaneous — but the
+    FIRST read is deliberately late, see the schedule below.
 
     **`reached` means exactly `state == target`, and nothing else.** The first
     version also accepted `before != now` "as evidence it moved", which is how a
@@ -673,7 +672,25 @@ async def _confirm_on_off_moved(
     """
     target = "on" if want_on else "off"
     moved: list[str] = []
-    for delay in (0.0, 0.25, 0.5):
+    # **The first read is at 1.0 s, not 0.** Measured 10.10.2026 on
+    # `switch.coffemaker` (the user's permission to toggle it taken explicitly):
+    #
+    #     t=+0.01  switch=on     power=1072 W
+    #     t=+0.26  switch=off    power=1072 W     <- HA already wrote the state
+    #     t=+0.77  switch=off    power=0 W        <- the physics agrees
+    #
+    # Home Assistant writes the entity state OPTIMISTICALLY on `switch.turn_on/off`
+    # and `/api/states` serves that value until the integration's next poll. A
+    # read-back at 0 / 0.25 / 0.5 s is therefore reading the value HA itself just
+    # wrote, and concluding the device moved. The old schedule could not prove
+    # anything; it was believed, which is worse than having no check at all.
+    #
+    # 1.0 s is this device's number, not a constant: it is the point at which state
+    # and physics had converged in the measurement above. An integration that
+    # settles slower needs longer, and this does not claim otherwise — the honest
+    # consequence of a read that is still unconfirmed at 2.5 s is a REFUSAL, which
+    # is the safe direction.
+    for delay in (1.0, 1.5, 2.5):
         if delay:
             await asyncio.sleep(delay)
         fresh = await ha.get_states(force=True)

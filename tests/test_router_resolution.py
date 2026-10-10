@@ -1846,3 +1846,68 @@ async def test_a_full_on_off_fan_out_still_speaks_plain_success():
 
     assert err is None
     assert sentence == "Включила", f"got {sentence!r}"
+
+
+# --- the first read-back must be LATE: HA writes the state before physics does ---
+#
+# Measured 10.10.2026 on `switch.coffemaker`, with the user's explicit permission
+# to toggle it:
+#
+#     t=+0.01  switch=on     power=1072 W
+#     t=+0.26  switch=off    power=1072 W     <- HA already wrote the state
+#     t=+0.77  switch=off    power=0 W        <- the physics agrees
+#
+# `switch.turn_on/off` updates the entity state OPTIMISTICALLY and `/api/states`
+# serves it until the integration's next poll. The old schedule read at 0 / 0.25 /
+# 0.5 s, i.e. entirely inside that window, so it was reading back the value HA
+# had just written and calling it a side effect.
+
+
+@pytest.mark.asyncio
+async def test_the_read_back_waits_longer_than_the_optimistic_window(monkeypatch):
+    """Asserted on the SCHEDULE, because that is the defect: a sub-second read
+    cannot outlast a state HA writes before the device acts."""
+    import inspect
+    import re
+
+    import app as jev_router_app
+
+    src = inspect.getsource(jev_router_app._confirm_on_off_moved)
+    m = re.search(r"for delay in \(([^)]*)\)", src)
+    assert m, "the retry schedule is gone; the check must stay explicit"
+    delays = [float(x) for x in m.group(1).split(",")]
+
+    assert delays[0] >= 1.0, (
+        f"the first read is at {delays[0]}s, inside the window in which HA's "
+        f"optimistic state is still being served — measured divergence is 0.5 s "
+        f"(state at +0.26 s, physics at +0.77 s)"
+    )
+    assert delays == sorted(delays), "the retries must back off, not tighten"
+    assert len(delays) >= 2, "a relay is not instantaneous; one read is not a retry"
+
+
+@pytest.mark.asyncio
+async def test_a_device_that_moves_late_is_still_accepted(monkeypatch):
+    """Moving the first read later must not turn slow relays into refusals — the
+    retry exists precisely for that."""
+    import app as jev_router_app
+
+    calls = {"n": 0}
+
+    class _HA:
+        async def get_states(self, force=False):
+            calls["n"] += 1
+            # Still off on the first read, on by the second — a relay that takes
+            # a moment, which the old schedule accepted at 0.25 s and this must
+            # keep accepting.
+            state = "off" if calls["n"] == 1 else "on"
+            return [{"entity_id": "switch.relay", "state": state}]
+
+    monkeypatch.setattr(jev_router_app, "ha", _HA())
+
+    moved, unmoved = await jev_router_app._confirm_on_off_moved(
+        ["switch.relay"], {"switch.relay": "off"}, want_on=True
+    )
+    assert moved == ["switch.relay"], (
+        f"a relay that settled on the second read was refused: {unmoved}"
+    )

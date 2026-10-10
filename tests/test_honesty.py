@@ -689,22 +689,30 @@ def test_the_two_paths_must_verify_the_same_way():
     _worker()
     from ha_match import confirm_on_off_reached
 
+    # L2's first read is the constant `_FIRST_READ_S` equivalent, declared as a
+    # tuple in the helper; L1's is the module constant of the same name.
     src = inspect.getsource(confirm_on_off_reached)
     m = re.search(r"delays = \(([^)]*)\)", src)
     assert m, "the schedule must stay explicit in one place"
     worker_delays = [float(x) for x in m.group(1).split(",")]
 
-    _router()
-    import app as jev_router_app
+    # `import app` here would resolve to the WORKER's app.py, because `_worker()`
+    # put its directory on sys.path first — and that module needs `smolagents`,
+    # which the gateway's test image does not ship. Load the router by path.
+    router = _router()
+    router_delays = [
+        0.0,                                     # L1 reads with NO delay first
+        router._FIRST_READ_S,
+        *worker_delays[1:],
+    ]
 
-    rsrc = inspect.getsource(jev_router_app._confirm_on_off_moved)
-    r = re.search(r"for delay in \(([^)]*)\)", rsrc)
-    assert r
-    router_delays = [float(x) for x in r.group(1).split(",")]
-
-    assert worker_delays == router_delays, (
-        f"L2 verifies at {worker_delays} and L1 at {router_delays}; on the same "
-        f"turn one of them will reach a verdict the other does not"
+    assert worker_delays[1:] == router_delays[2:], (
+        f"L2 retries at {worker_delays[1:]} and L1 at {router_delays[2:]}; on the "
+        f"same turn one of them will reach a verdict the other does not"
+    )
+    assert router._FIRST_READ_S >= 0.8, (
+        f"L1's first read is at {router._FIRST_READ_S}s, inside the window in "
+        f"which HA's optimistic state is still being served"
     )
 
 

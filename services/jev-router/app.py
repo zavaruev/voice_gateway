@@ -552,30 +552,32 @@ async def _execute_action(call, text_hint: str = "") -> tuple[str | None, dict |
                 # exists on the BLIND path below and was never added here: the same
                 # class of lie this file already documents for the other one.
                 if ok and not fatal:
-                    moved, unmoved = await _confirm_on_off_moved(ok, before, want_on)
-                    # The read-back result, always — a refusal is the interesting
-                    # outcome and it was previously indistinguishable from a
-                    # success in the log.
-                    logger.info(
-                        "  verify want=%s before=%s moved=%s unmoved=%s",
-                        "on" if want_on else "off", before, moved, unmoved,
-                    )
-                    if moved:
-                        if unmoved:
-                            # A PARTIAL fan-out must never speak as a whole. The
-                            # coffee maker word resolves to the power switch AND the
-                            # child lock; one of them answering must not be reported
-                            # as «Включила» for the device the user named.
-                            logger.warning(
-                                "on/off partially applied: moved=%s unmoved=%s",
-                                moved, unmoved,
-                            )
-                            return (
-                                f"Частично: {', '.join(moved)} — "
-                                f"{', '.join(unmoved)} не сработали.",
-                                None,
-                            )
+                    # **TWO-PART ANSWER, by the user's decision 10.10.2026.**
+                    # Measured that day: HA served `off` for five seconds while the
+                    # appliance was already on (the user saw the indicator lit), so
+                    # a single sentence is either a lie or a five-second silence.
+                    # Speaking «Включаю.» at once and confirming afterwards is the
+                    # only shape that is honest AND fast.
+                    #
+                    # The first read is at `_FIRST_READ_S` (0.8 s, measured) rather
+                    # than the whole settle, so the common case still answers in one
+                    # short utterance — «Включила» — and only the genuinely unsettled
+                    # case pays for the two-part form.
+                    ack = "Включаю." if want_on else "Выключаю."
+                    moved, _ = await confirm_on_off_one_read(ok, "on" if want_on else "off")
+                    if moved and not [e for e in ok if e not in moved]:
+                        logger.info(
+                            "  verify want=%s before=%s moved=%s settled=%s",
+                            "on" if want_on else "off", before, moved,
+                            "on first read",
+                        )
                         return call.speak_ok, None
+                    logger.info(
+                        "  verify want=%s before=%s first read moved=%s — speaking "
+                        "the acknowledgement and confirming after the settle",
+                        "on" if want_on else "off", before, moved,
+                    )
+                    return ack, None, _PendingVerify(ok, before, want_on, moved)
                     # Nothing moved. Claiming it did is worse than an honest refusal, so
                     # this escalates with the real blocker instead of speaking a success the
                     # user can plainly see is false.
@@ -642,6 +644,45 @@ async def _execute_action(call, text_hint: str = "") -> tuple[str | None, dict |
     return None, res
 
 
+def _on_off_verdict(moved: list[str], unmoved: list[str]) -> str:
+    """What to say AFTER the acknowledgement. Empty means say nothing further —
+    which is the right answer in the common case, where the device did what was
+    asked and a second «Включила» would be noise."""
+    if moved and not unmoved:
+        return ""
+    if moved and unmoved:
+        return (
+            f"Частично получилось: {', '.join(moved)} — "
+            f"{', '.join(unmoved)} не сработали."
+        )
+    return "Не получилось: устройство не переключилось."
+
+
+class _PendingVerify:
+    """Carried out of `_execute_action` so the caller can speak the
+    acknowledgement first and confirm after the remaining retries.
+
+    A plain tuple would do, and this is a tuple: it exists to make the contract
+    readable at the call site, because the failure mode being fixed is a verdict
+    with no audible counterpart and a three-field return is easy to misread.
+    """
+
+    __slots__ = ("ids", "before", "want_on", "moved")
+
+    def __init__(self, ids, before, want_on, moved):
+        self.ids, self.before, self.want_on, self.moved = ids, before, want_on, moved
+
+    async def settle(self) -> tuple[list[str], list[str]]:
+        target = "on" if self.want_on else "off"
+        moved = await _settle_on_off(self.ids, target, list(self.moved), (1.5, 2.5))
+        unmoved = [e for e in self.ids if e not in moved]
+        logger.info(
+            "  verify settled want=%s moved=%s unmoved=%s",
+            target, moved, unmoved,
+        )
+        return moved, unmoved
+
+
 async def _confirm_on_off_moved(
     ids: list[str], before: dict[str, str], want_on: bool
 ) -> tuple[list[str], list[str]]:
@@ -671,44 +712,61 @@ async def _confirm_on_off_moved(
     reached — there is nothing there that could have moved.
     """
     target = "on" if want_on else "off"
-    moved: list[str] = []
-    # **The first read is at 1.0 s, not 0.** Measured 10.10.2026 on
-    # `switch.coffemaker` (the user's permission to toggle it taken explicitly):
-    #
-    #     t=+0.01  switch=on     power=1072 W
-    #     t=+0.26  switch=off    power=1072 W     <- HA already wrote the state
-    #     t=+0.77  switch=off    power=0 W        <- the physics agrees
-    #
-    # Home Assistant writes the entity state OPTIMISTICALLY on `switch.turn_on/off`
-    # and `/api/states` serves that value until the integration's next poll. A
-    # read-back at 0 / 0.25 / 0.5 s is therefore reading the value HA itself just
-    # wrote, and concluding the device moved. The old schedule could not prove
-    # anything; it was believed, which is worse than having no check at all.
-    #
-    # 1.0 s is this device's number, not a constant: it is the point at which state
-    # and physics had converged in the measurement above. An integration that
-    # settles slower needs longer, and this does not claim otherwise — the honest
-    # consequence of a read that is still unconfirmed at 2.5 s is a REFUSAL, which
-    # is the safe direction.
-    for delay in (1.0, 1.5, 2.5):
-        if delay:
-            await asyncio.sleep(delay)
-        fresh = await ha.get_states(force=True)
-        by_id = {x.get("entity_id"): x for x in (fresh or [])}
-        if not by_id:
-            continue
-        for eid in ids:
-            if eid in moved:
-                continue
-            ent = by_id.get(eid)
-            if not ent:
-                continue          # not in the registry: nothing to have moved
-            st = str(ent.get("state", "")).lower()
-            if st == target:
+    moved, _ = await confirm_on_off_one_read(ids, target)
+    moved = await _settle_on_off(ids, target, moved, (1.5, 2.5))
+    return moved, [e for e in ids if e not in moved]
+
+
+# How long to wait before the FIRST read-back.
+#
+# Measured 10.10.2026 on `switch.coffemaker`, with the user's explicit permission
+# to toggle it: `switch` state `off` at t=+0.26 s while `sensor.coffemaker_power`
+# still read 1072 W, and 0 W by t=+0.77 s. Home Assistant writes the entity state
+# OPTIMISTICALLY on `turn_on/off` and `/api/states` serves it until the next poll,
+# so a read before ~0.8 s is reading the value HA itself just wrote.
+#
+# 0.8 s is this device's number, not a constant. It is a compromise with a
+# measured cost on each side, and both sides were chosen rather than guessed:
+#   - shorter and the common case reads HA's own optimistic write, so a device
+#     that did NOT move is reported as having moved — the worse error;
+#   - longer and every on/off turn pays silence before it answers.
+_FIRST_READ_S = 0.8
+
+
+async def confirm_on_off_one_read(
+    ids: list[str], target: str, delay: float = _FIRST_READ_S,
+) -> tuple[list[str], None]:
+    """ONE read-back after `delay`. Split out so the caller can speak before the
+    remaining retries — which is the whole point of the two-part answer."""
+    if delay:
+        await asyncio.sleep(delay)
+    fresh = await ha.get_states(force=True)
+    by_id = {x.get("entity_id"): x for x in (fresh or [])}
+    reached: list[str] = []
+    for eid in ids:
+        ent = by_id.get(eid)
+        if not ent:
+            continue              # not in the registry: nothing to have moved
+        if str(ent.get("state", "")).lower() == target:
+            reached.append(eid)
+    return reached, None
+
+
+async def _settle_on_off(
+    ids: list[str], target: str, moved: list[str], delays,
+) -> list[str]:
+    """The remaining retries, with gaps measured from the previous read."""
+    prev = _FIRST_READ_S
+    for delay in delays:
+        await asyncio.sleep(max(0.0, delay - prev))
+        prev = delay
+        reached, _ = await confirm_on_off_one_read(ids, target, delay=0.0)
+        for eid in reached:
+            if eid not in moved:
                 moved.append(eid)
         if moved:
             break
-    return moved, [e for e in ids if e not in moved]
+    return moved
 
 
 def _touched_a_usable_entity(res: dict, states: list[dict] | None) -> bool:
@@ -936,7 +994,13 @@ async def _handle(req: RouteRequest):
             # Resolved a second time (pure regex, no I/O): the pre-flight
             # already turned this branch off if the resolver said None.
             call = resolve_action(text, area_hint)
-            sentence, err = await _execute_action(call, text)
+            outcome = await _execute_action(call, text)
+            # Three-tuple only when the on/off path could not settle on its first
+            # read: the acknowledgement is spoken now and the verdict after the
+            # remaining retries, so an unsettled device produces a short utterance
+            # and then the truth rather than five seconds of silence.
+            pending = outcome[2] if len(outcome) > 2 else None
+            sentence, err = outcome[0], outcome[1]
             if sentence:
                 # Log what the user will actually hear. A side effect that was
                 # claimed but never performed is otherwise invisible: on
@@ -946,6 +1010,13 @@ async def _handle(req: RouteRequest):
                 logger.info("speaking: %r", sentence)
                 reply_parts.append(sentence)
                 yield _sse({"type": "sentence", "text": sentence})
+                if pending is not None:
+                    moved, unmoved = await pending.settle()
+                    verdict = _on_off_verdict(moved, unmoved)
+                    if verdict:
+                        logger.info("speaking: %r (confirmation)", verdict)
+                        reply_parts.append(verdict)
+                        yield _sse({"type": "sentence", "text": verdict})
             else:
                 # Side-effect failed (no matching entity, INVALID_AREA,
                 # offline device...) -> escalate with the concrete error

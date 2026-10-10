@@ -1561,11 +1561,15 @@ def test_the_onoff_fast_path_verifies_before_claiming_success():
     import inspect
 
     src = inspect.getsource(jev_router_app._execute_action)
-    # The success return must be behind the verification, not adjacent to it.
-    assert src.count("_confirm_on_off_moved") >= 1, (
-        "the on/off fast path still returns speak_ok on HA's `ok` alone"
+    # The fast path no longer calls `_confirm_on_off_moved`: it reads ONCE through
+    # `confirm_on_off_one_read` and hands a `_PendingVerify` to the caller, which
+    # is what makes the two-part answer possible. A grep for the old wrapper would
+    # have gone on passing while the path it guarded had moved.
+    assert "confirm_on_off_one_read" in src, (
+        "the on/off fast path no longer reads the state back at all"
     )
-    idx_call = src.index("_confirm_on_off_moved")
+    # The success return must be behind the verification, not adjacent to it.
+    idx_call = src.index("confirm_on_off_one_read")
     idx_return = src.index("return call.speak_ok, None", idx_call)
     assert idx_return > idx_call, "speak_ok is returned before the verification"
     # And there must be an unverified branch, so a still-false claim escalates
@@ -1801,51 +1805,68 @@ async def test_a_partial_on_off_fan_out_never_speaks_as_a_whole():
     named. A refusal that names what failed is recoverable; a success nobody can
     check is not."""
     mod = _router_app()
+    _on_off_verdict = mod._on_off_verdict
     mod.ha = _two_relays_stub_ha()
     mod.find_action_targets = lambda states, areas, hint, area: [
         {"entity_id": "switch.living_room_light_swith_relay", "state": "off"},
         {"entity_id": "switch.entrance_light_switch_relay", "state": "off"},
     ]
 
-    async def _only_one_moved(ids, before, want_on):
-        return [ids[0]], list(ids[1:])
+    async def _only_one_reached(ids, target, delay=0.0):
+        return [ids[0]], None
 
-    mod._confirm_on_off_moved = _only_one_moved
+    # Stub the ONE-READ helper, not `_confirm_on_off_moved`: the fast path now
+    # reads once and hands back a `_PendingVerify`. Stubbing the old wrapper tests
+    # a function the path no longer calls — which is how a test stays green for
+    # months while the thing it guarded has moved.
+    mod.confirm_on_off_one_read = _only_one_reached
 
-    sentence, err = await mod._execute_action(
+    outcome = await mod._execute_action(
         resolve_action("включи свет в гостиной", "livingroom")
     )
+    sentence, err = outcome[0], outcome[1]
 
     assert err is None, f"a partial application must not surface as an error: {err}"
     assert sentence != "Включила", (
         "the room was told the whole command succeeded while half of it did not"
     )
-    assert "не сработали" in sentence, (
-        f"the reply must name what failed, got {sentence!r}"
+    # It now answers in two parts: the acknowledgement goes out at once and the
+    # verdict follows the settle.
+    assert sentence == "Включаю."
+    assert len(outcome) > 2 and outcome[2] is not None, (
+        "a partial application must still be confirmed afterwards"
     )
+    verdict = _on_off_verdict(*await outcome[2].settle())
+    assert "не сработали" in verdict, f"the verdict must name what failed: {verdict!r}"
 
 
 @pytest.mark.asyncio
 async def test_a_full_on_off_fan_out_still_speaks_plain_success():
     """The partial case must not have broken the ordinary one."""
     mod = _router_app()
+    _on_off_verdict = mod._on_off_verdict
     mod.ha = _two_relays_stub_ha()
     mod.find_action_targets = lambda states, areas, hint, area: [
         {"entity_id": "switch.living_room_light_swith_relay", "state": "off"},
         {"entity_id": "switch.entrance_light_switch_relay", "state": "off"},
     ]
 
-    async def _all_moved(ids, before, want_on):
-        return list(ids), []
+    async def _all_reached(ids, target, delay=0.0):
+        return list(ids), None
 
-    mod._confirm_on_off_moved = _all_moved
+    mod.confirm_on_off_one_read = _all_reached
 
-    sentence, err = await mod._execute_action(
+    outcome = await mod._execute_action(
         resolve_action("включи свет в гостиной", "livingroom")
     )
+    sentence, err = outcome[0], outcome[1]
 
     assert err is None
     assert sentence == "Включила", f"got {sentence!r}"
+    assert len(outcome) == 2, (
+        "when the first read settles it, there is nothing to confirm afterwards — "
+        f"a second «Включила» would be noise, got {outcome!r}"
+    )
 
 
 # --- the first read-back must be LATE: HA writes the state before physics does ---
@@ -1872,18 +1893,29 @@ async def test_the_read_back_waits_longer_than_the_optimistic_window(monkeypatch
 
     import app as jev_router_app
 
-    src = inspect.getsource(jev_router_app._confirm_on_off_moved)
-    m = re.search(r"for delay in \(([^)]*)\)", src)
-    assert m, "the retry schedule is gone; the check must stay explicit"
-    delays = [float(x) for x in m.group(1).split(",")]
-
-    assert delays[0] >= 1.0, (
-        f"the first read is at {delays[0]}s, inside the window in which HA's "
-        f"optimistic state is still being served — measured divergence is 0.5 s "
-        f"(state at +0.26 s, physics at +0.77 s)"
+    # The first read is a named constant now, because the two-part answer needs to
+    # happen part-way through the settle rather than after it.
+    first = jev_router_app._FIRST_READ_S
+    assert first >= 0.8, (
+        f"the first read is at {first}s, inside the window in which HA's optimistic "
+        f"state is still being served — measured divergence is 0.5 s (state at "
+        f"+0.26 s, physics at +0.77 s)"
     )
-    assert delays == sorted(delays), "the retries must back off, not tighten"
-    assert len(delays) >= 2, "a relay is not instantaneous; one read is not a retry"
+
+    # And the retries must still back off, and must be explicit.
+    src = inspect.getsource(jev_router_app._settle_on_off)
+    m = re.search(r"delays\)|\(([^)]*)\)\n", src)
+    assert "max(0.0, delay - prev)" in src, (
+        "the retries must be spaced from the previous read, not from zero"
+    )
+    calls = inspect.getsource(jev_router_app._execute_action)
+    pending = inspect.getsource(jev_router_app._PendingVerify.settle)
+    assert "(1.5, 2.5)" in calls or "(1.5, 2.5)" in pending, (
+        "the settle schedule must be explicit where it is used"
+    )
+    assert "verify settled" in pending, (
+        "the settle must log its own verdict — the first read is not the verdict"
+    )
 
 
 @pytest.mark.asyncio

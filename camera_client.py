@@ -1151,6 +1151,14 @@ class CameraSession:
         self._stt_confirm_until = 0.0  # wall clock: STT-confirmation window
         self._confirm_saw_text = False  # a transcript arrived during window
         self._tts_play_end = 0.0  # approx wall clock: speaker finishes
+        # Did the last `_speak_pcm` actually put audio into the speaker?
+        #
+        # `_speak_pcm` returns `is_question` — a property of the TEXT, not of the
+        # playback — so it cannot answer that, and reading it as a success flag
+        # would have set the player's "already spoke" mark only on questions.
+        # Set inside `_speak_pcm` from its own `played` flag and read by the player
+        # to decide whether a failed sentence needs an apology.
+        self._last_play_ok = False
         self._veto_until = 0.0  # wall clock: sticky distant-veto
         self._wake_greeting_task = None
         # True while the AUTO-greeting (bare wake, no command yet) is being
@@ -4049,6 +4057,10 @@ class CameraSession:
         # turn's finally block believe it may leave the mic open forever.
         self._followup_open = False
         pending: asyncio.Task | None = None  # (sentence, pcm) for the NEXT turn
+        # Whether this turn has produced audible output yet. Guards the apology so
+        # a three-sentence reply that fails synthesis wholesale speaks once, not
+        # three times.
+        spoke_anything = False
         sent: str | None = None
         pcm: bytes | None = None
         try:
@@ -4076,6 +4088,38 @@ class CameraSession:
                 elif pcm is None:
                     pcm = await self._tts_fetch(sent)
 
+                # OUTSIDE the branch above, on purpose. This was an `elif` on
+                # `if pending is not None`, so it only ran when there was NO
+                # prefetch — but the prefetch is the common case and it is what
+                # returns `(sentence, None)` when synthesis fails. The check
+                # therefore never fired on the path it was written for: measured
+                # 10.10.2026 13:29:53, the kitchen queued two sentences, both
+                # prefetched, both unplayable, and the room said nothing at all.
+                if sent is not None and pcm is None:
+                    # A sentence that cannot be synthesised must not become
+                    # SILENCE. The backend guarantees `SORRY` when a stream ends
+                    # empty, and that guarantee is worthless if the very next stage
+                    # drops it on the floor: the user hears a room that woke for the
+                    # wake word, took the command, and then said nothing at all.
+                    # Measured 10.10.2026 13:29:53 on the kitchen — two sentences
+                    # queued, both lost here, zero `tts pcm` lines to show for it.
+                    logger.warning(
+                        f"[{self.stream_name}] TTS produced no audio for "
+                        f"{sent[:60]!r}"
+                    )
+                    if not spoke_anything:
+                        # One per turn: a three-sentence reply whose synthesis all
+                        # failed must not become three identical apologies.
+                        apol = "Простите, голос сейчас не получился."
+                        fb_pcm = await self._tts_fetch(apol)
+                        if fb_pcm:
+                            # TTS being down will usually fail here too, but the
+                            # attempt is one line and free when it succeeds — and the
+                            # case it covers is real: a single bad sentence, a rate
+                            # limit, a transient 5xx.
+                            await self._speak_pcm(fb_pcm, apol)
+                            spoke_anything = True
+
                 # Ask the queue for the following sentence BEFORE speaking this
                 # one, so its synthesis overlaps this one's playback.
                 if pending is None:
@@ -4091,6 +4135,10 @@ class CameraSession:
                         else False
                     )
                     last_q = bool(is_q)
+                    if self._last_play_ok:
+                        # Something really reached the speaker, so a later failed
+                        # sentence must not add an apology on top of it.
+                        spoke_anything = True
                     # The follow-up window opens when the reply actually
                     # FINISHES sounding, not when it was merely queued — a long
                     # reply played long past the old queue-time expiry.
@@ -4484,9 +4532,22 @@ class CameraSession:
                 timeout=aiohttp.ClientTimeout(total=60),
             ) as r:
                 if r.status != 200:
+                    # Logged because this path is SILENT, and silence here is
+                    # what the user hears. Measured 10.10.2026 13:29:53, kitchen:
+                    # the player ran twice and spoke nothing — no `tts pcm`, no
+                    # warning, no apology — because synthesis returned None here
+                    # and `if pcm else False` moved on. The room had an answer
+                    # («Кофеварка уже включена.») and never said it.
+                    logger.warning(
+                        f"[{self.stream_name}] tts HTTP {r.status} for "
+                        f"{text[:60]!r}"
+                    )
                     return None
                 mp3 = await r.read()
-        except Exception:
+        except Exception as e:
+            logger.warning(
+                f"[{self.stream_name}] tts request failed for {text[:60]!r}: {e!r}"
+            )
             return None
         try:
             seg = AudioSegment.from_file(io.BytesIO(mp3), format="mp3")
@@ -4661,11 +4722,17 @@ class CameraSession:
             # 08:50 — the reply POST timed out at 30 s and the room never spoke it.
             sent_at = time.time()
             played = False
+            # Reset first, so an exception below cannot leave the previous turn's
+            # `True` standing and suppress the apology for this one.
+            self._last_play_ok = False
 
             if self._play_audio_url:
                 # Preferred path: straight to the speaker at the right rate.
                 played = await self._play_audio_http(pcm)
                 if not played and self._out_track:
+                    # The backchannel is a real fallback when the session exists,
+                    # so this branch DID put audio somewhere.
+                    self._last_play_ok = True
                     logger.warning(
                         f"[{self.stream_name}] falling back to the go2rtc "
                         f"backchannel — expect a ~6x pitch shift"
@@ -4702,6 +4769,7 @@ class CameraSession:
                 # /play_audio returns as soon as the body is uploaded and the
                 # camera then plays it in real time, so the playback window
                 # starts AFTER the POST, not before it.
+                self._last_play_ok = True
                 self._tts_play_end = time.time() + audio_dur
                 if self._out_track:
                     self._out_track._last_play_duration = audio_dur

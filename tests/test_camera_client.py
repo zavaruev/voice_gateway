@@ -1383,6 +1383,12 @@ def _player_session():
     s._followup_window = True
     s._followup_min_peak = _FOLLOWUP_MIN_PEAK
     s._wake_detected = False
+    # Set by `_speak_pcm`, read by the player to decide whether a failed sentence
+    # needs an apology. Second time this helper has had to learn a new field, so
+    # it is asserted rather than assumed: a hand-built session missing one turns
+    # into "TTS sentence failed", which reads as a TTS fault rather than a helper
+    # fault.
+    s._last_play_ok = False
     s._dialogue_question_s = 30.0
     s._dialogue_statement_s = 10.0
     s.played = []
@@ -1461,6 +1467,9 @@ def _dialogue_session(question: bool):
     s._next_reply_is_question = question
     s._dialogue_question_s = 30.0
     s._dialogue_statement_s = 10.0
+    # Set by `_speak_pcm`, read by the player for the apology decision. Inherited
+    # from `_player_session()` — asserted there, not re-asserted here.
+    s._last_play_ok = False
     return s
 
 
@@ -3041,3 +3050,170 @@ async def test_the_ratio_is_zero_before_anything_has_played():
     """So a reader cannot confuse 'not measured yet' with 'perfectly real time'."""
     s = _make_http_session()
     assert s._play_slow_ratio == 0.0
+
+
+# --- the room had an answer and spoke NOTHING (kitchen 10.10.2026 13:29:53) ---
+#
+# Two sentences were queued and both were lost: `_tts_fetch` returned None on a
+# non-200 and on a transport error WITHOUT logging either, and the player read
+# that as `if pcm else False` and moved on. Zero `tts pcm` lines, zero warnings,
+# no apology. L2 had said «Кофеварка уже включена.» and the user heard a room
+# that woke for the wake word, took the command, and then said nothing.
+#
+# Two things must hold: a failed synthesis leaves a trace, and a turn that
+# produced no audible output at all says so.
+
+
+@pytest.mark.asyncio
+async def test_a_failed_tts_is_logged_not_swallowed(monkeypatch):
+    """Both silent `return None` paths in `_tts_fetch`, each with its reason."""
+    import camera_client as cc
+
+    class _Resp:
+        status = 503
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class _Session:
+        def post(self, *a, **kw):
+            return _Resp()
+
+    lines: list[str] = []
+
+    class _Log:
+        def warning(self, msg, *a):
+            lines.append(msg % a if a else msg)
+
+        def info(self, msg, *a):
+            lines.append(msg % a if a else msg)
+
+        def __getattr__(self, _name):
+            return self.info
+
+    s = _make_http_session()
+    s.http_session = _Session()
+
+    with patch.object(cc, "logger", _Log()):
+        pcm = await s._tts_fetch("Проверка синтеза")
+
+    assert pcm is None
+    joined = " ".join(lines)
+    assert "tts HTTP 503" in joined, (
+        f"a non-200 from the TTS endpoint was swallowed: {joined!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_turn_that_produced_no_audio_at_least_leaves_a_trace(monkeypatch):
+    """TTS completely down: the apology cannot be spoken either, because there is
+    no synthesiser left to speak it with. What must survive is the TRACE — the
+    old code returned None on a non-200 and on a transport error without a line
+    each, so this turn left nothing at all in the log."""
+    import camera_client as cc
+
+    s = _make_http_session()
+    lines: list[str] = []
+
+    class _Log:
+        def warning(self, msg, *a):
+            lines.append(msg % a if a else msg)
+
+        def info(self, msg, *a):
+            lines.append(msg % a if a else msg)
+
+        def __getattr__(self, _name):
+            return self.info
+
+    async def _fetch(text):
+        return None
+
+    async def _speak_pcm(pcm, reply=""):
+        return False
+
+    monkeypatch.setattr(s, "_tts_fetch", _fetch)
+    monkeypatch.setattr(s, "_speak_pcm", _speak_pcm)
+
+    q: asyncio.Queue = asyncio.Queue()
+    q.put_nowait("Первый ответ.")
+    q.put_nowait("Второй ответ.")
+    q.put_nowait(None)
+
+    with patch.object(cc, "logger", _Log()):
+        await asyncio.wait_for(s._nanobot_player_task(q), timeout=5.0)
+
+    joined = " ".join(lines)
+    assert joined.count("TTS produced no audio") == 2, (
+        f"each unspeakable sentence must leave a line naming it: {joined!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_turn_with_no_audible_output_speaks_one_apology(monkeypatch):
+    """The recoverable case, and the one worth covering: synthesis fails for the
+    reply's sentences but a later call succeeds, so the user gets told rather than
+    left in silence. One apology, not three."""
+    import camera_client as cc
+
+    s = _make_http_session()
+    spoken: list[str] = []
+
+    async def _fetch(text):
+        # Reply sentences fail; the apology's own synthesis succeeds.
+        return b"\x00\x01" * 48000 if "Простите" in text else None
+
+    async def _speak_pcm(pcm, reply=""):
+        spoken.append(reply)
+        s._last_play_ok = pcm is not None
+        return False
+
+    monkeypatch.setattr(s, "_tts_fetch", _fetch)
+    monkeypatch.setattr(s, "_speak_pcm", _speak_pcm)
+
+    q: asyncio.Queue = asyncio.Queue()
+    q.put_nowait("Первый ответ.")
+    q.put_nowait("Второй ответ.")
+    q.put_nowait(None)
+
+    await asyncio.wait_for(s._nanobot_player_task(q), timeout=5.0)
+
+    assert len(spoken) == 1, f"expected exactly one apology, got {spoken}"
+    assert spoken[0].startswith("Простите"), (
+        f"the fallback must be the apology, got {spoken[0]!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_silent_second_sentence_does_not_add_an_apology(monkeypatch):
+    """Once something HAS reached the speaker, a later failure is logged and
+    nothing more — otherwise a two-sentence reply ending in a 5xx speaks an
+    apology the user cannot place."""
+    import camera_client as cc
+
+    s = _make_http_session()
+    spoken: list[str] = []
+
+    async def _fetch(text):
+        return b"\x00\x01" * 48000 if "Первое" in text else None
+
+    async def _speak_pcm(pcm, reply=""):
+        spoken.append(reply)
+        s._last_play_ok = pcm is not None
+        return False
+
+    monkeypatch.setattr(s, "_tts_fetch", _fetch)
+    monkeypatch.setattr(s, "_speak_pcm", _speak_pcm)
+
+    q: asyncio.Queue = asyncio.Queue()
+    q.put_nowait("Первое предложение.")
+    q.put_nowait("Второе предложение.")
+    q.put_nowait(None)
+
+    await asyncio.wait_for(s._nanobot_player_task(q), timeout=5.0)
+
+    assert spoken == ["Первое предложение."], (
+        f"an apology was added after a sentence that had already been heard: {spoken}"
+    )

@@ -67,7 +67,9 @@ from concurrent.futures import ThreadPoolExecutor
 from ha_match import (
     MEDIA_DOMAIN,
     claimed_a_usable_entity,
+    claimed_entity_ids,
     confirm_delays,
+    confirm_on_off_reached,
     has_data,
     media_fingerprint,
     match_states,
@@ -296,6 +298,12 @@ def _http_text(url: str, payload: dict | None = None, timeout: float = config.TO
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read().decode("utf-8", errors="replace")
+
+
+def _raw_states() -> list | None:
+    """Just the state list, for `confirm_on_off_reached`."""
+    states, _areas = _raw_registry()
+    return states
 
 
 def _raw_registry() -> tuple[list | None, dict | None]:
@@ -559,6 +567,42 @@ def ha_action(tool_name: str, arguments_json: str) -> str:
                 "on/off intent claimed only areas/unavailable entities -> %s",
                 result[:120],
             )
+        else:
+            # "HA named a usable entity" is NOT "the device moved". Measured
+            # 10.10.2026 13:18, kitchen: HA answered `action_done` naming
+            # `switch.coffemaker` as a success — a real, available entity — while
+            # the appliance never switched. L1 in the SAME turn did the right thing
+            # (`verify want=on ... moved=[] unmoved=['switch.coffemaker']`) and
+            # escalated with `unverified_side_effect`; L2 was handed that blocker,
+            # called the intent again, got the same optimistic payload, and said
+            # «Кофеварка включена.»
+            #
+            # That payload also disarms the honesty veto: `_record_action` sets
+            # `ok = has_data(result)`, and an `action_done` with a non-empty
+            # `success` list counts as data — so the veto is switched off by
+            # exactly the answer it exists to overrule.
+            #
+            # L2 therefore needs the SAME read-back L1 uses, not the weaker
+            # "did HA name something" test, and the same schedule: HA writes the
+            # entity state ~0.5 s before the device acts (state at +0.26 s,
+            # `sensor.coffemaker_power` at +0.77 s), so a sub-second read reads
+            # back HA's own optimistic write. Two paths that verify differently
+            # will disagree about the same turn, which is what happened here.
+            claimed = claimed_entity_ids(result)
+            target = "on" if tool_name.endswith("TurnOn") else "off"
+            if claimed and not confirm_on_off_reached(claimed, target, _raw_states):
+                result = (
+                    "Тул вернул ошибку: Home Assistant принял вызов "
+                    f"{tool_name} и ответил «успех», но перечитывание состояния "
+                    f"через 1-2.5 с показало, что ни одно из устройств "
+                    f"({', '.join(sorted(claimed))}) не пришло в состояние "
+                    f"'{target}'. Устройство НЕ переключено. Не говори, что "
+                    f"включила или выключила: назови настоящую причину."
+                )
+                logger.warning(
+                    "on/off intent claimed success but nothing reached '%s': %s",
+                    target, ", ".join(sorted(claimed)),
+                )
     _record_action(tool_name, result)
     return result
 

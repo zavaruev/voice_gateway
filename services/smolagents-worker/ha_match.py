@@ -1013,3 +1013,60 @@ def claimed_a_usable_entity(text: str, states: list[dict] | None) -> bool:
         and live.get(eid) not in ("unavailable", "unknown", "none", "")
         for eid in ids
     )
+
+
+def claimed_entity_ids(text: str) -> list[str]:
+    """Entity ids HA named as done, from the payload shape
+    `claimed_a_usable_entity` reads."""
+    try:
+        payload = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    if not isinstance(payload, dict):
+        return []
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return []
+    claimed = data.get("success") or data.get("claimed") or []
+    return [
+        row.get("id")
+        for row in claimed
+        if isinstance(row, dict) and row.get("type") == "entity" and row.get("id")
+    ]
+
+
+def confirm_on_off_reached(entity_ids: list[str], target: str,
+                           fetch_states) -> list[str]:
+    """Which of these entities actually reached `target`, read back LATE.
+
+    `fetch_states` is a zero-argument callable returning the raw HA state list; it
+    is passed in rather than imported so this module stays pure stdlib and the
+    suite can drive the whole thing without a network — `tools.py` cannot be
+    imported at all in the gateway's test image because it needs `smolagents`.
+
+    The delay is not a fudge. Home Assistant updates a `switch` entity
+    optimistically on `turn_on`/`turn_off`, so an immediate read returns the value
+    HA itself just wrote. Measured 10.10.2026 on `switch.coffemaker`: state `off`
+    at t=+0.26 s while `sensor.coffemaker_power` still read 1072 W, and 0 W by
+    t=+0.77 s. L1 uses the same schedule for the same reason, and the two must stay
+    identical or they will disagree about the same turn.
+    """
+    import time as _time
+
+    delays = (1.0, 1.5, 2.5)
+    reached: list[str] = []
+    prev = 0.0
+    for delay in delays:
+        _time.sleep(delay - prev)
+        prev = delay
+        live = {
+            str(s.get("entity_id")): str(s.get("state", "")).lower()
+            for s in (fetch_states() or [])
+            if isinstance(s, dict)
+        }
+        for eid in entity_ids:
+            if eid not in reached and live.get(eid) == target:
+                reached.append(eid)
+        if reached:
+            break
+    return reached

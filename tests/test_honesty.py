@@ -601,3 +601,125 @@ def test_an_unparseable_result_verifies_nothing():
     states = [{"entity_id": "switch.x", "state": "on"}]
     assert claimed_a_usable_entity("Выполнено", states) is False
     assert claimed_a_usable_entity("", states) is False
+
+
+# --- L2 said «Кофеварка включена.» while L1 had already refused the same turn ---
+#
+# Kitchen 10.10.2026 13:18. L1 (the honest path) logged
+#   verify want=on before={'switch.coffemaker': 'off'} moved=[] unmoved=[...]
+# and escalated with `unverified_side_effect`. L2 was HANDED that blocker, called
+# the intent again, and got:
+#
+#   {"response_type": "action_done",
+#    "data": {"success": [{"type": "area",   "id": "kitchen"},
+#                         {"type": "entity", "id": "switch.coffemaker"}],
+#             "failed": []}}
+#
+# and said «Кофеварка включена.» The 07.10 check did not catch it because it asks
+# "did HA name a live, available entity" — and this names a real one. It never asks
+# whether it MOVED. And the payload disarms the veto: `_record_action` sets
+# `ok = has_data(result)`, and a non-empty `success` list is data.
+
+
+def _worker():
+    import os
+    import sys
+
+    _WORKER = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "services", "smolagents-worker")
+    )
+    if _WORKER not in sys.path:
+        sys.path.insert(0, _WORKER)
+
+
+def test_claimed_entity_ids_reads_the_optimistic_payload():
+    _worker()
+    import json
+
+    from ha_match import claimed_entity_ids
+
+    payload = json.dumps({
+        "speech": {}, "response_type": "action_done",
+        "data": {"success": [{"type": "area", "id": "kitchen"},
+                             {"type": "entity", "id": "switch.coffemaker"}],
+                 "failed": []},
+    })
+    assert claimed_entity_ids(payload) == ["switch.coffemaker"]
+
+
+def test_a_read_back_is_required_before_claiming_the_device_moved():
+    """The decisive one: HA names a REAL entity and it still did not move."""
+    _worker()
+    from ha_match import claimed_entity_ids, confirm_on_off_reached
+
+    payload = ('{"response_type": "action_done", "data": {"success": '
+               '[{"type": "entity", "id": "switch.coffemaker"}], "failed": []}}')
+    ids = claimed_entity_ids(payload)
+    assert ids == ["switch.coffemaker"], "the entity IS real — that is the trap"
+
+    # The appliance never switched: every read says `off` whatever was asked.
+    never_moved = [{"entity_id": "switch.coffemaker", "state": "off"}]
+    assert confirm_on_off_reached(ids, "on", lambda: never_moved) == [], (
+        "an entity that stayed off was reported as reaching 'on' — this is the "
+        "optimistic `action_done` that made L2 say «включена»"
+    )
+
+
+def test_a_device_that_really_moved_is_accepted():
+    _worker()
+    from ha_match import confirm_on_off_reached
+
+    calls = {"n": 0}
+
+    def _settles_on_second_read():
+        calls["n"] += 1
+        state = "off" if calls["n"] == 1 else "on"
+        return [{"entity_id": "switch.relay", "state": state}]
+
+    assert confirm_on_off_reached(["switch.relay"], "on", _settles_on_second_read) \
+        == ["switch.relay"], "a real move on the second read was refused"
+
+
+def test_the_two_paths_must_verify_the_same_way():
+    """L1 and L2 run the same check on the same turn; if their schedules drift
+    they will disagree, and the disagreement is spoken."""
+    import inspect
+    import re
+
+    _worker()
+    from ha_match import confirm_on_off_reached
+
+    src = inspect.getsource(confirm_on_off_reached)
+    m = re.search(r"delays = \(([^)]*)\)", src)
+    assert m, "the schedule must stay explicit in one place"
+    worker_delays = [float(x) for x in m.group(1).split(",")]
+
+    _router()
+    import app as jev_router_app
+
+    rsrc = inspect.getsource(jev_router_app._confirm_on_off_moved)
+    r = re.search(r"for delay in \(([^)]*)\)", rsrc)
+    assert r
+    router_delays = [float(x) for x in r.group(1).split(",")]
+
+    assert worker_delays == router_delays, (
+        f"L2 verifies at {worker_delays} and L1 at {router_delays}; on the same "
+        f"turn one of them will reach a verdict the other does not"
+    )
+
+
+def _router():
+    """Load jev-router/app.py under its own name, the way test_router_resolution
+    does — `app` belongs to FastAPI in test_main.py, and importing the wrong one
+    silently tests nothing."""
+    import importlib.util
+    import os
+
+    path = os.path.join(
+        os.path.dirname(__file__), "..", "services", "jev-router", "app.py"
+    )
+    spec = importlib.util.spec_from_file_location("jev_router_app", path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.path.insert(0, os.path.dirname(os.path.abspath(path)))
+    spec.loader.exec_module(mod)
+    return mod

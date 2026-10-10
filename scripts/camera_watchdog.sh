@@ -224,6 +224,44 @@ reregister() {
 # clock every 20 s and logs `AUDIO STARVED: NN% of real time` below its threshold —
 # the correct instrument, already in production, with the room name in the line.
 # Read it from there rather than taking a second measurement.
+# Room level history, written HERE on the host because the gateway's own log does
+# not survive `docker compose up --build` — which is exactly how the kitchen's
+# 10.10.2026 morning went unexplained: the level tripled at 09:10 with everyone
+# asleep, every physical sensor in HA was `unavailable`, and the log that held the
+# only instrument was destroyed by the redeploy I did at 11:29. A record that dies
+# with the process that made it cannot answer "what happened at 09:10".
+#
+# It is a RECORD, not a gate. Nothing here decides anything, because the threshold
+# is precisely what is unknown: that level was 451-541 rms for hours and 1869 for
+# an hour, it resolved on its own, and it cost no false wakes. Inventing a limit
+# now would be the same guess that the notes warn about. The history is what makes
+# a limit derivable next time.
+record_room_level() {
+  local since="${1:-210}" stats
+  stats="$(docker logs voice_gateway --since "${since}s" 2>&1 | python3 -c '
+import re, sys
+from collections import defaultdict
+
+rows = defaultdict(list)
+for line in sys.stdin:
+    m = re.search(r"\[(\w+)\] feed rms=(\d+) peak=(\d+)", line)
+    if m:
+        rows[m.group(1)].append((int(m.group(2)), int(m.group(3))))
+if not rows:
+    sys.exit(0)
+for room, vals in sorted(rows.items()):
+    vals.sort()
+    rms = sorted(v for v, _ in vals)
+    peaks = [p for _, p in vals]
+    mid = rms[len(rms) // 2]
+    print("    %-11s rms med=%-5d max=%-5d  peak max=%-6d n=%d"
+          % (room, mid, rms[-1], max(peaks), len(vals)))
+' 2>/dev/null)"
+  [ -n "$stats" ] || return 0
+  log "room level (${since}s window):"
+  printf '%s\n' "$stats" | while IFS= read -r line; do log "$line"; done
+}
+
 audio_starved_hits() {
   local since="${1:-$STARVE_WINDOW_S}" lines
   lines="$(docker logs voice_gateway --since "${since}s" 2>&1 \
@@ -339,6 +377,9 @@ for entry in $CAMERAS; do
       ;;
   esac
 done
+# Recorded on every pass, healthy or not, so a level that changes while everything
+# looks fine still leaves a trace somewhere that outlives the gateway container.
+record_room_level
 [ -n "$SICK" ] || exit 0
 
 # --- confirm before acting ---------------------------------------------------

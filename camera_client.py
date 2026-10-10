@@ -1245,6 +1245,12 @@ class CameraSession:
         self._tts_total = 0  # monotonic samples written
         self._echo_corr_threshold = 0.4
         self._last_echo_log = 0.0
+        # Wall-clock seconds per second of audio the camera actually played, from
+        # the last successful /play_audio call. 1.0 is real time; measured healthy
+        # 0.06-0.11 s per 1 s of audio, and a wedged majestic 3-17x. Initialised
+        # here so a read before the first reply is 0.0 ("nothing measured yet")
+        # rather than an AttributeError.
+        self._play_slow_ratio = 0.0
 
         self._bg_window: list[int] = []
         self._resample_buf = bytearray()
@@ -4545,6 +4551,13 @@ class CameraSession:
         """
         if not self._play_audio_url:
             return False
+        # Local on purpose. `_speak_pcm` keeps its own `sent_at` for the playback
+        # guards, but that is a DIFFERENT frame: reusing the name here without
+        # assigning it is exactly the NameError that silenced Whisper for two hours
+        # on 07.10.2026, so the timer is taken here and `test_play_audio_logs_a_ratio
+        # _on_success` drives the real function so an unbound name fails a test
+        # instead of a live camera.
+        sent_at = time.time()
         headers = dict(self._play_audio_headers)
         headers["Content-Type"] = f"application/octet-stream;rate={TTS_PLAY_RATE}"
         try:
@@ -4567,6 +4580,33 @@ class CameraSession:
                     90.0, max(20.0, 8.0 * (len(pcm) / (TTS_PLAY_RATE * 2))))),
             ) as r:
                 if r.status == 200:
+                    # TIMED ON SUCCESS — the instrument this path did not have.
+                    # Measured 08.10.2026: 1 s of audio answered in 0.060 s on the
+                    # living room and 0.106 s on the kitchen, while a wedged
+                    # `majestic` took 3-17x the audio length for the same 200. A
+                    # response time several times the audio length is the only
+                    # non-invasive evidence that the camera is playing stretched,
+                    # and it is the ONLY evidence, because:
+                    #   - the microphone cannot measure it (input is saturated:
+                    #     input peaks of 20000/10000/4000 all capture as rms ~26300),
+                    #   - a "normal" answer and a 3x-slow one are indistinguishable
+                    #     by ear until it is bad enough to notice, and the report
+                    #     then arrives as «писк ненормальный» with nothing in the
+                    #     log to act on — this function was silent on success, so the
+                    #     one case that mattered produced no line at all.
+                    # Costs nothing: the POST is already made and the audio length
+                    # is already known. Read by scripts/camera_watchdog.sh as
+                    # `playback-slow`, symmetric with its `audio-starved` state —
+                    # same fault (a wedged majestic), opposite direction (output
+                    # instead of input), and the same cheap lever to clear it.
+                    took = time.time() - sent_at
+                    dur = len(pcm) / (TTS_PLAY_RATE * 2)
+                    ratio = took / dur if dur > 0 else 0.0
+                    logger.info(
+                        f"[{self.stream_name}] play_audio {dur:.2f}s audio in "
+                        f"{took:.2f}s (x{ratio:.1f})"
+                    )
+                    self._play_slow_ratio = ratio
                     return True
                 logger.warning(
                     f"[{self.stream_name}] play_audio HTTP {r.status}"

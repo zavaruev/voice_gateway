@@ -2967,3 +2967,77 @@ def test_the_wake_block_no_longer_slides_forward_on_every_echo():
         "while nothing is playing must not move the deadline"
     )
     assert "_ECHO_TAIL_S" in src, "the real tail must still apply"
+
+
+# --- /play_audio was silent on SUCCESS, so the one report that mattered had no
+# --- line behind it (kitchen, 10.10.2026: «писк после компьютер ненормальный»)
+
+
+@pytest.mark.asyncio
+async def test_play_audio_logs_a_ratio_on_success(monkeypatch):
+    """Drives the REAL function, so an unbound name in the timing path fails here
+    instead of on a live camera.
+
+    That is not hypothetical: on 07.10.2026 a per-clip budget referencing `pcm`
+    was written into `_fetch_transcription`, whose argument is `wav`. Every call
+    raised NameError, an `except: pass` swallowed it, and Whisper returned nothing
+    for two hours while the log said `Whisper empty` — the same line a silent room
+    produces. The first draft of this instrument repeated it, using `sent_at` from
+    `_speak_pcm` without assigning it here.
+    """
+    import camera_client as cc
+
+    clock = {"t": 500.0}
+
+    def _now():
+        return clock["t"]
+
+    class _Resp:
+        status = 200
+
+        async def __aenter__(self):
+            clock["t"] += 3.0        # a 3x-slow camera, i.e. the fault
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class _Session:
+        def post(self, *a, **kw):
+            return _Resp()
+
+    lines: list[str] = []
+
+    class _Log:
+        def info(self, msg, *a):
+            lines.append(msg % a if a else msg)
+
+        def warning(self, msg, *a):
+            lines.append(msg % a if a else msg)
+
+        def __getattr__(self, _name):
+            return self.info
+
+    s = _make_http_session()
+    s.http_session = _Session()
+    s._play_audio_url = "http://10.0.0.9/play_audio"
+    s._play_audio_headers = {}
+
+    with monkeypatch.context() as m, patch.object(cc, "logger", _Log()):
+        m.setattr(cc.time, "time", _now)
+        ok = await s._play_audio_http(b"\x00\x01" * 48000)   # 1 s at 48 kHz
+
+    assert ok is True
+    joined = " ".join(lines)
+    assert "play_audio 1.00s audio in 3.00s (x3.0)" in joined, (
+        f"a successful /play_audio logged nothing about how long it took: "
+        f"{joined!r}"
+    )
+    assert abs(s._play_slow_ratio - 3.0) < 0.01
+
+
+@pytest.mark.asyncio
+async def test_the_ratio_is_zero_before_anything_has_played():
+    """So a reader cannot confuse 'not measured yet' with 'perfectly real time'."""
+    s = _make_http_session()
+    assert s._play_slow_ratio == 0.0

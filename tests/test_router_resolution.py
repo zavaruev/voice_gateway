@@ -1750,3 +1750,99 @@ def test_the_relative_volume_case_still_drops_the_room():
     assert "area" not in call.args, (
         f"«громче» must not inherit the room as a player claim: {call.args}"
     )
+
+
+# --- the on/off happy path was silent, so a false «Включила» was unauditable ---
+#
+# Kitchen 10.10.2026 11:51: «включи кофеварку» -> route=easy_action conf=0.92 ->
+# `speaking: 'Включила'` in 0.32 s, and that was ALL the router logged. HA's own
+# history showed `switch.coffemaker` still `off` for the whole window (the next
+# change was at 11:54:20, by hand), and `switch.coffemaker_child_lock` never moved
+# either. The word «кофеварка» resolves to BOTH, so a partial fan-out was speaking
+# as a whole.
+#
+# Three changes, all about being able to tell afterwards what happened: the target
+# list with its states, every per-call answer, and the read-back verdict including
+# the entities that did NOT reach the target. A verdict that cannot be audited is
+# the same class of problem as a verdict that is wrong.
+
+
+# --- a partial on/off fan-out must never speak as a whole --------------------
+#
+# Kitchen 10.10.2026 11:51: «включи кофеварку» -> `speaking: 'Включила'` in
+# 0.32 s, and that was ALL the router logged. HA's history showed
+# `switch.coffemaker` still `off` for the whole window — the next change was
+# 11:54:20, by hand — so the turn claimed a side effect that never happened, and
+# nothing in the log recorded the targets, the per-call answers or the read-back.
+#
+# Two separate fixes are pinned here: the trace, and the refusal to speak for a
+# partial fan-out. The partial case needs two entities that are NOT facets of each
+# other — `dedupe_device_facets` drops `switch.coffemaker_child_lock` as a facet of
+# `switch.coffemaker` (verified live), so the coffee maker alone cannot produce it.
+# Two light relays can.
+
+
+def _two_relays_stub_ha():
+    return _DeadHA(
+        states=[
+            {"entity_id": "switch.living_room_light_swith_relay", "state": "off",
+             "attributes": {"friendly_name": "living_room_light_swith Relay"}},
+            {"entity_id": "switch.entrance_light_switch_relay", "state": "off",
+             "attributes": {"friendly_name": "entrance_light_switch Relay"}},
+        ],
+        result={"ok": True, "claimed": [{"type": "entity",
+                                         "id": "switch.living_room_light_swith_relay"}]},
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_partial_on_off_fan_out_never_speaks_as_a_whole():
+    """One of two devices answering is not «Включила» for the devices the user
+    named. A refusal that names what failed is recoverable; a success nobody can
+    check is not."""
+    mod = _router_app()
+    mod.ha = _two_relays_stub_ha()
+    mod.find_action_targets = lambda states, areas, hint, area: [
+        {"entity_id": "switch.living_room_light_swith_relay", "state": "off"},
+        {"entity_id": "switch.entrance_light_switch_relay", "state": "off"},
+    ]
+
+    async def _only_one_moved(ids, before, want_on):
+        return [ids[0]], list(ids[1:])
+
+    mod._confirm_on_off_moved = _only_one_moved
+
+    sentence, err = await mod._execute_action(
+        resolve_action("включи свет в гостиной", "livingroom")
+    )
+
+    assert err is None, f"a partial application must not surface as an error: {err}"
+    assert sentence != "Включила", (
+        "the room was told the whole command succeeded while half of it did not"
+    )
+    assert "не сработали" in sentence, (
+        f"the reply must name what failed, got {sentence!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_full_on_off_fan_out_still_speaks_plain_success():
+    """The partial case must not have broken the ordinary one."""
+    mod = _router_app()
+    mod.ha = _two_relays_stub_ha()
+    mod.find_action_targets = lambda states, areas, hint, area: [
+        {"entity_id": "switch.living_room_light_swith_relay", "state": "off"},
+        {"entity_id": "switch.entrance_light_switch_relay", "state": "off"},
+    ]
+
+    async def _all_moved(ids, before, want_on):
+        return list(ids), []
+
+    mod._confirm_on_off_moved = _all_moved
+
+    sentence, err = await mod._execute_action(
+        resolve_action("включи свет в гостиной", "livingroom")
+    )
+
+    assert err is None
+    assert sentence == "Включила", f"got {sentence!r}"

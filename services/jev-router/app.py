@@ -486,6 +486,23 @@ async def _execute_action(call, text_hint: str = "") -> tuple[str | None, dict |
                 return None, {"ok": False, "error": f"too_many_targets:{len(todo)}"}
             if todo:
                 todo.sort(key=_target_rank)
+                # Logged because the happy path is otherwise silent, and on
+                # 10.10.2026 11:51 the kitchen said «Включила» for «включи
+                # кофеварку» with NOTHING in this log: no targets, no per-call
+                # answer, no read-back. HA's history showed both the power switch
+                # and the child lock still `off` for the whole window, so the turn
+                # could not be reconstructed after the fact — the artifacts simply
+                # did not exist. A verdict that cannot be audited is the same class
+                # of problem as a verdict that is wrong.
+                logger.info(
+                    "on/off %s %s: %d target(s) %s",
+                    call.tool.rsplit("__", 1)[-1],
+                    call.hint or call.args.get("area") or "",
+                    len(todo),
+                    ", ".join(
+                        f"{e['entity_id']}={e.get('state')}" for e in todo
+                    )[:400],
+                )
                 ok: list[str] = []
                 # State BEFORE the calls, so the read-back can tell a device that
                 # moved from one that merely accepted the call.
@@ -512,6 +529,10 @@ async def _execute_action(call, text_hint: str = "") -> tuple[str | None, dict |
                     args["name"] = eid
                     args["domain"] = [eid.split(".", 1)[0]]
                     res = await ha.call_tool(call.tool, args)
+                    logger.info(
+                        "  call %s -> ok=%s claimed=%s",
+                        eid, bool(res.get("ok")), res.get("claimed"),
+                    )
                     if res.get("ok"):
                         ok.append(eid)
                         continue
@@ -531,8 +552,29 @@ async def _execute_action(call, text_hint: str = "") -> tuple[str | None, dict |
                 # exists on the BLIND path below and was never added here: the same
                 # class of lie this file already documents for the other one.
                 if ok and not fatal:
-                    moved, _unmoved = await _confirm_on_off_moved(ok, before, want_on)
+                    moved, unmoved = await _confirm_on_off_moved(ok, before, want_on)
+                    # The read-back result, always — a refusal is the interesting
+                    # outcome and it was previously indistinguishable from a
+                    # success in the log.
+                    logger.info(
+                        "  verify want=%s before=%s moved=%s unmoved=%s",
+                        "on" if want_on else "off", before, moved, unmoved,
+                    )
                     if moved:
+                        if unmoved:
+                            # A PARTIAL fan-out must never speak as a whole. The
+                            # coffee maker word resolves to the power switch AND the
+                            # child lock; one of them answering must not be reported
+                            # as «Включила» for the device the user named.
+                            logger.warning(
+                                "on/off partially applied: moved=%s unmoved=%s",
+                                moved, unmoved,
+                            )
+                            return (
+                                f"Частично: {', '.join(moved)} — "
+                                f"{', '.join(unmoved)} не сработали.",
+                                None,
+                            )
                         return call.speak_ok, None
                     # Nothing moved. Claiming it did is worse than an honest refusal, so
                     # this escalates with the real blocker instead of speaking a success the

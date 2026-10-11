@@ -368,6 +368,22 @@ if not logger.handlers:
 logger.propagate = False
 
 
+# --- TTS synthesis: how many attempts, and how long between them ---------
+#
+# Measured 11.10.2026 across the `edge-tts` container's life: 25 HTTP 500 out of
+# 776 requests — 3.2%, i.e. one reply in thirty lost its text and the room spoke
+# the apology («Простите, голос сейчас не получился.») INSTEAD of the answer.
+# The upstream cause is `edge-tts`'s websocket handshake to Microsoft being
+# rejected (`WSServerHandshakeError: 403`), which its handler surfaces as a 500;
+# the next request ~0.5 s later succeeded every time it was checked.
+#
+# Two attempts, not more: the evidence supports "the next one works", and a
+# longer ladder would mean a longer silence before the apology on a TTS that is
+# genuinely down.
+_TTS_ATTEMPTS = 2
+_TTS_RETRY_S = 0.5
+
+
 class AIVoiceOutputTrack(MediaStreamTrack):
     """aiortc sendonly track that plays TTS PCM to the camera speaker.
 
@@ -4556,39 +4572,66 @@ class CameraSession:
         speaker's native rate — see TTS_PLAY_RATE). Split out of _speak so the
         player can prefetch the NEXT sentence while the current one is still
         playing — without that overlap the playback queue runs dry between
-        sentences and the speaker stutters with silence gaps."""
+        sentences and the speaker stutters with silence gaps.
+
+        **RETRIED ONCE, because the upstream fails ~3% of the time and every
+        failure costs a whole sentence.** Measured 11.10.2026 across the TTS
+        container's life: **25 HTTP 500 out of 776 requests (3.2%)** — so roughly
+        one reply in thirty lost its text, and the user heard the apology
+        instead of the answer. The cause is upstream, not ours: `edge-tts` fails
+        the websocket handshake to Microsoft with `WSServerHandshakeError: 403`
+        and its handler turns that into a 500. The NEXT request, ~0.5 s later,
+        succeeded in every case checked — which is what makes a single retry the
+        right instrument rather than a bigger change.
+
+        **A 4xx is NOT retried.** A request the service rejected on its merits
+        will be rejected identically, and retrying only delays the apology the
+        user is waiting for. Only 5xx and transport errors are worth a second
+        attempt.
+        """
         headers = {}
         if self.tts_api_key:
             headers["Authorization"] = f"Bearer {self.tts_api_key}"
-        try:
-            async with self.http_session.post(
-                self.tts_url,
-                json={
-                    "model": "tts-1",
-                    "input": text,
-                    "voice": self.tts_voice,
-                    "response_format": "mp3",
-                },
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=60),
-            ) as r:
-                if r.status != 200:
-                    # Logged because this path is SILENT, and silence here is
-                    # what the user hears. Measured 10.10.2026 13:29:53, kitchen:
-                    # the player ran twice and spoke nothing — no `tts pcm`, no
-                    # warning, no apology — because synthesis returned None here
-                    # and `if pcm else False` moved on. The room had an answer
-                    # («Кофеварка уже включена.») and never said it.
-                    logger.warning(
-                        f"[{self.stream_name}] tts HTTP {r.status} for "
-                        f"{text[:60]!r}"
-                    )
-                    return None
-                mp3 = await r.read()
-        except Exception as e:
-            logger.warning(
-                f"[{self.stream_name}] tts request failed for {text[:60]!r}: {e!r}"
-            )
+        mp3 = None
+        for attempt in range(1, _TTS_ATTEMPTS + 1):
+            if attempt > 1:
+                await asyncio.sleep(_TTS_RETRY_S)
+            try:
+                async with self.http_session.post(
+                    self.tts_url,
+                    json={
+                        "model": "tts-1",
+                        "input": text,
+                        "voice": self.tts_voice,
+                        "response_format": "mp3",
+                    },
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=60),
+                ) as r:
+                    if r.status != 200:
+                        # Logged because this path is SILENT, and silence here is
+                        # what the user hears. Measured 10.10.2026 13:29:53, kitchen:
+                        # the player ran twice and spoke nothing — no `tts pcm`, no
+                        # warning, no apology — because synthesis returned None here
+                        # and `if pcm else False` moved on. The room had an answer
+                        # («Кофеварка уже включена.») and never said it.
+                        logger.warning(
+                            f"[{self.stream_name}] tts HTTP {r.status} "
+                            f"(attempt {attempt}/{_TTS_ATTEMPTS}) for "
+                            f"{text[:60]!r}"
+                        )
+                        if 400 <= r.status < 500:
+                            return None      # rejected on its merits: retrying is pointless
+                        continue
+                    mp3 = await r.read()
+                break
+            except Exception as e:
+                logger.warning(
+                    f"[{self.stream_name}] tts request failed "
+                    f"(attempt {attempt}/{_TTS_ATTEMPTS}) for {text[:60]!r}: {e!r}"
+                )
+                continue
+        if not mp3:
             return None
         try:
             seg = AudioSegment.from_file(io.BytesIO(mp3), format="mp3")

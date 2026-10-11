@@ -3217,3 +3217,125 @@ async def test_a_silent_second_sentence_does_not_add_an_apology(monkeypatch):
     assert spoken == ["Первое предложение."], (
         f"an apology was added after a sentence that had already been heard: {spoken}"
     )
+
+
+# ---------------------------------------------------------------------------
+# edge-tts loses ~3% of sentences, and every loss costs the user the answer.
+#
+# Measured 11.10.2026 across the TTS container's life: 25 HTTP 500 out of 776
+# requests (3.2%). The kitchen turn at 10:47:10 was one of them:
+#
+#     10:47:10.059  router speaking: 'Выключила'
+#     10:47:10.627  tts HTTP 500 for 'Выключила'
+#     10:47:10.627  TTS produced no audio for 'Выключила'
+#     10:47:11.388  tts pcm ...          <- the APOLOGY, spoken instead
+#     10:47:12.938  play_audio 3.34s
+#
+# The user heard «Простите, голос сейчас не получилось.» — the apology working
+# exactly as designed over an answer that never made it. The upstream cause is
+# `edge-tts`'s websocket handshake to Microsoft being rejected with
+# `WSServerHandshakeError: 403`, which its handler turns into a 500.
+# ---------------------------------------------------------------------------
+
+
+class _SeqResp:
+    """One scripted response, with a status the tests can choose."""
+
+    def __init__(self, status, raw):
+        self.status = status
+        self._raw = raw
+
+    async def read(self):
+        return self._raw
+
+
+class _SeqPost:
+    def __init__(self, script, raw):
+        self._script = script
+        self._raw = raw
+
+    async def __aenter__(self):
+        return _SeqResp(self._script.pop(0), self._raw)
+
+    async def __aexit__(self, *_a):
+        return False
+
+
+class _SeqSession:
+    """Serves a scripted sequence of status codes and counts the attempts."""
+
+    def __init__(self, statuses, raw):
+        self._script = list(statuses)
+        self._raw = raw
+        self.calls = 0
+
+    def post(self, *_a, **_k):
+        self.calls += 1
+        return _SeqPost(self._script, self._raw)
+
+
+@pytest.mark.asyncio
+async def test_a_transient_tts_failure_is_retried_and_the_answer_is_kept():
+    """THE regression test: one 500 must not cost the user the whole sentence.
+
+    Before the retry this returned None, the player spoke the apology, and the
+    actual reply — «Выключила» — was never heard. That is the turn the user
+    reported as «голос не получился».
+    """
+    raw = _raw_with_peak(MEASURED_PEAK)
+    s = _tts_session(0)
+    sess = _SeqSession([500, 200], raw)     # fails once, then works
+    s.http_session = sess
+    with patch("camera_client.AudioSegment.from_file", return_value=_TtsFakeSeg(raw)):
+        out = await s._tts_fetch("Выключила")
+    assert sess.calls == 2, f"expected one retry, got {sess.calls} attempts"
+    assert out is not None, (
+        "a single transient 500 cost the whole sentence — the room spoke the "
+        "apology instead of the answer"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_client_error_is_not_retried():
+    """A 4xx is rejected on its merits; a second identical request is wasted
+    latency in front of the apology the user is already waiting for."""
+    raw = _raw_with_peak(MEASURED_PEAK)
+    s = _tts_session(0)
+    sess = _SeqSession([403, 200], raw)
+    s.http_session = sess
+    out = await s._tts_fetch("Выключила")
+    assert sess.calls == 1, f"a 4xx was retried {sess.calls - 1} times"
+    assert out is None
+
+
+@pytest.mark.asyncio
+async def test_a_dead_tts_still_gives_up_and_the_apology_still_gets_a_chance():
+    """The retry must not turn a dead TTS into a longer silence: it gives up
+    after the bounded number of attempts and returns None, which is what the
+    apology branch keys on."""
+    raw = _raw_with_peak(MEASURED_PEAK)
+    s = _tts_session(0)
+    sess = _SeqSession([500, 500], raw)
+    s.http_session = sess
+    with patch("camera_client.AudioSegment.from_file", return_value=_TtsFakeSeg(raw)):
+        out = await s._tts_fetch("Выключила")
+    assert sess.calls == 2, (
+        f"gave up after {sess.calls} attempts; the ladder must stay bounded or "
+        "a dead TTS means an unbounded silence"
+    )
+    assert out is None
+
+
+def test_the_retry_budget_is_named_and_bounded():
+    """`2` and `0.5` are the measurement, and they must be visible as constants
+    rather than as literals buried in a loop — a third attempt would triple the
+    wait before an apology on the evidence of nothing."""
+    import camera_client
+
+    assert camera_client._TTS_ATTEMPTS == 2, (
+        "the evidence supports 'the next request works', not a longer ladder"
+    )
+    assert 0 < camera_client._TTS_RETRY_S <= 1.0, (
+        "the retry must land inside the window in which the upstream recovered "
+        "(~0.5 s measured), or it is not buying anything"
+    )

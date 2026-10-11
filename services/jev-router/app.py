@@ -563,19 +563,28 @@ async def _execute_action(call, text_hint: str = "") -> tuple[str | None, dict |
                     # than the whole settle, so the common case still answers in one
                     # short utterance — «Включила» — and only the genuinely unsettled
                     # case pays for the two-part form.
+                    #
+                    # **PROVED devices only.** `confirm_on_off_one_read` returns
+                    # two lists and the difference is the whole fix: entities with a
+                    # power sensor are proved by what the appliance draws, entities
+                    # without one cannot be proved at all and come back as `unproven`.
+                    # A one-word answer needs the first list alone — speaking
+                    # «Включила» on an unproven read is precisely the echo measured
+                    # on `switch.coffemaker` at 16:03:55 on 16.10.2026.
                     ack = "Включаю." if want_on else "Выключаю."
-                    moved, _ = await confirm_on_off_one_read(ok, "on" if want_on else "off")
+                    target = "on" if want_on else "off"
+                    moved, unproven = await confirm_on_off_one_read(ok, target)
                     if moved and not [e for e in ok if e not in moved]:
                         logger.info(
-                            "  verify want=%s before=%s moved=%s settled=%s",
-                            "on" if want_on else "off", before, moved,
-                            "on first read",
+                            "  verify want=%s before=%s moved=%s — proved by the "
+                            "power sensor on the first read",
+                            target, before, moved,
                         )
                         return call.speak_ok, None
                     logger.info(
-                        "  verify want=%s before=%s first read moved=%s — speaking "
-                        "the acknowledgement and confirming after the settle",
-                        "on" if want_on else "off", before, moved,
+                        "  verify want=%s before=%s first read moved=%s unproven=%s — "
+                        "speaking the acknowledgement and confirming after the settle",
+                        target, before, moved, unproven or [],
                     )
                     return ack, None, _PendingVerify(ok, before, want_on, moved)
                     # Nothing moved. Claiming it did is worse than an honest refusal, so
@@ -644,10 +653,27 @@ async def _execute_action(call, text_hint: str = "") -> tuple[str | None, dict |
     return None, res
 
 
-def _on_off_verdict(moved: list[str], unmoved: list[str]) -> str:
+def _on_off_verdict(
+    moved: list[str], unmoved: list[str], unproven: list[str] | None = None,
+) -> str:
     """What to say AFTER the acknowledgement. Empty means say nothing further —
     which is the right answer in the common case, where the device did what was
-    asked and a second «Включила» would be noise."""
+    asked and a second «Включила» would be noise.
+
+    **`unproven` is a third outcome, not a flavour of failure.** It means there
+    was no instrument able to see whether the device moved, so the room cannot
+    honestly say either way. Saying «Не получилось» there would invent a failure,
+    and saying nothing would imply success — both are claims it cannot support.
+    Measured 16.10.2026: HA answers `switch.turn_on` in ~20 ms and the appliance
+    acted 2 min 56 s later, so «не получилось» at 2.5 s would have been a lie in
+    the other direction.
+    """
+    unproven = unproven or []
+    if unproven and not unmoved:
+        # No verdict either way, and saying so is the honest answer: the
+        # appliance may well start in a minute (measured 2 min 56 s on 16.10),
+        # and «не получилось» would be a failure invented by a 2.5 s window.
+        return "Пока не подтвердилось."
     if moved and not unmoved:
         return ""
     if moved and unmoved:
@@ -672,15 +698,20 @@ class _PendingVerify:
     def __init__(self, ids, before, want_on, moved):
         self.ids, self.before, self.want_on, self.moved = ids, before, want_on, moved
 
-    async def settle(self) -> tuple[list[str], list[str]]:
+    async def settle(self) -> tuple[list[str], list[str], list[str]]:
         target = "on" if self.want_on else "off"
-        moved = await _settle_on_off(self.ids, target, list(self.moved), (1.5, 2.5))
-        unmoved = [e for e in self.ids if e not in moved]
-        logger.info(
-            "  verify settled want=%s moved=%s unmoved=%s",
-            target, moved, unmoved,
+        moved, unproven = await _settle_on_off(
+            self.ids, target, list(self.moved), (1.5, 2.5)
         )
-        return moved, unmoved
+        unmoved = [
+            e for e in self.ids
+            if e not in moved and e not in unproven
+        ]
+        logger.info(
+            "  verify settled want=%s moved=%s unmoved=%s unproven=%s",
+            target, moved, unmoved, unproven,
+        )
+        return moved, unmoved, unproven
 
 
 async def _confirm_on_off_moved(
@@ -713,7 +744,7 @@ async def _confirm_on_off_moved(
     """
     target = "on" if want_on else "off"
     moved, _ = await confirm_on_off_one_read(ids, target)
-    moved = await _settle_on_off(ids, target, moved, (1.5, 2.5))
+    moved, _ = await _settle_on_off(ids, target, moved, (1.5, 2.5))
     return moved, [e for e in ids if e not in moved]
 
 
@@ -733,40 +764,151 @@ async def _confirm_on_off_moved(
 _FIRST_READ_S = 0.8
 
 
+# How a device is proved to have moved, when its state cannot be trusted.
+#
+# **MEASURED 16.10.2026, twice by hand, on `switch.coffemaker`:**
+#
+#     16:16:20  switch.turn_on   -> HTTP 200 IMMEDIATELY
+#     16:19:16  the appliance actually drew current      <- 2 min 56 s later
+#     16:16:32  switch.turn_off  -> HTTP 200 IMMEDIATELY
+#     16:19:31  the current stopped                      <- 2 min 59 s later
+#
+# And the same delay explains the field case an hour earlier: the router said
+# «Включила» at 16:03:55 and «Выключила» at 16:04:07, while the appliance ran
+# 16:06:47-16:06:59 — 2 min 52 s after the room had already answered.
+#
+# HA's recorder holds NO transition at 16:03:55 or 16:04:07 either, so the value
+# the read-back saw was never a recorded state change: it was the value HA writes
+# OPTIMISTICALLY when it accepts the call. **Reading `state` back is reading our
+# own request echoed.** It returns "the target" for a device that has not moved
+# and will not move for minutes, and no retry schedule can fix that — the wrong
+# value stays the right value for as long as the device takes.
+#
+# A POWER sensor is the only instrument that cannot lie this way: it reports what
+# the appliance is drawing, not what we asked for. Measured above, it answered in
+# ~2 s after the physics, and `sensor.coffemaker_power` read 1074 W on a running
+# coffee maker against 0 W on a stopped one.
+#
+# So: where a power sensor exists, the PHYSICS decides. Where none exists, the
+# state read is all there is, and it is logged as unproven rather than believed.
+_POWER_SENSOR_SUFFIX = "_power"
+# Below this the appliance is drawing nothing measurable. 1074 W on vs 0 W off,
+# so the midpoint is not a judgement call — but it is a number, and it is named.
+_POWER_ON_W = 5.0
+
+
+def _power_sensor_for(entity_id: str, states: list[dict]) -> str | None:
+    """The power sensor paired with this switch, or None.
+
+    Matched by name (`switch.coffemaker` -> `sensor.coffemaker_power`) and only
+    when it really is a power sensor. There is no device_id on a `/api/states`
+    row, so name pairing is the instrument available; it is deliberately
+    conservative — a wrong pairing would mean believing a number about the wrong
+    appliance, which is worse than admitting there is none.
+    """
+    if not entity_id.startswith("switch."):
+        return None
+    base = entity_id.split(".", 1)[1]
+    want = "sensor." + base + _POWER_SENSOR_SUFFIX
+    for ent in states or []:
+        if ent.get("entity_id") != want:
+            continue
+        attrs = ent.get("attributes") or {}
+        if attrs.get("device_class") != "power":
+            return None       # same name, not a power reading: do not trust it
+        return want
+    return None
+
+
+def _physics_agrees(ent: dict | None, target: str) -> bool | None:
+    """Does the power sensor support the target state? None = no opinion.
+
+    None is returned whenever the number cannot be read, and the caller must
+    treat that as UNPROVEN rather than as success — the whole point of the
+    exercise. An `unavailable`/`unknown` sensor is the absence of evidence.
+    """
+    if not ent:
+        return None
+    raw = str(ent.get("state", "")).strip().lower()
+    if raw in ("unknown", "unavailable", "none", ""):
+        return None
+    try:
+        watts = float(raw)
+    except ValueError:
+        return None
+    return watts >= _POWER_ON_W if target == "on" else watts < _POWER_ON_W
+
+
 async def confirm_on_off_one_read(
     ids: list[str], target: str, delay: float = _FIRST_READ_S,
 ) -> tuple[list[str], None]:
     """ONE read-back after `delay`. Split out so the caller can speak before the
-    remaining retries — which is the whole point of the two-part answer."""
+    remaining retries — which is the whole point of the two-part answer.
+
+    **Proves devices by their power sensor where one exists** (see the note above
+    for the measurement that forced it). Entities without a paired power sensor
+    fall back to the state read, and those are returned SEPARATELY so the caller
+    can say so out loud instead of passing an echo off as a movement.
+    """
     if delay:
         await asyncio.sleep(delay)
-    fresh = await ha.get_states(force=True)
-    by_id = {x.get("entity_id"): x for x in (fresh or [])}
+    fresh = await ha.get_states(force=True) or []
+    by_id = {x.get("entity_id"): x for x in fresh}
     reached: list[str] = []
+    unproven: list[str] = []
     for eid in ids:
+        sensor_id = _power_sensor_for(eid, fresh)
+        if sensor_id:
+            if _physics_agrees(by_id.get(sensor_id), target) is True:
+                reached.append(eid)
+                continue
+            # NOT reached, and specifically NOT called a failure either.
+            #
+            # The measured lag on this appliance is 2 min 56 s, and this read is
+            # at most 2.5 s, so a sensor that has not started drawing yet is
+            # indistinguishable from a device that never will. Reporting that as
+            # «Не получилось» would be the same class of lie as the optimistic
+            # read, pointed the other way — and it is the direction a person
+            # notices, because the machine starts brewing two minutes later.
+            unproven.append(eid)
+            continue
         ent = by_id.get(eid)
         if not ent:
             continue              # not in the registry: nothing to have moved
         if str(ent.get("state", "")).lower() == target:
-            reached.append(eid)
-    return reached, None
+            unproven.append(eid)
+    return reached, (unproven or None)
 
 
 async def _settle_on_off(
     ids: list[str], target: str, moved: list[str], delays,
-) -> list[str]:
-    """The remaining retries, with gaps measured from the previous read."""
+) -> tuple[list[str], list[str]]:
+    """The remaining retries, with gaps measured from the previous read.
+
+    Returns `(moved, unproven)` — and the split is the point. An entity with no
+    power sensor can never be PROVED, so it is reported apart from the ones that
+    were: reporting it as unmoved would be a false alarm, and reporting it as
+    moved would be the echo this whole exercise exists to stop.
+    """
     prev = _FIRST_READ_S
+    unproven: list[str] = []
     for delay in delays:
         await asyncio.sleep(max(0.0, delay - prev))
         prev = delay
-        reached, _ = await confirm_on_off_one_read(ids, target, delay=0.0)
+        reached, unproved = await confirm_on_off_one_read(ids, target, delay=0.0)
         for eid in reached:
             if eid not in moved:
                 moved.append(eid)
+        unproven = list(unproved or [])
         if moved:
             break
-    return moved
+    # ONLY the entities that had no instrument are unproven. An entity whose
+    # sensor contradicted the target, or that is absent from the registry, was
+    # observed and did not comply — that is a failure, and calling it "we could
+    # not check" would be the soft direction. The `or still` that stood here
+    # relabelled every failure as unprovable, which is how a partial fan-out
+    # came out as «нечем проверить».
+    return moved, unproven
 
 
 def _touched_a_usable_entity(res: dict, states: list[dict] | None) -> bool:
@@ -1011,8 +1153,8 @@ async def _handle(req: RouteRequest):
                 reply_parts.append(sentence)
                 yield _sse({"type": "sentence", "text": sentence})
                 if pending is not None:
-                    moved, unmoved = await pending.settle()
-                    verdict = _on_off_verdict(moved, unmoved)
+                    moved, unmoved, unproven = await pending.settle()
+                    verdict = _on_off_verdict(moved, unmoved, unproven)
                     if verdict:
                         logger.info("speaking: %r (confirmation)", verdict)
                         reply_parts.append(verdict)

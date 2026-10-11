@@ -304,26 +304,67 @@ logging.getLogger("aiortc").setLevel(logging.WARNING)
 logging.getLogger("aioice").setLevel(logging.WARNING)
 logging.getLogger().setLevel(logging.INFO)
 _r = logging.getLogger()
-if not _r.handlers:
+
+# The durable host-side file, wired here as well as in `main._install_durable_log`
+# because THE TWO DO NOT MEET on their own. The camera lines — every wake,
+# every utterance, every level reading, i.e. the whole of what this file is for —
+# are written by the standard library `camera` logger with `propagate = False`,
+# so a loguru sink in `main` receives none of them. Measured 11.10.2026: with the
+# sink installed, `docker logs` showed a live audio path while the file stayed
+# frozen at its startup lines. Two logging libraries, one process, and the half
+# that matters was going nowhere.
+#
+# So the file handler is added HERE, on the standard-library side, and it is
+# shared with the root logger's own handler below so one file covers both.
+_LOG_FORMAT = "%(asctime)s.%(msecs)03d | %(levelname)-7s | %(name)s:%(lineno)d - %(message)s"
+
+
+def _durable_file_handler():
+    """A FileHandler on `GATEWAY_LOG_DIR`, or None.
+
+    Deliberately best-effort and importable from `main`: the directory is created
+    once here, and `main` only adds the loguru sink for its own records.
+    """
+    import os
+    import sys
+
+    log_dir = os.environ.get("GATEWAY_LOG_DIR", "").strip()
+    if not log_dir:
+        return None
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        path = os.path.join(log_dir, "gateway.log")
+        # Same file as loguru's sink; both open in append mode, and rotation is
+        # the sum of the two configured sizes, not a doubling.
+        h = logging.FileHandler(path, encoding="utf-8")
+        h.setLevel(logging.DEBUG)
+        h.setFormatter(logging.Formatter(_LOG_FORMAT, datefmt="%Y-%m-%d %H:%M:%S"))
+        return h
+    except Exception as e:  # a full or read-only disk must not take us down
+        sys.stderr.write(f"durable log handler unavailable ({e!r})\n")
+        return None
+
+
+_durable = _durable_file_handler()
+if _r.handlers:
+    if _durable is not None:
+        _r.addHandler(_durable)
+else:
     _rh = logging.StreamHandler()
     _rh.setLevel(logging.DEBUG)
-    _rh.setFormatter(
-        logging.Formatter(
-            "%(asctime)s.%(msecs)03d | %(levelname)-7s | %(name)s:%(lineno)d - %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-        )
-    )
+    _rh.setFormatter(logging.Formatter(_LOG_FORMAT, datefmt="%Y-%m-%d %H:%M:%S"))
     _r.addHandler(_rh)
+    if _durable is not None:
+        _r.addHandler(_durable)
 if not logger.handlers:
     _h = logging.StreamHandler()
     _h.setLevel(logging.DEBUG)
-    _h.setFormatter(
-        logging.Formatter(
-            "%(asctime)s.%(msecs)03d | %(levelname)-7s | %(name)s:%(lineno)d - %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-        )
-    )
+    _h.setFormatter(logging.Formatter(_LOG_FORMAT, datefmt="%Y-%m-%d %H:%M:%S"))
     logger.addHandler(_h)
+    if _durable is not None:
+        # Direct, not via propagation: `propagate` is off on the next line, so
+        # the root handler would otherwise never see a camera record at all.
+        logger.addHandler(_durable)
 logger.propagate = False
 
 

@@ -1605,7 +1605,16 @@ async def test_a_device_that_did_not_move_is_reported_as_moved(monkeypatch):
 @pytest.mark.asyncio
 async def test_a_relay_that_answers_on_the_second_read_counts(monkeypatch):
     """A relay is not instantaneous, which is the whole reason for the retry —
-    and a single instant read-back would have produced a false refusal."""
+    and a single instant read-back would have produced a false refusal.
+
+    **Now measured by PHYSICS rather than by `state`**, because the state read is
+    the echo (16.10.2026): the switch says `on` the moment HA accepts the call,
+    while the appliance takes minutes. Here the switch says `on` immediately and
+    the appliance only draws current on the second read — so a check that read
+    the switch would have reported success on read #1, and a check that reads
+    the wrong instrument reports it on read #2. Both must agree on the answer,
+    and only the second is honest about WHY.
+    """
     import app as jev_router_app
 
     class _HA:
@@ -1619,14 +1628,19 @@ async def test_a_relay_that_answers_on_the_second_read_counts(monkeypatch):
 
     monkeypatch.setattr(
         jev_router_app, "ha",
-        _HA([[{"entity_id": "switch.coffemaker", "state": "off"}],
-             [{"entity_id": "switch.coffemaker", "state": "on"}]]),
+        # The switch flips at once; the current arrives one read later.
+        _HA([_switch_with_power("on", 0),
+             _switch_with_power("on", 1074)]),
     )
+    monkeypatch.setattr(jev_router_app, "_FIRST_READ_S", 0)
+    monkeypatch.setattr(jev_router_app.asyncio, "sleep", _no_sleep)
 
     moved, unmoved = await jev_router_app._confirm_on_off_moved(
         ["switch.coffemaker"], {"switch.coffemaker": "off"}, want_on=True
     )
-    assert moved == ["switch.coffemaker"]
+    assert moved == ["switch.coffemaker"], (
+        "a relay that settled on the second read was refused"
+    )
     assert unmoved == []
 
 
@@ -1673,19 +1687,25 @@ async def test_a_device_that_went_the_OTHER_way_is_not_moved(monkeypatch):
 @pytest.mark.asyncio
 async def test_a_device_already_in_the_requested_state_counts_as_reached(monkeypatch):
     """The user asked for a state, not for an event — «включи свет» with the lamp
-    already on is satisfied, and the caller says so before ever reaching here."""
+    already on is satisfied, and the caller says so before ever reaching here.
+
+    With a power sensor this is settled by the appliance's own consumption, so the
+    echo cannot enter into it: the lamp is lit whether or not anyone just asked.
+    """
     import app as jev_router_app
 
     class _HA:
         async def get_states(self, force=False):
-            return [{"entity_id": "switch.entrance_light_switch_relay", "state": "on"}]
+            return _switch_with_power("on", 42)   # lit, 42 W
 
     monkeypatch.setattr(jev_router_app, "ha", _HA())
+    monkeypatch.setattr(jev_router_app, "_FIRST_READ_S", 0)
+    monkeypatch.setattr(jev_router_app.asyncio, "sleep", _no_sleep)
     moved, _ = await jev_router_app._confirm_on_off_moved(
-        ["switch.entrance_light_switch_relay"],
-        {"switch.entrance_light_switch_relay": "off"}, want_on=True,
+        ["switch.coffemaker"],
+        {"switch.coffemaker": "off"}, want_on=True,
     )
-    assert moved == ["switch.entrance_light_switch_relay"]
+    assert moved == ["switch.coffemaker"]
 
 
 # --- «сними с паузы» was PAUSING, and «пауза» had no room (06.10.2026 20:10) ---
@@ -1838,6 +1858,11 @@ async def test_a_partial_on_off_fan_out_never_speaks_as_a_whole():
     )
     verdict = _on_off_verdict(*await outcome[2].settle())
     assert "не сработали" in verdict, f"the verdict must name what failed: {verdict!r}"
+    assert "проверить нечем" not in verdict, (
+        "a relay with no power sensor is still OBSERVABLE through its own state "
+        "when a sibling sensor is absent — a partial fan-out must not be "
+        "softened into «we could not check»"
+    )
 
 
 @pytest.mark.asyncio
@@ -1929,17 +1954,271 @@ async def test_a_device_that_moves_late_is_still_accepted(monkeypatch):
     class _HA:
         async def get_states(self, force=False):
             calls["n"] += 1
-            # Still off on the first read, on by the second — a relay that takes
-            # a moment, which the old schedule accepted at 0.25 s and this must
-            # keep accepting.
-            state = "off" if calls["n"] == 1 else "on"
-            return [{"entity_id": "switch.relay", "state": state}]
+            # Nothing drawn on the first read, current on the second — a relay
+            # that takes a moment, which the old schedule accepted at 0.25 s and
+            # this must keep accepting.
+            watts = 0 if calls["n"] == 1 else 1074
+            return _switch_with_power("on", watts)
 
     monkeypatch.setattr(jev_router_app, "ha", _HA())
+    monkeypatch.setattr(jev_router_app, "_FIRST_READ_S", 0)
+    monkeypatch.setattr(jev_router_app.asyncio, "sleep", _no_sleep)
 
     moved, unmoved = await jev_router_app._confirm_on_off_moved(
-        ["switch.relay"], {"switch.relay": "off"}, want_on=True
+        ["switch.coffemaker"], {"switch.coffemaker": "off"}, want_on=True
     )
-    assert moved == ["switch.relay"], (
+    assert moved == ["switch.coffemaker"], (
         f"a relay that settled on the second read was refused: {unmoved}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The read-back read our own request back. Measured 16.10.2026 on
+# `switch.coffemaker`, twice, by hand:
+#
+#     16:16:20  switch.turn_on  -> HTTP 200 IMMEDIATELY
+#     16:19:16  the appliance actually drew current      <- 2 min 56 s later
+#     16:16:32  switch.turn_off -> HTTP 200 IMMEDIATELY
+#     16:19:31  the current stopped                      <- 2 min 59 s later
+#
+# The router said «Включила» at 16:03:55 and «Выключила» at 16:04:07 for an
+# appliance that ran 16:06:47-16:06:59. HA's recorder holds NO transition at
+# 16:03:55 at all, so the value the read-back saw was the one HA writes
+# OPTIMISTICALLY on accepting a call — our own request, echoed.
+#
+# These tests encode that: the state read must NOT be able to prove anything,
+# and the power sensor must be the thing that decides.
+# ---------------------------------------------------------------------------
+
+
+def _off_call_for(text):
+    """A call built by the REAL resolver, so `speak_ok` is the real phrase.
+
+    Hand-writing a call object here would be a stub of a thing I have not read:
+    the resolver is the authority on what a command looks like, and the whole
+    point of this test is what happens to a genuine one.
+    """
+    return resolve_action(text, "device")
+
+
+async def _no_sleep(_seconds):
+    """Collapse the read-back schedule so a verification test costs no wall time.
+
+    The delays are asserted separately, by source inspection: a test that really
+    waited would be slow, and one that stubbed the wrong sleep would be green
+    without testing anything.
+    """
+    return None
+
+
+def _switch_with_power(switch_state, watts, device_class="power"):
+    """The registry as HA serves it: a switch AND its paired power sensor.
+
+    Deliberately keeps the switch in the OPTIMISTIC value (`switch_state`) while
+    the appliance is physically elsewhere (`watts`) — that disagreement is the
+    entire situation these tests exist for.
+    """
+    return [
+        {"entity_id": "switch.coffemaker", "state": switch_state},
+        {
+            "entity_id": "sensor.coffemaker_power",
+            "state": str(watts),
+            "attributes": {"device_class": device_class, "unit_of_measurement": "W"},
+        },
+    ]
+
+
+def test_a_power_sensor_is_paired_by_name_and_only_when_it_really_is_one():
+    import app as jev_router_app
+
+    states = _switch_with_power("on", 1074)
+    assert jev_router_app._power_sensor_for("switch.coffemaker", states) == (
+        "sensor.coffemaker_power"
+    )
+    # A same-named sensor that is NOT a power sensor must not be believed: a
+    # wrong pairing means trusting a number about the wrong appliance.
+    impostor = _switch_with_power("on", 5, device_class="voltage")
+    assert jev_router_app._power_sensor_for("switch.coffemaker", impostor) is None
+    # No sensor at all is None too — not a guess.
+    assert jev_router_app._power_sensor_for("switch.coffemaker", [
+        {"entity_id": "switch.coffemaker", "state": "on"}]) is None
+    # Only switches get this treatment.
+    assert jev_router_app._power_sensor_for("sensor.coffemaker_power", states) is None
+
+
+def test_an_unreadable_power_sensor_is_no_opinion_not_success():
+    import app as jev_router_app
+
+    for bad in ("unknown", "unavailable", "", "not-a-number"):
+        assert jev_router_app._physics_agrees(
+            {"entity_id": "sensor.coffemaker_power", "state": bad}, "on"
+        ) is None, f"{bad!r} was treated as evidence"
+    assert jev_router_app._physics_agrees(None, "on") is None
+    # A real reading is an opinion.
+    assert jev_router_app._physics_agrees({"state": "1074"}, "on") is True
+    assert jev_router_app._physics_agrees({"state": "0"}, "on") is False
+    assert jev_router_app._physics_agrees({"state": "0"}, "off") is True
+    assert jev_router_app._physics_agrees({"state": "1074"}, "off") is False
+
+
+@pytest.mark.asyncio
+async def test_the_optimistic_state_alone_can_no_longer_prove_a_move(monkeypatch):
+    """THE regression test.
+
+    The switch says `on` because HA wrote it there when it accepted our call;
+    the appliance is drawing nothing. The old code read `state` and said
+    «Включила» — the exact lie measured at 16:03:55 on 16.10.2026. Proving it
+    requires the power sensor, and with one present the physics decides.
+    """
+    import app as jev_router_app
+
+    class _HA:
+        async def get_states(self, force=False):
+            return _switch_with_power("on", 0)   # optimistic `on`, appliance off
+
+    monkeypatch.setattr(jev_router_app, "ha", _HA())
+    monkeypatch.setattr(jev_router_app, "_FIRST_READ_S", 0)
+    monkeypatch.setattr(jev_router_app.asyncio, "sleep", _no_sleep)
+
+    moved, unproven = await jev_router_app.confirm_on_off_one_read(
+        ["switch.coffemaker"], "on"
+    )
+    assert moved == [], (
+        "the optimistic state was accepted as proof while the appliance drew "
+        "0 W — this is the 16.10.2026 lie"
+    )
+    assert unproven == ["switch.coffemaker"], (
+        "not yet drawing is not yet confirmed: the appliance takes 2 min 56 s "
+        "and this read is at 2.5 s, so it must not be announced as a failure"
+    )
+
+
+@pytest.mark.asyncio
+async def test_physics_confirms_a_move_the_state_could_have_faked(monkeypatch):
+    import app as jev_router_app
+
+    class _HA:
+        async def get_states(self, force=False):
+            return _switch_with_power("on", 1074)   # really drawing current
+
+    monkeypatch.setattr(jev_router_app, "ha", _HA())
+    monkeypatch.setattr(jev_router_app, "_FIRST_READ_S", 0)
+    monkeypatch.setattr(jev_router_app.asyncio, "sleep", _no_sleep)
+
+    moved, unproven = await jev_router_app.confirm_on_off_one_read(
+        ["switch.coffemaker"], "on"
+    )
+    assert moved == ["switch.coffemaker"]
+    assert unproven is None
+
+
+@pytest.mark.asyncio
+async def test_a_device_with_no_power_sensor_is_reported_unproven_not_moved(
+    monkeypatch,
+):
+    """Silence is not a movement, and it is not a failure either.
+
+    With no instrument there is no verdict — so the room must be able to SAY
+    that, instead of picking whichever of the two is less embarrassing.
+    """
+    import app as jev_router_app
+
+    class _HA:
+        async def get_states(self, force=False):
+            return [{"entity_id": "switch.entrance_light_switch_relay",
+                     "state": "on"}]
+
+    monkeypatch.setattr(jev_router_app, "ha", _HA())
+    monkeypatch.setattr(jev_router_app, "_FIRST_READ_S", 0)
+    monkeypatch.setattr(jev_router_app.asyncio, "sleep", _no_sleep)
+
+    moved, unproven = await jev_router_app.confirm_on_off_one_read(
+        ["switch.entrance_light_switch_relay"], "on"
+    )
+    assert moved == [], "an unverifiable read was reported as a movement"
+    assert unproven == ["switch.entrance_light_switch_relay"], (
+        "an unverifiable device must be reported apart from a failed one"
+    )
+
+
+def test_the_room_can_say_it_cannot_tell_either_way():
+    """Three outcomes, not two. «Не получилось» for a device we could not even
+    watch is a lie in the opposite direction, and this turn is the reason:
+    HA accepted the call in 20 ms and the appliance acted 2 min 56 s later."""
+    import app as jev_router_app
+
+    v = jev_router_app._on_off_verdict(["switch.coffemaker"], [],
+                                       unproven=["switch.relay"])
+    assert "не подтвердилось" in v, v
+    assert "Не получилось" not in v, (
+        "a device that has merely not settled yet was announced as a failure — "
+        "it started 2 min 56 s after the command, and this window is 2.5 s"
+    )
+    # Proved: silence, because «Включила» was already spoken.
+    assert jev_router_app._on_off_verdict(["switch.coffemaker"], []) == ""
+    # Proved failure: still a failure.
+    assert "Не получилось" in jev_router_app._on_off_verdict([], ["switch.coffemaker"])
+    # Partial stays partial.
+    assert "Частично" in jev_router_app._on_off_verdict(
+        ["switch.a"], ["switch.b"], unproven=["switch.c"])
+
+
+@pytest.mark.asyncio
+async def test_a_two_minute_delay_does_not_produce_a_false_success(monkeypatch):
+    """The measured field case, end to end through the fast path.
+
+    `switch` flips to the target at once (optimistic), the appliance does not
+    draw current for two minutes. The one-word answer must NOT come out.
+    """
+    import app as jev_router_app
+
+    # `friendly_name` is REQUIRED here: `find_entity` runs before the room resolver
+    # and a stub without it refuses with «Не нашла такого устройства». The real
+    # entity's name is «coffeemaker», vendor spelling and all.
+    mod = _router_app()
+    mod.ha = _DeadHA(
+        states=[
+            {"entity_id": "switch.coffemaker", "state": "on",
+             "attributes": {"friendly_name": "coffeemaker"}},
+            {"entity_id": "sensor.coffemaker_power", "state": "0",
+             "attributes": {"device_class": "power"}},
+        ],
+        result={"ok": True, "claimed": [{"type": "entity",
+                                         "id": "switch.coffemaker"}]},
+    )
+    monkeypatch.setattr(mod, "_FIRST_READ_S", 0)
+    monkeypatch.setattr(mod.asyncio, "sleep", _no_sleep)
+    mod.find_action_targets = lambda states, areas, hint, area: [
+        {"entity_id": "switch.coffemaker", "state": "off"},
+    ]
+
+    outcome = await mod._execute_action(
+        _off_call_for("включи кофеварку"), "включи кофеварку"
+    )
+    sentence = outcome[0]
+    assert sentence != "Включила", (
+        "the room claimed success on an optimistic state with the appliance off"
+    )
+    assert sentence == "Включаю.", f"got {sentence!r}"
+    assert len(outcome) > 2 and outcome[2] is not None, (
+        "an unsettled device must still be confirmed afterwards"
+    )
+
+
+def test_the_first_read_is_not_documented_as_being_safe_any_more():
+    """The 0.8 s calibration was measured on a device that answered in 0.5 s.
+
+    The comment beside it must not keep claiming that a sub-second read is past
+    the optimistic window, because it demonstrably is not: the appliance took
+    2 min 56 s. If someone reads only that comment they will trust it.
+    """
+    import inspect
+    import app as jev_router_app
+
+    src = inspect.getsource(jev_router_app.confirm_on_off_one_read)
+    assert "_power_sensor_for" in src, (
+        "the read-back no longer consults the power sensor"
+    )
+    assert "unproven" in src, (
+        "an unverifiable device must be reported apart from a failed one"
     )

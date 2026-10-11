@@ -3906,8 +3906,55 @@ async def on_shutdown():
     await stop_camera_sessions()
 
 
+def _install_durable_log() -> None:
+    """Write the log to a file the HOST keeps, not only to stderr.
+
+    **Why this exists.** `docker compose up --build` recreates the container, and
+    the container's json-file log dies with it. That is not a theoretical loss:
+    on 10.10.2026 it destroyed the gateway log holding the 09:10 kitchen level
+    window, which is why that investigation could not be closed — every
+    instrument for it was gone. It has now happened twice, and the log is the
+    only place several of the recorded diagnoses exist at all.
+
+    So the file lives on a bind-mounted host directory (`GATEWAY_LOG_DIR`, wired
+    in `docker-compose.yml`) and is written by loguru itself rather than by the
+    Docker logging driver. Rotation is bounded so it cannot fill the disk:
+    `GATEWAY_LOG_ROTATION` (default 50 MB) with `GATEWAY_LOG_RETENTION` (5).
+
+    stderr is KEPT — `docker logs` remains the convenient instrument, and the
+    watchdog already reads it. This adds a second, surviving copy; it does not
+    move the first.
+    """
+    import os
+
+    log_dir = os.environ.get("GATEWAY_LOG_DIR", "").strip()
+    if not log_dir:
+        return          # not configured: stderr only, as before
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        rotation = os.environ.get("GATEWAY_LOG_ROTATION", "50 MB")
+        retention = int(os.environ.get("GATEWAY_LOG_RETENTION", "5"))
+        logger.add(
+            os.path.join(log_dir, "gateway.log"),
+            rotation=rotation,
+            retention=retention,
+            encoding="utf-8",
+            enqueue=False,
+        )
+        # loguru uses `{}` braces, NOT printf `%s`: the printf form reaches the
+        # log verbatim, which is how a confirmation line can look like it proved
+        # something while printing nothing that it asserts.
+        logger.info(f"durable log -> {log_dir} (rotation={rotation}, retention={retention})")
+    except Exception as e:
+        # Never let logging setup take the process down: a full or read-only disk
+        # must cost us the file, not the gateway.
+        logger.warning(f"durable log unavailable ({e!r}); stderr only")
+
+
 if __name__ == "__main__":
     import uvicorn
+
+    _install_durable_log()
 
     uvicorn.run(
         app,

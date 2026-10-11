@@ -276,12 +276,52 @@ _ANCHOR_FRAC = 0.5
 
 
 
+# --- Echo guard: what counts as "the room heard itself" -------------------
+#
+# Measured 11.10.2026 14:24:34, and the reason these are two numbers and not
+# one: the user said «выключи свет в гостиной» from the corridor and a Jaccard-
+# only test (>= 0.5) matched it against a reply about the same lamp, because
+# «свет», «в» and «гостиной» are shared BY CONSTRUCTION whenever a person and
+# the assistant talk about the same object. The command was discarded and the
+# room said «Да?».
+#
+#   containment  0.75  measured real command  -> must NOT pass
+#   jaccard      0.50  measured real command  -> must NOT pass
+#   containment  0.86  a garbled echo (1 of 7 tokens lost) -> MUST pass
+#
+# Containment alone would accept «свет в гостиной» against any long reply about
+# the living room, so Jaccard is kept as the second condition.
+_ECHO_CONTAINMENT_MIN = 0.8
+_ECHO_JACCARD_MIN = 0.6
+
+
 def _echo_of_reply(norm: str, reply_norm: str) -> bool:
     """True if `norm` is the echoed TTS reply `reply_norm`.
 
     The camera speaker plays our own reply, so Whisper transcribes it
-    ~verbatim. A high token-overlap (Jaccard) means the incoming transcript
-    is the echo of what we just said, not a real user command.
+    ~verbatim. A high token-overlap means the incoming transcript is the echo
+    of what we just said, not a real user command.
+
+    **Jaccard alone DISCARDS REAL COMMANDS. Measured 11.10.2026 14:24:34:** the
+    user said «выключи свет в гостиной» from the corridor, Whisper transcribed it
+    correctly, and this function threw it away as the echo of a reply that was
+    *about the same lamp* — so the two texts shared «свет», «в» and «гостиной»
+    by construction, purely because the user and the assistant were discussing
+    the same object. The command was lost and the room said «Да?» instead.
+
+    So two conditions, not one:
+      * **containment** — how much of the TRANSCRIPT is inside the reply. A true
+        echo is our own sentence coming back, so nearly all of it is there; a
+        real command adds a word the reply never said («выключи» against a reply
+        that said «включить»). Measured case: 3 of 4 tokens = 0.75, which must
+        NOT pass.
+      * **Jaccard** — kept, but stricter. It is what stops a two-word transcript
+        like «свет в гостиной» from matching a long reply it merely shares
+        vocabulary with (0.33 there), which containment alone would accept.
+
+    The defaults are tuned so a garbled echo (one Whisper substitution out of
+    seven tokens → containment 0.86, Jaccard 0.86) is STILL an echo, while the
+    measured real command is not.
     """
     if not norm or not reply_norm:
         return False
@@ -289,7 +329,10 @@ def _echo_of_reply(norm: str, reply_norm: str) -> bool:
     b = set(reply_norm.split())
     if not a or not b:
         return False
-    return len(a & b) / len(a | b) >= 0.5
+    inter = len(a & b)
+    containment = inter / len(a)
+    jaccard = inter / len(a | b)
+    return containment >= _ECHO_CONTAINMENT_MIN and jaccard >= _ECHO_JACCARD_MIN
 
 
 logger.setLevel(logging.INFO)

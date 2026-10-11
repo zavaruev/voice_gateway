@@ -3339,3 +3339,62 @@ def test_the_retry_budget_is_named_and_bounded():
         "the retry must land inside the window in which the upstream recovered "
         "(~0.5 s measured), or it is not buying anything"
     )
+
+
+# ---------------------------------------------------------------------------
+# A REAL COMMAND WAS DISCARDED AS AN ECHO. Measured 11.10.2026 14:24:34:
+#
+#     14:24:34.401  ✅ Whisper OK: 'выключи свет в гостиной'
+#     14:24:34.402  ❌ Echo of TTS reply, ignoring: 'выключи свет в гостиной'
+#     14:24:34.937  🎯 Wake with no command — sending greeting
+#
+# The user spoke from the corridor about the LIVING ROOM lamp, so the command
+# and the previous reply shared «свет», «в» and «гостиной» by construction.
+# A Jaccard-only test read that overlap as self-echo and threw the turn away.
+# ---------------------------------------------------------------------------
+
+
+def test_a_real_command_about_the_same_object_is_not_an_echo():
+    """THE regression test, with the measured strings.
+
+    Both texts are about the same lamp — that is the whole trap. A person saying
+    «выключи свет в гостиной» and an assistant saying «не получилось включить
+    свет в гостиной» overlap on the object and differ on the ACTION.
+    """
+    from camera_client import _echo_of_reply
+
+    user = "выключи свет в гостиной"
+    for reply in (
+        "не получилось включить свет в гостиной",
+        "свет в гостиной не включился",
+        "не нашла такой свет в гостиной",
+    ):
+        assert not _echo_of_reply(user, reply), (
+            f"the genuine command was discarded as the echo of {reply!r} — the "
+            "user was talking about the same lamp, which is not the same as the "
+            "room hearing itself"
+        )
+
+
+def test_a_verbatim_echo_is_still_an_echo():
+    """The guard must survive the fix: our own sentence coming back is the case
+    it exists for, and Whisper transcribes it nearly word for word."""
+    from camera_client import _echo_of_reply
+
+    reply = "не получилось включить свет в гостиной"
+    assert _echo_of_reply(reply, reply)
+    # And with a single Whisper substitution — the garble must not buy a pass.
+    assert _echo_of_reply("не получилось включить свет в гостином", reply), (
+        "one garbled token out of seven must still read as an echo"
+    )
+
+
+def test_two_words_about_an_object_do_not_match_a_long_reply():
+    """Containment alone would accept this: «свет в гостиной» is entirely inside
+    a long reply about the living room. Jaccard is what stops it."""
+    from camera_client import _echo_of_reply
+
+    assert not _echo_of_reply(
+        "свет в гостиной",
+        "не получилось включить свет в гостиной, попробуйте ещё раз позже",
+    )

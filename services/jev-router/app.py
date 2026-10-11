@@ -537,10 +537,16 @@ async def _execute_action(call, text_hint: str = "") -> tuple[str | None, dict |
                         ok.append(eid)
                         continue
                     et = _err_text(res)
-                    if "ASSISTANT" in et:
-                        # Matched, but not exposed to the voice assistant:
-                        # not voice-controllable — must not fail the rest
-                        # (the living-room aux "Network led switch" is one).
+                    # **Case-INSENSITIVE, because HA does not spell it the way
+                    # this check was written.** Measured 11.10.2026 14:24:13: HA
+                    # answered `No matching entities are exposed to the assistant`
+                    # — lower case — so `"ASSISTANT" in et` was False, the
+                    # unexposed `switch.living_room_light_swith_network_led_switch`
+                    # was recorded as FATAL, and a turn in which the real relay
+                    # call had already succeeded (`ok=True`) was thrown away and
+                    # escalated to L2. An unexposed device is not a failure, it is
+                    # a device that was never ours to control.
+                    if "assistant" in et.lower():
                         skipped.append(eid)
                         logger.info("target not exposed to assistant: %s", eid)
                     else:

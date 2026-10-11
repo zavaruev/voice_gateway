@@ -2222,3 +2222,94 @@ def test_the_first_read_is_not_documented_as_being_safe_any_more():
     assert "unproven" in src, (
         "an unverifiable device must be reported apart from a failed one"
     )
+
+
+@pytest.mark.asyncio
+async def test_an_unexposed_entity_is_not_a_fatal_error():
+    """HA spells this in lower case; the check was upper-case.
+
+    Measured 11.10.2026 14:24:13: the real relay call returned `ok=True`, the
+    unexposed `switch.living_room_light_swith_network_led_switch` answered
+    `No matching entities are exposed to the assistant`, and `"ASSISTANT" in et`
+    was False — so a turn that had already succeeded was thrown away and
+    escalated. A device that was never exposed is not a failure.
+    """
+    mod = _router_app()
+
+    async def _ok(tool, args, rpc_id=1):
+        return {"ok": True, "result": {}}
+
+    async def _unexposed(tool, args, rpc_id=1):
+        # The shape `ha_client.call_tool` really returns on failure — and
+        # `_err_text` reads `error`/`raw` at the TOP level. A stub that parked
+        # the message under `result` made `_err_text` answer "unknown", so the
+        # branch under test was never reached: a green test asserting nothing,
+        # which is the very mistake this test exists to catch.
+        inner = {"error": (
+            "Error calling tool: No matching entities are exposed to the "
+            "assistant for this request")}
+        return {"ok": False, "error": inner["error"], "raw": inner}
+
+    calls = []
+
+    async def _call_tool(name, args, rpc_id=1):
+        calls.append(args.get("name"))
+        if "network_led" in (args.get("name") or ""):
+            return await _unexposed(name, args)
+        return await _ok(name, args)
+
+    mod.ha = type("HA", (), {
+        "get_states": staticmethod(lambda force=False: _noop_states()),
+        "get_entity_areas": staticmethod(lambda: _noop_areas()),
+        "call_tool": staticmethod(_call_tool),
+    })()
+    # `get_states` is awaited by the code under test, so the stub must be a
+    # coroutine function — a plain list here fails as a TypeError long before
+    # the branch this test is about.
+    async def _get_states(force=False):
+        return _noop_states()
+    mod.ha.get_states = _get_states
+    # The targets must report `on`, or the "already in the requested state" branch
+    # answers «В гостиной уже выключено.» and never reaches the call loop at
+    # all — which is how the first version of this test passed on the BROKEN
+    # code: green, and proving nothing about the branch it names.
+    mod.find_action_targets = lambda states, areas, hint, area: [
+        {"entity_id": "switch.living_room_light_swith_relay", "state": "on"},
+        {"entity_id": "switch.living_room_light_swith_network_led_switch",
+         "state": "on"},
+    ]
+    mod.confirm_on_off_one_read = _all_reached_ids
+
+    outcome = await mod._execute_action(
+        _off_call_for("выключи свет в гостиной"), "выключи свет в гостиной"
+    )
+    assert calls, (
+        "the call loop never ran — this test was passing for the wrong reason, "
+        "which is the exact failure it is written to catch"
+    )
+    assert "switch.living_room_light_swith_relay" in calls, (
+        "the real device was never asked to switch: %r" % (calls,)
+    )
+    assert outcome[1] is None, (
+        "an unexposed entity was treated as a fatal error and the turn was "
+        "escalated even though the real device had already been switched: %r"
+        % (outcome[1],)
+    )
+
+
+async def _noop_areas():
+    return {}
+
+
+def _noop_states():
+    return [
+        {"entity_id": "switch.living_room_light_swith_relay", "state": "on",
+         "attributes": {"friendly_name": "living_room_light_swith Relay"}},
+        {"entity_id": "switch.living_room_light_swith_network_led_switch",
+         "state": "on",
+         "attributes": {"friendly_name": "living_room_light_swith Network led switch"}},
+    ]
+
+
+async def _all_reached_ids(ids, target, delay=0.0):
+    return list(ids), None

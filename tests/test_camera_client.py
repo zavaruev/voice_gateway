@@ -727,17 +727,27 @@ def test_filter_sdp_empty():
     assert CameraSession._filter_sdp("") == ""
 
 def test_corridor_streams_cover_the_renamed_cams():
-    """The corridor-specific mic gain must survive the corridor1/corridor2 split.
+    """The corridor-specific mic gain must survive BOTH renames.
 
     go2rtc has no plain "corridor" stream any more, so the `== "corridor"`
     tests in _vad_process matched nothing and both the x5 boost and the 9000
     AGC target were dead code.
+
+    And the user renamed the rooms again on 11.10.2026 — corridor -> entrance —
+    so the CURRENT names are asserted too. **A set that only knew the old
+    spelling would drop those two rooms back to the generic 4000 target with no
+    error anywhere**, which is the same silent failure this test exists for.
     """
     assert {"corridor", "corridor1", "corridor2"} <= _CORRIDOR_STREAMS
+    assert {"entrance", "entrance1", "entrance2"} <= _CORRIDOR_STREAMS, (
+        "the corridor rooms were renamed to entrance on 11.10.2026; without "
+        "these names their mic gain silently reverts to the generic target"
+    )
 
 def test_corridor_cams_take_the_corridor_agc_target():
-    for name in ("corridor", "corridor1", "corridor2"):
-        assert name in _CORRIDOR_STREAMS
+    for name in ("corridor", "corridor1", "corridor2",
+                 "entrance", "entrance1", "entrance2"):
+        assert name in _CORRIDOR_STREAMS, f"{name} lost the corridor AGC target"
         target = (
             6500
             if name == "kitchen"

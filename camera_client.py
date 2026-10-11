@@ -60,12 +60,23 @@ from engine import LocalAudioEngine, CameraProcessor, AgentState
 
 logger = logging.getLogger("camera")
 
-# go2rtc stream names that count as "the corridor". There is NO plain
-# "corridor" entry any more — the second corridor cam split it into
-# corridor1/corridor2 (frigate/config/config.yaml) — so every `== "corridor"`
-# test below was matching nothing and the corridor-specific mic gain silently
-# stopped applying when the rename happened.
-_CORRIDOR_STREAMS = frozenset({"corridor", "corridor1", "corridor2"})
+# go2rtc stream names that count as "the corridor rooms" — these carry the
+# corridor-specific mic gain (a louder AGC target, measured on their own noise).
+#
+# **Both spellings are kept, and that is deliberate.** These are the SAME two
+# physical cameras: the user renamed corridor -> entrance on 11.10.2026 and the
+# go2rtc streams now read `entrance1`/`entrance2`. A name set that only knew the
+# old spelling would silently drop those rooms back to the generic AGC target
+# (4000 instead of 9000) with no error anywhere — the exact failure this set
+# exists to prevent, which already happened once when a plain "corridor" stream
+# was split into corridor1/corridor2.
+#
+# Note the Home Assistant entities were NOT renamed: the relays are still
+# `switch.corridor1_light_switch_relay`, so nothing here depends on them.
+_CORRIDOR_STREAMS = frozenset({
+    "corridor", "corridor1", "corridor2",     # the pre-rename names
+    "entrance", "entrance1", "entrance2",     # renamed by the user, 11.10.2026
+})
 
 # Sample rate of everything we push INTO the camera speaker (AIVoiceOutputTrack
 # -> go2rtc -> ONVIF AudioOutput backchannel).

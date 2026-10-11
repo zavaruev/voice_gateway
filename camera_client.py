@@ -2759,7 +2759,26 @@ class CameraSession:
                         f"decodes={self._vosk_wake.decodes}"
                     )
                     self._vosk_wake.reset()
-                    await self._fire_wake(reason="vosk")
+                    # **Cross-camera arbitration BEFORE anything audible.**
+                    # Measured 11.10.2026 16:19: the user said «компьютер»
+                    # between two cameras; both decoded it 0.2 s apart and
+                    # BOTH played the attention pip:
+                    #
+                    #     16:19:09.444 [entrance1]  VOSK WAKE  peak=3613
+                    #     16:19:09.454 [entrance1]  🔔 attention pip
+                    #     16:19:09.637 [livingroom] VOSK WAKE  peak=1599
+                    #     16:19:09.651 [livingroom] 🔔 attention pip
+                    #
+                    # There was NO `arbiter[wake]` line anywhere. The wake-level
+                    # arbiter lived ONLY in the openWakeWord branch (on
+                    # `_ww_consec`/`_ww_thresh`), and every room here runs vosk —
+                    # so on this path it was dead code, and `_fire_wake` claimed
+                    # ownership and beeped unconditionally. The command-level
+                    # arbiter did its job later (entrance1 ceded at 16:19:17), so
+                    # only ONE room spoke — **but two beeps is exactly what a
+                    # person hears, and "answers once" is not what they heard.**
+                    if await self._claim_wake():
+                        await self._fire_wake(reason="vosk")
                     return
 
             # openWakeWord acoustic wake detector on the live 16k feed. This is
@@ -2903,15 +2922,10 @@ class CameraSession:
                         # grace window while this coroutine holds the session
                         # VAD lock, so earlier calls would stall the whole
                         # audio pipeline.
-                        w_ok, _, _ = await _arbiter_submit(
-                            "wake", self.stream_name, self._proximity_level()
-                        )
+                        w_ok = await self._claim_wake()
                         if not w_ok:
                             # A closer camera claimed the same wake — abandon
                             # our candidacy entirely (no pip, no state change).
-                            logger.info(
-                                f"[{self.stream_name}] 🤝 wake ceded to a closer camera"
-                            )
                             self._ww_consec = 0
                         elif sc >= 0.68:
                             # Loud-confident single chunk counts as fully
@@ -3137,6 +3151,29 @@ class CameraSession:
         if now < self._wake_suppress_until:
             return f"echo_tail={self._wake_suppress_until - now:+.1f}s"
         return f"same_breath={now - self._last_wake_fired_at:.1f}s"
+
+    async def _claim_wake(self) -> bool:
+        """Settle cross-camera ownership for a wake BEFORE anything is audible.
+
+        Returns True if this room won and may beep.
+
+        **Both detectors must go through here.** The arbitration used to live in
+        the openWakeWord branch alone, which is why the vosk rooms — every room
+        in this deployment — beeped together when a word landed between two
+        cameras (measured 11.10.2026 16:19, pips 0.2 s apart, no `arbiter[wake]`
+        line at all). A guard that only one of two paths calls is not a guard.
+
+        Deliberately NOT called from `_fire_wake`: the oww detector arbitrates
+        on its SECOND qualifying chunk and keeps scoring in between, so it needs
+        the verdict before it decides whether it is debounced. Same helper, two
+        call sites, one rule.
+        """
+        w_ok, _key, _winner = await _arbiter_submit(
+            "wake", self.stream_name, self._proximity_level()
+        )
+        if not w_ok:
+            logger.info(f"[{self.stream_name}] 🤝 wake ceded to a closer camera")
+        return w_ok
 
     async def _fire_wake(self, reason: str, score: float = 1.0):
         """Enter the post-wake state and announce the wake.

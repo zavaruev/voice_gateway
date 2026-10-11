@@ -426,3 +426,73 @@ def test_the_wake_log_reports_the_peak_the_gate_actually_judged():
         f"the threshold is now logged as window=<max>/<threshold>, and the old "
         f"label invites reading it against the trigger chunk: {wake_line!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# A WAKE THAT LOSES THE CROSS-CAMERA CONTEST MUST NOT BEEP.
+#
+# Measured 11.10.2026 16:19: the user said «компьютер» between two cameras and
+# BOTH greeted:
+#
+#     16:19:09.444 [entrance1]  VOSK WAKE  peak=3613
+#     16:19:09.454 [entrance1]  🔔 attention pip
+#     16:19:09.637 [livingroom] VOSK WAKE  peak=1599
+#     16:19:09.651 [livingroom] 🔔 attention pip
+#
+# There was no `arbiter[wake]` line at all: the arbitration lived only in the
+# openWakeWord branch, and every room here runs vosk.
+#
+# NOTE ON WHY THIS WENT UNNOTICED, because it is the more useful half: the
+# helper `_feed_quiet` above patches `_arbiter_submit` to return "we won". A
+# path that never CALLS the arbiter therefore looks identical to one that calls
+# it and wins — the stub made the missing guard invisible. These tests feed the
+# chunk themselves and let the arbiter answer.
+# ---------------------------------------------------------------------------
+
+
+async def _feed_with_arbiter(session, won: bool, peak: int = 12000):
+    """Drive one vosk chunk with the arbiter answering a chosen way."""
+    with (
+        patch("camera_client._arbiter_submit",
+              new=AsyncMock(return_value=(won, (), "other" if not won else "t"))),
+        patch.object(session, "_play_attention", new=AsyncMock()),
+        patch.object(session, "_schedule_wake_greeting"),
+        patch.object(session, "_fire_wake", new=AsyncMock()) as fire,
+    ):
+        await session._vad_process(_chunk(peak))
+        await asyncio.sleep(0)
+    return fire
+
+
+@pytest.mark.asyncio
+async def test_a_wake_that_loses_the_cross_camera_contest_does_not_beep():
+    """Two cameras heard the same word; only the louder one may greet.
+
+    The pip is inside `_fire_wake`, so refusing to fire is what keeps the room
+    from answering twice — and it is the ONLY thing the user hears at that
+    moment.
+    """
+    s = _make_session()
+    s._vosk_wake = _StubVosk()
+
+    fire = await _feed_with_arbiter(s, won=False)
+
+    assert fire.await_count == 0, (
+        "this room lost the cross-camera contest and still fired: it claimed "
+        "ownership and played the attention pip, which is the double greeting "
+        "measured on 11.10.2026 16:19"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_wake_that_wins_the_cross_camera_contest_does_beep():
+    """The other direction, because a guard that only ever says "no" would
+    silence the house: winning must still fire."""
+    s = _make_session()
+    s._vosk_wake = _StubVosk()
+
+    fire = await _feed_with_arbiter(s, won=True)
+
+    assert fire.await_count == 1, (
+        "the winning room did not fire — the contest is now refusing everyone"
+    )

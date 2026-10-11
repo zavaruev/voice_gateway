@@ -2149,11 +2149,13 @@ def test_the_room_can_say_it_cannot_tell_either_way():
 
     v = jev_router_app._on_off_verdict(["switch.coffemaker"], [],
                                        unproven=["switch.relay"])
-    assert "не подтвердилось" in v, v
-    assert "Не получилось" not in v, (
-        "a device that has merely not settled yet was announced as a failure — "
-        "it started 2 min 56 s after the command, and this window is 2.5 s"
+    assert v == "", (
+        "an unwatchable device got a spoken verdict at all: measured 11.10.2026 "
+        "18:38, the living-room relay acts 2 min 56 s after the call, so any "
+        "second sentence here is a claim about a lamp that has not failed yet. "
+        "The acknowledgement «Включаю.» was already spoken and is true"
     )
+    assert "Не получилось" not in v
     # Proved: silence, because «Включила» was already spoken.
     assert jev_router_app._on_off_verdict(["switch.coffemaker"], []) == ""
     # Proved failure: still a failure.
@@ -2313,3 +2315,54 @@ def _noop_states():
 
 async def _all_reached_ids(ids, target, delay=0.0):
     return list(ids), None
+
+
+@pytest.mark.asyncio
+async def test_an_unwatchable_device_is_re_read_when_the_answer_exists(monkeypatch):
+    """The log must finally record what really happened.
+
+    Measured 11.10.2026 18:38: `HassTurnOn` at 18:38:27.968 moved the living-room
+    relay at 18:41:23 — 2 min 55 s. Every log ended at 2.5 s with the state still
+    stale, so the real outcome was invisible and the room kept saying the device
+    was unconfirmed for a lamp that was working.
+
+    `_late_verify` re-reads at the moment `state` actually carries information
+    about this command, and says so in the log. It must NOT speak: a verdict
+    three minutes later arrives after the user has moved on.
+    """
+    import app as jev_router_app
+
+    calls = []
+
+    class _HA:
+        async def get_states(self, force=False):
+            # A plain counter, not a clock: what is under test is THAT the
+            # re-read happens, and an import added for a timestamp would be one
+            # more thing that can be missing when the test runs.
+            calls.append(True)
+            return [{"entity_id": "switch.living_room_light_swith_relay",
+                     "state": "on"}]
+
+    monkeypatch.setattr(jev_router_app, "ha", _HA())
+    # The DEFAULT has to be read before it is patched: the assertion below is
+    # about the shipped value, and checking it after overwriting it with 0.01
+    # asserts against my own test fixture. (First version of this test did
+    # exactly that and failed for it.)
+    real_delay = jev_router_app._LATE_VERIFY_S
+    monkeypatch.setattr(jev_router_app, "_LATE_VERIFY_S", 0.01)
+
+    p = jev_router_app._PendingVerify(
+        ["switch.living_room_light_swith_relay"], {}, True, [],
+    )
+    p.unproven_at_settle = ["switch.living_room_light_swith_relay"]
+    await p._late_verify()
+
+    assert calls, "the late re-read never happened"
+    assert real_delay >= 120, (
+        f"the shipped re-read delay is {real_delay}s — it must be later than the "
+        "player's 120 s sentinel timeout, or it races the end of the turn"
+    )
+    assert real_delay >= 150, (
+        f"{real_delay}s does not cover the measured 2 min 56 s HA→device queue, "
+        "so the re-read would still be reading a stale state"
+    )

@@ -1026,6 +1026,20 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
   * **The backend already promised `SORRY` when a stream ends empty, and that promise was worthless one stage later.** Two guards in series where only one of them was real is the shape to look for: a guarantee is worth exactly as much as the weakest link after it.
   * **Also settled by this turn:** the coffee maker question. L1 refused it twice (`moved=[] unmoved=['switch.coffemaker']`) and L2 answered «Кофеварка включена.» then «Кофеварка уже включена.» — and the user saw the indicator lit. **So L2 was right and L1's read-back was the thing that did not see it**: HA kept serving `off` for five seconds while the appliance was already on. The verification is honest about what it observed; what it observed is not the device. That is the remaining gap, and it is not closable by reading `/api/states` sooner — the only signal that agreed with the physics was `sensor.coffemaker_power` at 1072 W, arriving 10-40 s later than a voice turn may stay silent.
 
+- **«У ТЕБЯ ПРОБЛЕМА С МЕТОДАМИ ПОДТВЕРЖДЕНИЯ» — the user was right, and the method was mine. Measured 11.10.2026 18:38.**
+  * The complaint: the living-room lamp switches perfectly, and the room says «Пока не подтвердилось.» — on **every** light command, because none of these relays has a power sensor and the physics proof I made mandatory is therefore impossible for every lamp in the house.
+  * **The measurement that settles what is actually true:**
+    ```
+    HassTurnOn  sent 18:38:27.968 -> relay physically `on`  18:41:23   (2 min 55 s)
+    HassTurnOff sent 18:38:46.345 -> relay physically `off` 18:41:42   (2 min 56 s)
+    ```
+    **HA did NOT write the state optimistically for this relay.** It sat at `off` for the full three minutes and only read `on` when the device physically acted — so here `state` is a **TRUTHFUL BUT LATE** signal, unlike the coffee maker, where the state API was optimistic (16.10, read back within 0.83 s while nothing had moved). **One rule cannot cover both**, which is the real reason a power sensor is required for a verdict and a plain relay cannot get one.
+  * **The room was RIGHT to refuse to claim success at 2.5 s. The sentence it said instead was wrong.** «Пока не подтвердилось» tells the user something is broken for a lamp that is about to work — and repeats it on every command, so it stops being information and becomes noise.
+  * **So the second sentence is now SILENCE.** «Включаю.» has already been spoken and is true; anything after it is a claim we cannot support in either direction. `_on_off_verdict` returns `""` for the unwatchable case.
+  * **And the log gets the truth back via `_late_verify` at +185 s** — detached, silent, logging only. It cannot hold the turn open (the player waits 120 s for the `None` sentinel) and it must not speak (a verdict three minutes later arrives after the user has moved on), but **every command's real outcome is now recorded**, which it was not before: each log used to end at 2.5 s with the state still stale, and that missing line is exactly why this went unmeasured for hours.
+  * `185 s` is named, not guessed: four independent samples put the queue at **2:55, 2:56, 2:56, 2:59**, so it is a property of the HA→device path rather than of any one appliance. The test asserts both that it exceeds the player's 120 s sentinel and that it clears 150 s.
+  * **A guard that cannot fail is not a guard, and a verdict that cannot be supported is not a verdict.** I replaced one unsupported claim («Включила» on an optimistic echo) with another («не подтвердилось» on a slow device) — same failure in the opposite direction, which is the tell: when a check has no instrument behind it, the right answer is usually to say less.
+
 - **BOTH CAMERAS GREETED AT ONCE: THE CROSS-CAMERA ARBITER NEVER RAN ON THE VOSK PATH, SO IT WAS DEAD CODE. Measured 11.10.2026 16:19 — this is the user's report «сказал компьютер между камер, обе приветственно пропищали».**
   ```
   16:19:09.444  [entrance1]  VOSK WAKE  peak=3613

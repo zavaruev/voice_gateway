@@ -676,10 +676,28 @@ def _on_off_verdict(
     """
     unproven = unproven or []
     if unproven and not unmoved:
-        # No verdict either way, and saying so is the honest answer: the
-        # appliance may well start in a minute (measured 2 min 56 s on 16.10),
-        # and «не получилось» would be a failure invented by a 2.5 s window.
-        return "Пока не подтвердилось."
+        # **SAY NOTHING.** This used to answer «Пока не подтвердилось.» and it
+        # was wrong twice over — measured 11.10.2026 18:38 on the living-room
+        # relay, which has NO power sensor and therefore can never be proved:
+        #
+        #     HassTurnOn  sent 18:38:27.968 -> relay physically `on`  18:41:23  (2:55)
+        #     HassTurnOff sent 18:38:46.345 -> relay physically `off` 18:41:42  (2:56)
+        #
+        # HA did NOT write the state optimistically here: the relay sat at `off`
+        # for the whole three minutes and only read `on` when it physically acted.
+        # So `state` is a TRUTHFUL BUT LATE signal for this device, and the room
+        # was right to refuse to claim success at 2.5 s — while the sentence it
+        # spoke instead told the user something was wrong, for a lamp that was
+        # about to work.
+        #
+        # It also repeated on EVERY light command in the house, which is what
+        # «у тебя проблема с методами подтверждения» actually was: not a device
+        # fault and not a flaky check, but a verdict phrased as a complaint
+        # about a device we simply cannot watch. The acknowledgement «Включаю.»
+        # has already been spoken and is true; adding a second, worse sentence
+        # on top of it is the only thing to remove. `_late_verify` still re-reads
+        # the state afterwards and LOGS what really happened.
+        return ""
     if moved and not unmoved:
         return ""
     if moved and unmoved:
@@ -688,6 +706,18 @@ def _on_off_verdict(
             f"{', '.join(unmoved)} не сработали."
         )
     return "Не получилось: устройство не переключилось."
+
+
+# When HA→device actually takes this long, a 2.5 s window is not a check, it is
+# a guess. Measured twice on the living-room relay (18:38 → 18:41:23 and
+# 18:38:46 → 18:41:42, 2:55 and 2:56) and twice by hand on the coffee maker
+# (16:16:20 → 16:19:16 and 16:16:32 → 16:19:31, 2:56 and 2:59). Four samples,
+# one number: **the queue is a property of the HA→device path, not of any one
+# appliance**, so it is a module constant rather than a per-device guess.
+#
+# The re-read at that point is what makes the log trustworthy again — it is the
+# only moment at which `state` carries information about this command.
+_LATE_VERIFY_S = 185.0
 
 
 class _PendingVerify:
@@ -699,10 +729,48 @@ class _PendingVerify:
     with no audible counterpart and a three-field return is easy to misread.
     """
 
-    __slots__ = ("ids", "before", "want_on", "moved")
+    __slots__ = ("ids", "before", "want_on", "moved", "unproven_at_settle")
 
     def __init__(self, ids, before, want_on, moved):
         self.ids, self.before, self.want_on, self.moved = ids, before, want_on, moved
+        self.unproven_at_settle: list[str] = []
+
+    def verify_later(self) -> None:
+        """Re-read the state when the answer actually exists, and LOG it.
+
+        **Deliberately detached and silent.** It must not hold the turn open —
+        the player waits 120 s for the `None` sentinel and this fires at 185 s —
+        and it must not speak: the acknowledgement has already been given, and a
+        spoken verdict three minutes later would arrive after the user has moved
+        on.
+
+        What it buys is the thing the field lost today: with the state re-read at
+        the right moment, the log finally records whether the device moved, which
+        is what a later change to the spoken verdict would have to be built on.
+        Without it every log ends at 2.5 s with the state still stale, and the
+        real outcome is invisible — which is how «не подтвердилось» went on
+        claiming failure for lamps that were working.
+        """
+        asyncio.create_task(self._late_verify())
+
+    async def _late_verify(self) -> None:
+        target = "on" if self.want_on else "off"
+        try:
+            await asyncio.sleep(_LATE_VERIFY_S)
+            fresh = await ha.get_states(force=True) or []
+            by_id = {x.get("entity_id"): x for x in fresh}
+            moved, still = [], []
+            for eid in self.ids:
+                ent = by_id.get(eid)
+                st = str((ent or {}).get("state", "")).lower()
+                (moved if st == target else still).append(eid)
+            logger.info(
+                "  verify late (+%.0fs) want=%s moved=%s not=%s unproven_at_2s=%s%s",
+                _LATE_VERIFY_S, target, moved, still, self.unproven_at_settle or [],
+                "" if moved else "  ← THE DEVICE NEVER MOVED",
+            )
+        except Exception as e:
+            logger.warning("  verify late failed: %r", e)
 
     async def settle(self) -> tuple[list[str], list[str], list[str]]:
         target = "on" if self.want_on else "off"
@@ -713,6 +781,7 @@ class _PendingVerify:
             e for e in self.ids
             if e not in moved and e not in unproven
         ]
+        self.unproven_at_settle = list(unproven)
         logger.info(
             "  verify settled want=%s moved=%s unmoved=%s unproven=%s",
             target, moved, unmoved, unproven,
@@ -1161,6 +1230,11 @@ async def _handle(req: RouteRequest):
                 if pending is not None:
                     moved, unmoved, unproven = await pending.settle()
                     verdict = _on_off_verdict(moved, unmoved, unproven)
+                    if unproven:
+                        # Nothing to say, but the outcome is still knowable at
+                        # +185 s — and today it was not knowable at all, which is
+                        # how a working lamp was reported as unconfirmed.
+                        pending.verify_later()
                     if verdict:
                         logger.info("speaking: %r (confirmation)", verdict)
                         reply_parts.append(verdict)

@@ -1074,6 +1074,20 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
   * **`entrance1` was DISABLED**, because its camera is the one now standing in the corridor and one camera cannot be two independent rooms — that is precisely the double-pip case `_claim_wake()` was written for. Every `*_ENTRANCE1` variable is kept, so restoring the room is one line.
   * The stray dead `corridor1` stream (again pointing at .165) was deleted, and `.165` is gone from the network entirely — `GET /` returns nothing.
 
+- **ALL CAMERAS RETURNED TO THEIR ORIGINAL PLACES 12.10.2026; the configuration was restored and re-verified.** `camera-corridor1` → **192.168.22.165** again, `entrance1` **re-enabled** → 192.168.22.198. Four rooms back: livingroom, kitchen, entrance1, camera-corridor1.
+
+  | комната | floor | состояние |
+  |---|---|---|
+  | livingroom | 0.0104 | здоров |
+  | kitchen | 0.0156 | здоров |
+  | entrance1 | 0.0287 | здоров — камера снова слышит, `feed rms 1053-1095` |
+  | **camera-corridor1** | **0.0930** | **глуха: это та же .165** |
+
+  * **The swap's conclusion survived the swap.** Back in its own mount, `.165` still measures **rms 10 579 with 1.78% clipping and the peak at 32 768** — against 400-640 and 0.00% everywhere else. The fault travels with the unit, exactly as the experiment showed.
+  * **`.165` needs time after power-on and says so only by refusing RTSP.** Right after it came back, `GET /` answered in 0.38 s while `ffmpeg` failed with **`Invalid data found when processing input`** and produced no file at all. ~20 s later the same command worked. **A camera that answers HTTP but not RTSP is booting, not broken** — and the gateway's own healer would have logged `AUDIO STARVED` on a stream that was merely starting.
+  * **The room is left fully configured so a replacement needs no further change** (stream, source URL with credentials + `#backchannel=1`, `/play_audio`, vosk model, `CAMERA_WEBRTC=false`, `_CORRIDOR_STREAMS`). Only the unit has to change.
+  * 0 false wakes after the restore.
+
 - **«У ТЕБЯ ПРОБЛЕМА С МЕТОДАМИ ПОДТВЕРЖДЕНИЯ» — the user was right, and the method was mine. Measured 11.10.2026 18:38.**
   * The complaint: the living-room lamp switches perfectly, and the room says «Пока не подтвердилось.» — on **every** light command, because none of these relays has a power sensor and the physics proof I made mandatory is therefore impossible for every lamp in the house.
   * **The measurement that settles what is actually true:**

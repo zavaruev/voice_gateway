@@ -1304,6 +1304,12 @@ def test_a_media_title_is_not_a_missing_device():
             return [{"entity_id": "switch.living_room_light_swith_relay",
                      "state": "off", "attributes": {"friendly_name": "Relay"}}]
 
+        async def get_entity_areas(self):
+            # The target finder — and so the area map — runs BEFORE the
+            # existence gate now, because the gate may no longer veto what the
+            # finder found. Same reason as the sibling test below.
+            return {"switch.living_room_light_swith_relay": "Living Room"}
+
         async def call_tool(self, *a, **k):
             raise AssertionError("a media title must not reach the intent")
 
@@ -1330,6 +1336,14 @@ def test_a_genuinely_absent_device_still_refuses_without_escalating():
         async def get_states(self, force=False):
             return [{"entity_id": "switch.living_room_light_swith_relay",
                      "state": "off", "attributes": {"friendly_name": "Relay"}}]
+
+        # Present because the target finder (and therefore the area map) now runs
+        # BEFORE the existence gate — the gate can no longer veto what the finder
+        # found, so it has to be consulted first. A stub without this method
+        # fails on a missing attribute rather than on the behaviour under test,
+        # which is the least useful way for a test to fail.
+        async def get_entity_areas(self):
+            return {"switch.living_room_light_swith_relay": "Living Room"}
 
         async def call_tool(self, *a, **k):
             raise AssertionError("an absent device must not reach the intent")
@@ -2365,4 +2379,80 @@ async def test_an_unwatchable_device_is_re_read_when_the_answer_exists(monkeypat
     assert real_delay >= 150, (
         f"{real_delay}s does not cover the measured 2 min 56 s HA→device queue, "
         "so the re-read would still be reading a stale state"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_real_lamp_is_not_refused_by_a_weaker_global_lookup():
+    """Field case 11.10.2026 18:51: «выключи свет в прихожей» answered
+    «Не нашла такого устройства» with `switch.entrance_light_switch_relay`
+    sitting in area `Entrance`.
+
+    The existence gate asked `find_entity` — a GLOBAL name lookup with no area
+    and no domain — and refused when it came back empty, while
+    `find_action_targets`, which knows the room, held the lamp throughout.
+
+    That lookup is the weaker instrument by construction: for «свет» it finds
+    nothing today, and for other words it lands on a same-named press-action
+    button (`sensor.corridor1_light_switch_switch_press_action_switch`) rather
+    than on a lamp. **It must not be able to veto the authoritative lookup.**
+    """
+    mod = _router_app()
+    relay = {"entity_id": "switch.entrance_light_switch_relay", "state": "on",
+             "attributes": {"friendly_name": "entrance_light_switch Relay"}}
+    button = {
+        "entity_id": "sensor.corridor1_light_switch_switch_press_action_switch",
+        "state": "long_press",
+        "attributes": {"friendly_name": "corridor1_light_switch switch press action"},
+    }
+    mod.ha = _DeadHA(
+        states=[relay, button],
+        result={"ok": True, "claimed": [{"type": "entity",
+                                         "id": "switch.entrance_light_switch_relay"}]},
+    )
+    mod.find_action_targets = lambda states, areas, hint, area: [relay]
+    mod.confirm_on_off_one_read = _all_reached_ids
+    # **None — which is what the refusal actually requires.** The first version
+    # of this test returned the button here, the same-named press action, and
+    # therefore PASSED on the broken code: a truthy match does not trigger the
+    # gate at all. The condition that refuses is "the global lookup found
+    # NOTHING" while the area-scoped finder still holds the lamp.
+    mod.find_entity = lambda states, hint, area, **kw: None
+
+    outcome = await mod._execute_action(
+        _off_call_for("выключи свет в прихожей"), "выключи свет в прихожей"
+    )
+    assert outcome[0] != "Не нашла такого устройства. Может, уточните название?", (
+        "the room refused a lamp that is in the registry and in the named room, "
+        "because a same-named button was what the global lookup happened to find"
+    )
+    assert outcome[1] is None, f"unexpected error: {outcome[1]!r}"
+
+
+@pytest.mark.asyncio
+async def test_a_device_that_is_absent_everywhere_is_still_refused(monkeypatch):
+    """The other direction: a ghost device must NOT reach L2.
+
+    The fix narrows the gate, it does not remove it — «включи кафеварку» with a
+    STT typo was answered by a free model inventing a device (04.10.2026).
+    """
+    mod = _router_app()
+    # NOT an empty state list: `_execute_action` skips the whole block when
+    # `states` is empty (that is the "HA did not answer" path, refused for a
+    # different reason). The ghost-device case is a registry that ANSWERS and
+    # simply holds nothing for this word.
+    mod.ha = _DeadHA(
+        states=[{"entity_id": "light.wled", "state": "on",
+                 "attributes": {"friendly_name": "wled"}}],
+        result={"ok": True, "result": {}},
+    )
+    mod.find_action_targets = lambda states, areas, hint, area: []
+    mod.find_entity = lambda states, hint, area, **kw: None
+
+    outcome = await mod._execute_action(
+        _off_call_for("выключи чайник"), "выключи чайник"
+    )
+    assert outcome[0] == "Не нашла такого устройства. Может, уточните название?", (
+        "a device absent from the whole registry reached L2, where a free model "
+        "will happily invent one"
     )

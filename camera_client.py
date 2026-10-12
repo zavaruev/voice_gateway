@@ -76,6 +76,11 @@ logger = logging.getLogger("camera")
 _CORRIDOR_STREAMS = frozenset({
     "corridor", "corridor1", "corridor2",     # the pre-rename names
     "entrance", "entrance1", "entrance2",     # renamed by the user, 11.10.2026
+    # The user's own stream name for the first corridor cam, added 12.10.2026.
+    # It is listed here rather than inferred: nothing can tell a corridor from a
+    # living room by its name, and a room that misses this set silently drops to
+    # the generic 4000 AGC target — quieter wake word, no error anywhere.
+    "camera-corridor1",
 })
 
 # Sample rate of everything we push INTO the camera speaker (AIVoiceOutputTrack

@@ -743,6 +743,10 @@ def test_corridor_streams_cover_the_renamed_cams():
         "the corridor rooms were renamed to entrance on 11.10.2026; without "
         "these names their mic gain silently reverts to the generic target"
     )
+    assert "camera-corridor1" in _CORRIDOR_STREAMS, (
+        "the first corridor cam added on 12.10.2026 is a corridor room and must "
+        "keep the corridor AGC target — nothing infers that from the name"
+    )
 
 def test_corridor_cams_take_the_corridor_agc_target():
     for name in ("corridor", "corridor1", "corridor2",

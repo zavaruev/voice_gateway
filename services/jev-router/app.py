@@ -422,10 +422,31 @@ async def _execute_action(call, text_hint: str = "") -> tuple[str | None, dict |
             )
             return None, {"ok": False, "error": "ha_registry_unavailable"}
         if states:
+            area_map = await ha.get_entity_areas()
+            targets = dedupe_device_facets(
+                find_action_targets(
+                    states, area_map, call.hint, call.args.get("area")
+                )
+            )
             # Deterministic refusal: a device absent from the whole registry
             # must never reach L2 — a free model happily «включает» ghost
             # devices (field case: «Включи кафеварку», STT typo + wrong name).
-            if call.hint and find_entity(states, call.hint, None) is None:
+            #
+            # **AND ONLY WHEN THE TARGET FINDER AGREES.** Measured 11.10.2026
+            # 18:51: «выключи свет в прихожей» answered «Не нашла такого
+            # устройства» while `switch.entrance_light_switch_relay` was right
+            # there in area `Entrance`. `find_action_targets` finds it; the
+            # gate above used `find_entity`, a GLOBAL name lookup with no area
+            # and no domain, and that one lands on whatever entity shares the
+            # word — here a press-action BUTTON:
+            #
+            #     sensor.corridor1_light_switch_switch_press_action_switch
+            #
+            # So the refusal hinged on which same-named entity the registry
+            # happened to hand back, while the real lamp sat unconsidered.
+            # **A gate that can veto a device the authoritative lookup found is
+            # not a gate, it is a second opinion with worse tools.**
+            if call.hint and not targets and find_entity(states, call.hint, None) is None:
                 # A media CONTENT word is not a device name. «включи следующую
                 # серию черного зеркала» reaches here with hint «серию» — the
                 # noun matches `RE_MEDIA_NOUN`, but `resolve_action` only takes
@@ -445,12 +466,6 @@ async def _execute_action(call, text_hint: str = "") -> tuple[str | None, dict |
                         ),
                     }
                 return "Не нашла такого устройства. Может, уточните название?", None
-            area_map = await ha.get_entity_areas()
-            targets = dedupe_device_facets(
-                find_action_targets(
-                    states, area_map, call.hint, call.args.get("area")
-                )
-            )
             if not call.args.get("area") and len(targets) > 1:
                 # No room in the utterance and several devices match —
                 # acting would mean guessing which one.

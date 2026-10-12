@@ -1074,6 +1074,22 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
   * **`entrance1` was DISABLED**, because its camera is the one now standing in the corridor and one camera cannot be two independent rooms — that is precisely the double-pip case `_claim_wake()` was written for. Every `*_ENTRANCE1` variable is kept, so restoring the room is one line.
   * The stray dead `corridor1` stream (again pointing at .165) was deleted, and `.165` is gone from the network entirely — `GET /` returns nothing.
 
+- **I DECLARED THE CORRIDOR CAMERA DEAD, AND THE USER WAS RIGHT: IT WAS A GAIN SETTING. 12.10.2026.** The user answered «так в чем проблема с камерой, она точна такая же как и остальные та же модель, та же прошивка, возможно где-то не те настройки». **They were right, and I was wrong for one reason: I read "уже на максимуме" as "нечего убавлять".**
+  * **The mistake, exactly.** The audio config of `.165` and a working camera is **identical** — `volume: 100`, `outputVolume`, `srate: 48000`, `speakerPin: 0`; `/proc/asound` empty on both; no audio modules, no extra config files, no voltage readouts. Finding nothing, I concluded "there is nothing to turn down". **Maximum is not the same as nothing to reduce** — and the direction that helps a saturated input is DOWN, which is exactly the direction I refused to consider. The kitchen had already proved this control works in both directions (30 → `rms 4`, 100 → `rms 410`).
+  * **The measurement that settles it, on the same camera:**
+
+    | `audio.volume` | rms (прямой замер) | клип | вердикт |
+    |---|---|---|---|
+    | 100 | 10 579 – 27 166 | 1.8–7.7% | насыщение, декодер молчит |
+    | 70 | **~2 000 фон / 14 492 фраза** | **0.01%** | **работает** |
+    | 50 | 542 | 0.00% | работает |
+    | 20 | 73 | 0.00% | слишком тихо |
+
+    The loopback through its own speaker decodes **verbatim**: at 70 vosk returned **both** `'включи свет в коридоре'` and `'секунду занимаясь'`. Shown in the gateway's own instrument, `feed rms` is **639-729 with peak 1934** at volume 70 — squarely inside the healthy band (livingroom 324-394, kitchen 563-586, entrance1 919-1114). **Shipped value: `volume: 70`.**
+  * **What the swap actually proved, read correctly this time.** Swapping hardware at the same spot separated the LOCATION from the CAMERA — that part was sound and worth doing. What I then over-read is the word "camera": **"the difference is carried by the unit" does not mean "the unit is faulty"**, because the unit carries its configuration too. Every measurement in that investigation was correct; the conclusion drawn from "the config is identical to a healthy camera's" was "so the hardware differs" when it should have been "so the difference is in this unit, and I have not yet found where."
+  * **The spectral observation that survived.** Even at a healthy level `.165` keeps more energy below 150 Hz than the working rooms (75% against 36-44%), so the noise is still LF-dominated — which is why the room needs a **lower** gain than its neighbours rather than the same one. A unit can be well-behaved at a setting that saturates another.
+  * **Two self-inflicted errors in this same experiment, both caught by reading the file afterwards rather than by the script.** A `%s` in a `sed` reached the camera verbatim and left **`volume: %s`** in `/etc/majestic.yaml` — an invalid config that stopped RTSP entirely; and an assertion compared against a value I had just `.strip()`ed, so it fired on a write that had succeeded. **A verification that compares a stripped string against an unstripped one is not a verification.**
+
 - **ALL CAMERAS RETURNED TO THEIR ORIGINAL PLACES 12.10.2026; the configuration was restored and re-verified.** `camera-corridor1` → **192.168.22.165** again, `entrance1` **re-enabled** → 192.168.22.198. Four rooms back: livingroom, kitchen, entrance1, camera-corridor1.
 
   | комната | floor | состояние |

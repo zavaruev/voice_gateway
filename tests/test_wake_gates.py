@@ -546,3 +546,101 @@ async def test_arbiter_prefers_the_room_that_heard_better_relative_to_its_own_fl
         "merely has a louder microphone: near=16.2x its own floor, far=6.6x its "
         "own, and the arbiter picked the room with the higher RAW level"
     )
+
+
+# ---------------------------------------------------------------------------
+# Measured 13.10.2026 on `camera-corridor1` (192.168.22.165), which has produced
+# zero wake words in ~49,000 chunks while its neighbour reads them all night.
+#
+# The room is not quiet and not clipped; it is LOW-FREQUENCY DOMINATED, and its
+# SNR is 15-20 dB worse than a healthy room in every band. The microphone DOES
+# pass high frequencies — +19.9 dB in 3-7 kHz measured against its own floor —
+# so the margin is recoverable without touching the hardware.
+#
+# A first attempt at this was rejected: the filter was a block FFT with no
+# overlap-add, and it decoded to nothing. That rejection measured the
+# implementation, not the idea. These tests pin the properties that made it work.
+# ---------------------------------------------------------------------------
+
+
+def test_a_room_without_the_filter_gets_its_audio_untouched():
+    """Default off, everywhere. A wrong default would silently filter three
+    working rooms the first time this shipped."""
+    s = _make_session()
+    s._wake_highpass_hz = 0
+    s._init_wake_highpass()
+    assert s._hp_sos is None
+
+    chunk = _chunk(12000)
+    assert s._wake_audio(chunk) == chunk
+
+
+def test_the_filter_attenuates_the_rumble_and_leaves_the_speech_band():
+    """That is the whole point: the noise lives below 300 Hz here."""
+    import numpy as np
+
+    s = _make_session()
+    s._wake_highpass_hz = 150
+    s._init_wake_highpass()
+    assert s._hp_sos is not None, "the filter was not built"
+
+    sr = 16000
+    t = np.arange(int(sr * 0.16)) / sr  # one 160 ms chunk
+    rumble = 1200.0 * np.sin(2 * np.pi * 40 * t)
+    speech = 1200.0 * np.sin(2 * np.pi * 1200 * t)
+    mixed = (rumble + speech).astype(np.int16).tobytes()
+
+    before = np.frombuffer(mixed, dtype=np.int16).astype(np.float64)
+    out = np.frombuffer(s._wake_audio(mixed), dtype=np.int16).astype(np.float64)
+
+    def db(sig, freq):
+        spec = np.abs(np.fft.rfft(sig * np.hanning(len(sig))))
+        f = np.fft.rfftfreq(len(sig), 1.0 / sr)
+        band = spec[(f >= freq * 0.8) & (f <= freq * 1.2)]
+        other = spec[(f >= 0) & (f < sr / 2)]
+        # relative to total energy, since the input mixes both tones
+        return 10 * np.log10(max(float((band ** 2).sum()), 1e-9) / float((other ** 2).sum()))
+
+    drop = db(before, 40) - db(out, 40)
+    kept = db(before, 1200) - db(out, 1200)
+    assert drop > 6, f"40 Hz rumble survived: only {drop:.1f} dB down"
+    # A 4th-order Butterworth at 150 Hz is -3 dB at its own corner, so a few dB
+    # at 1.2 kHz is correct behaviour and not damage. What must NOT happen is the
+    # speech band being gutted — that is exactly what the first block-FFT attempt
+    # did, and it is what this test exists to catch.
+    assert abs(kept) < 8, (
+        f"1.2 kHz speech band was changed by {kept:+.1f} dB — the filter is "
+        f"damaging the band it is supposed to preserve"
+    )
+
+
+def test_the_filter_carries_its_state_so_there_is_no_edge_at_every_chunk():
+    """Running the filter per chunk would put a transient at every 160 ms
+    boundary, and a transient that often is what eats consonants. The state is
+    carried, so a steady tone stays steady across a chunk boundary."""
+    import numpy as np
+
+    s = _make_session()
+    s._wake_highpass_hz = 150
+    s._init_wake_highpass()
+
+    sr = 16000
+    t = np.arange(sr) / sr  # one full second, fed as six 160 ms chunks
+    # 200 Hz, so the SIGNAL's own largest sample-to-sample step is ~94 and any
+    # edge a restarting filter would add is unmistakable above it.
+    tone = (1200.0 * np.sin(2 * np.pi * 200 * t)).astype(np.int16)
+
+    out = np.concatenate([
+        np.frombuffer(s._wake_audio(tone[i * 2560:(i + 1) * 2560].tobytes()),
+                      dtype=np.int16).astype(np.float64)
+        for i in range(6)
+    ])
+
+    jumps = np.abs(np.diff(out))
+    natural = jumps.max()
+    at_edges = jumps[[2559, 5119, 7679, 10239, 12799]]
+    assert at_edges.max() < 3 * natural, (
+        f"a step of {at_edges.max():.0f} samples at a chunk boundary against a "
+        f"signal's own maximum step of {natural:.0f} means the filter state is "
+        f"not being carried between chunks"
+    )

@@ -1157,6 +1157,25 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
   * **Correction to this file's own earlier entry.** On 12.10 I concluded "it was `audio.volume`, not a dead unit", and lowering the volume was genuinely right about one thing — it removed the clipping. But it did not give the microphone its high frequencies, and this entry supersedes that part: **the volume change stopped the saturation, not the deafness.** The right reading of the swap, which I stated at the time, is the one that survived: the fault travels with the unit, and the location is innocent.
   * **Conclusion: replace the unit, or have its audio path repaired.** A swap proved a different camera works at that exact mount. No software setting, no filter, no token list and no threshold reaches a signal that is not in the recording.
 
+- **«КАМЕРА ПЕРЕСТАЛА СЛУШАТЬ ОТВЕТ ПОСЛЕ ВОПРОСА» — the window was never off; the LOG lied for 24 s and the mic was muted for 65. Measured 13.10.2026 15:21, living room.**
+  * **The behaviour was working the whole time.** The exchange reads:
+    ```
+    15:21:04  💬 Follow-up open (question) 30s
+    15:21:27  ✅ Whisper OK: 'какая флора'   peak=2968
+    15:21:27  💬 follow-up answer accepted after our question, peak=2968
+    ```
+    **`peak=2968` is far under `_FOLLOWUP_MIN_PEAK = 24000`, and it did not matter** — the gate is skipped entirely when `_followup_only and _followup_is_question`, because after WE asked, refusing the answer leaves the question hanging forever (measured 05.10.2026 20:29). That part is right.
+  * **What actually happened is in the log twice, telling opposite stories:**
+    ```
+    15:21:29  💬 no free-form window: the wake word is required again after our reply
+    15:21:53  💬 Follow-up open (question) 30s
+    ```
+    **Twenty-four seconds of the log asserting the opposite of what it then does.** Cause: `is_q` is what `_speak_pcm` returns for the sentence it just spoke, so it is a property of THAT sentence. A reply whose question sits in the third sentence — «Прости, я не совсем понимаю, что ты имеешь в виду под «флорой»», then the question — is judged a statement for every sentence before the question. `CAMERA_FOLLOWUP` has never been set in compose and the default `question` was in force the whole time.
+    **Fixed**: `turn_is_q` accumulates across the turn and the negative is said once, in the `finally` block, only if no sentence was a question. The window opens exactly as before; only the false claim is gone.
+  * **The more expensive half: the mic was muted for ~65 s over a ~19 s reply.** `drop[muted=…]` jumped 82 -> 492 between two diags: **410 chunks = 65.6 s**, against 18.96 s of reply audio plus four pips. `muted` counts `time.time() < self._speaking_until`, the HARD mute in `_feed_audio`. Every answer during that stretch was dropped before anything could recognise it, which is why the captured windows were `raw_rms=372-448`, `dB -37…-39`, `ns=1`, `gain=20x` — **the room recorded itself, not the user.** The `muted` counter is exactly the instrument that separates "the user said nothing" from "we threw it away", and without reading it this would have been reported as a microphone fault again.
+  * **Not yet explained, and instrumented rather than guessed:** `_SPEAKER_SETTLE_S` is 0.3 s and the reply path sets `_speaking_until = sent_at + audio_dur + 0.3`, so the reply itself is not over-muted. The attention pip computes `played_at = time.time()` **after** its POST, so a pip whose POST takes 2.8-6.1 s (measured repeatedly on this endpoint) extends its own mute by that much — a 0.4 s pip can mute for 6 s. That accounts for a large part of it but not all, so `_feed_audio` now logs the remaining mute the first time it drops a chunk. **The next occurrence gives the number instead of an inference.**
+  * Worth remembering next time: **a "the room stopped listening" report is three candidate faults with one log line each** — the window decision, the hard mute, and the echo guard. All three were in one exchange; only the counter separated them.
+
 - **«У ТЕБЯ ПРОБЛЕМА С МЕТОДАМИ ПОДТВЕРЖДЕНИЯ» — the user was right, and the method was mine. Measured 11.10.2026 18:38.**
   * The complaint: the living-room lamp switches perfectly, and the room says «Пока не подтвердилось.» — on **every** light command, because none of these relays has a power sensor and the physics proof I made mandatory is therefore impossible for every lamp in the house.
   * **The measurement that settles what is actually true:**

@@ -3616,6 +3616,16 @@ async def start_camera_sessions():
                 wake_vosk_model=os.getenv(
                     f"WAKE_VOSK_MODEL_{name.upper()}"
                 ) or os.getenv("WAKE_VOSK_MODEL", ""),
+                # High-pass applied ONLY to the audio handed to the wake DECODER,
+                # per room: CAMERA_WAKE_HIGHPASS_<NAME>, 0 => off (the default
+                # everywhere). Not for the other rooms — this exists for a room
+                # whose noise is concentrated below 300 Hz and whose SNR there is
+                # 15-20 dB worse than a healthy room's. See
+                # CameraSession._init_wake_highpass for the measurement and for
+                # why the peak gate deliberately stays on the raw signal.
+                wake_highpass_hz=float(
+                    os.getenv(f"CAMERA_WAKE_HIGHPASS_{name.upper()}", "0") or 0
+                ),
                 # Level-based utterance endpointing for this room. OFF unless
                 # asked for: it changes WHEN a command is dispatched in a live
                 # audio path, so it is enabled per room only after its

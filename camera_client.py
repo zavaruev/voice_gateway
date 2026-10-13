@@ -987,6 +987,11 @@ class CameraConfig:
     # 0 false accepts on a held-out television tail, where an acoustic head
     # trained on this room managed 229 false/hour.
     wake_vosk_model: str = ""
+
+    # Cut-off (Hz) of a high-pass applied ONLY to the audio fed to the vosk wake
+    # decoder. 0 => off. See _wake_audio() for why it exists and why the peak
+    # gate deliberately stays on the raw signal.
+    wake_highpass_hz: float = 0.0
     wake_timeout: float = 15.0
     vad: object = None
     wakeword_model_path: str = ""
@@ -1178,6 +1183,12 @@ class CameraSession:
         # vosk wake-word config, read in __init__ because _init_audio_processing()
         # builds the matcher and has no access to the CameraConfig object.
         self._wake_vosk_model = config.wake_vosk_model
+
+        self._wake_highpass_hz = float(getattr(config, "wake_highpass_hz", 0) or 0)
+        self._hp_sos = None
+        self._hp_zi = None
+        if self._wake_highpass_hz > 0:
+            self._init_wake_highpass()
         # Level-based utterance endpointing for this room (see _PauseEndpoint).
         # Read here because _init_audio_processing() has no CameraConfig.
         self._pause_endpoint_on = config.pause_endpoint
@@ -2334,6 +2345,12 @@ class CameraSession:
         # speaking. "The user said nothing" and "we threw it away" look identical
         # from the outside, so the counters are what tell them apart.
         if time.time() < self._speaking_until:
+            if self._drop_muted == 0:
+                left = self._speaking_until - time.time()
+                logger.debug(
+                    f"[{self.stream_name}] mic muted by our playback, "
+                    f"{left:.1f}s left"
+                )
             self._drop_muted += 1
             return
         # Hard echo guard: while TTS frames are still queued for playback,
@@ -2510,6 +2527,82 @@ class CameraSession:
             return 0.0
         return float(level) / floor
 
+    def _init_wake_highpass(self) -> None:
+        """4th-order Butterworth high-pass for the wake decoder's input.
+
+        Measured 13.10.2026 on `camera-corridor1` (192.168.22.165). The room is
+        not quiet and not clipped — it is LOW-FREQUENCY DOMINATED, and its SNR is
+        15-20 dB worse than a healthy room in every band:
+
+            полоса      коридор     гостиная
+            0-3 кГц       +5.8 дБ    +25.9 дБ
+            3-7 кГц      +19.9 дБ    +35.0 дБ
+
+        **The microphone does pass high frequencies** — the +19.9 dB in 3-7 kHz
+        is speech, clearly present. What is missing is margin, and the margin
+        sits below 300 Hz.
+
+        Replaying the camera's own speaker into its own mic (the loopback that
+        worked on 12.10) through a correctly implemented filter:
+
+            без фильтра -> ['капля яда', 'включи']
+            ФВЧ 150 Гц  -> ['капля яда включи свет в коридоре', 'включай']
+
+        **A crude block-FFT filter rejected this outright** — it decoded to
+        nothing, which is how I first concluded a high-pass would not help. It
+        had no overlap-add and its own reconstruction artefacts were destroying
+        the signal. The rejection was an artefact of the implementation, not of
+        the idea.
+        """
+        try:
+            from scipy.signal import butter
+
+            self._hp_sos = butter(
+                4,
+                float(self._wake_highpass_hz) / (16000.0 / 2.0),
+                btype="highpass",
+                output="sos",
+            )
+            # Shape is (n_sections, 2). Leaving it None makes sosfilt
+            # return a bare array instead of (y, zf) — see _wake_audio.
+            self._hp_zi = np.zeros((len(self._hp_sos), 2), dtype=np.float64)
+        except Exception as exc:  # pragma: no cover - dependency missing
+            self._hp_sos = None
+            logger.warning(
+                f"[{self.stream_name}] wake high-pass requested at "
+                f"{self._wake_highpass_hz} Hz but the filter could not be "
+                f"built ({exc!r}); feeding the decoder unfiltered"
+            )
+
+    def _wake_audio(self, chunk: bytes) -> bytes:
+        """`chunk` as the wake decoder should hear it — high-passed if asked.
+
+        The filter state is CARRIED between chunks (`zi`) on purpose: running a
+        zero-phase or per-chunk filter over a 160 ms block would put a transient
+        at every chunk boundary, and a transient every 160 ms is exactly the kind
+        of edge that eats consonants. `sosfilt` is causal, so there is no such
+        edge and no need for padding or overlap.
+
+        Everything else in the wake path keeps the RAW signal: the
+        `CAMERA_WAKE_MIN_PEAK` gate is a raw-peak gate, and the log line prints
+        the raw trigger peak. Filtering them too would change what the gate means
+        without saying so in the log.
+        """
+        if self._hp_sos is None:
+            return chunk
+        x = np.frombuffer(chunk, dtype=np.int16).astype(np.float64)
+        if len(x) < 64:
+            return chunk
+        from scipy.signal import sosfilt
+
+        # With `zi` passed, sosfilt returns exactly (y, zf) and zf is the
+        # state to carry. Without it — which is what happened when this was
+        # first written and `_hp_zi` was still None — it returns a bare array,
+        # and unpacking that raised a ValueError inside the audio path.
+        y, zi = sosfilt(self._hp_sos, x, zi=self._hp_zi)
+        self._hp_zi = zi
+        return np.clip(y, -32768, 32767).astype(np.int16).tobytes()
+
     async def _vad_process(self, chunk: bytes):
         async with self._vad_lock:
             s16 = np.frombuffer(chunk, dtype=np.int16)
@@ -2666,7 +2759,9 @@ class CameraSession:
                     self._vosk_last_peak, int(np.abs(s16).max())
                 )
                 self._vosk_peak_win.append(int(np.abs(s16).max()))
-                got_wake = await asyncio.to_thread(self._vosk_wake.feed, chunk)
+                got_wake = await asyncio.to_thread(
+                    self._vosk_wake.feed, self._wake_audio(chunk)
+                )
                 if got_wake:
                     # A wake word that HEARD always re-arms the interaction,
                     # even in the middle of a dialogue — that is what a wake
@@ -4260,6 +4355,8 @@ class CameraSession:
         # a three-sentence reply that fails synthesis wholesale speaks once, not
         # three times.
         spoke_anything = False
+        # Whole-turn question flag: a reply is a question if ANY of its sentences is.
+        turn_is_q = False
         sent: str | None = None
         pcm: bytes | None = None
         try:
@@ -4361,12 +4458,17 @@ class CameraSession:
                         self._followup_mode == "all"
                         or (self._followup_mode == "question" and is_q)
                     )
-                    if window > 0 and not want_window:
-                        logger.info(
-                            f"[{self.stream_name}] 💬 no free-form window: the "
-                            f"wake word is required again after our reply "
-                            f"(CAMERA_FOLLOWUP={self._followup_mode})"
-                        )
+                    # The negative decision is NOT logged here. `is_q` is a property
+                    # of THIS sentence (it is what `_speak_pcm` returns for the text it
+                    # just spoke), so a reply whose question sits in the third
+                    # sentence logged "the wake word is required again" for the first
+                    # two and then opened the window anyway — measured 13.10.2026
+                    # living room: `no free-form window` at 15:21:29, `Follow-up
+                    # open (question)` at 15:21:53, twenty-four seconds of the log
+                    # asserting the opposite of what happened. It is now said once,
+                    # in the `finally` block, only if the whole turn was not a
+                    # question.
+                    turn_is_q = turn_is_q or bool(is_q)
                     if want_window:
                         await self._wait_playback_drain()
                         self._wake_detected = True
@@ -4395,6 +4497,12 @@ class CameraSession:
             # statement set last_q False and the window was torn down even
             # though the utterance it belonged to had just been dispatched.
             if not self._followup_open:
+                if not turn_is_q and self._dialogue_statement_s > 0:
+                    logger.info(
+                        f"[{self.stream_name}] 💬 no free-form window: the wake "
+                        f"word is required again after our reply "
+                        f"(CAMERA_FOLLOWUP={self._followup_mode})"
+                    )
                 self._back_to_wake()
 
     def _encode_wav(self, pcm_16k: bytes) -> bytes:

@@ -237,6 +237,12 @@ _WAKE_ALONE_MAX_DUR_S = 1.5     # 1.12 s for the word, 1.68 s for a command
 # which restores the old behaviour of answering anything said in the window.
 _FOLLOWUP_MIN_PEAK = 24000
 
+# How many consecutive turns may be answered from a window opened by our own reply
+# before the wake word is required again. 2 lets a real two-step question
+# ("what time?" -> "and in Berlin?") finish; a cascade is unbounded by definition,
+# so any small number terminates it.
+_FOLLOWUP_CHAIN_MAX = 2
+
 # Pause before re-offering the WebRTC session, doubling up to the max. This is
 # not politeness, it is the fix: an un-answered offer still makes go2rtc rebuild
 # the stream producer, and the abandoned session is what filled the camera's
@@ -3339,6 +3345,9 @@ class CameraSession:
         # it sounds like. The follow-up window opened by our own reply is the
         # opposite case and says so here — see _handle_wake_or_command.
         self._followup_only = False
+        # The wake word is the only unambiguous reset of the cascade breaker:
+        # it is what proves a person is present, not our own voice.
+        self._followup_chain = 0
         self._ww_consec = 0
         self._ww_recent.clear()
         # Reset VAD collection: corridor's permanent noise floor keeps
@@ -3915,6 +3924,8 @@ class CameraSession:
         # so the user's 3145 sits inside the television's range. A dead dialogue
         # is worse than the occasional answer to the telly, and an answer that
         # does not resolve to anything is refused downstream anyway.
+        if self._followup_only:
+            self._followup_chain += 1
         if self._followup_only and self._followup_is_question:
             logger.info(
                 f"[{self.stream_name}] 💬 follow-up answer accepted after our "
@@ -4458,6 +4469,30 @@ class CameraSession:
                         self._followup_mode == "all"
                         or (self._followup_mode == "question" and is_q)
                     )
+                    if want_window and self._followup_chain >= _FOLLOWUP_CHAIN_MAX:
+                        # Circuit breaker. Measured 13.10.2026 16:22-16:26 in
+                        # `entrance1`: a turn in one room, then EIGHT consecutive
+                        # turns in the other that no one spoke for — 'А ну, блядь,
+                        # блядь…', 'Я долго', 'давайте всем' — each answered, each
+                        # answer re-opening the window that let the next one in.
+                        #
+                        # `_is_echo` could not stop it and that is not a tuning
+                        # miss: the guard only correlates within `_ECHO_HORIZON_S`
+                        # (8 s) of `_tts_play_end`, while the reply sounds for up
+                        # to 19 s and the next utterance is captured 20-30 s after
+                        # the window opened. The echo is simply outside the
+                        # horizon by the time it arrives, so `_is_echo` correctly
+                        # answers "that is not us" and the audio is dispatched.
+                        #
+                        # The breaker is deliberately one-directional: it can only
+                        # cost a wake word, never a wrong action. Reset by the wake
+                        # word, which is the only unambiguous signal there is.
+                        want_window = False
+                        logger.info(
+                            f"[{self.stream_name}] 🔗 follow-up chain cut at "
+                            f"{self._followup_chain} turns without the wake word; "
+                            f"the wake word is required again"
+                        )
                     # The negative decision is NOT logged here. `is_q` is a property
                     # of THIS sentence (it is what `_speak_pcm` returns for the text it
                     # just spoke), so a reply whose question sits in the third
@@ -4647,6 +4682,9 @@ class CameraSession:
         self._wake_detected = False
         self._followup_only = False
         self._followup_is_question = False
+        # Consecutive turns answered WITHOUT the wake word. Circuit breaker
+        # for an echo cascade; see _followup_chain_note for the measurement.
+        self._followup_chain = 0
         _arbiter_clear_owner(self.stream_name)
         # No threshold bump on empty wake windows: the old +0.07 "false-fire
         # penalty" compounded after every missed/empty command (Whisper glitch,

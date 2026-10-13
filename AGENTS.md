@@ -1176,6 +1176,26 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
   * **Not yet explained, and instrumented rather than guessed:** `_SPEAKER_SETTLE_S` is 0.3 s and the reply path sets `_speaking_until = sent_at + audio_dur + 0.3`, so the reply itself is not over-muted. The attention pip computes `played_at = time.time()` **after** its POST, so a pip whose POST takes 2.8-6.1 s (measured repeatedly on this endpoint) extends its own mute by that much — a 0.4 s pip can mute for 6 s. That accounts for a large part of it but not all, so `_feed_audio` now logs the remaining mute the first time it drops a chunk. **The next occurrence gives the number instead of an inference.**
   * Worth remembering next time: **a "the room stopped listening" report is three candidate faults with one log line each** — the window decision, the hard mute, and the echo guard. All three were in one exchange; only the counter separated them.
 
+- **«КАМЕРА 10 МИНУТ НЕСЁТ ХЕРНЮ» — AN ECHO CASCADE, NOT A LISTENING ROOM. Measured 13.10.2026 16:22-16:26.**
+  * **The living room was innocent.** It spoke once, correctly — `включи свет в гостиной`, `route=easy_action conf=1.00`, `HassTurnOn`, `Включаю.` — and has been silent since 16:22:58. The garbage is `entrance1`, and it is the classic cascade:
+    ```
+    16:22:49  гостиная : 'включи свет в гостиной'            ← настоящая команда
+    16:22:53  прихожяя : 'что-то в машине компьютер включи свет в гостиной'   ← услышала ДРУГУЮ комнату
+    16:23:00  прихожяя : 'А ну, блядь, блядь, блядь, блядь'
+    16:23:32  прихожяя : 'несчастные ладно, это для микроиглы'
+    16:24:00  прихожяя : 'Я долго'
+    16:24:40  прихожяя : 'наверное вообще здесь вкусно и вкусно, просто забиваешь воду'
+    16:25:10  прихожяя : 'давайте всем'
+    16:25:38  прихожяя : 'ну там можно'
+    16:26:03  прихожяя : 'не общих'
+    ```
+    Every one went `route=complex_logic conf=0.00-0.44` to L2, every one produced a spoken reply, and **every reply re-opened the listening window that let the next one in.** `awake ends` climbed `{'cap': 8}` to `{'cap': 14}` — one per turn.
+  * **`_is_echo` could not stop it, and that is not a tuning miss.** It correlates only within `_ECHO_HORIZON_S = 8 s` of `_tts_play_end`, deliberately: measured 08.10, the wide sweep was the thing that "muted the room for half an hour" on room noise. Here the reply sounds for up to **19 s** (`play_audio 8.66s in 6.17s`) and the next utterance is captured **20-30 s** after the window opened. **The echo is outside the horizon by the time it arrives**, so `_is_echo` answers "that is not us" correctly, and the audio is dispatched. `echo=5` drops against eight garbage turns is the same fact from the other side.
+  * **`GLOBAL_TTS_UNTIL`, the cross-camera guard, fired ZERO times** in the whole window.
+  * **Fix: a chain breaker, `_FOLLOWUP_CHAIN_MAX = 2`.** After two consecutive turns answered from a window opened by our own reply, the next reply does not open a window and the wake word is required again. It is deliberately one-directional — **it can only cost a wake word, never a wrong action** — and it is reset by the wake word, the only signal that is never our own voice. Two still allows a real two-step question («который час?» -> «а в Берлине?»).
+  * **This is the same shape as every other guard in this file: bound the failure instead of trying to detect it perfectly.** A cascade is unbounded by definition, so any small number terminates it.
+  * **And the third repeat today of the test-helper trap**, which is why it is written down here as well as in the code: adding `_followup_chain` to the production path broke **eleven** tests with `AttributeError`, which the player's broad `except` turned into «no window» and which then read as a behaviour regression in the window logic. **Every attribute the loop touches must exist in `_player_session()`, `_followup_session()` and `_make_session()`.** A regex-based edit to the test file also destroyed `s._preroll`; `git checkout` on the test file was the repair, and the fix went in by hand afterwards.
+
 - **«У ТЕБЯ ПРОБЛЕМА С МЕТОДАМИ ПОДТВЕРЖДЕНИЯ» — the user was right, and the method was mine. Measured 11.10.2026 18:38.**
   * The complaint: the living-room lamp switches perfectly, and the room says «Пока не подтвердилось.» — on **every** light command, because none of these relays has a power sensor and the physics proof I made mandatory is therefore impossible for every lamp in the house.
   * **The measurement that settles what is actually true:**

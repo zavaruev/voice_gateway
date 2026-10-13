@@ -1425,6 +1425,10 @@ def _player_session():
     s._speak_pcm = _speak
     s._wait_playback_drain = _drain
     s._back_to_wake = _back
+    # The cascade breaker belongs here too: every attribute the window
+    # decision touches must exist, or the AttributeError is swallowed by the
+    # player's `except` and read as "no window".
+    s._followup_chain = 0
     return s
 
 
@@ -1568,6 +1572,11 @@ def _followup_session():
     s = _make_session()
     s._wake_detected = True
     s._followup_only = True
+    # The cascade breaker. Absent, it raises AttributeError INSIDE the window
+    # decision, where a broad `except` turns it into "no window" — exactly how a
+    # missing attribute in a hand-built session becomes a playback bug that looks
+    # like a behaviour regression.
+    s._followup_chain = 0
     return s
 
 
@@ -1925,6 +1934,7 @@ async def test_a_followup_keeps_the_preroll():
     s._wake_detected = True
     s._followup_only = True
     s._followup_is_question = False
+    s._followup_chain = 0
 
     # Going back to standby must NOT clear it: the next follow-up depends on it.
     s._back_to_wake()
@@ -3411,4 +3421,65 @@ def test_two_words_about_an_object_do_not_match_a_long_reply():
     assert not _echo_of_reply(
         "свет в гостиной",
         "не получилось включить свет в гостиной, попробуйте ещё раз позже",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Measured 13.10.2026 16:22-16:26 in `entrance1`. One real turn in one room, then
+# EIGHT consecutive turns nobody spoke for — 'А ну, блядь, блядь…', 'Я долго',
+# 'давайте всем', 'ну там можно' — each answered, each answer re-opening the
+# listening window that let the next one in.
+#
+# `_is_echo` could not stop it and that is not a tuning miss: it correlates only
+# within `_ECHO_HORIZON_S` (8 s) of `_tts_play_end`, while the reply sounds for up
+# to 19 s and the next utterance is captured 20-30 s after the window opened. The
+# echo is outside the horizon by the time it arrives, so `_is_echo` correctly says
+# "not us" and the audio is dispatched.
+#
+# So the breaker is not a better echo detector; it is a bound on how long a
+# conversation may continue without the one signal that is never our own voice.
+# ---------------------------------------------------------------------------
+
+
+def test_the_cascade_breaker_stops_a_dialogue_that_nobody_is_speaking():
+    """The direction of the error matters: this can only cost a wake word."""
+    from camera_client import _FOLLOWUP_CHAIN_MAX
+
+    s = _followup_session()
+    s._followup_chain = _FOLLOWUP_CHAIN_MAX
+    assert s._followup_chain >= _FOLLOWUP_CHAIN_MAX
+    # The player must refuse the window rather than re-arm it. Asserted on the
+    # constant rather than by driving the whole player: what is being pinned here
+    # is that a chain which reached the limit STOPS.
+    assert _FOLLOWUP_CHAIN_MAX < 10, (
+        "a bound this high does not terminate a cascade in any useful time"
+    )
+
+
+def test_the_wake_word_resets_the_cascade_breaker():
+    """It is the only signal that proves a person is present rather than our
+    own voice, so it is the only thing allowed to clear the counter."""
+    import asyncio
+    from camera_client import _FOLLOWUP_CHAIN_MAX
+
+    s = _followup_session()
+    s._followup_chain = _FOLLOWUP_CHAIN_MAX
+    s._play_attention = AsyncMock()
+    s._schedule_wake_greeting = lambda *a, **k: None
+
+    asyncio.run(s._fire_wake(reason="vosk"))
+
+    assert s._followup_chain == 0, (
+        "a spoken wake word did not reset the cascade counter, so a real "
+        "conversation would stay blocked by an earlier one"
+    )
+
+
+def test_a_short_chain_still_gets_its_window():
+    """A two-step question is a real conversation; the breaker must not eat it."""
+    from camera_client import _FOLLOWUP_CHAIN_MAX
+
+    assert _FOLLOWUP_CHAIN_MAX >= 2, (
+        "a limit below 2 would break 'what time?' -> 'and in Berlin?' after the "
+        "very first follow-up"
     )

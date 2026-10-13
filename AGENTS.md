@@ -1165,7 +1165,19 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
     ```
     The microphone is NOT dead: a loopback through its OWN speaker gives 5.5x over its own floor. **But that speaker sits 5 cm from the mic and the human is two metres away, so the loopback says nothing about a person at distance — which is exactly the trap this room invites.**
   * **Method error worth recording, because it is the fourth today and the same one:** the first pass at this recording analysed **82 s of a 300 s file**, because the analysis was started while ffmpeg was still writing. The conclusion was unchanged on the full file, but a conclusion drawn from a partial file is not a conclusion, and three separate bad measurements in one day make the fourth worth naming. **Check the byte count against the duration you asked for before trusting any of it.**
-  * **Conclusion: replace the unit, or have its audio path repaired.** A swap proved a different camera works at that exact mount. No software setting, no filter, no token list and no threshold reaches a signal that is not in the recording.
+  * **Conclusion: replace the unit, or have its audio path repaired.**
+
+- **«МИКРОФОН МЁРТВ» — ЭТО ИНОГДА НЕ ПРИМЕНЁННАЯ НАСТРОЙКА, а измеренная величина молча об этом не говорит. 13.10.2026, закрывает коридор.**
+
+  Новый блок встал как `.247`, `audio.volume` в конфиге был уже `100` — и комната читала **фон 4, пик 114**. Петля через собственный динамик давала ровно ноль. Я объявил вход мёртвым в железе и записал это в AGENTS.md.
+
+  **Причина: в majestic камеры есть кнопка «применить».** Пока её не нажали, `volume: 100` лежал на диске и не действовал. После нажатия фон **4 → 529**, а петля через собственный динамик — **21.6x** (561 → 12107) с дословной расшифровкой «включи свет в коридоре». Железо было исправно всё это время.
+
+  **Величина не выдаёт себя.** 700-кратная разница с боевой выглядит ровно так же, как «сломанный микрофон», и ничем в логе или в замере не помечена. Это уже четвёртый сегодня случай одного класса — обрезанный файл, слепая петля как доказательство, уровни в разное время, и вот этот: **вывод, поставленный раньше, чем проверено, что величина вообще соответствует включённой конфигурации.**
+
+  * **Отсюда правило: перед тем как объявить что-то мёртвым, убедиться, что настройка действует.** Для камеры это значит перечитать `audio.volume` и **применить** его, а не ограничиваться чтением файла. Для всего остального — проверить, что измерено против действующего, а не против записанного намерения.
+  * **`.165` проверен отдельно и НЕ задет.** На ней `volume: 70` в памяти, фон **1741** — не «мёртвая четвёрка», то есть её конфиг был применён. Её собственные измерения (петля 5.5x, три минуты записи без единого речевого всплеска) остаются в силе. Именно поэтому проверка была перепроверена, а не принята на веру: один и тот же симптом у двух камер с разной причиной.
+  * **Шлюз при этом слушал `.165`, а не `.247`.** Тест «новый блок не реагирует на компьютер» был физически невозможен: комната `camera-corridor1` читала поток go2rtc, указывавший на старый адрес. Голос у новой камеры не доходил до декодера ни при каких условиях. **Сменить адрес в compose недостаточно — поток в go2rtc надо перерегистрировать** (`PUT /api/streams?name=…&src=…`, оба как параметры запроса; `src` в теле отвечает 200 и НЕ создаёт поток). Шлюз этого не делает сам, пока поток отдаёт хоть какие-то данные: heal срабатывает по голоду, а `.165` аудио отдавал. A swap proved a different camera works at that exact mount. No software setting, no filter, no token list and no threshold reaches a signal that is not in the recording.
 
 - **«КАМЕРА ПЕРЕСТАЛА СЛУШАТЬ ОТВЕТ ПОСЛЕ ВОПРОСА» — the window was never off; the LOG lied for 24 s and the mic was muted for 65. Measured 13.10.2026 15:21, living room.**
   * **The behaviour was working the whole time.** The exchange reads:

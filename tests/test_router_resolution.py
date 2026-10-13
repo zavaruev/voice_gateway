@@ -2456,3 +2456,70 @@ async def test_a_device_that_is_absent_everywhere_is_still_refused(monkeypatch):
         "a device absent from the whole registry reached L2, where a free model "
         "will happily invent one"
     )
+
+
+# ---------------------------------------------------------------------------
+# Measured 13.10.2026 09:49, living room. The user said «выключи свет» and
+# Whisper wrote it as TWO separate distortions in one utterance:
+#
+#     text='Цвет выключен'   route=complex_logic conf=0.60 -> L2, nothing spoken
+#
+#   * «свет» -> «Цвет» (colour): `_DEVICE_NOUN` has no «цвет», so the sentence
+#     names no device at all;
+#   * «выключи» -> «выключен»: a past participle instead of an imperative, and
+#     `RE_OFF` matches `выключи|выключить|погаси|...` but not `выключен`.
+#
+# With neither a device nor a known verb the text cannot reach the on/off path at
+# all — it is not a wrong action, it is no action. The same turn's sibling
+# («Свет включи») went through at conf 0.92 and switched the relay.
+#
+# Both repairs are gated so that a STATEMENT about a light is not executed:
+# a question mark blocks the participle mapping, and «цвет» counts as a device
+# only inside that exact construction, which no sentence about paint produces.
+# ---------------------------------------------------------------------------
+
+
+def test_the_past_participle_of_the_off_verb_is_read_as_an_imperative():
+    """`выключен` is what Whisper actually wrote. RE_OFF knows none of it."""
+    from resolver import normalize_stt_verbs, resolve_action
+
+    assert normalize_stt_verbs("свет выключен") == "свет выключи"
+    assert normalize_stt_verbs("Свет выключен") == "Свет выключи"
+
+    call = resolve_action("свет выключен", "livingroom")
+    assert call is not None, "'свет выключен' still escalates instead of acting"
+    assert "TurnOff" in call.tool, f"-> {call.tool}, expected TurnOff"
+
+
+def test_the_past_participle_of_the_on_verb_is_read_as_an_imperative():
+    """The same distortion on the ON side — 'включен' is what the log showed."""
+    from resolver import normalize_stt_verbs, resolve_action
+
+    assert normalize_stt_verbs("свет включен") == "свет включи"
+
+    call = resolve_action("свет включен", "livingroom")
+    assert call is not None, "'свет включен' still escalates instead of acting"
+    assert "TurnOn" in call.tool, f"-> {call.tool}, expected TurnOn"
+
+
+def test_asking_whether_the_light_is_on_does_not_switch_it():
+    """The whole reason the mapping is gated: a question is not an order."""
+    from resolver import normalize_stt_verbs
+
+    for text in ("свет выключен?", "свет включен?", "Свет выключен ?"):
+        assert normalize_stt_verbs(text) == text, (
+            f"{text!r} was rewritten into a command — this is the exact error "
+            f"the gate exists to prevent"
+        )
+
+
+def test_colour_is_a_device_only_inside_the_light_state_construction():
+    """«цвет» is an ordinary Russian word (paint, colour). Mapping it anywhere
+    would turn «переключи цвет» into a lamp command, so it is admitted only in
+    the one construction Whisper actually produced."""
+    from resolver import normalize_stt_verbs
+
+    assert normalize_stt_verbs("Цвет выключен") == "Свет выключи"
+
+    for text in ("переключи цвет", "какого цвета стены", "цвет обоев"):
+        assert normalize_stt_verbs(text) == text, f"{text!r} was rewritten"

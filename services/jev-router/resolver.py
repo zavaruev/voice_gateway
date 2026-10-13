@@ -191,20 +191,67 @@ _STT_OFF_VARIANTS: tuple[tuple[re.Pattern[str], str], ...] = (
 )
 
 
+# Measured 13.10.2026 09:49 in the living room. The user said «выключи свет» and
+# Whisper produced a STATEMENT, not an order: 'Цвет выключен', which the router
+# sent to L2 at conf 0.60 and nothing spoke. Two independent distortions in one
+# utterance:
+#
+#   * «свет» -> «Цвет» (colour) — a homophone, so the sentence named NO device;
+#   * «выключи» -> «выключен» — a past participle, which RE_OFF does not list,
+#     so no verb was recognised either.
+#
+# Neither is a typo; both are ordinary grammar Whisper applies to an imperative.
+# The first entry is the measured OFF spelling. The ON participle is the same
+# mechanism one verb over — it was NOT observed in the log — and it is here
+# because «свет включен» would fail for exactly the same reason and one-sided
+# repair is the kind of thing that looks finished and is not.
+#
+# Order matters: \bвключен\b cannot match inside «выключен» (the character before
+# «в» is a word character, so there is no boundary there), and the OFF entry runs
+# first regardless.
+_STT_PARTICIPLE_VARIANTS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"\bвыключен\b", re.IGNORECASE), "выключи"),
+    (re.compile(r"\bвключен\b", re.IGNORECASE), "включи"),
+)
+
+# «цвет» is an ordinary Russian word, so it is admitted as a device ONLY where
+# it is followed by the light-state participle — a construction no sentence about
+# paint produces. Lookahead does the gating; the replacement keeps the writer's
+# capitalisation so «Цвет выключен» becomes «Свет выключи» and not «свет …».
+_RE_COLOUR_AS_LIGHT = re.compile(r"\bцвет\b(?=\s+(?:выключен|включен)\b)", re.IGNORECASE)
+
+
+def _colour_to_light(m: "re.Match[str]") -> str:
+    w = m.group(0)
+    return ("С" + w[1:]) if w[:1].isupper() else w
+
+
 def normalize_stt_verbs(text: str) -> str:
-    """Rewrite observed STT spellings of the off verb into the canonical one.
+    """Rewrite observed STT spellings of the action verbs into the canonical ones.
 
     Returns the text unchanged unless it carries a device noun AND one of the
     measured variants. Gating on the device noun is what makes a mapping of two
     common Russian words safe: without it «куча чая» would switch a lamp off.
+
+    The participle mapping is additionally gated on the ABSENCE of a question
+    mark. That is the whole reason it is not just another entry above: «свет
+    выключен» is a statement in Russian, and executing a statement because
+    Whisper turned an order into one would be the opposite error. A question
+    («свет выключен?», «свет включён ли») keeps its verb and stays a question.
     """
     t = (text or "").strip()
-    if not t or not _DEVICE_NOUN.search(t):
+    if not t:
         return t
+    t = _RE_COLOUR_AS_LIGHT.sub(_colour_to_light, t, count=1)
+    if not _DEVICE_NOUN.search(t):
+        return t
+    if "?" not in t:
+        for pattern, canonical in _STT_PARTICIPLE_VARIANTS:
+            t = pattern.sub(canonical, t, count=1)
     for pattern, canonical in _STT_OFF_VARIANTS:
         t = pattern.sub(canonical, t, count=1)
     if t.strip() != (text or "").strip():
-        logger.info("STT off-verb normalised: %r", text[:80])
+        logger.info("STT off-verb normalised: %r -> %r", text[:80], t[:80])
     return t
 
 

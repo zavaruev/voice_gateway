@@ -1120,6 +1120,18 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
   * **The regression test fails on the pre-fix code for the same reason the field did** — it is written with the measured 7303/9577 and the measured 495/1981 floors, not with invented values.
   * A related finding from the same session: **the living-room pause endpoint was cutting commands.** `run_frames 6` gives a minimum utterance of (5+6)x160 ms = **1.29 s**, shorter than a short command; on 12.10 the nine "speech" frames were the wake word itself and the six quiet ones the ~0.96 s gap before the command, so «включи свет» became «В плечи свет». Shipped `CAMERA_PAUSE_RUN_FRAMES_LIVINGROOM=15` (minimum 3.20 s). The threshold was deliberately **not** touched: `thresh 0.0247` already sits in the measured gap between background (p90 0.0166) and speech (p99 0.0446), so changing it would have been a guess. `0`-means-unset means a revert is one line back to 6.
 
+- **THE LIVING ROOM STOPPED SWITCHING THE LIGHT BECAUSE WHISPER WROTE AN ORDER AS A STATEMENT. Measured 13.10.2026 09:49.**
+  * Both fixes shipped that morning were working: `arbiter[wake]: {'livingroom': (22, 0)} -> 'livingroom'` (uncontested, 22x its own floor) and `UTTERANCE END dur=2800ms via pause (run=15 speech=11)` — **2.4x faster** than the 7040 ms cap. «Свет включи» went through at conf 0.92 and switched the relay.
+  * Then «выключи свет» produced:
+    ```
+    text='Цвет выключен'   route=complex_logic conf=0.60 -> L2, nothing spoken
+    ```
+    **Two independent distortions in one utterance.** «свет» -> «Цвет» (colour), so `_DEVICE_NOUN` found no device; «выключи» -> «выключен», a past participle that `RE_OFF` (`выключи|выключить|погаси|...`) does not list, so no verb either. Neither is a typo — both are ordinary grammar Whisper applies to an imperative. The sentence has neither a device nor a known verb, so it is not a wrong action, it is **no action**.
+  * **Both repairs are gated, because a statement is not an order.** The participle mapping is skipped when the text contains `?`, so «свет выключен?» stays a question (verified live: `conf=0.56`, not executed). «цвет» is admitted as a device **only** under a lookahead for the light-state participle — a construction no sentence about paint produces — so «переключи цвет» is untouched (verified live: `conf=0.45`). «куча чая» still refuses (`conf=0.54`).
+  * **The ON participle was NOT observed, and is labelled as such in the code.** «свет выключен» is in the log; «свет включен» is the same mechanism one verb over and would fail identically, and one-sided repair is the kind of thing that looks finished and is not. The repo's standing rule — "adding one would be inventing a rule from no measurement" — is why this is called out rather than buried.
+  * Live verification on the deployed router: `Цвет выключен` -> `easy_action conf=0.94`; `свет выключен` -> `conf=0.93`; `свет включен` -> `conf=0.92` + `HassTurnOn`. And «В гостиной уже выключено.» was honest — the next call's own log shows the relay at `off` beforehand.
+  * A reminder that cost a confused minute: **`/route` answers SSE, not JSON.** A `curl | grep` over it returns nothing and looks like a dead router while the access log shows `200 OK` and the router logs the route normally.
+
 - **«У ТЕБЯ ПРОБЛЕМА С МЕТОДАМИ ПОДТВЕРЖДЕНИЯ» — the user was right, and the method was mine. Measured 11.10.2026 18:38.**
   * The complaint: the living-room lamp switches perfectly, and the room says «Пока не подтвердилось.» — on **every** light command, because none of these relays has a power sensor and the physics proof I made mandatory is therefore impossible for every lamp in the house.
   * **The measurement that settles what is actually true:**

@@ -1132,6 +1132,31 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
   * Live verification on the deployed router: `Цвет выключен` -> `easy_action conf=0.94`; `свет выключен` -> `conf=0.93`; `свет включен` -> `conf=0.92` + `HassTurnOn`. And «В гостиной уже выключено.» was honest — the next call's own log shows the relay at `off` beforehand.
   * A reminder that cost a confused minute: **`/route` answers SSE, not JSON.** A `curl | grep` over it returns nothing and looks like a dead router while the access log shows `200 OK` and the router logs the route normally.
 
+- **THE CORRIDOR CAMERA'S MICROPHONE CARRIES NOTHING ABOVE 3 kHz, SO THE WAKE WORD CAN NEVER BE DETECTED IN THAT ROOM. Measured 13.10.2026, `camera-corridor1` (192.168.22.165).**
+  * The room is alive and not quiet: `chunks` advance at the normal rate, `floor=0.0091` is a healthy value, `peak_max=12847` is **four times the 3000 wake gate** — the level was never the problem. The decoder simply never recognises the word: **`triggers=0 near=0 decodes=0 hyp=''` over ~49 000 chunks**, and `near=` is printed only when non-zero, so its absence IS the measurement — it separates "did not hear" from "heard and discarded", which is the only reason that counter exists.
+  * **The instrument that settles it is energy above 7 kHz**, measured on the camera's native 48 kHz so nothing is thrown away at the 16 kHz capture rate:
+
+    | | 0-3 kHz | 3-7 kHz | 7 kHz+ |
+    |---|---|---|---|
+    | гостиная (.241) | 96.29% | **1.51%** | **2.20%** |
+    | **коридор (.165)** | **99.99%** | **0.00%** | **0.00%** |
+
+  * **Not time compression.** That signature is content moved UP (7 kHz pushed to 14 kHz, empty at 5-8 kHz). There is no hump anywhere above 7 kHz here — the content is simply absent, not displaced. The one document that predicted a time-compressed camera, with the 04.10 autopsy of a dead camera microphone and the corroborating note about the man who heard his cat on the ethernet port, both point the wrong way.
+  * **Not analog overload either — measured, not assumed.** Scanning the band at three gain settings:
+
+    | `audio.volume` | rms | 0-3 kHz | 3-7 kHz |
+    |---|---|---|---|
+    | 70 | 3215 | 100.00% | **0.00%** |
+    | 50 | 882 | 99.99% | **0.00%** |
+    | 30 | 243 | 99.99% | **0.01%** |
+
+    The control works — the level falls 13x from 70 to 30 — and the high frequencies never appear at any of them. **So there is no setting that restores them**, and lowering the volume again is not a fix.
+  * **A high-pass was tested and REJECTED on a positive control.** Playing «Компьютер, включи свет в коридоре.» through the camera's own speaker, the raw recording decoded as `['включи свет']` and the **180 Hz high-passed recording decoded as nothing**. The filter removed the one result that worked. My earlier reasoning — that the filter "raises the speech band sevenfold, therefore it will help" — was a spectral ratio doing the work of a measurement, and the measurement says no.
+  * **`WAKE_TOKENS` is irrelevant here**: `near=0` means nothing remotely like «компьютер» was decoded, so there is no spelling to add.
+  * **Precision matters, because "deaf" would be wrong.** Whisper *did* read three whole sentences from this microphone on 12.10 (`'включи свет в кофе'`, `'Сколько времени?'`, `'Где мы находимся?'`). A large model with long context and strong language priors can work around a missing band; a small streaming wake-word decoder cannot. **Same audio, two models, two verdicts** — which is why the wake word never fires once in ~49 000 chunks while the room is plainly not silent.
+  * **Correction to this file's own earlier entry.** On 12.10 I concluded "it was `audio.volume`, not a dead unit", and lowering the volume was genuinely right about one thing — it removed the clipping. But it did not give the microphone its high frequencies, and this entry supersedes that part: **the volume change stopped the saturation, not the deafness.** The right reading of the swap, which I stated at the time, is the one that survived: the fault travels with the unit, and the location is innocent.
+  * **Conclusion: replace the unit, or have its audio path repaired.** A swap proved a different camera works at that exact mount. No software setting, no filter, no token list and no threshold reaches a signal that is not in the recording.
+
 - **«У ТЕБЯ ПРОБЛЕМА С МЕТОДАМИ ПОДТВЕРЖДЕНИЯ» — the user was right, and the method was mine. Measured 11.10.2026 18:38.**
   * The complaint: the living-room lamp switches perfectly, and the room says «Пока не подтвердилось.» — on **every** light command, because none of these relays has a power sensor and the physics proof I made mandatory is therefore impossible for every lamp in the house.
   * **The measurement that settles what is actually true:**

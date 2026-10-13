@@ -1155,6 +1155,16 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
   * **`WAKE_TOKENS` is irrelevant here**: `near=0` means nothing remotely like «компьютер» was decoded, so there is no spelling to add.
   * **Precision matters, because "deaf" would be wrong.** Whisper *did* read three whole sentences from this microphone on 12.10 (`'включи свет в кофе'`, `'Сколько времени?'`, `'Где мы находимся?'`). A large model with long context and strong language priors can work around a missing band; a small streaming wake-word decoder cannot. **Same audio, two models, two verdicts** — which is why the wake word never fires once in ~49 000 chunks while the room is plainly not silent.
   * **Correction to this file's own earlier entry.** On 12.10 I concluded "it was `audio.volume`, not a dead unit", and lowering the volume was genuinely right about one thing — it removed the clipping. But it did not give the microphone its high frequencies, and this entry supersedes that part: **the volume change stopped the saturation, not the deafness.** The right reading of the swap, which I stated at the time, is the one that survived: the fault travels with the unit, and the location is innocent.
+  * **The decisive measurement is the LONGEST RUN above the floor, on a recording timed around the user speaking.** Not the rms, not the spectrum: speech is 50-200 ms of contiguous high-amplitude samples, and this signal has none.
+    ```
+    300.0 с записи, пока пользователь говорил в коридоре
+    фон 2596, максимум огибающей 2879
+    полусекунд выше 2x фона:   0 из 600
+    длиннейшая серия >= 8000:   42 сэмпла = 2.6 мс
+    сэмплов >= 20000:           14 за все 300 с
+    ```
+    The microphone is NOT dead: a loopback through its OWN speaker gives 5.5x over its own floor. **But that speaker sits 5 cm from the mic and the human is two metres away, so the loopback says nothing about a person at distance — which is exactly the trap this room invites.**
+  * **Method error worth recording, because it is the fourth today and the same one:** the first pass at this recording analysed **82 s of a 300 s file**, because the analysis was started while ffmpeg was still writing. The conclusion was unchanged on the full file, but a conclusion drawn from a partial file is not a conclusion, and three separate bad measurements in one day make the fourth worth naming. **Check the byte count against the duration you asked for before trusting any of it.**
   * **Conclusion: replace the unit, or have its audio path repaired.** A swap proved a different camera works at that exact mount. No software setting, no filter, no token list and no threshold reaches a signal that is not in the recording.
 
 - **«КАМЕРА ПЕРЕСТАЛА СЛУШАТЬ ОТВЕТ ПОСЛЕ ВОПРОСА» — the window was never off; the LOG lied for 24 s and the mic was muted for 65. Measured 13.10.2026 15:21, living room.**

@@ -2477,6 +2477,39 @@ class CameraSession:
             else 0.0
         )
 
+    def _relative_level(self, level: float) -> float:
+        """`level` divided by THIS room's own tracked noise floor.
+
+        WHY THIS EXISTS — the arbiter's rule is "louder wins", and that is only
+        a proximity test when every microphone has the same gain. These do not:
+        the median feed rms measured 13.10.2026 is 495 in the living room, 1981
+        at the entrance and 3616 in the kitchen — a ~4x spread. A raw comparison
+        is therefore mostly a measurement of which mic is most sensitive, and it
+        hands every tie to that room.
+
+        Measured 13.10.2026 09:03, the user speaking directly beside the
+        living-room camera and the ENTRANCE camera answering. Both rooms heard
+        the same word 37 ms apart and the arbiter logged
+            {'livingroom': (7303, 0), 'entrance1': (9577, 0)} -> 'entrance1'
+        which reads like a correct decision. Against their own floors the same
+        event was 16.2x for the living room and 6.6x for the entrance: the room
+        he was next to heard it 2.5x better and lost to a microphone that is
+        simply louder.
+
+        A floor that cannot be established (`_NoiseFloor.value` stays 0.0 until
+        it is seeded from the first 12 frames) scores 0, so the room stands
+        down — another room answers, never the wrong one carrying the user's
+        command. `_NoiseFloor` is fed `orig_rms`, which is already divided by
+        32768, hence the multiplication back into raw units here.
+
+        NOTE this changes the UNITS of the number in `arbiter[...]` log lines:
+        they are now multiples of the room's own floor, not raw peaks.
+        """
+        floor = self._noise.value * 32768.0
+        if floor <= 1.0:
+            return 0.0
+        return float(level) / floor
+
     async def _vad_process(self, chunk: bytes):
         async with self._vad_lock:
             s16 = np.frombuffer(chunk, dtype=np.int16)
@@ -2956,6 +2989,15 @@ class CameraSession:
                             or time.time() < self._speaking_until
                         )
                         my_lvl = self._proximity_level()
+                        # Proximity comparisons run on the level relative
+                        # to this room's OWN floor: the mics differ ~4x in
+                        # gain, so a raw comparison makes a quiet-mic room
+                        # unable to steal (5 x its owner's raw level can
+                        # exceed the 32767 ceiling) and hands every tie to
+                        # a loud-mic room. `my_lvl` itself stays RAW below,
+                        # because the quiet-source fire bar thresholds it
+                        # against 2000.
+                        my_rel = self._relative_level(my_lvl)
                         # Quiet-source fire bar: 0.58 below 2000 raw peak,
                         # 0.55 above it. Computed once so the guard, its log
                         # line and the STT rescue band below cannot drift
@@ -3107,11 +3149,11 @@ class CameraSession:
                             if (
                                 busy
                                 and not _ARB_STATE.get("cmd_sent")
-                                and my_lvl >= 5.0 * max(olvl, 1.0)
+                                and my_rel >= 5.0 * max(olvl, 1.0)
                             ):
                                 logger.info(
                                     f"[{self.stream_name}] 🥇 stealing ownership "
-                                    f"(lvl {my_lvl:.0f} vs owner {olvl:.0f})"
+                                    f"(rel {my_rel:.1f}x vs owner {olvl:.1f}x)"
                                 )
                                 busy = False
                             if busy:
@@ -3174,7 +3216,9 @@ class CameraSession:
         call sites, one rule.
         """
         w_ok, _key, _winner = await _arbiter_submit(
-            "wake", self.stream_name, self._proximity_level()
+            "wake",
+            self.stream_name,
+            self._relative_level(self._proximity_level()),
         )
         if not w_ok:
             logger.info(f"[{self.stream_name}] 🤝 wake ceded to a closer camera")
@@ -3189,7 +3233,7 @@ class CameraSession:
         """
         # Claim global interaction ownership so other rooms' detectors stand
         # down for this exchange.
-        _arbiter_set_owner(self.stream_name, self._proximity_level())
+        _arbiter_set_owner(self.stream_name, self._relative_level(self._proximity_level()))
         self._wake_cmd_sent = False
         self._last_fire_ts = time.time()
         self._last_wake_fired_at = time.time()
@@ -3537,14 +3581,16 @@ class CameraSession:
                     f"'{txt[:60]}'"
                 )
                 won, _, winner = await _arbiter_submit(
-                    "wake", self.stream_name, self._proximity_level()
+                    "wake",
+            self.stream_name,
+            self._relative_level(self._proximity_level()),
                 )
                 if not won:
                     logger.info(
                         f"[{self.stream_name}] 🤝 stt-confirm ceded to '{winner}'"
                     )
                     return
-                _arbiter_set_owner(self.stream_name, self._proximity_level())
+                _arbiter_set_owner(self.stream_name, self._relative_level(self._proximity_level()))
                 self._wake_cmd_sent = False
                 self._last_fire_ts = time.time()
                 self._wake_detected = True
@@ -3841,7 +3887,7 @@ class CameraSession:
         won, gk, winner = await _arbiter_submit(
             "cmd",
             self.stream_name,
-            float(self._last_utt_peak or 0),
+            self._relative_level(self._last_utt_peak or 0),
             0.6,
             quality=qual,
             respect_owner=True,

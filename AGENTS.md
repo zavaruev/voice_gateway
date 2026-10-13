@@ -1104,6 +1104,22 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
   * **The room is left fully configured so a replacement needs no further change** (stream, source URL with credentials + `#backchannel=1`, `/play_audio`, vosk model, `CAMERA_WEBRTC=false`, `_CORRIDOR_STREAMS`). Only the unit has to change.
   * 0 false wakes after the restore.
 
+- **«Я ГОВОРИЛ РЯДОМ С КАМЕРОЙ В ГОСТИНОЙ, ОТВЕТИЛА КАМЕРА ПРИХОЖЕЙ» — THE ARBITER COMPARED RAW LEVELS, SO THE LOUDEST MICROPHONE WON EVERY TIE. Measured 13.10.2026 09:03.**
+  * Both rooms heard the same word **37 ms apart** and the arbiter logged what looks like a correct decision:
+    ```
+    09:03:14.902  [livingroom] VOSK WAKE peak=1145 window=17864   -> claim 7303
+    09:03:14.939  [entrance1]  VOSK WAKE peak=2487 window=25695   -> claim 9577
+    09:03:15.620  ⚖️ arbiter[wake]: {'livingroom': (7303, 0), 'entrance1': (9577, 0)} -> 'entrance1'
+    ```
+    9577 beats 7303, and the rule is "louder wins". **That is not a proximity measurement when the microphones do not match.** Median `feed rms` over the same 10 minutes: livingroom **495**, entrance1 **1981**, camera-corridor1 2390, kitchen **3616** — a **~4x spread**. A raw comparison is mostly a measurement of which mic is most sensitive.
+  * Against their own floors the same event was **16.2x** for the living room and **6.6x** for the entrance. The room the user was standing next to heard it **2.5x better and lost.** The user confirmed the entrance camera is in the entrance hall where it always was, so this is the rule and not the placement.
+  * **The same defect made a proximity steal impossible for a quiet room.** `my_lvl >= 5.0 * max(olvl, 1.0)` compares raw levels, and with the living room at 7303 the threshold is **36 515 — above the 32 767 ceiling of the raw signal.** A room whose mic is quiet could be the interaction owner and be *provably* immune to takeover, while the loudest mic in the house took every wake.
+  * **Fix: `_relative_level()` — the level divided by the room's own `_NoiseFloor`.** Applied at every level comparison: both wake submissions, the command submission, both `_arbiter_set_owner` calls and the steal test. `my_lvl` itself stays **raw**, because the quiet-source fire bar thresholds it against 2000 — mixing the two units would have silently moved a wake threshold.
+  * **A floor that cannot be established scores 0** (`_NoiseFloor.value` is 0.0 until seeded from the first 12 frames), so that room stands down: another room answers, never the wrong one carrying the command. Same asymmetry as everywhere else here.
+  * **The numbers in `arbiter[...]` lines are now multiples of the room's own floor, not raw peaks.** Anyone comparing them against an old log has to know the unit changed.
+  * **The regression test fails on the pre-fix code for the same reason the field did** — it is written with the measured 7303/9577 and the measured 495/1981 floors, not with invented values.
+  * A related finding from the same session: **the living-room pause endpoint was cutting commands.** `run_frames 6` gives a minimum utterance of (5+6)x160 ms = **1.29 s**, shorter than a short command; on 12.10 the nine "speech" frames were the wake word itself and the six quiet ones the ~0.96 s gap before the command, so «включи свет» became «В плечи свет». Shipped `CAMERA_PAUSE_RUN_FRAMES_LIVINGROOM=15` (minimum 3.20 s). The threshold was deliberately **not** touched: `thresh 0.0247` already sits in the measured gap between background (p90 0.0166) and speech (p99 0.0446), so changing it would have been a guess. `0`-means-unset means a revert is one line back to 6.
+
 - **«У ТЕБЯ ПРОБЛЕМА С МЕТОДАМИ ПОДТВЕРЖДЕНИЯ» — the user was right, and the method was mine. Measured 11.10.2026 18:38.**
   * The complaint: the living-room lamp switches perfectly, and the room says «Пока не подтвердилось.» — on **every** light command, because none of these relays has a power sensor and the physics proof I made mandatory is therefore impossible for every lamp in the house.
   * **The measurement that settles what is actually true:**

@@ -496,3 +496,53 @@ async def test_a_wake_that_wins_the_cross_camera_contest_does_beep():
     assert fire.await_count == 1, (
         "the winning room did not fire — the contest is now refusing everyone"
     )
+
+
+# ---------------------------------------------------------------------------
+# The arbiter compared RAW levels, so the room with the most sensitive
+# microphone won every tie instead of the room the user was standing in.
+#
+# Measured 13.10.2026 09:03: the user spoke directly beside the living-room
+# camera and the ENTRANCE camera answered. Both rooms heard the same word 37 ms
+# apart and the arbiter logged
+#
+#     arbiter[wake]: {'livingroom': (7303, 0), 'entrance1': (9577, 0)}
+#                    -> 'entrance1'
+#
+# which looks correct — 9577 beats 7303. It is not a proximity measurement: the
+# two microphones differ ~4x in gain (median feed rms 495 in the living room
+# against 1981 at the entrance, and 3616 in the kitchen). Against their OWN
+# floors the same event was 16.2x for the living room and 6.6x for the entrance,
+# so the room the user was next to heard it 2.5x better and lost.
+#
+# The numbers below are those two rooms' measured values, so this test fails on
+# the pre-fix code for the same reason the field did.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_arbiter_prefers_the_room_that_heard_better_relative_to_its_own_floor():
+    """Loudest-wins is only a proximity test when the microphones match."""
+    near = _make_session()          # the room the user was standing in
+    far = _make_session()           # a different room, heard from further away
+    near.stream_name = "livingroom"
+    far.stream_name = "entrance1"
+
+    # Measured absolute peak level over the last ~2 s (mean of _recent_peaks).
+    near._recent_peaks = [7303] * 12
+    far._recent_peaks = [9577] * 12
+
+    # ...and each room's own tracked noise floor, normalised 0-1 exactly as
+    # _NoiseFloor stores it (it is fed `orig_rms`, which is rms/32768).
+    near._noise.value = 495 / 32768.0
+    far._noise.value = 1981 / 32768.0
+
+    near_won, far_won = await asyncio.gather(
+        near._claim_wake(), far._claim_wake(),
+    )
+
+    assert near_won and not far_won, (
+        "the room the user was standing next to lost the contest to a room that "
+        "merely has a louder microphone: near=16.2x its own floor, far=6.6x its "
+        "own, and the arbiter picked the room with the higher RAW level"
+    )

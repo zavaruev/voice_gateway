@@ -322,6 +322,11 @@ _ANCHOR_FRAC = 0.5
 _ECHO_CONTAINMENT_MIN = 0.8
 _ECHO_JACCARD_MIN = 0.6
 
+# Default for `CameraConfig.echo_repeat_horizon`. See the field's comment for
+# the measurements behind it: the guard existed for a 15-25 s speaker delay and
+# had no timer, so it discarded commands spoken 9 and 15 minutes later.
+_ECHO_REPEAT_HORIZON_S = 45.0
+
 
 def _echo_of_reply(norm: str, reply_norm: str) -> bool:
     """True if `norm` is the echoed TTS reply `reply_norm`.
@@ -361,6 +366,24 @@ def _echo_of_reply(norm: str, reply_norm: str) -> bool:
     containment = inter / len(a)
     jaccard = inter / len(a | b)
     return containment >= _ECHO_CONTAINMENT_MIN and jaccard >= _ECHO_JACCARD_MIN
+
+
+def _echo_replies_this_soon(now: float, spoken_at: float, horizon: float) -> bool:
+    """Is `spoken_at` recent enough for a reply to still be the echo?
+
+    **NEITHER echo guard had this, and both need it.** `_echo_of_reply` is pure
+    text similarity: it takes no time input at all, so its verdict on a sentence
+    spoken an hour later is identical to its verdict on one spoken during
+    playback. The transcript-level anti-loop check had the same hole, and it is
+    the one that actually cost a command — measured 14.10.2026, the corridor
+    said «включи свет», and nine minutes later the SAME sentence was dropped as
+    «Echo repeat» with the reply nine minutes old. A guard that cannot tell
+    "the user said that again" from "the microphone replayed that" is not an
+    echo guard.
+    """
+    if not spoken_at:
+        return False
+    return (now - spoken_at) < horizon
 
 
 logger.setLevel(logging.INFO)
@@ -1117,6 +1140,20 @@ class CameraConfig:
     # SpeexDSP noise-suppression cutoff in raw rms. 0 => 400. Was hardcoded per
     # room (`800 if kitchen else 400`); see _preprocess_audio.
     ns_rms_gate: int = 0
+    # How long a transcript may still be treated as our own voice coming back
+    # through the microphone. 0 => _ECHO_REPEAT_HORIZON_S.
+    #
+    # The anti-loop guard this bounds was WRITTEN for a 15-25 s speaker delay
+    # (its own comment says so) but carried no timer at all, so it outlived its
+    # own justification by hours. Measured 14.10.2026: every one of its two
+    # firings in the log was a REAL command — 923 s and 543 s after the reply,
+    # both «включи свет» — and zero genuine echoes. 45 s covers the worst
+    # measured return of the ONVIF backchannel (3-40 s, AGENTS.md 07.10.2026)
+    # and is 12x shorter than the nearest false positive. Per-room because the
+    # two playback paths differ: `/play_audio` answers in 0.06-0.11 s and its
+    # acoustic tail measured ~1.9 s, while a WebRTC-only room still depends on
+    # the backchannel.
+    echo_repeat_horizon: float = 0.0
     # Minimum raw peak a chunk must reach for a decoded wake word to count.
     #
     # A decoder fed near-silence returns its most likely phrase, and for this
@@ -1287,6 +1324,12 @@ class CameraSession:
         self._wake_min_peak = (
             config.wake_min_peak if config.wake_min_peak > 0 else _WAKE_MIN_PEAK
         )
+        # 0 means "unset, use the default" like every other tuning value here.
+        self._echo_repeat_horizon = (
+            config.echo_repeat_horizon
+            if config.echo_repeat_horizon > 0
+            else _ECHO_REPEAT_HORIZON_S
+        )
         # Pre-built Authorization header: aiohttp.BasicAuth is deprecated in
         # aiohttp 4, and /play_audio is the only place we do HTTP basic auth.
         self._play_audio_headers = {}
@@ -1334,6 +1377,7 @@ class CameraSession:
         self._auto_greeting = False
         self._last_auto_greet_ts = 0.0
         self._last_tts_reply = ""  # normalized text we last spoke (echo guard)
+        self._last_tts_reply_at: float = 0.0  # when we last spoke it
         self._wake_greeting_delay = 5.0
         # True while a follow-up window WE opened is still live. The player's
         # finally block uses it to decide whether it may close the window, and
@@ -1360,6 +1404,12 @@ class CameraSession:
         self._pc: RTCPeerConnection | None = None
         self._out_track: AIVoiceOutputTrack | None = None
         self._last_transcript: str = ""
+        # When that transcript was HEARD. Without it the anti-loop guard below
+        # cannot tell "the user said the same thing twice" from "the microphone
+        # played the same audio twice" — measured 14.10.2026, where it discarded
+        # «включи свет» in two different rooms, 923 s and 543 s after the reply
+        # it was supposedly the echo of, and caught no real echo at all.
+        self._last_transcript_at: float = 0.0
         self._speaking = False
         self._speaking_until = 0.0
         # Suppress the wake *model* for the full delayed-echo window after TTS
@@ -3791,26 +3841,67 @@ class CameraSession:
             await self._play_attention("ack")
             self._back_to_wake()
             return
-        # Anti-loop: camera hears its own TTS echo with 15-25s delay;
-        # if this transcript matches a recent one, it's the echo.
-        if norm and norm == self._last_transcript:
+        # Anti-loop and the reply-overlap backstop, both behind ONE horizon. Extracted
+        # into a method so they can be CALLED: grepping the source for the guard
+        # is the wrong instrument, because both rules are written in these very
+        # comments as the mistakes they are, so a search finds the counter-example
+        # it is trying to prove absent. Returns which guard fired, so the log
+        # line names it instead of both reading "echo".
+        echo = self._transcript_is_echo(norm)
+        if echo == "repeat":
             logger.info(f"[{self.stream_name}] ❌ Echo repeat, ignoring: '{txt[:60]}'")
             return
-        # Stronger echo guard: the speaker plays our own reply, so Whisper
-        # transcribes it ~verbatim. If this transcript strongly overlaps the
-        # text we most recently spoke (and we're in a wake window, where an
-        # echo is plausible), treat it as the echo and drop it. This is the
-        # backstop for the waveform-based _is_echo in _feed_audio.
-        if norm and self._last_tts_reply and self._wake_detected:
-            if _echo_of_reply(norm, self._last_tts_reply):
-                logger.info(
-                    f"[{self.stream_name}] ❌ Echo of TTS reply, ignoring: '{txt[:60]}'"
-                )
-                return
+        if echo == "reply":
+            logger.info(
+                f"[{self.stream_name}] ❌ Echo of TTS reply, ignoring: '{txt[:60]}'"
+            )
+            return
         self._last_transcript = norm
+        self._last_transcript_at = time.time()
         if uid and uid != "unknown":
             logger.info(f"[{self.stream_name}] 👤 Speaker: {uid} | '{txt[:60]}'")
         await self._handle_wake_or_command(txt, uid or "camera")
+
+    def _transcript_is_echo(self, norm: str) -> str | None:
+        """Which echo guard claims this transcript, if any. "repeat" | "reply" | None.
+
+        Both rules answer the same physical question — is this our own voice
+        coming back through the microphone? — so both are bounded by the same
+        horizon, and neither is allowed to answer on text alone.
+
+        * **"repeat"** — identical to the previous transcript. Its own comment put
+          the speaker's return delay at 15-25 s, but the check carried NO timer,
+          so `_last_transcript` lived for the life of the process and the guard
+          became «the user already said that». Both firings in the log were real
+          commands: «включи свет» in the living room 923 s after the reply and in
+          the corridor 543 s after it (measured 14.10.2026). It caught no echo.
+        * **"reply"** — `_echo_of_reply`, the containment+Jaccard backstop for the
+          waveform guard `_is_echo`. Also had no time input, so a sentence that
+          happened to share vocabulary with a reply from any point in the session
+          would be dropped. `_is_echo` was fixed to respect `_ECHO_HORIZON_S` on
+          07.10.2026; this half of the same question never was.
+
+        The horizon here is deliberately wider than `_is_echo`'s 8 s: that guard
+        works on a chunk as it arrives, while this one works on a TRANSCRIPT
+        assembled over seconds and arriving after the audio it contains.
+        """
+        if not norm:
+            return None
+        now = time.time()
+        horizon = self._echo_repeat_horizon
+        if (
+            norm == self._last_transcript
+            and _echo_replies_this_soon(now, self._last_transcript_at, horizon)
+        ):
+            return "repeat"
+        if (
+            self._last_tts_reply
+            and self._wake_detected
+            and _echo_replies_this_soon(now, self._last_tts_reply_at, horizon)
+            and _echo_of_reply(norm, self._last_tts_reply)
+        ):
+            return "reply"
+        return None
 
     def _is_wake_word_alone(self) -> bool:
         """Is this utterance the wake word's OWN audio rather than a command?
@@ -5123,6 +5214,7 @@ class CameraSession:
         self._speaking = True
         # Remember what we said so we can drop the echoed transcript later.
         self._last_tts_reply = reply.lower().strip().strip(".,!? -") if reply else ""
+        self._last_tts_reply_at = time.time()
 
         # Block the mic while the speaker is actually sounding, and for NO longer.
         #

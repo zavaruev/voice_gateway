@@ -26,7 +26,11 @@ import numpy as np
 import pytest
 
 import camera_client
-from camera_client import CameraConfig, CameraSession
+from camera_client import (
+    _ECHO_REPEAT_HORIZON_S,
+    CameraConfig,
+    CameraSession,
+)
 
 
 class _SilentVAD:
@@ -797,3 +801,122 @@ async def test_dump_stops_at_the_cap(tmp_path):
         await s._vad_process(_chunk(1000))
         await asyncio.sleep(0)
     assert s._vosk_dump_fh is None, "the dump must close itself at the cap"
+
+
+# ---------------------------------------------------------------------------
+# The echo guards had no idea what TIME it was.
+# ---------------------------------------------------------------------------
+# Measured 14.10.2026, the corridor spoke at 16:50:59 and the user said «включи
+# свет» at 17:00:02 — 543 s later:
+#
+#   17:00:02.373 ✅ Whisper OK: 'включи свет'
+#   17:00:02.374 ❌ Echo repeat, ignoring: 'включи свет'
+#
+# and the same one millisecond gap in the living room, 923 s after its reply.
+# Both were real commands. The anti-loop guard's own comment said the speaker
+# returns in 15-25 s, so the author knew the bound — and then implemented none.
+# The result was a filter that drops anyone who says a sentence twice, in any
+# room, at any time. Neither firing was an echo; that is 0 for 2.
+
+def _echo_session(last_at, last_norm="включи свет", reply="", reply_at=0.0):
+    """A session carrying only what `_transcript_is_echo` reads.
+
+    Built by hand, so every attribute it touches has to be here by name — a
+    missing one used to surface as `TTS sentence failed` several layers away
+    (AGENTS.md, 14.10.2026).
+
+    Offsets are real seconds against the wall clock rather than an injected
+    `now`, because the method reads `time.time()` itself. Giving it a `now`
+    argument for the convenience of the test would put a test-only hook into the
+    live audio path, and a stub that lets the test dictate the answer hides the
+    very thing it claims to check.
+    """
+    s = CameraSession.__new__(CameraSession)
+    s.stream_name = "camera-corridor1"
+    s._echo_repeat_horizon = _ECHO_REPEAT_HORIZON_S
+    s._last_transcript = last_norm
+    s._last_transcript_at = time.time() - last_at
+    s._last_tts_reply = reply
+    s._last_tts_reply_at = (time.time() - reply_at) if reply_at else 0.0
+    s._wake_detected = True
+    return s
+
+
+def test_the_reply_overlap_guard_is_bounded_too():
+    """`_echo_of_reply` is pure text similarity and had no time input, so it
+    would drop a sentence sharing vocabulary with a reply from any point in the
+    session. The waveform guard `_is_echo` was bounded on 07.10.2026; this half
+    of the same question never was.
+
+    `last_norm=""` puts the OTHER guard out of reach on purpose: it compares the
+    transcript to the previous one, and leaving "включи свет" in place made it
+    fire first and answer for the reply guard — a stub whose default quietly
+    changed which branch was under test.
+
+    The echoed text is a spoken CONFIRMATION rather than a light command, and
+    that is deliberate. Whisper transcribes our «Включила свет» back as
+    «включила», so «включи» and «включила» are different tokens and the
+    similarity test never reaches its thresholds — a realistic echo is our own
+    answer heard again («сейчас в коридоре горит свет»), which is the case this
+    guard actually exists for. The 11.10.2026 field cases already cover the
+    similarity axis.
+    """
+    echoed = "сейчас в коридоре горит свет"
+    old = _echo_session(last_at=0.0, last_norm="", reply=echoed, reply_at=400.0)
+    assert old._transcript_is_echo(echoed) is None, (
+        "реплика 400 с назад не может быть эхом этого utterance"
+    )
+    fresh = _echo_session(last_at=0.0, last_norm="", reply=echoed, reply_at=3.0)
+    assert fresh._transcript_is_echo(echoed) == "reply", (
+        "эхо свежего ответа должно отсекаться"
+    )
+
+
+def test_repeating_the_same_sentence_nine_minutes_later_is_not_an_echo():
+    """The field case, verbatim: 543 s, same words, real command."""
+    s = _echo_session(last_at=543.0)
+    assert s._transcript_is_echo("включи свет") is None, (
+        "пользователь повторил фразу через 9 минут — это команда, а не эхо"
+    )
+
+
+def test_repeating_the_same_sentence_fifteen_minutes_later_is_not_an_echo():
+    """The other field firing, 923 s, in a different room."""
+    s = _echo_session(last_at=923.0)
+    assert s._transcript_is_echo("включи свет") is None
+
+
+def test_a_genuine_echo_within_the_horizon_is_still_caught():
+    """A guard that can only ever say "no" is worth nothing.
+
+    12 s is inside the 15-25 s the old comment described, and well inside the
+    45 s horizon, so the acoustic loop this was written for is still stopped.
+    """
+    s = _echo_session(last_at=12.0)
+    assert s._transcript_is_echo("включи свет") == "repeat", (
+        "настоящее эхо должно отсекаться, иначе защита стала безвредной"
+    )
+
+
+def test_the_horizon_default_covers_the_worst_measured_echo_return():
+    """45 s, not a round number chosen for looks: it covers the ONVIF
+    backchannel's worst measured return (3-40 s, AGENTS.md 07.10.2026) and is
+    12x shorter than the nearest false positive measured (543 s)."""
+    assert _ECHO_REPEAT_HORIZON_S == 45.0
+    assert _ECHO_REPEAT_HORIZON_S < 543.0, (
+        "горизонт обязан быть короче ближайшего зафиксированного ложного "
+        "срабатывания, иначе поломка не исправлена"
+    )
+
+
+def test_zero_means_unset_and_not_a_window_that_can_never_fire():
+    """0 is «unset, use the default» throughout this project. Taken literally
+    it would produce a guard that can never refuse anything."""
+    cfg = CameraConfig(stream_name="x", echo_repeat_horizon=0.0)
+    assert cfg.echo_repeat_horizon == 0.0
+    s = _echo_session(last_at=12.0)
+    s._echo_repeat_horizon = (
+        cfg.echo_repeat_horizon if cfg.echo_repeat_horizon > 0
+        else _ECHO_REPEAT_HORIZON_S
+    )
+    assert s._transcript_is_echo("включи свет") == "repeat"

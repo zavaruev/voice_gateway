@@ -3729,6 +3729,16 @@ async def start_camera_sessions():
                     or os.getenv("CAMERA_WAKE_MIN_PEAK")
                     or 0
                 ),
+                # How long a transcript may still be dismissed as our own voice
+                # coming back. 0 => 45 s. The guard it bounds was written for a
+                # 15-25 s speaker delay and had no timer, so it discarded real
+                # commands 543 s and 923 s after the reply (measured
+                # 14.10.2026 in the corridor and the living room).
+                echo_repeat_horizon=float(
+                    os.getenv(f"CAMERA_ECHO_REPEAT_HORIZON_{name.upper()}")
+                    or os.getenv("CAMERA_ECHO_REPEAT_HORIZON")
+                    or 0
+                ),
                 # Peak the reply is normalised to before the camera plays it.
                 # 0 => the built-in 20000 (61 % of full scale). Exists for an
                 # unresolved field report of crackling playback (05.10.2026):

@@ -16,6 +16,13 @@ DESIGN.md
 AGENTS.md
 setup_gateway.sh
 
+# Runtime logs — bind-mounted host dir (GATEWAY_LOG_DIR), not repo content.
+# `*.log` below covers the rotated text logs but NOT logs/vosk_dump/*.raw,
+# which is a 16 kHz mono PCM dump and reached 44 MB in one afternoon. An
+# unignored binary in a gitignored-shaped directory is exactly what `git add -A`
+# picks up.
+logs/
+
 # OS junk
 .DS_Store
 Thumbs.db

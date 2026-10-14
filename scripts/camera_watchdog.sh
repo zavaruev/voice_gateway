@@ -326,6 +326,52 @@ print(vals[len(vals) // 2])
 ' "$CUR_STREAM" 2>/dev/null
 }
 
+# CONFIG-DRIFT: read the setting itself, not just its consequence.
+#
+# `mic-silent` above catches a room that has gone quiet, which is what a wiped
+# `audio.volume` LOOKS LIKE. It cannot say WHY, and it only fires once the level
+# has already collapsed. This reads the key off the camera over SSH and reports it
+# while the rest of the file is still intact — on 14.10.2026 the update took
+# `volume` AND `rtsp.backchannel`, `video0.gopSize`, the video1 substream,
+# `outgoing.substream` and `watchdog.timeout` in one go.
+#
+# Reported, never rewritten. Restoring a camera's config unattended is a bigger
+# decision than this script may take: the file is per-camera state, and the person
+# who set the value should be the one to find out it did not survive. The output
+# is the value, the expected value and the one-line fix.
+#
+# 100 is MEASURED, not chosen: it is what every one of these four cameras carried
+# while working (AGENTS.md, 14.10.2026), and 30 is the value at which the kitchen
+# read rms 4 and the room is effectively deaf.
+CAM_CONFIG_CHECK="${CAM_CONFIG_CHECK:-1}"
+CAM_AUDIO_VOLUME="${CAM_AUDIO_VOLUME:-100}"
+
+# The raw `  volume:` value, or nothing when the key is absent. EMPTY means
+# "absent", which IS the fault — so it has to stay distinguishable from "SSH
+# failed", which returns early in config_drift instead.
+cam_audio_volume() {
+  cam_ssh "awk '/^ *volume:/{print \$2; exit}' /etc/majestic.yaml"
+}
+
+config_drift() {
+  local got
+  [ "$CAM_CONFIG_CHECK" = "1" ] || return 1
+  if ! cam_ssh_ok; then
+    log "$CUR_NAME config check skipped: no SSH key on $CUR_IP — this room has no drift cover"
+    return 1
+  fi
+  got="$(cam_audio_volume | tr -d '\r[:space:]')"
+  if [ -z "$got" ]; then
+    log "$CUR_NAME CONFIG DRIFT — /etc/majestic.yaml has NO audio.volume (expected ${CAM_AUDIO_VOLUME}). The 14.10.2026 firmware update dropped it and took rtsp.backchannel and video0.gopSize with it. Fix: put a known-good config on $CUR_IP, then S95majestic restart. Nothing restarted."
+    return 0
+  fi
+  if [ "$got" != "$CAM_AUDIO_VOLUME" ]; then
+    log "$CUR_NAME CONFIG DRIFT — audio.volume is $got, expected ${CAM_AUDIO_VOLUME}. Fix on $CUR_IP and restart S95majestic. Nothing restarted."
+    return 0
+  fi
+  return 1
+}
+
 audio_starved_hits() {
   local since="${1:-$STARVE_WINDOW_S}" lines
   lines="$(docker logs voice_gateway --since "${since}s" 2>&1 \
@@ -461,10 +507,15 @@ for entry in $CAMERAS; do
       # Stream alive, rate fine, level on the floor. Reported, never acted on —
       # there is nothing here a restart fixes. Logged with the one-line repair so
       # the reader does not have to know what happened on 14.10.2026.
-      log "$CUR_NAME MIC SILENT — level below ${MIC_SILENT_RMS} while streaming at real time (most likely: a firmware update dropped audio.volume from /etc/majestic.yaml). NOT restarting anything; fix is \`volume: 100\` + S95majestic restart on $CUR_IP"
+      log "$CUR_NAME MIC SILENT — level below ${MIC_SILENT_RMS} while streaming at real time. NOT restarting anything; most likely audio.volume was dropped from /etc/majestic.yaml"
       rm -f "${MIC_SILENT_STAMPS}_$CUR_STREAM" 2>/dev/null || true
       ;;
   esac
+  # Checked for EVERY room regardless of state, healthy included: the whole point
+  # is to catch the drift while the file is still otherwise intact and the room
+  # is still audible, which is exactly the state right after a firmware update and
+  # long before anything logs a symptom.
+  config_drift || true
 done
 # Recorded on every pass, healthy or not, so a level that changes while everything
 # looks fine still leaves a trace somewhere that outlives the gateway container.

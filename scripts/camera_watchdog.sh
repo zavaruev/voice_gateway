@@ -343,34 +343,104 @@ print(vals[len(vals) // 2])
 # 100 is MEASURED, not chosen: it is what every one of these four cameras carried
 # while working (AGENTS.md, 14.10.2026), and 30 is the value at which the kitchen
 # read rms 4 and the room is effectively deaf.
+
+# Defined here and nowhere else: `set -u` turns a missing definition into an abort
+# of the WHOLE script, not into a skipped check, so the default is mandatory.
 CAM_CONFIG_CHECK="${CAM_CONFIG_CHECK:-1}"
-CAM_AUDIO_VOLUME="${CAM_AUDIO_VOLUME:-100}"
 
-# The raw `  volume:` value, or nothing when the key is absent. EMPTY means
-# "absent", which IS the fault — so it has to stay distinguishable from "SSH
-# failed", which returns early in config_drift instead.
-cam_audio_volume() {
-  cam_ssh "awk '/^ *volume:/{print \$2; exit}' /etc/majestic.yaml"
-}
+# The whole config, fetched once and parsed on THIS side. Parsing on the host
+  # rather than with awk on the box keeps the comparison readable and lets quotes
+  # be normalised properly — the broken file carried `srate: 48000` where the good
+  # one has `srate: "48000"`, which is the same value written differently and must
+  # not read as drift.
+  cam_config_dump() {
+    cam_ssh "cat /etc/majestic.yaml"
+  }
 
-config_drift() {
-  local got
-  [ "$CAM_CONFIG_CHECK" = "1" ] || return 1
-  if ! cam_ssh_ok; then
-    log "$CUR_NAME config check skipped: no SSH key on $CUR_IP — this room has no drift cover"
+  # Dotted paths for the whole file. This config is two levels deep and uses no
+  # anchors or multi-line values, so a two-level walk is exact here. Anything
+  # unparsable produces no entry, and an unparsable file must not then read as
+  # "every key absent".
+  cam_config_keys() {
+    python3 -c '
+import sys
+q = chr(34) + chr(39)
+out, section = {}, None
+for raw in sys.stdin:
+    line = raw.rstrip("\r\n")
+    if not line.strip() or line.lstrip().startswith("#"):
+        continue
+    if line.startswith((" ", "\t")):
+        key, _, val = line.strip().partition(":")
+        if section and key:
+            out["%s.%s" % (section, key)] = val.strip().strip(q)
+    else:
+        section = line.rstrip(":").strip()
+for k in sorted(out):
+    print("%s=%s" % (k, out[k]))
+'
+  }
+
+  # Every key the 14.10.2026 firmware update took, with the value these four
+  # cameras carried while working. Enumerated rather than diffed against a
+  # reference file on purpose: `mirror`/`flip` and anything else per-mount is
+  # allowed to differ, and a whole-file comparison would cry wolf on it.
+  #
+  # A MISSING key is reported too, and not as a complaint about the value: that is
+  # exactly the shape of the incident — the key vanished, the build default took
+  # over, and the room changed behaviour with nothing logged. Whether the new
+  # default happens to be harmless is beside the point; the operator decides.
+  CAM_CONFIG_KEYS="${CAM_CONFIG_KEYS:-audio.volume=100
+audio.enabled=true
+audio.srate=48000
+audio.outputEnabled=true
+audio.outputVolume=80
+rtsp.backchannel=true
+video0.enabled=true
+video0.gopSize=1
+video1.enabled=false
+outgoing.substream=true
+watchdog.timeout=30
+nightMode.lightMonitor=true}"
+
+  config_drift() {
+    # `line` is initialised here and not merely declared: under `set -u` reading
+    # it before the first append aborts the WHOLE script, and it is only read on
+    # the first room that actually has drift — so the bug would surface exactly
+    # when the check is needed.
+    local dump want path expect got seen line="" missing=0 wrong=0
+    [ "$CAM_CONFIG_CHECK" = "1" ] || return 1
+    if ! cam_ssh_ok; then
+      log "$CUR_NAME config check skipped: no SSH key on $CUR_IP — this room has no drift cover"
+      return 1
+    fi
+    dump="$(cam_config_dump)"
+    if [ -z "$dump" ]; then
+      log "$CUR_NAME config check skipped: could not read /etc/majestic.yaml on $CUR_IP"
+      return 1
+    fi
+    seen="$(printf '%s\n' "$dump" | cam_config_keys)"
+
+    for want in $CAM_CONFIG_KEYS; do
+      path="${want%%=*}"
+      expect="${want#*=}"
+      got="$(printf '%s\n' "$seen" | grep "^${path}=" | head -1 | cut -d= -f2-)"
+      if [ -z "$got" ]; then
+        missing=$(( missing + 1 ))
+        line="$line|$path: НЕТ (ожидалось $expect) — действует умолчание сборки"
+      elif [ "$got" != "$expect" ]; then
+        wrong=$(( wrong + 1 ))
+        line="$line|$path: $got вместо $expect"
+      fi
+    done
+
+    if [ "$missing" -gt 0 ] || [ "$wrong" -gt 0 ]; then
+      log "$CUR_NAME CONFIG DRIFT — отсутствует $missing, значение не то у $wrong ($CUR_IP):${line}
+    Прошивка от 14.10.2026 удалила всё, что отличалось от новых умолчаний. Починка: скопировать рабочий /etc/majestic.yaml на $CUR_IP и перезапустить S95majestic. Ничего не перезапущено."
+      return 0
+    fi
     return 1
-  fi
-  got="$(cam_audio_volume | tr -d '\r[:space:]')"
-  if [ -z "$got" ]; then
-    log "$CUR_NAME CONFIG DRIFT — /etc/majestic.yaml has NO audio.volume (expected ${CAM_AUDIO_VOLUME}). The 14.10.2026 firmware update dropped it and took rtsp.backchannel and video0.gopSize with it. Fix: put a known-good config on $CUR_IP, then S95majestic restart. Nothing restarted."
-    return 0
-  fi
-  if [ "$got" != "$CAM_AUDIO_VOLUME" ]; then
-    log "$CUR_NAME CONFIG DRIFT — audio.volume is $got, expected ${CAM_AUDIO_VOLUME}. Fix on $CUR_IP and restart S95majestic. Nothing restarted."
-    return 0
-  fi
-  return 1
-}
+  }
 
 audio_starved_hits() {
   local since="${1:-$STARVE_WINDOW_S}" lines

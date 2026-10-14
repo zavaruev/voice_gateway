@@ -561,8 +561,8 @@ def find_entity(
     # domain ["light"]).
     pool = candidates
     if domain:
-        want = {d.lower() for d in domain}
-        in_dom = [e for e in candidates if e["entity_id"].split(".", 1)[0] in want]
+        want = tuple(f"{d.lower()}." for d in domain)
+        in_dom = [e for e in candidates if e["entity_id"].startswith(want)]
         if in_dom:
             pool = in_dom
     # Prefer a numeric sensor (temperature/battery readings) over helpers

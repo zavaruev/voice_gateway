@@ -51,7 +51,17 @@ set -u
 # made `go2rtc_up` look up a stream that does not exist, so BOTH rooms read as
 # `dead-stream`, and the ladder rebooted a perfectly healthy camera. It is
 # exercised by the tests below for exactly that reason.
-CAMERAS="${CAMERAS:-livingroom:192.168.22.241 kitchen:192.168.22.232}"
+# All four rooms. This list was livingroom+kitchen only, which left entrance1
+# and camera-corridor1 outside the state machine entirely: they appeared in the
+# passive `room level` record and nowhere else — no classification, no
+# mic-silent alert, no healing. The two newest rooms are exactly the two that
+# were swapped this month, so they are the two most likely to come back wrong.
+#
+# The watchdog SSH key is authorised on NONE of these boxes (measured 14.10.2026),
+# so every camera-side step is skipped with a log line and only the gateway-side
+# step and the classification run. That is fine for mic-silent, which reads the
+# gateway's own log and needs no SSH at all.
+CAMERAS="${CAMERAS:-livingroom:192.168.22.241 kitchen:192.168.22.232 entrance1:192.168.22.198 camera-corridor1:192.168.22.247}"
 GO2RTC="${GO2RTC:-http://192.168.22.102:1984}"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/voice_watchdog_ed25519}"
 LOG="${LOG:-/tmp/camera_watchdog.log}"
@@ -244,7 +254,10 @@ from collections import defaultdict
 
 rows = defaultdict(list)
 for line in sys.stdin:
-    m = re.search(r"\[(\w+)\] feed rms=(\d+) peak=(\d+)", line)
+    # The class is [A-Za-z0-9_-] and NOT \w: \w does not match a hyphen, and
+    # `camera-corridor1` has one — the corridor was silently absent from this
+    # record, and every detector copied from it inherited the blind spot.
+    m = re.search(r"\[([A-Za-z0-9_-]+)\] feed rms=(\d+) peak=(\d+)", line)
     if m:
         rows[m.group(1)].append((int(m.group(2)), int(m.group(3))))
 if not rows:
@@ -260,6 +273,57 @@ for room, vals in sorted(rows.items()):
   [ -n "$stats" ] || return 0
   log "room level (${since}s window):"
   printf '%s\n' "$stats" | while IFS= read -r line; do log "$line"; done
+}
+
+# MIC-SILENT: the stream is alive and the audio arrives at real time, but the
+# level sits on the floor. Measured 14.10.2026 after a firmware update: the new
+# build rewrote /etc/majestic.yaml to its own defaults and dropped
+# `audio.volume` from four of five cameras. Three rooms went deaf on a level of
+# 7-24 against a healthy 304-1070, i.e. the SAME state the kitchen lived in for a
+# week at volume 30. Nothing logged it: the stream was fine, the rate was fine,
+# every existing signal said healthy.
+#
+# The threshold comes from the two sides of that event, not from taste:
+#
+#   сломанные (11:38-11:43, до восстановления)   p90 = 25, максимум 83
+#   здоровые   (11:50-12:00, после восстановления) минимум 304, p10 = 356
+#
+# 150 sits x1.8 above the worst sample actually observed broken and x2.0 below
+# the lowest sample actually observed healthy. Overridable per room, because the
+# right number is a property of that room's noise, not of the house.
+#
+# MEDIAN, never the last sample: a 3 s log line is not a decision, and this
+# script has already restarted a healthy container seventeen times in a day off
+# exactly that. `MIC_SILENT_MIN_HITS` consecutive passes must agree.
+#
+# NOT ACTIONED, deliberately. There is nothing to restart: the setting is missing
+# FROM THE FILE, so a `majestic` restart re-reads the same file and the room stays
+# mute. Restarting the gateway is worse — it drops every model and every room. The
+# honest output is the level, the room and the one-line fix. Rewriting a camera's
+# config unattended is a bigger decision than this script may take on its own; the
+# person who set the volume should be the one to check that it came back.
+MIC_SILENT_RMS="${MIC_SILENT_RMS:-150}"
+MIC_SILENT_MIN_HITS="${MIC_SILENT_MIN_HITS:-3}"
+MIC_SILENT_WINDOW_S="${MIC_SILENT_WINDOW_S:-300}"
+MIC_SILENT_STAMPS="$STAMP_DIR/.camera_watchdog_micsilent"
+
+# Median `feed rms` for this room over the window. EMPTY when the gateway has
+# logged nothing, and an empty answer must never be read as "silent" — a gateway
+# that just restarted would otherwise declare four deaf rooms on the first pass.
+mic_silent_median() {
+  local since="${1:-$MIC_SILENT_WINDOW_S}"
+  docker logs voice_gateway --since "${since}s" 2>&1 | python3 -c '
+import re, sys
+vals = []
+for line in sys.stdin:
+    m = re.search(r"\[([A-Za-z0-9_-]+)\] feed rms=(\d+)", line)
+    if m and m.group(1) == sys.argv[1]:
+        vals.append(int(m.group(2)))
+if not vals:
+    sys.exit(0)
+vals.sort()
+print(vals[len(vals) // 2])
+' "$CUR_STREAM" 2>/dev/null
 }
 
 audio_starved_hits() {
@@ -294,6 +358,24 @@ classify() {
     if [ "${CAM_STARVED_HITS}" -ge "$STARVE_MIN_HITS" ]; then
       STATE="audio-starved"
       return 0
+    fi
+    # Last gate before healthy, and only while the stream is up: with no stream
+    # there is no level to read and dead-stream/wedged already route correctly.
+    local med thr hits_file hits
+    med="$(mic_silent_median)"
+    thr="${MIC_SILENT_RMS:-$MIC_SILENT_RMS}"
+    [ -n "$med" ] || thr=0
+    if [ "$thr" -gt 0 ] 2>/dev/null && [ -n "$med" ] && [ "$med" -lt "$thr" ]; then
+      hits_file="${MIC_SILENT_STAMPS}_$CUR_STREAM"
+      hits="$(cat "$hits_file" 2>/dev/null || echo 0)"
+      hits=$(( hits + 1 ))
+      echo "$hits" > "$hits_file" 2>/dev/null || true
+      if [ "$hits" -ge "$MIC_SILENT_MIN_HITS" ]; then
+        STATE="mic-silent"
+        return 0
+      fi
+    else
+      rm -f "${MIC_SILENT_STAMPS}_$CUR_STREAM" 2>/dev/null || true
     fi
   fi
   if [ "$fast" = 1 ] && [ "$up" = 1 ]; then
@@ -374,6 +456,13 @@ for entry in $CAMERAS; do
       # audio is arriving at a fraction of real time while the stream looks fine.
       SICK="$SICK $CUR_STREAM"
       log "$CUR_NAME UNHEALTHY state=$STATE http=$(cam_latency)s stream=$CUR_STREAM${CAM_STARVED_HITS:+ starved=${CAM_STARVED_HITS}/${STARVE_WINDOW_S}s}"
+      ;;
+    mic-silent)
+      # Stream alive, rate fine, level on the floor. Reported, never acted on —
+      # there is nothing here a restart fixes. Logged with the one-line repair so
+      # the reader does not have to know what happened on 14.10.2026.
+      log "$CUR_NAME MIC SILENT — level below ${MIC_SILENT_RMS} while streaming at real time (most likely: a firmware update dropped audio.volume from /etc/majestic.yaml). NOT restarting anything; fix is \`volume: 100\` + S95majestic restart on $CUR_IP"
+      rm -f "${MIC_SILENT_STAMPS}_$CUR_STREAM" 2>/dev/null || true
       ;;
   esac
 done

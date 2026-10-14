@@ -86,6 +86,7 @@ from ha_client import (
 from resolver import (
     area_of as resolver_area_of,
     RE_MEDIA_NOUN,
+    STREAM_DEFAULT_AREA,
     device_hint_from,
     resolve_action,
     resolve_query,
@@ -535,7 +536,9 @@ async def _execute_media(call) -> tuple[str | None, dict | None]:
     return call.speak_ok, None
 
 
-async def _execute_action(call, text_hint: str = "") -> tuple[str | None, dict | None]:
+async def _execute_action(
+    call, text_hint: str = "", stream_name: str = ""
+) -> tuple[str | None, dict | None]:
     """Run one easy_action MCP call. Returns (sentence, None) on success or
     an «already in state» answer, (None, error) otherwise — it never claims
     a side-effect that was not confirmed.
@@ -615,6 +618,24 @@ async def _execute_action(call, text_hint: str = "") -> tuple[str | None, dict |
             if not call.args.get("area") and len(targets) > 1:
                 # No room in the utterance and several devices match —
                 # acting would mean guessing which one.
+                #
+                # The refusal itself is right; what was WRONG was that it said
+                # nothing about WHY the area was missing. Measured 14.10.2026
+                # 16:50:40: «включи свет» in camera-corridor1 escalated with
+                # exactly this error, and the room name that would have settled
+                # it was one table row away. The satellite's own stream is
+                # therefore named in the log, and whether the table knows it —
+                # because "no room was named" and "this satellite has no default
+                # room" are different faults with different fixes, and the error
+                # text alone cannot tell them apart.
+                logger.warning(
+                    "  команда без комнаты, %d целей, stream=%r%s",
+                    len(targets), stream_name,
+                    ""
+                    if (stream_name or "").lower() in STREAM_DEFAULT_AREA
+                    else " — У ЭТОГО ПОТОКА НЕТ Area ПО УМОЛЧАНИЮ "
+                         "(STREAM_DEFAULT_AREA в resolver.py)",
+                )
                 return None, {
                     "ok": False,
                     "error": f"ambiguous_no_area: {len(targets)} targets, команда без комнаты",
@@ -1399,7 +1420,7 @@ async def _handle(req: RouteRequest):
             # Resolved a second time (pure regex, no I/O): the pre-flight
             # already turned this branch off if the resolver said None.
             call = resolve_action(text, area_hint)
-            outcome = await _execute_action(call, text)
+            outcome = await _execute_action(call, text, req.stream_name)
             # Three-tuple only when the on/off path could not settle on its first
             # read: the acknowledgement is spoken now and the verdict after the
             # remaining retries, so an unsettled device produces a short utterance

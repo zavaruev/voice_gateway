@@ -79,12 +79,39 @@ ROOMS: dict[str, list[str]] = {
 # Why: "выключи свет" said in the kitchen satellite must act on the kitchen —
 # the physical origin of the voice is the only room information available.
 # Keys are lowercased `stream_name` values from the ESP32 satellite config.
+#
+# **The table has to carry the CURRENT stream names AND the historical ones.**
+# It did not, and the failure was silent: `entrance1` and `camera-corridor1`
+# were absent, so «включи свет» said in either of the two NEWEST rooms carried
+# no Area at all, matched 9 devices across the whole house and escalated
+# (measured 14.10.2026 16:50:40, `ambiguous_no_area: 9 targets`) — while the same
+# sentence from `livingroom` and `kitchen` worked. A rename is exactly how this
+# table rots, and the 11.10.2026 corridor→entrance rename already moved half the
+# names, so both spellings stay. `test_every_live_camera_room_has_a_default_area`
+# asserts the live four by name, because nothing in this table can notice that a
+# new camera was added without it.
+#
+# Areas are the canonical HA names (measured from the registry: Balcony,
+# Bathroom, Bedroom, Bedroom Vlada, Corridor, Entrance, Kitchen, Living Room).
+# `corridor1`/`corridor2` map to `Corridor` because BOTH those HA relays are in
+# that single Area — the entities were never renamed, only the go2rtc streams.
 STREAM_DEFAULT_AREA: dict[str, str] = {
     "kitchen": "Kitchen",
     "livingroom": "Living Room",
     "living_room": "Living Room",
     "corridor": "Corridor",
     "hallway": "Corridor",
+    # corridor1/corridor2 were renamed to entrance1/entrance2 in go2rtc on
+    # 11.10.2026; the HA relays kept their ids and both sit in Area `Corridor`.
+    "corridor1": "Corridor",
+    "corridor2": "Corridor",
+    # Current camera streams (measured: `CAMERA_STREAMS=…,entrance1,camera-corridor1`).
+    "entrance": "Entrance",
+    "entrance1": "Entrance",
+    "camera-corridor1": "Corridor",
+    # `balcony` is served by go2rtc and has its own Area, so it costs one line.
+    "balcony": "Balcony",
+    "bathroom": "Bathroom",
     "bedroom": "Bedroom",
 }
 

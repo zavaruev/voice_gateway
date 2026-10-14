@@ -2644,3 +2644,56 @@ def test_an_automation_already_in_the_wanted_state_is_left_alone():
         mod._tie_light_automation(ha.areas, ["switch.corridor1_light_switch_relay"], True)
     )
     assert ha.services == []
+
+
+# --- the default area table -------------------------------------------------
+#
+# Measured 14.10.2026 16:50:40: «включи свет» in camera-corridor1 reached HA with
+# no Area at all, matched 9 devices across the whole house and escalated
+# (`ambiguous_no_area: 9 targets`), while the same sentence from `livingroom` and
+# `kitchen` worked. `entrance1` and `camera-corridor1` — the two NEWEST rooms —
+# were simply absent from STREAM_DEFAULT_AREA, and nothing in the table can notice
+# a room that was added without it.
+
+LIVE_CAMERA_STREAMS = ("livingroom", "kitchen", "entrance1", "camera-corridor1")
+
+
+def test_every_live_camera_room_has_a_default_area():
+    """The four rooms in `CAMERA_STREAMS`, asserted BY NAME.
+
+    A test that only checked «the resolver can map some stream to some area»
+    passes with two of four rooms missing, which is the state this was written
+    against. Stream names are spelled out rather than imported from the compose
+    file precisely so that adding a camera does not silently edit the test too.
+    """
+    from resolver import STREAM_DEFAULT_AREA
+
+    missing = [s for s in LIVE_CAMERA_STREAMS if not STREAM_DEFAULT_AREA.get(s)]
+    assert not missing, (
+        f"эти комнаты живы, но у них нет Area по умолчанию: {missing} — команда без "
+        "слова комнаты уйдёт в эскалацию"
+    )
+
+
+@pytest.mark.parametrize("stream", LIVE_CAMERA_STREAMS)
+def test_a_roomless_light_command_carries_the_speakers_own_area(stream):
+    """«включи свет» says nothing about rooms; the satellite's location is the
+    only room information there is, so it has to become the Area."""
+    call = resolve_action("включи свет", stream)
+    assert call is not None, f"{stream}: команда не разрешилась"
+    assert call.args.get("area"), (
+        f"{stream}: команда без слов комнаты обязана нести Area самой комнаты, "
+        "иначе 9 целей по всему дому и эскалация"
+    )
+
+
+def test_the_historical_corridor_stream_names_still_map():
+    """The go2rtc streams were renamed on 11.10.2026 while the HA relays kept
+    their ids, so both spellings have to keep working — a set holding only one of
+    them fails silently, exactly as this table did."""
+    from resolver import STREAM_DEFAULT_AREA
+
+    for name in ("corridor1", "corridor2", "corridor"):
+        assert STREAM_DEFAULT_AREA.get(name) == "Corridor", (
+            f"{name} — историческое имя потока должно работать наравне с текущим"
+        )

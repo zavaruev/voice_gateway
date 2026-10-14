@@ -1122,7 +1122,7 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
     * **`area_id` в `attributes` состояния отсутствует** — Area лежит в реестре, и у автоматизаций этот отбор отбрасывал всё. Area автоматизации берётся `ha.get_entity_areas()`.
     * **«Corridor2 light OFF» вообще не назначена ни в одну Area**, тогда как её реле — в `Corridor`. Строгий отбор по Area оставлял второй коридорный свет драться с пользователем. Исключение: у автоматизации НЕТ Area и токен буквально в её имени — тогда берём по токену, с отдельной строкой в логе.
 
-- **«Я ГОВОРИЛ РЯДОМ С КАМЕРОЙ В ГОСТИНОЙ, ОТВЕТИЛА КАМЕРА ПРИХОЖЕЙ»- **«Я ГОВОРИЛ РЯДОМ С КАМЕРОЙ В ГОСТИНОЙ, ОТВЕТИЛА КАМЕРА ПРИХОЖЕЙ» — THE ARBITER COMPARED RAW LEVELS, SO THE LOUDEST MICROPHONE WON EVERY TIE. Measured 13.10.2026 09:03.**
+- **«Я ГОВОРИЛ РЯДОМ С КАМЕРОЙ В ГОСТИНОЙ, ОТВЕТИЛА КАМЕРА ПРИХОЖЕЙ» — THE ARBITER COMPARED RAW LEVELS, SO THE LOUDEST MICROPHONE WON EVERY TIE. Measured 13.10.2026 09:03.**
   * Both rooms heard the same word **37 ms apart** and the arbiter logged what looks like a correct decision:
     ```
     09:03:14.902  [livingroom] VOSK WAKE peak=1145 window=17864   -> claim 7303

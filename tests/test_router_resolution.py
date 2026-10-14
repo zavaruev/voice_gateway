@@ -2523,3 +2523,124 @@ def test_colour_is_a_device_only_inside_the_light_state_construction():
 
     for text in ("переключи цвет", "какого цвета стены", "цвет обоев"):
         assert normalize_stt_verbs(text) == text, f"{text!r} was rewritten"
+
+
+# --- manual light control vs. the motion automations ---------------------------
+#
+# Reported 14.10.2026: the corridor lamp is driven by a motion sensor, and someone
+# working at a desk does not move enough, so the sensor decides the room is empty
+# and switches the light off. «включи свет» must disarm that automation and
+# «выключи свет» must re-arm it.
+
+def _automation_ha(relay_state="off", auto_state="on"):
+    """A HA stub carrying one relay and the two automations beside it."""
+    import asyncio
+
+    class _HA:
+        def __init__(self):
+            self.services = []
+            self.areas = {
+                "switch.corridor1_light_switch_relay": "Corridor",
+                "automation.corridor2_light_off_2": "Corridor",   # "Corridor1 light OFF"
+                "automation.corridor1_light_on": "Corridor",     # "Corridor1 light ON"
+                "automation.entrance_light_off": "Entrance",     # another room
+            }
+
+        async def get_entity_areas(self):
+            return dict(self.areas)
+
+        async def get_states(self, force=False):
+            return [
+                {"entity_id": "switch.corridor1_light_switch_relay",
+                 "state": relay_state, "attributes": {}},
+                {"entity_id": "automation.corridor2_light_off_2",
+                 "state": auto_state,
+                 "attributes": {"friendly_name": "Corridor1 light OFF"}},
+                {"entity_id": "automation.corridor1_light_on",
+                 "state": "on",
+                 "attributes": {"friendly_name": "Corridor1 light ON"}},
+                {"entity_id": "automation.entrance_light_off",
+                 "state": "on",
+                 "attributes": {"friendly_name": "Entrance light OFF"}},
+            ]
+
+        async def call_service(self, domain, service, data):
+            # entity_id stays a STRING, as HA expects. Turning it into a tuple
+            # here made the assertion compare against a tuple of characters and
+            # fail on a call that had in fact been made correctly.
+            self.services.append((domain, service, data.get("entity_id", "")))
+            return {"ok": True, "changed": [], "error": ""}
+
+    return _HA()
+
+
+def test_turning_the_light_on_disarms_its_motion_automation():
+    """The arm is the inverse of the lamp: on by hand means the sensor stands down."""
+    import asyncio
+
+    mod = _router_app()
+    mod.LIGHT_AUTOMATION_ROOMS = ("corridor",)
+    ha = _automation_ha()
+    mod.ha = ha
+    asyncio.run(
+        mod._tie_light_automation(
+            ha.areas, ["switch.corridor1_light_switch_relay"], True
+        )
+    )
+    assert ("automation", "turn_off", "automation.corridor2_light_off_2") in ha.services, (
+        "the lamp is on by hand, so the automation that would switch it off must "
+        "be disarmed"
+    )
+    assert not any("corridor1_light_on" in e for _, _, e in ha.services), (
+        "the ON automation does nothing harmful and must be left alone"
+    )
+    assert not any("entrance" in e for _, _, e in ha.services), (
+        "another room's automation must not be touched by a corridor command"
+    )
+
+
+def test_turning_the_light_off_rearms_the_automation():
+    import asyncio
+
+    mod = _router_app()
+    mod.LIGHT_AUTOMATION_ROOMS = ("corridor",)
+    ha = _automation_ha(auto_state="off")
+    mod.ha = ha
+    asyncio.run(
+        mod._tie_light_automation(
+            ha.areas, ["switch.corridor1_light_switch_relay"], False
+        )
+    )
+    assert ("automation", "turn_on", "automation.corridor2_light_off_2") in ha.services, (
+        "handing the lamp back means re-arming the sensor"
+    )
+
+
+def test_the_tie_is_off_by_default():
+    """Not every room was asked for this. A flag that defaults to "do it
+    everywhere" would silently disarm sensors nobody asked about."""
+    mod = _router_app()
+    mod.LIGHT_AUTOMATION_ROOMS = ()
+    ha = _automation_ha()
+    mod.ha = ha
+    import asyncio
+
+    asyncio.run(
+        mod._tie_light_automation(ha.areas, ["switch.corridor1_light_switch_relay"], True)
+    )
+    assert ha.services == [], "with no rooms configured nothing may be called"
+
+
+def test_an_automation_already_in_the_wanted_state_is_left_alone():
+    """Otherwise every turn would re-issue the same call, and the log would
+    claim work that was not needed."""
+    import asyncio
+
+    mod = _router_app()
+    mod.LIGHT_AUTOMATION_ROOMS = ("corridor",)
+    ha = _automation_ha(auto_state="off")   # already disarmed, lamp going on
+    mod.ha = ha
+    asyncio.run(
+        mod._tie_light_automation(ha.areas, ["switch.corridor1_light_switch_relay"], True)
+    )
+    assert ha.services == []

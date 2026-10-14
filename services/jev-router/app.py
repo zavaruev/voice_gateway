@@ -44,6 +44,8 @@ SSE event schema (one JSON object per `data:` line):
 import asyncio
 import json
 import logging
+import os
+import re
 import time
 from contextlib import asynccontextmanager
 
@@ -241,6 +243,150 @@ _ONOFF_TOOLS = ("intent__HassTurnOn", "intent__HassTurnOff")
 # Upper bound of devices one utterance may toggle: "выключи весь свет" must
 # not become an unbounded fan-out of MCP calls with per-call timeouts.
 _MAX_ONOFF_TARGETS = 5
+
+# ---------------------------------------------------------------------------
+# Manual light control vs. the "nobody is here, switch it off" automations.
+# ---------------------------------------------------------------------------
+# Reported 14.10.2026: the corridor light is driven by a motion sensor, and a
+# person working at a desk does not move enough, so the sensor decides the room
+# is empty and switches the light off mid-sentence. Wanted: «включи свет» leaves
+# the light on AND stops the automation from fighting it; «выключи свет» turns it
+# off AND re-arms the automation.
+#
+# The link is the DEVICE TOKEN, carried in both names: the relay
+# `switch.corridor1_light_switch_relay` and the automation "Corridor1 light OFF"
+# both say `corridor1`. Deliberately NOT the room and NOT a substring of the
+# English word "off":
+#   * by room would tie every lamp in a room to that room's automation, so
+#     «включи свет» in the living room would disarm the corridor's sensor;
+#   * by "off" is an English word-order guess, and this house has 14
+#     automations named "<thing> OFF" of several different kinds.
+# The token happens to name the entity id of "Corridor1 light ON" as `corridor1`
+# while its friendly name carries no "off" at all, so the test picks the OFF one
+# and leaves the ON one alone — verified live on both.
+#
+# Scoped to named rooms. A room with no such automation simply matches nothing
+# and nothing is called, but the default is OFF rather than "every room",
+# because disarming a sensor changes a home's behaviour and it was asked for in
+# exactly one room.
+LIGHT_AUTOMATION_ROOMS: tuple[str, ...] = tuple(
+    r.strip().lower()
+    for r in os.getenv("LIGHT_AUTOMATION_ROOMS", "").split(",")
+    if r.strip()
+)
+
+# The token is the middle chunk of a Sonoff entity id:
+#   switch.<token>_light_switch_relay
+_TOKEN_RE = re.compile(r"^switch\.([a-z0-9]+?)_")
+
+
+def _device_token(entity_id: str) -> str:
+    m = _TOKEN_RE.match(entity_id)
+    return m.group(1) if m else ""
+
+
+async def _tie_light_automation(
+    areas: dict[str, str], entities: list[str], want_on: bool
+) -> list[str]:
+    """Disarm (on) or re-arm (off) the motion automations of these lamps.
+
+    Never raises and never changes what is spoken: the light command's own answer
+    is about the light, and a failed automation call must not turn a working
+    command into an error the user has to listen to. It is logged at WARNING,
+    which is the whole cost of it failing.
+    """
+    if not LIGHT_AUTOMATION_ROOMS or not entities:
+        return []
+    wanted_areas = {
+        areas.get(e, "").strip().lower()
+        for e in entities
+        if areas.get(e, "").strip().lower() in LIGHT_AUTOMATION_ROOMS
+    }
+    if not wanted_areas:
+        return []
+    tokens = {_device_token(e) for e in entities if _device_token(e)}
+    if not tokens:
+        logger.info("light automation tie: нет токена устройства в %s", entities)
+        return []
+    try:
+        # The AUTOMATION's area must come from `get_entity_areas()`, not from
+        # the state: `/api/states` carries no `area_id` in attributes, so filtering
+        # on it matched nothing at all and failed in silence. Measured 14.10.2026
+        # on the first live run — the light came on and every automation stayed
+        # armed, with no log line to say so.
+        auto_areas = await ha.get_entity_areas()
+        states = await ha.get_states(force=True)
+    except Exception as exc:  # the light already answered; this is secondary
+        logger.warning("light automation tie: не удалось прочитать состояния: %r", exc)
+        return []
+    touched: list[str] = []
+    seen_off: list[str] = []
+    for s in states or []:
+        eid = s.get("entity_id", "")
+        if not eid.startswith("automation."):
+            continue
+        attrs = s.get("attributes") or {}
+        name = str(attrs.get("friendly_name") or "")
+        if "off" not in name.lower():
+            continue
+        token_in_name = [t for t in tokens if t in name.lower()]
+        if not token_in_name:
+            continue
+        # The area is authoritative and is not overruled by a name that happens to
+        # contain the token. An automation with NO area is the one exception, and
+        # only when the token is literally in its name: measured 14.10.2026,
+        # "Corridor2 light OFF" is unassigned while its relay is in Corridor, and
+        # a strict area test silently left the second corridor lamp still
+        # fighting the user. Device tokens do not collide across rooms, so the
+        # fallback cannot reach into another one.
+        area = str(auto_areas.get(eid, "")).strip().lower()
+        if not area:
+            if token_in_name:
+                logger.info(
+                    "light automation tie: %s без Area, беру по токену %s",
+                    name, sorted(tokens),
+                )
+            else:
+                continue
+        elif area not in wanted_areas:
+            logger.info(
+                "light automation tie: %s пропущена — Area=%r не в %s",
+                name, area, sorted(wanted_areas),
+            )
+            continue
+        seen_off.append(name)
+        # Desired automation state is the INVERSE of the light's: a lamp switched
+        # on by hand has its sensor disarmed. The first version compared the
+        # current state to the LIGHT's state and so skipped precisely the case it
+        # existed for — the armed automation on an already-lit lamp.
+        want_enabled = not want_on
+        enabled = str(s.get("state", "")).lower() == "on"
+        if enabled == want_enabled:
+            continue  # already in the state we are asking for
+        try:
+            await ha.call_service(
+                "automation",
+                "turn_on" if want_enabled else "turn_off",
+                {"entity_id": eid},
+            )
+            touched.append(eid)
+            logger.info(
+                "  light automation tie: %s %s (%s) — ручное управление светом",
+                "включена" if want_enabled else "выключена", name, eid,
+            )
+        except Exception as exc:
+            logger.warning(
+                "  light automation tie НЕ удалась для %s (%s): %r", eid, name, exc,
+            )
+    if not touched:
+        # Silence here is indistinguishable from "the code never ran", which is
+        # how the `area_id` bug above survived a live test.
+        logger.info(
+            "light automation tie: подходящих автоматик нет или они уже в нужном "
+            "состоянии (токены=%s, комнаты=%s, найдено OFF-имён=%s)",
+            sorted(tokens), sorted(wanted_areas), seen_off or "—",
+        )
+    return touched
 
 
 def _err_text(res: dict | None) -> str:
@@ -483,6 +629,33 @@ async def _execute_action(call, text_hint: str = "") -> tuple[str | None, dict |
                 }
             want_on = call.tool.endswith("HassTurnOn")
             opposite = "off" if want_on else "on"
+            # Manual control takes the lamp away from its motion sensor, and puts
+            # it back when the user is done. Placed HERE, above every early
+            # return, on purpose: «включи свет» spoken while the lamp is ALREADY
+            # on is exactly the case that matters — the light is fine and the
+            # automation is the thing that will kill it a minute later — and the
+            # "уже включено" branch below returns before any state changes.
+            #
+            # Runs on `targets`, not `todo`: a lamp already in the requested
+            # state still has to lose (or regain) its automation, and `todo` is
+            # empty in that case by construction.
+            if not LIGHT_AUTOMATION_ROOMS:
+                pass
+            else:
+                try:
+                    touched = await _tie_light_automation(
+                        area_map,
+                        [t.get("entity_id", "") for t in targets if t.get("entity_id")],
+                        want_on,
+                    )
+                    if touched:
+                        logger.info(
+                            "  automation %s для ручного «%s»",
+                            "выключены" if want_on else "включены",
+                            ", ".join(touched),
+                        )
+                except Exception as exc:  # a diagnostic side effect, never fatal
+                    logger.warning("light automation tie не отработала: %r", exc)
             # Only devices currently in the OPPOSITE state are worth calling;
             # the rest need no MCP call at all — and if nothing needed
             # changing, the "already ..." branch below says so truthfully.

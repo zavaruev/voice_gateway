@@ -3483,3 +3483,19 @@ def test_a_short_chain_still_gets_its_window():
         "a limit below 2 would break 'what time?' -> 'and in Berlin?' after the "
         "very first follow-up"
     )
+
+def test_arbiter_set_owner():
+    """Test that _arbiter_set_owner updates the _ARB_STATE correctly."""
+    from unittest.mock import patch
+    import camera_client
+
+    with patch("camera_client.time.time", return_value=12345.0):
+        with patch.dict(camera_client._ARB_STATE, {"owner": None, "cmd_sent": "some_command"}, clear=True):
+            camera_client._arbiter_set_owner("kitchen_camera", 0.95)
+
+            assert camera_client._ARB_STATE["owner"] == {
+                "stream": "kitchen_camera",
+                "ts": 12345.0,
+                "level": 0.95
+            }
+            assert camera_client._ARB_STATE["cmd_sent"] is None

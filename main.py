@@ -3626,6 +3626,14 @@ async def start_camera_sessions():
                 wake_highpass_hz=float(
                     os.getenv(f"CAMERA_WAKE_HIGHPASS_{name.upper()}", "0") or 0
                 ),
+                # Debug dump of the exact bytes fed to the wake decoder, per room:
+                # CAMERA_VOSK_DUMP_<NAME>. Empty => off, the default everywhere.
+                # Stands alone per room rather than global on purpose: the open
+                # question is about ONE room, and a global switch would silently
+                # write a file per room per minute for all of them.
+                vosk_dump_dir=os.getenv(
+                    f"CAMERA_VOSK_DUMP_{name.upper()}", ""
+                ),
                 # Level-based utterance endpointing for this room. OFF unless
                 # asked for: it changes WHEN a command is dispatched in a live
                 # audio path, so it is enabled per room only after its

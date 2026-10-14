@@ -644,3 +644,156 @@ def test_the_filter_carries_its_state_so_there_is_no_edge_at_every_chunk():
         f"signal's own maximum step of {natural:.0f} means the filter state is "
         f"not being carried between chunks"
     )
+
+
+# --- wake-decoder debug dump ---------------------------------------------------
+#
+# On 13.10.2026 the corridor room fed the gateway audio that decoded as
+# «компьютер» 3 times of 3 in an EXTERNAL capture of the same go2rtc stream,
+# and reproduced the production feed path offline with a firing. The live
+# decoder then never fired in 123786 chunks. No offline capture can settle
+# that, because an external ffmpeg of the same stream clipped at the rail
+# (peak exactly 32768) while the gateway received 7448-11201 over the same
+# seconds — two different signals. So the dump writes the decoder's ACTUAL
+# input, which is the only copy of the signal the question is about.
+
+class _RecordingVosk:
+    """A matcher that records exactly what it was fed and never fires."""
+
+    active = True
+    triggers = 0
+    decodes = 0
+    last_partial = ""
+    last_text = ""
+    last_trigger_text = ""
+    near_misses = 0
+    last_near_miss = ""
+
+    def __init__(self):
+        self.fed: list[bytes] = []
+
+    def begin(self):
+        self.active = True
+
+    def feed(self, chunk):
+        self.fed.append(bytes(chunk))
+        return False
+
+    def reset(self):
+        pass
+
+
+def _session_with_dump(tmp_path, **cfg):
+    s = CameraSession(
+        CameraConfig(
+            stream_name="dump_room",
+            go2rtc_host="127.0.0.1",
+            go2rtc_port=1984,
+            vosk_dump_dir=str(tmp_path),
+            **cfg,
+        )
+    )
+    s._vad = _SilentVAD()
+    s._engine.oww_model = object()
+    s._engine._ww_vad_speech = lambda *_a, **_k: True
+    s._engine.check_wakeword = lambda *_a, **_k: None
+    s._audio_epoch = time.time() - 60.0
+    s._wake_suppress_until = 0.0
+    s._out_track = None
+    s._speaking_until = 0.0
+    s._bg_window = []
+    return s
+
+
+@pytest.mark.asyncio
+async def test_dump_is_off_by_default(tmp_path):
+    """Off must be the default: a forgotten debug flag must not write a file
+    per room per minute. An empty `vosk_dump_dir` means no handle at all."""
+    s = _make_session()
+    s._vosk_wake = _RecordingVosk()
+    await _feed_quiet(s, 1000)
+    assert s._vosk_dump_fh is None
+    assert list(tmp_path.iterdir()) == [], "nothing may be written when disabled"
+
+
+@pytest.mark.asyncio
+async def test_dump_writes_exactly_what_the_decoder_received(tmp_path):
+    """The whole point: these bytes must be the decoder's input, byte for
+    byte, so an offline reproduction runs the same signal the live room did.
+    Writing the pre-filter chunk would reproduce a room that does not exist."""
+    s = _session_with_dump(tmp_path)
+    stub = _RecordingVosk()
+    s._vosk_wake = stub
+    chunks = [_chunk(1000), _chunk(1200), _chunk(900)]
+    with (
+        patch("camera_client._arbiter_submit", new=AsyncMock(return_value=(True, (), "t"))),
+        patch.object(s, "_play_attention", new=AsyncMock()),
+    ):
+        for c in chunks:
+            await s._vad_process(c)
+        await asyncio.sleep(0)
+
+    path = tmp_path / "dump_room.raw"
+    assert path.exists(), "the dump must be written when enabled"
+    written = path.read_bytes()
+    expected = b"".join(c for c, f in zip(chunks, stub.fed) if f is not None)
+    assert written == expected, (
+        "the dump must be the bytes fed to the decoder, not some nearby signal"
+    )
+    assert written == b"".join(stub.fed)
+    # And they must be the RAW chunk here, because this room has no high-pass.
+    assert written == b"".join(chunks)
+
+
+@pytest.mark.asyncio
+async def test_dump_follows_the_filter_not_the_raw_chunk(tmp_path):
+    """With a high-pass configured the decoder sees filtered audio, and so
+    must the dump. Capturing the raw chunk would silently hand an offline
+    reproduction a signal the room never decoded — exactly the mistake this
+    dump exists to prevent."""
+    s = _session_with_dump(tmp_path, wake_highpass_hz=300.0)
+    s._init_wake_highpass()
+    stub = _RecordingVosk()
+    s._vosk_wake = stub
+    sig = np.sin(2 * np.pi * 60 * np.arange(1280) / 16000) * 2000
+    chunk = sig.astype(np.int16).tobytes()
+    with (
+        patch("camera_client._arbiter_submit", new=AsyncMock(return_value=(True, (), "t"))),
+        patch.object(s, "_play_attention", new=AsyncMock()),
+    ):
+        await s._vad_process(chunk)
+        await asyncio.sleep(0)
+
+    written = (tmp_path / "dump_room.raw").read_bytes()
+    assert len(stub.fed) == 1
+    assert written == stub.fed[0], "dump must equal the decoder's actual input"
+    assert written != chunk, (
+        "a 300 Hz high-pass must change the bytes; if it did not, this test is "
+        "proving nothing"
+    )
+    got = np.frombuffer(written, dtype=np.int16).astype(np.float64)
+    # A 60 Hz tone is what the filter removes, so the dump must hold less of it.
+    def energy_at(a, f):
+        n = len(a)
+        X = np.fft.rfft(a * np.hanning(n))
+        fr = np.fft.rfftfreq(n, 1 / 16000)
+        m = (fr >= f - 5) & (fr <= f + 5)
+        return float(np.abs(X[m]).sum() ** 2)
+
+    assert energy_at(got, 60) < energy_at(np.frombuffer(chunk, dtype=np.int16), 60)
+
+
+@pytest.mark.asyncio
+async def test_dump_stops_at_the_cap(tmp_path):
+    """A diagnostic must not fill the disk. The cap is reached and the handle
+    closed rather than the write path growing without bound."""
+    s = _session_with_dump(tmp_path)
+    s._vosk_wake = _RecordingVosk()
+    s._vosk_dump_written = camera_client._VOSK_DUMP_CAP_BYTES
+    with (
+        patch("camera_client._arbiter_submit", new=AsyncMock(return_value=(True, (), "t"))),
+        patch.object(s, "_play_attention", new=AsyncMock()),
+    ):
+        await s._vad_process(_chunk(1000))
+        await asyncio.sleep(0)
+    assert s._vosk_dump_fh is None, "the dump must close itself at the cap"

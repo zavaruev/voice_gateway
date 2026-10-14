@@ -221,6 +221,12 @@ _WAKE_MIN_PEAK = 3000
 # ceiling does not move at all (2316). ~1.9 s, which covers the whole word.
 _WAKE_PEAK_WINDOW = 12
 
+# Hard cap for the vosk debug dump, in megabytes. 16 kHz mono int16 is 32 kB/s,
+# so 64 MB is ~33 minutes per room — far more than the question needs, and
+# small enough that a forgotten flag cannot fill the log volume.
+_VOSK_DUMP_CAP_MB = 64
+_VOSK_DUMP_CAP_BYTES = _VOSK_DUMP_CAP_MB * 1024 * 1024
+
 # Bounds for telling the wake word's own audio from the command after it. All
 # three are measured on 06.10.2026; see _is_wake_word_alone for the numbers.
 _WAKE_ALONE_MAX_ONSET_S = 0.9   # wake word alone began 0.73 s after the wake
@@ -998,6 +1004,12 @@ class CameraConfig:
     # decoder. 0 => off. See _wake_audio() for why it exists and why the peak
     # gate deliberately stays on the raw signal.
     wake_highpass_hz: float = 0.0
+
+    # Directory for the wake-decoder debug dump ("" => off, the default).
+    # When set, the EXACT bytes passed to VoskWakeMatcher.feed() are appended to
+    # <dir>/<stream_name>.raw. Diagnostic only, hard-capped at _VOSK_DUMP_CAP_MB.
+    vosk_dump_dir: str = ""
+
     wake_timeout: float = 15.0
     vad: object = None
     wakeword_model_path: str = ""
@@ -1250,6 +1262,28 @@ class CameraSession:
         self._attention_pip = config.attention_pip
         self._ns_rms_gate = config.ns_rms_gate
         self._vosk_peak_win: deque = deque(maxlen=_WAKE_PEAK_WINDOW)
+        # Debug dump of the EXACT bytes handed to the wake decoder. Off unless
+        # CAMERA_VOSK_DUMP_DIR is set, and hard-capped: this is a diagnostic for
+        # one unanswered question, not a recorder. See the dump in _vad_process.
+        self._vosk_dump_fh = None
+        self._vosk_dump_written = 0
+        if config.vosk_dump_dir:
+            try:
+                os.makedirs(config.vosk_dump_dir, exist_ok=True)
+                self._vosk_dump_fh = open(
+                    os.path.join(config.vosk_dump_dir, f"{self.stream_name}.raw"),
+                    "wb",
+                )
+                logger.info(
+                    f"[{self.stream_name}] vosk dump ON -> "
+                    f"{config.vosk_dump_dir}/{self.stream_name}.raw "
+                    f"(cap {_VOSK_DUMP_CAP_MB} MB)"
+                )
+            except Exception as e:  # a diagnostic must never break the audio path
+                logger.warning(
+                    f"[{self.stream_name}] vosk dump unavailable: {e!r}"
+                )
+                self._vosk_dump_fh = None
         self._wake_min_peak = (
             config.wake_min_peak if config.wake_min_peak > 0 else _WAKE_MIN_PEAK
         )
@@ -2765,8 +2799,42 @@ class CameraSession:
                     self._vosk_last_peak, int(np.abs(s16).max())
                 )
                 self._vosk_peak_win.append(int(np.abs(s16).max()))
+                wake_pcm = self._wake_audio(chunk)
+                # Dump the decoder's ACTUAL input, after _wake_audio and before
+                # feed(). Everything measured outside this process saw a
+                # different signal — on 13.10.2026 an external capture of the
+                # same stream clipped at the rail (32768) while the gateway saw
+                # 7448-11201 over the same seconds — so no offline reproduction
+                # can settle a question about the live feed. These bytes can.
+                if self._vosk_dump_fh is not None:
+                    if self._vosk_dump_written < _VOSK_DUMP_CAP_BYTES:
+                        try:
+                            self._vosk_dump_fh.write(wake_pcm)
+                            # Flush every chunk, deliberately. The point of this
+                            # file is to be `docker cp`'d OUT of a live room, and
+                            # Python's buffer would leave it empty on disk for
+                            # exactly as long as the question is being asked —
+                            # and lose everything on a restart.
+                            self._vosk_dump_fh.flush()
+                            self._vosk_dump_written += len(wake_pcm)
+                        except Exception as e:  # never break audio for a dump
+                            logger.warning(
+                                f"[{self.stream_name}] vosk dump write failed, "
+                                f"stopping: {e!r}"
+                            )
+                            self._vosk_dump_fh = None
+                    else:
+                        logger.info(
+                            f"[{self.stream_name}] vosk dump cap reached "
+                            f"({_VOSK_DUMP_CAP_MB} MB), closing"
+                        )
+                        try:
+                            self._vosk_dump_fh.close()
+                        except Exception:
+                            pass
+                        self._vosk_dump_fh = None
                 got_wake = await asyncio.to_thread(
-                    self._vosk_wake.feed, self._wake_audio(chunk)
+                    self._vosk_wake.feed, wake_pcm
                 )
                 if got_wake:
                     # A wake word that HEARD always re-arms the interaction,

@@ -1104,7 +1104,7 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
   * **The room is left fully configured so a replacement needs no further change** (stream, source URL with credentials + `#backchannel=1`, `/play_audio`, vosk model, `CAMERA_WEBRTC=false`, `_CORRIDOR_STREAMS`). Only the unit has to change.
   * 0 false wakes after the restore.
 
-- **МОЯ ПРОВЕРКА ДУБЛЕЙ ЧЕТЫРЕ РАЗА ПОДРЯД БЫЛА ЗЕЛЁНОЙ ПРИ НАЛИЧИИ ДЕФЕКТА. 14–15.10.2026.**
+- **ТРИ МОИ ПРОВЕРКИ ПОДРЯД БЫЛИ ЗЕЛЁНЫМИ ПРИ НАЛИЧИИ ДЕФЕКТА. 14–15.10.2026.**
 
   Сплей в этот файл (`new + s[i:]`, где `new` уже заканчивается якорем) склеивает заголовок с копией себя же. Пять раз за 14–15.10.2026, и **три раза проверка, которую я запускал после этого, проходила при наличии дефекта:**
 

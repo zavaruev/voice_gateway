@@ -179,6 +179,11 @@ _ATTENTION_MIN_GAP_S = 3.5
 # `_echo_of_reply`'s job, not this timer's.
 _SPEAKER_SETTLE_S = 0.3
 
+# How early the camera can possibly start making noise, once the request body
+# begins arriving. Small and deliberately so: it exists to cover the gap between
+# "we called /play_audio" and "audio is actually in the room", not to be a guard.
+_TTS_START_GUARD_S = 0.25
+
 # Chunks of audio kept BEFORE the VAD confirms speech, seeded into the utterance
 # when it opens. 160 ms each, so 8 is 1.28 s.
 #
@@ -1412,6 +1417,10 @@ class CameraSession:
         self._last_transcript_at: float = 0.0
         self._speaking = False
         self._speaking_until = 0.0
+        # "The camera might be making noise until this moment" — deliberately
+        # WIDER than `_speaking_until`, and used only to stop the pause endpoint
+        # from ending an utterance on our own audio. See `_arm_tts_inflight`.
+        self._tts_playing_until: float = 0.0
         # Suppress the wake *model* for the full delayed-echo window after TTS
         # (the AI's own "компьютер" echoes back 8-15s later and would re-trigger
         # the model). This is separate from _speaking_until (which hard-mutes the
@@ -2816,10 +2825,24 @@ class CameraSession:
             # since-boot tally meaningless — `pause` would mostly count the
             # television, and the one number that decides whether the endpoint
             # works would answer the wrong question.
+            # AND NOT while our own audio may be in the room. The attention pip is
+            # a loud two-tone beep played the instant the wake fires, i.e. exactly
+            # when the user is starting to speak; its own decay is a level dip, and
+            # the detector reads a level dip as the end of the sentence. Measured
+            # 14.10.2026 17:39 on the corridor: the endpoint closed a 1.44 s
+            # utterance on the pip (`ref=0.6123` — the beep is IN the reference
+            # window), Whisper was handed `raw_rms=12533 peak=32767` of beep and
+            # answered `Whisper empty`, and the command was never in the buffer.
+            #
+            # Skipped frames can never create a false end, only delay a real one,
+            # which is why this window is wider than the mic mute and is separate
+            # from it — over-muting costs the user's speech, over-feeding the
+            # endpoint costs nothing.
             if (
                 getattr(self, "_endpoint", None) is not None
                 and self._vad_has_speech
                 and self._wake_detected
+                and time.time() >= self._tts_playing_until
             ):
                 verdict, detail = self._endpoint.feed(orig_rms)
                 if verdict == "end":
@@ -4860,6 +4883,43 @@ class CameraSession:
         except Exception:
             pass
 
+    def _arm_tts_inflight(self, sent_at: float, duration: float) -> None:
+        """Record that the camera may be making noise, from BEFORE the POST.
+
+        One function for all three playback paths, because two of them had this
+        inline and DRIFTED: on 07.10.2026 the three mic-mute timestamps were found
+        computing from `time.time()` *after* the response returned, and the fix was
+        applied to the reply path alone. The two cue paths kept it.
+
+        Measured 14.10.2026 17:39, on the attention pip: a POST that took 2.18 s for
+        0.4 s of audio (x5.5) left the microphone fully live for the whole of it.
+        The camera played a loud two-tone beep, the pause endpoint read the beep's
+        own decay as the end of the sentence and closed a 1.44 s utterance, and
+        Whisper was handed the beep — `raw_rms=12533, peak=32767`, then
+        `Whisper empty`. The user's command was never in the buffer at all.
+
+        **This window is deliberately wider than `_speaking_until` and is used for a
+        different purpose, because the two have opposite costs:**
+          * `_speaking_until` is a hard `return` in `_feed_audio`. Over-extending it
+            throws the user's speech away — measured 13.10.2026, where a 0.4 s pip
+            whose POST took 6 s muted the room for 6 s.
+          * Here, the only consumer is the pause endpoint, and a frame it never sees
+            CANNOT create a false end; it can only delay a real one by a few frames.
+            So the window is opened at `sent_at` (audio cannot start before the body
+            starts arriving) and widened to cover the entire response, which is
+            where the unknown lives.
+        """
+        self._tts_playing_until = max(
+            getattr(self, "_tts_playing_until", 0.0), sent_at + _TTS_START_GUARD_S
+        )
+
+    def _close_tts_inflight(self, duration: float) -> None:
+        """Called once the response is in: the camera may still be finishing."""
+        self._tts_playing_until = max(
+            getattr(self, "_tts_playing_until", 0.0),
+            time.time() + duration + _SPEAKER_SETTLE_S,
+        )
+
     async def _play_attention(self, reason: str = ""):
         now = time.time()
         if now - self._last_attention < _ATTENTION_MIN_GAP_S:
@@ -4901,6 +4961,10 @@ class CameraSession:
             # register it in the reference ring so _is_echo recognizes (and
             # suppresses wake on) the distorted return signal.
             self._store_tts_echo(pcm)
+            # BEFORE the POST: the camera can start sounding as soon as the body
+            # starts arriving, which on a slow endpoint is seconds before the
+            # response — measured 14.10.2026, 2.18 s for 0.4 s of audio.
+            self._arm_tts_inflight(time.time(), duration)
             if self._out_track:
                 self._out_track._last_play_duration = duration
             if not await self._play_audio_http(pcm) and self._out_track:
@@ -4936,6 +5000,7 @@ class CameraSession:
             delay = played_at + duration + _SPEAKER_SETTLE_S
             if delay > self._speaking_until:
                 self._speaking_until = delay
+            self._close_tts_inflight(duration)
         except Exception as exc:
             logger.warning(f"[{self.stream_name}] attention error: {exc}")
 
@@ -4958,6 +5023,7 @@ class CameraSession:
             if self._out_track:
                 self._out_track._last_play_duration = duration
             played_at = time.time()
+            self._arm_tts_inflight(played_at, duration)
             if not await self._play_audio_http(pcm) and self._out_track:
                 await self._out_track.queue_frame(pcm, TTS_PLAY_RATE)
             self._tts_play_end = max(
@@ -4966,6 +5032,7 @@ class CameraSession:
             delay = time.time() + duration + _SPEAKER_SETTLE_S
             if delay > self._speaking_until:
                 self._speaking_until = delay
+            self._close_tts_inflight(duration)
         except Exception as exc:
             # Was `except Exception: pass`, which made this path untestable and
             # hid a real failure: a missing cue file left the mic open with no
@@ -5205,7 +5272,12 @@ class CameraSession:
                 )
                 return False
         except Exception as e:
-            logger.warning(f"[{self.stream_name}] play_audio failed: {e}")
+            # `repr`, not `str`: `asyncio.TimeoutError` stringifies to the EMPTY
+            # STRING, so this line read `play_audio failed: ` with nothing after the
+            # colon — measured 14.10.2026 17:40:02, the room's «Да?» never played
+            # and the one line that could have said why was blank. The same mistake
+            # was fixed for Whisper on 10.10.2026 and missed here.
+            logger.warning(f"[{self.stream_name}] play_audio failed: {e!r}")
             return False
 
     async def _speak_pcm(self, pcm: bytes, reply: str = "") -> bool:
@@ -5237,6 +5309,9 @@ class CameraSession:
             len(pcm) / (TTS_PLAY_RATE * 2)
         )
         self._speaking_until = time.time() + queued + _SPEAKER_SETTLE_S
+        # Same reason as the two cues, and for the same reason this is a separate
+        # window from the mute above: the endpoint must not hear the reply either.
+        self._arm_tts_inflight(time.time(), queued)
         try:
             # Record the audio we are about to play so the mic feed can later
             # be checked for our own echo (cross-correlation in _is_echo).
@@ -5334,6 +5409,7 @@ class CameraSession:
             # 30 s response produced `_speaking_until = 1032.3` against an audio
             # end of 1002.0.
             self._speaking_until = sent_at + audio_dur + ECHO_TAIL
+            self._close_tts_inflight(audio_dur)
             global GLOBAL_TTS_UNTIL
             # Was `audio_dur + echo_tail` (up to 3 s), and it is the SECOND place
             # the same 3 s tail bit: it drops the finished transcript outright with

@@ -920,3 +920,93 @@ def test_zero_means_unset_and_not_a_window_that_can_never_fire():
         else _ECHO_REPEAT_HORIZON_S
     )
     assert s._transcript_is_echo("включи свет") == "repeat"
+
+
+# ---------------------------------------------------------------------------
+# The attention pip used to close the user's sentence.
+# ---------------------------------------------------------------------------
+# Measured 14.10.2026 17:39:47-51 on the corridor:
+#
+#   17:39:47.799  🔔 attention pip (vosk)          play_audio 0.40s in 2.18s (x5.5)
+#   17:39:48.475  VAD UTTERANCE END dur=1440ms via pause (rms=0.0144 ref=0.6123)
+#   17:39:48.477  🎤 Whisper IN: 1.44s raw_rms=12533 peak=32767
+#   17:39:51.487  ❌ Whisper empty
+#
+# The utterance was closed on the PIP'S OWN DECAY, the beep is inside the
+# reference window (ref=0.6123), and Whisper was handed 1.44 s of two-tone beep
+# at the rail instead of a command. The 07.10.2026 fix that stopped computing the
+# mic mute from the RESPONSE was applied to the reply path alone; both cue paths
+# kept `time.time()` after the POST, so on a slow endpoint the mic stayed live for
+# the whole 2.18 s the camera was making noise into it.
+
+def _inflight_session():
+    s = CameraSession.__new__(CameraSession)
+    s.stream_name = "camera-corridor1"
+    s._tts_playing_until = 0.0
+    s._tts_play_end = 0.0
+    s._speaking_until = 0.0
+    return s
+
+
+def test_the_window_opens_before_the_post_not_after_it():
+    """The whole defect in one assertion: armed at `sent_at`, so it is already
+    closed when the slow response comes back."""
+    s = _inflight_session()
+    sent_at = time.time()
+    s._arm_tts_inflight(sent_at, duration=0.4)
+    # 2.18 s later the camera is still making noise — the pip's own audio is
+    # already in the room and the endpoint must not be hearing it.
+    at_response = time.time()
+    assert at_response - sent_at < 2.18, "проверка должна идти до ответа POST"
+    assert s._tts_playing_until > at_response, (
+        "окно должно быть открыто уже во время ответа POST — именно эту "
+        "двухсекундную дыру пик и оставлял открытой"
+    )
+
+
+def test_the_window_covers_the_whole_slow_response():
+    """`_close_tts_inflight` is what makes a 2.18 s POST survivable: the window
+    is stretched to cover the response, not just the 0.4 s of audio."""
+    s = _inflight_session()
+    s._arm_tts_inflight(time.time(), duration=0.4)
+    # pretend 2.18 s of POST elapsed
+    s._close_tts_inflight(0.4)
+    assert s._tts_playing_until > time.time() + 0.3, (
+        "окно обязано пережить медленный ответ, иначе ровно тот случай вернётся"
+    )
+
+
+def test_the_window_is_never_narrowed_by_a_later_shorter_call():
+    """Two cues in a row must not let the second one's short audio pull the
+    window back and re-open the hole while the first is still sounding."""
+    s = _inflight_session()
+    s._tts_playing_until = time.time() + 5.0
+    s._arm_tts_inflight(time.time(), duration=0.1)
+    s._close_tts_inflight(0.1)
+    assert s._tts_playing_until > time.time() + 4.5, "окно сузилось — это тот же баг"
+
+
+def test_the_endpoint_is_not_fed_while_our_audio_may_be_in_the_room():
+    """The condition itself, as the live path evaluates it. A paused/closed
+    endpoint never returns "end", so a pause inside our own audio cannot close an
+    utterance."""
+    s = _inflight_session()
+    s._vad_has_speech = True
+    s._wake_detected = True
+    s._tts_playing_until = time.time() + 2.0
+    can_endpoint = (
+        s._vad_has_speech and s._wake_detected
+        and time.time() >= s._tts_playing_until
+    )
+    assert can_endpoint is False, (
+        "пока наш звук может быть в комнате, детектор паузы не должен решать"
+    )
+    s._tts_playing_until = time.time() - 1.0
+    can_endpoint = (
+        s._vad_has_speech and s._wake_detected
+        and time.time() >= s._tts_playing_until
+    )
+    assert can_endpoint is True, (
+        "а после нашего звука детектор обязан работать — иначе пауза перестанет "
+        "заканчивать фразы и каждая команда снова ждёт 7 с"
+    )

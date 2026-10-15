@@ -332,15 +332,6 @@ _ECHO_JACCARD_MIN = 0.6
 # had no timer, so it discarded commands spoken 9 and 15 minutes later.
 _ECHO_REPEAT_HORIZON_S = 45.0
 
-# Default for `CameraConfig.stt_min_peak`. See that field's comment for the 70
-# measurements behind it: every usable transcript had a peak >= 13523, every
-# garbage one had a peak <= 8117, and nothing landed in between.
-#
-# **The allowed error is asymmetric, deliberately.** Dropping a quiet real command
-# costs the user one more "say it again". Letting a room-floor buffer into Whisper
-# costs a hallucinated sentence spoken aloud, L2 seconds, and a follow-up window
-# consumed by a phrase nobody uttered. Silence is the cheaper failure.
-_STT_MIN_PEAK = 10000
 
 
 def _echo_of_reply(norm: str, reply_norm: str) -> bool:
@@ -1169,22 +1160,6 @@ class CameraConfig:
     # acoustic tail measured ~1.9 s, while a WebRTC-only room still depends on
     # the backchannel.
     echo_repeat_horizon: float = 0.0
-    # Peak an utterance must reach in its OWN audio to be worth sending to
-    # Whisper at all. 0 => _STT_MIN_PEAK.
-    #
-    # Measured 15.10.2026 on the corridor, and it separates completely: over 70
-    # utterances the peak of every buffer that produced a usable transcript was
-    # >= 13523, and the peak of every buffer that produced garbage was <= 8117.
-    # **Nothing in between, not once.** The threshold sits at 10000 — 1.23x above
-    # the worst empty buffer and 1.35x below the quietest real command.
-    #
-    # Why it matters: a 7 s buffer assembled from a room floor has no speech in
-    # it, and Whisper given one returns its most likely phrase rather than
-    # nothing. Measured 18:25:25 on the corridor, `raw_rms=553 peak=3447` in,
-    # `Whisper OK: 'и училась'` out, the follow-up gate accepted it as an answer
-    # to our own question, and the room spent two TTS calls answering a sentence
-    # nobody said. That is the whole of «ответила ерундой».
-    stt_min_peak: int = 0
     # Minimum raw peak a chunk must reach for a decoded wake word to count.
     #
     # A decoder fed near-silence returns its most likely phrase, and for this
@@ -1361,14 +1336,11 @@ class CameraSession:
             if config.echo_repeat_horizon > 0
             else _ECHO_REPEAT_HORIZON_S
         )
-        # 0 means "unset, use the default" like every other tuning value here.
-        self._stt_min_peak = (
-            config.stt_min_peak if config.stt_min_peak > 0 else _STT_MIN_PEAK
-        )
-        # Counted and printed on the vosk diag line: a gate that drops something
-        # invisibly is indistinguishable from one that is not running.
-        self._stt_dropped_silent = 0
-        # Pre-built Authorization header: aiohttp.BasicAuth is deprecated in
+        # NOTE: an STT level gate (drop a room-floor buffer before Whisper)
+        # was written and REMOVED on 15.10.2026 — see the field history in
+        # AGENTS.md. Whole-buffer rms does NOT separate: real corridor commands
+        # measure 553 and so does a hallucination from silence.
+# Pre-built Authorization header: aiohttp.BasicAuth is deprecated in
         # aiohttp 4, and /play_audio is the only place we do HTTP basic auth.
         self._play_audio_headers = {}
         if config.play_audio_url and config.play_audio_user:
@@ -3049,7 +3021,7 @@ class CameraSession:
                         f"decodes={self._vosk_wake.decodes} "
                         f"hyp='{self._vosk_wake.last_partial}'"
                         f"{near_txt} "
-                        f"{ep_txt} {drops} stt_drop={self._stt_dropped_silent}"
+                        f"{ep_txt} {drops}"
                     )
                     self._vosk_last_peak = 0
                 if got_wake:
@@ -4080,27 +4052,6 @@ class CameraSession:
         try:
             buf_processed, buf_raw, duration_s, stats = self._preprocess_audio(buf)
             if not buf_processed or not buf_raw:
-                return
-
-            # A buffer with no speech in it must not reach Whisper: a decoder
-            # given near-silence returns its most likely phrase, not nothing.
-            # Measured 18:25:25 on the corridor — `raw_rms=553 peak=3447` in,
-            # `Whisper OK: 'и училась'` out, and the room answered it aloud
-            # because the follow-up gate took it for a reply to our question.
-            #
-            # Measured on its own audio, NOT after normalisation: this is the
-            # same reason the wake gate reads `peak_raw`. And the count goes to
-            # the diag line, so a drop is visible rather than inferred from a
-            # missing transcript.
-            peak = int((stats or {}).get("peak_raw", 0) or 0)
-            if 0 < peak < self._stt_min_peak:
-                self._stt_dropped_silent += 1
-                logger.info(
-                    f"[{self.stream_name}] 🔇 no speech in the buffer, not sent to "
-                    f"STT: peak={peak} < {self._stt_min_peak}, "
-                    f"raw_rms={stats.get('rms_raw', 0):.0f}, dur={duration_s:.2f}s "
-                    f"(dropped={self._stt_dropped_silent})"
-                )
                 return
 
             txt, uid = await self._process_stt(

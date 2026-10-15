@@ -3739,6 +3739,19 @@ async def start_camera_sessions():
                     or os.getenv("CAMERA_ECHO_REPEAT_HORIZON")
                     or 0
                 ),
+                # Peak an utterance must reach in its own audio to be sent to
+                # Whisper. 0 => 10000. Measured 15.10.2026 over 70 utterances:
+                # every buffer that produced a real transcript peaked >= 13523,
+                # every buffer that produced garbage peaked <= 8117, and nothing
+                # landed in between. Without it a room-floor buffer reaches a
+                # decoder that answers with its most likely phrase instead of
+                # nothing — measured 18:25:25, `raw_rms=553 peak=3447` in,
+                # `Whisper OK: 'и училась'` out, spoken aloud by the room.
+                stt_min_peak=int(
+                    os.getenv(f"CAMERA_STT_MIN_PEAK_{name.upper()}")
+                    or os.getenv("CAMERA_STT_MIN_PEAK")
+                    or 0
+                ),
                 # Peak the reply is normalised to before the camera plays it.
                 # 0 => the built-in 20000 (61 % of full scale). Exists for an
                 # unresolved field report of crackling playback (05.10.2026):

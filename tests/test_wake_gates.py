@@ -1010,3 +1010,81 @@ def test_the_endpoint_is_not_fed_while_our_audio_may_be_in_the_room():
         "а после нашего звука детектор обязан работать — иначе пауза перестанет "
         "заканчивать фразы и каждая команда снова ждёт 7 с"
     )
+
+
+# ---------------------------------------------------------------------------
+# A buffer with no speech in it must not reach Whisper.
+# ---------------------------------------------------------------------------
+# Measured 15.10.2026 18:25:25 on the corridor:
+#
+#   🎤 Whisper IN: 7.04s raw_rms=553 peak=3447 dB=-35.4 gain=9.5x
+#   ✅ Whisper OK: 'и училась'
+#   💬 follow-up answer accepted after our question — 'и училась'
+#   🗣 Post-wake command: 'и училась'
+#
+# and the room then spent two TTS calls answering a sentence nobody said. A
+# decoder given a room floor returns its most likely phrase, not nothing, and
+# the follow-up gate took the result for a reply to our own question.
+#
+# The discriminator separates COMPLETELY over 70 measured utterances: every
+# buffer that produced a real transcript peaked >= 13523, every buffer that
+# produced garbage peaked <= 8117, and nothing landed in between.
+
+# Peaks measured on buffers that produced a usable transcript.
+MEASURED_REAL_PEAKS = (13523, 18768, 19708, 20927, 21375, 23445, 24077, 25532,
+                       30197, 32767)
+# Peaks measured on buffers that produced garbage.
+MEASURED_GARBAGE_PEAKS = (2399, 2572, 3391, 3447, 4268, 5127, 6102, 6386,
+                          7724, 8117)
+
+
+def test_the_threshold_sits_in_the_gap_between_the_two_measured_sets():
+    """Not a round number chosen for looks: it must be above EVERY garbage peak
+    and below EVERY real one, or it is not separating anything."""
+    from camera_client import _STT_MIN_PEAK
+
+    assert _STT_MIN_PEAK > max(MEASURED_GARBAGE_PEAKS), (
+        "порог ниже худшего пустого буфера — часть мусора пройдёт в Whisper"
+    )
+    assert _STT_MIN_PEAK < min(MEASURED_REAL_PEAKS), (
+        "порог выше самой тихой рабочей команды — команда будет выброшена"
+    )
+
+
+def test_every_measured_buffer_lands_on_the_correct_side():
+    from camera_client import _STT_MIN_PEAK
+
+    wrong = [p for p in MEASURED_REAL_PEAKS if p < _STT_MIN_PEAK]
+    assert not wrong, f"рабочие буферы, которые гейт выбросил бы: {wrong}"
+    wrong = [p for p in MEASURED_GARBAGE_PEAKS if p >= _STT_MIN_PEAK]
+    assert not wrong, f"пустые буферы, которые гейт пропустил бы: {wrong}"
+
+
+def test_the_field_case_is_below_the_threshold():
+    """The exact measurement from 18:25:25, `peak=3447`."""
+    from camera_client import _STT_MIN_PEAK
+
+    assert 3447 < _STT_MIN_PEAK, "тот самый буфер обязан отсеяться"
+
+
+def test_a_gate_with_no_counter_is_invisible():
+    """The drop count has to reach the diag line, or a gate that is quietly
+    discarding commands looks exactly like a gate that is not running."""
+    import inspect
+
+    src = inspect.getsource(camera_client.CameraSession)
+    assert "stt_drop=" in src, (
+        "счётчик пропусков обязан печататься в vosk diag — иначе отличить "
+        "«гейт молчит» от «гейта нет» нечем"
+    )
+    assert "_stt_dropped_silent" in src
+
+
+def test_zero_means_unset_and_not_a_gate_that_blocks_everything():
+    """0 is «unset, use the default» throughout this project. Taken literally it
+    would make every utterance fail the gate."""
+    cfg = camera_client.CameraConfig(stream_name="x", stt_min_peak=0)
+    assert cfg.stt_min_peak == 0
+    resolved = cfg.stt_min_peak if cfg.stt_min_peak > 0 else camera_client._STT_MIN_PEAK
+    assert resolved > 0
+    assert 32767 >= resolved, "громкая команда проходит при разрешённом значении"

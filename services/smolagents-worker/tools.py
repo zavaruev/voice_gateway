@@ -380,6 +380,208 @@ MCP_TOOLS: frozenset[str] = frozenset({
 })
 
 
+def _handle_on_off_fallback(tool_name: str, args: dict, result: str) -> str:
+    """
+    On/off intents whose domain/area filter did not survive HA's matcher —
+    field case 02.10.2026 05:45 («Значит, прихожий.»): the hallway lamp is
+    `switch.entrance_light_switch_relay`, so `domain: ["light"]` answered
+    MatchFailedReason.AREA for «прихожая» AND for «Entrance», and before the
+    relay was exposed to Assist the answer was MatchFailedReason.ASSISTANT.
+    L1 (jev-router) resolves the concrete entity from raw /api/states before
+    calling the intent; this is that rule for L2, and it only fires when the
+    resolver is SURE: a device word to aim at, a room when several devices
+    match, ≤ MAX_ONOFF_TARGETS of them, all on/off right now, facets (the
+    status LED next to the relay) dropped. Anything else — an unreadable
+    registry, an offline device, an ambiguity — keeps the ORIGINAL error:
+    a refusal must stay honest, never a guessed side effect.
+
+    NAME joins AREA/ASSISTANT because HA answers it for two cases the
+    resolver CAN settle: a phrase in the `name` slot («свет в первом
+    коридоре» — HA matches names, not sentences) and the CONCATENATED
+    friendly name, which HA accepts only for some entities (field check
+    02.10.2026: «corridor1_light_switch Relay» and «coffemaker» ->
+    MatchFailedReason.NAME while «entrance_light_switch Relay» matched).
+    The honesty contract of 2.34 survives untouched: an INVENTED word
+    («кашеварку») matches nothing in the registry, the resolver returns []
+    and the original NAME error stands — the fallback rescues phrasing,
+    never guessing.
+    """
+    if tool_name not in ("intent__HassTurnOn", "intent__HassTurnOff") or not any(
+        r in result
+        for r in ("MatchFailedReason.AREA", "MatchFailedReason.ASSISTANT",
+                  "MatchFailedReason.NAME")
+    ):
+        return result
+
+    states, areas = _raw_registry()
+    targets = resolve_onoff_targets(
+        states or [],
+        name=str(args.get("name") or ""),
+        area=str(args.get("area") or ""),
+        domains=args.get("domain"),
+        area_map=areas,
+    )
+    oks: list[tuple[str, str]] = []
+    fails: list[str] = []
+    for ent in targets:
+        eid = ent.get("entity_id", "")
+        # Name + domain pinned to the resolved entity: the area slot is
+        # deliberately DROPPED — it was the filter that just failed, and
+        # the entity id is already unique. `name` takes the entity ID
+        # rather than the friendly name on purpose: HA's matcher accepts
+        # the concatenated friendly name only for some entities — field
+        # check 02.10.2026, «corridor1_light_switch Relay» and
+        # «coffemaker» answered MatchFailedReason.NAME while
+        # «entrance_light_switch Relay» matched, which is what made this
+        # retry fail exactly where it was needed. Exposure is still
+        # enforced: the intent keeps its assistant='conversation' filter
+        # however the entity was named.
+        retry_args = {"name": eid, "domain": [eid.split(".", 1)[0]]}
+        res2 = mcp_call(tool_name, retry_args)
+        (oks if _action_ok(res2) else fails).append((eid, res2))
+    if oks and not fails:
+        logger.info("on/off matcher miss -> resolved %s, retried %s",
+                    ", ".join(e for e, _ in oks), tool_name)
+        # One target keeps HA's own confirmation payload; several are
+        # summarised so the veto records exactly what moved.
+        return oks[-1][1] if len(oks) == 1 else (
+            "Выполнено: " + ", ".join(e for e, _ in oks)
+        )
+    elif oks:
+        # Partial fan-out: the refusal must not hide the side effects
+        # that DID happen (same contract as L1's `done` in its error).
+        return (
+            f"Тул вернул ошибку: выполнено {len(oks)}/{len(targets)}: "
+            f"{', '.join(e for e, _ in oks)}; остальные не сработали"
+        )
+    # Zero successes: the ORIGINAL error stands — it is what actually
+    # happened, and the model must report that instead of a guess.
+    return result
+
+
+def _verify_on_off_result(tool_name: str, result: str) -> str:
+    """
+    AN `ok` THAT NAMED A ROOM IS NOT A DEVICE THAT MOVED
+    Field case 07.10.2026 11:39, living room: «Выключи свет в гостиной» was
+    transcribed «Выключиться в гостиной», escalated to L2, and L2 called
+
+        ha_action("intent__HassTurnOff", {"area": "Living Room", "domain": ["light"]})
+
+    which answered, with HTTP 200 and `failed: []`:
+
+        {"response_type": "action_done",
+         "data": {"success": [{"type": "area",   "id": "living_room"},
+                               {"type": "entity", "id": "light.wled_living_room"}],
+                  "failed": []}}
+
+    and the room SAID «Выключила свет в гостиной.» The lamp did not move: it is
+    `switch.living_room_light_swith_relay`, and `domain: ["light"]` cannot match
+    a `switch` at all. The only entity named was `light.wled_living_room`, which
+    has been `unavailable` since 28.09, and the other entry is the ROOM.
+
+    `_action_ok` above accepted it because the list is non-empty, `has_data` then
+    recorded `ok=True`, which DISARMS the honesty veto, and the model was free to
+    speak as done. The router has refused this exact shape since 04.10.2026 via
+    `_touched_a_usable_entity` — one path was guarded and the other was not, the
+    same asymmetry already documented for the on/off fast path vs the blind one.
+    Applied HERE as well, and deliberately only to the on/off intents: an area-only
+    match is provably not a lamp for those, whereas a vacuum `CleanArea` may
+    legitimately report a room.
+    """
+    if tool_name not in ("intent__HassTurnOn", "intent__HassTurnOff"):
+        return result
+
+    states, _areas = _raw_registry()
+    if not claimed_a_usable_entity(result, states):
+        res = (
+            "Тул вернул ошибку: intent__Hass"
+            + ("TurnOn" if tool_name.endswith("TurnOn") else "TurnOff")
+            + " ответил успехом, но не назвал ни одного рабочего устройства"
+            " — в списке только комната и/или недоступные сущности "
+            "(проверено по живому реестру HA). Устройство НЕ переключено. "
+            "Не говори, что включила или выключила: назови настоящую "
+            "причину."
+        )
+        logger.warning(
+            "on/off intent claimed only areas/unavailable entities -> %s",
+            res[:120],
+        )
+        return res
+
+    # "HA named a usable entity" is NOT "the device moved". Measured
+    # 10.10.2026 13:18, kitchen: HA answered `action_done` naming
+    # `switch.coffemaker` as a success — a real, available entity — while
+    # the appliance never switched. L1 in the SAME turn did the right thing
+    # (`verify want=on ... moved=[] unmoved=['switch.coffemaker']`) and
+    # escalated with `unverified_side_effect`; L2 was handed that blocker,
+    # called the intent again, got the same optimistic payload, and said
+    # «Кофеварка включена.»
+    #
+    # That payload also disarms the honesty veto: `_record_action` sets
+    # `ok = has_data(result)`, and an `action_done` with a non-empty
+    # `success` list counts as data — so the veto is switched off by
+    # exactly the answer it exists to overrule.
+    #
+    # L2 therefore needs the SAME read-back L1 uses, not the weaker
+    # "did HA name something" test, and the same schedule: HA writes the
+    # entity state ~0.5 s before the device acts (state at +0.26 s,
+    # `sensor.coffemaker_power` at +0.77 s), so a sub-second read reads
+    # back HA's own optimistic write. Two paths that verify differently
+    # will disagree about the same turn, which is what happened here.
+    claimed = claimed_entity_ids(result)
+    target = "on" if tool_name.endswith("TurnOn") else "off"
+    if claimed and not confirm_on_off_reached(claimed, target, _raw_states):
+        res = (
+            "Тул вернул ошибку: Home Assistant принял вызов "
+            f"{tool_name} и ответил «успех», но перечитывание состояния "
+            f"через 1-2.5 с показало, что ни одно из устройств "
+            f"({', '.join(sorted(claimed))}) не пришло в состояние "
+            f"'{target}'. Устройство НЕ переключено. Не говори, что "
+            f"включила или выключила: назови настоящую причину."
+        )
+        logger.warning(
+            "on/off intent claimed success but nothing reached '%s': %s",
+            target, ", ".join(sorted(claimed)),
+        )
+        return res
+
+    return result
+
+
+def _handle_vacuum_fallback(tool_name: str, args: dict, result: str) -> tuple[str, str]:
+    """
+    Field regression 25.09.2026 («Пусть робот уберется на кухне»): in
+    HassVacuumStart the area slot filters by the vacuum's LOCATION, and the
+    robot is assigned to no area in HA -> MatchFailedReason.AREA every time,
+    while the user's intent with a room is "clean there". Fallback:
+    Start+area -> CleanArea (area = cleaning target, entity match ignores
+    the robot's area), ReturnToBase+area -> same tool without area (a
+    location filter is meaningless for docking). Original behaviour is kept
+    when Start+area actually matches.
+    Why deterministic code and not a prompt rule: the model ignored the
+    prompt version of this advice, and the fix must hold for a FREE LLM.
+    `tool_name`/`result` are REBOUND so _record_action below logs the
+    call that actually executed — the veto judges the retried outcome.
+    """
+    if "area" in args and "MatchFailedReason.AREA" in result:
+        if tool_name == "vacuum__HassVacuumStart":
+            retry_tool = "vacuum__HassVacuumCleanArea"
+            retry_args = {k: v for k, v in args.items() if k in ("area", "name")}
+        elif tool_name == "vacuum__HassVacuumReturnToBase":
+            retry_tool = tool_name
+            retry_args = {k: v for k, v in args.items() if k != "area"}
+        else:
+            # Non-vacuum tool with an AREA mismatch: no safe automatic
+            # rewrite exists (intent tools resolve rooms for real devices),
+            # so the original error stands and the model must report it.
+            retry_tool, retry_args = "", {}
+        if retry_tool:
+            logger.info("vacuum AREA mismatch -> retry %s %s",
+                        retry_tool, retry_args)
+            return retry_tool, mcp_call(retry_tool, retry_args)
+    return tool_name, result
+
+
 @tool
 def ha_action(tool_name: str, arguments_json: str) -> str:
     """Выполнить действие в Home Assistant через MCP-тул.
@@ -425,184 +627,10 @@ def ha_action(tool_name: str, arguments_json: str) -> str:
         _record_action(tool_name, msg)
         return msg
     result = mcp_call(tool_name, args)
-    # Field regression 25.09.2026 («Пусть робот уберется на кухне»): in
-    # HassVacuumStart the area slot filters by the vacuum's LOCATION, and the
-    # robot is assigned to no area in HA -> MatchFailedReason.AREA every time,
-    # while the user's intent with a room is "clean there". Fallback:
-    # Start+area -> CleanArea (area = cleaning target, entity match ignores
-    # the robot's area), ReturnToBase+area -> same tool without area (a
-    # location filter is meaningless for docking). Original behaviour is kept
-    # when Start+area actually matches.
-    # Why deterministic code and not a prompt rule: the model ignored the
-    # prompt version of this advice, and the fix must hold for a FREE LLM.
-    # `tool_name`/`result` are REBOUND so _record_action below logs the
-    # call that actually executed — the veto judges the retried outcome.
-    if "area" in args and "MatchFailedReason.AREA" in result:
-        if tool_name == "vacuum__HassVacuumStart":
-            retry_tool = "vacuum__HassVacuumCleanArea"
-            retry_args = {k: v for k, v in args.items() if k in ("area", "name")}
-        elif tool_name == "vacuum__HassVacuumReturnToBase":
-            retry_tool = tool_name
-            retry_args = {k: v for k, v in args.items() if k != "area"}
-        else:
-            # Non-vacuum tool with an AREA mismatch: no safe automatic
-            # rewrite exists (intent tools resolve rooms for real devices),
-            # so the original error stands and the model must report it.
-            retry_tool, retry_args = "", {}
-        if retry_tool:
-            logger.info("vacuum AREA mismatch -> retry %s %s",
-                        retry_tool, retry_args)
-            tool_name, result = retry_tool, mcp_call(retry_tool, retry_args)
-    # On/off intents whose domain/area filter did not survive HA's matcher —
-    # field case 02.10.2026 05:45 («Значит, прихожий.»): the hallway lamp is
-    # `switch.entrance_light_switch_relay`, so `domain: ["light"]` answered
-    # MatchFailedReason.AREA for «прихожая» AND for «Entrance», and before the
-    # relay was exposed to Assist the answer was MatchFailedReason.ASSISTANT.
-    # L1 (jev-router) resolves the concrete entity from raw /api/states before
-    # calling the intent; this is that rule for L2, and it only fires when the
-    # resolver is SURE: a device word to aim at, a room when several devices
-    # match, ≤ MAX_ONOFF_TARGETS of them, all on/off right now, facets (the
-    # status LED next to the relay) dropped. Anything else — an unreadable
-    # registry, an offline device, an ambiguity — keeps the ORIGINAL error:
-    # a refusal must stay honest, never a guessed side effect.
-    #
-    # NAME joins AREA/ASSISTANT because HA answers it for two cases the
-    # resolver CAN settle: a phrase in the `name` slot («свет в первом
-    # коридоре» — HA matches names, not sentences) and the CONCATENATED
-    # friendly name, which HA accepts only for some entities (field check
-    # 02.10.2026: «corridor1_light_switch Relay» and «coffemaker» ->
-    # MatchFailedReason.NAME while «entrance_light_switch Relay» matched).
-    # The honesty contract of 2.34 survives untouched: an INVENTED word
-    # («кашеварку») matches nothing in the registry, the resolver returns []
-    # and the original NAME error stands — the fallback rescues phrasing,
-    # never guessing.
-    if tool_name in ("intent__HassTurnOn", "intent__HassTurnOff") and any(
-        r in result
-        for r in ("MatchFailedReason.AREA", "MatchFailedReason.ASSISTANT",
-                  "MatchFailedReason.NAME")
-    ):
-        states, areas = _raw_registry()
-        targets = resolve_onoff_targets(
-            states or [],
-            name=str(args.get("name") or ""),
-            area=str(args.get("area") or ""),
-            domains=args.get("domain"),
-            area_map=areas,
-        )
-        oks: list[tuple[str, str]] = []
-        fails: list[str] = []
-        for ent in targets:
-            eid = ent.get("entity_id", "")
-            # Name + domain pinned to the resolved entity: the area slot is
-            # deliberately DROPPED — it was the filter that just failed, and
-            # the entity id is already unique. `name` takes the entity ID
-            # rather than the friendly name on purpose: HA's matcher accepts
-            # the concatenated friendly name only for some entities — field
-            # check 02.10.2026, «corridor1_light_switch Relay» and
-            # «coffemaker» answered MatchFailedReason.NAME while
-            # «entrance_light_switch Relay» matched, which is what made this
-            # retry fail exactly where it was needed. Exposure is still
-            # enforced: the intent keeps its assistant='conversation' filter
-            # however the entity was named.
-            retry_args = {"name": eid, "domain": [eid.split(".", 1)[0]]}
-            res2 = mcp_call(tool_name, retry_args)
-            (oks if _action_ok(res2) else fails).append((eid, res2))
-        if oks and not fails:
-            logger.info("on/off matcher miss -> resolved %s, retried %s",
-                        ", ".join(e for e, _ in oks), tool_name)
-            # One target keeps HA's own confirmation payload; several are
-            # summarised so the veto records exactly what moved.
-            result = oks[-1][1] if len(oks) == 1 else (
-                "Выполнено: " + ", ".join(e for e, _ in oks)
-            )
-        elif oks:
-            # Partial fan-out: the refusal must not hide the side effects
-            # that DID happen (same contract as L1's `done` in its error).
-            result = (
-                f"Тул вернул ошибку: выполнено {len(oks)}/{len(targets)}: "
-                f"{', '.join(e for e, _ in oks)}; остальные не сработали"
-            )
-        # Zero successes: the ORIGINAL error stands — it is what actually
-        # happened, and the model must report that instead of a guess.
+    tool_name, result = _handle_vacuum_fallback(tool_name, args, result)
+    result = _handle_on_off_fallback(tool_name, args, result)
+    result = _verify_on_off_result(tool_name, result)
 
-    # --- AN `ok` THAT NAMED A ROOM IS NOT A DEVICE THAT MOVED -------------------
-    # Field case 07.10.2026 11:39, living room: «Выключи свет в гостиной» was
-    # transcribed «Выключиться в гостиной», escalated to L2, and L2 called
-    #
-    #     ha_action("intent__HassTurnOff", {"area": "Living Room", "domain": ["light"]})
-    #
-    # which answered, with HTTP 200 and `failed: []`:
-    #
-    #     {"response_type": "action_done",
-    #      "data": {"success": [{"type": "area",   "id": "living_room"},
-    #                            {"type": "entity", "id": "light.wled_living_room"}],
-    #               "failed": []}}
-    #
-    # and the room SAID «Выключила свет в гостиной.» The lamp did not move: it is
-    # `switch.living_room_light_swith_relay`, and `domain: ["light"]` cannot match
-    # a `switch` at all. The only entity named was `light.wled_living_room`, which
-    # has been `unavailable` since 28.09, and the other entry is the ROOM.
-    #
-    # `_action_ok` above accepted it because the list is non-empty, `has_data` then
-    # recorded `ok=True`, which DISARMS the honesty veto, and the model was free to
-    # speak as done. The router has refused this exact shape since 04.10.2026 via
-    # `_touched_a_usable_entity` — one path was guarded and the other was not, the
-    # same asymmetry already documented for the on/off fast path vs the blind one.
-    # Applied HERE as well, and deliberately only to the on/off intents: an area-only
-    # match is provably not a lamp for those, whereas a vacuum `CleanArea` may
-    # legitimately report a room.
-    if tool_name in ("intent__HassTurnOn", "intent__HassTurnOff"):
-        states, _areas = _raw_registry()
-        if not claimed_a_usable_entity(result, states):
-            result = (
-                "Тул вернул ошибку: intent__Hass"
-                + ("TurnOn" if tool_name.endswith("TurnOn") else "TurnOff")
-                + " ответил успехом, но не назвал ни одного рабочего устройства"
-                " — в списке только комната и/или недоступные сущности "
-                "(проверено по живому реестру HA). Устройство НЕ переключено. "
-                "Не говори, что включила или выключила: назови настоящую "
-                "причину."
-            )
-            logger.warning(
-                "on/off intent claimed only areas/unavailable entities -> %s",
-                result[:120],
-            )
-        else:
-            # "HA named a usable entity" is NOT "the device moved". Measured
-            # 10.10.2026 13:18, kitchen: HA answered `action_done` naming
-            # `switch.coffemaker` as a success — a real, available entity — while
-            # the appliance never switched. L1 in the SAME turn did the right thing
-            # (`verify want=on ... moved=[] unmoved=['switch.coffemaker']`) and
-            # escalated with `unverified_side_effect`; L2 was handed that blocker,
-            # called the intent again, got the same optimistic payload, and said
-            # «Кофеварка включена.»
-            #
-            # That payload also disarms the honesty veto: `_record_action` sets
-            # `ok = has_data(result)`, and an `action_done` with a non-empty
-            # `success` list counts as data — so the veto is switched off by
-            # exactly the answer it exists to overrule.
-            #
-            # L2 therefore needs the SAME read-back L1 uses, not the weaker
-            # "did HA name something" test, and the same schedule: HA writes the
-            # entity state ~0.5 s before the device acts (state at +0.26 s,
-            # `sensor.coffemaker_power` at +0.77 s), so a sub-second read reads
-            # back HA's own optimistic write. Two paths that verify differently
-            # will disagree about the same turn, which is what happened here.
-            claimed = claimed_entity_ids(result)
-            target = "on" if tool_name.endswith("TurnOn") else "off"
-            if claimed and not confirm_on_off_reached(claimed, target, _raw_states):
-                result = (
-                    "Тул вернул ошибку: Home Assistant принял вызов "
-                    f"{tool_name} и ответил «успех», но перечитывание состояния "
-                    f"через 1-2.5 с показало, что ни одно из устройств "
-                    f"({', '.join(sorted(claimed))}) не пришло в состояние "
-                    f"'{target}'. Устройство НЕ переключено. Не говори, что "
-                    f"включила или выключила: назови настоящую причину."
-                )
-                logger.warning(
-                    "on/off intent claimed success but nothing reached '%s': %s",
-                    target, ", ".join(sorted(claimed)),
-                )
     _record_action(tool_name, result)
     return result
 

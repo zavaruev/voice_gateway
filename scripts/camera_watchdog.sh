@@ -285,8 +285,8 @@ for room, vals in sorted(rows.items()):
 #
 # The threshold comes from the two sides of that event, not from taste:
 #
-#   сломанные (11:38-11:43, до восстановления)   p90 = 25, максимум 83
-#   здоровые   (11:50-12:00, после восстановления) минимум 304, p10 = 356
+#   broken  (11:38-11:43, before the repair)      p90 = 25, max 83
+#   healthy  (11:50-12:00, after the repair)      min 304, p10 = 356
 #
 # 150 sits x1.8 above the worst sample actually observed broken and x2.0 below
 # the lowest sample actually observed healthy. Overridable per room, because the
@@ -427,16 +427,16 @@ nightMode.lightMonitor=true}"
       got="$(printf '%s\n' "$seen" | grep "^${path}=" | head -1 | cut -d= -f2-)"
       if [ -z "$got" ]; then
         missing=$(( missing + 1 ))
-        line="$line|$path: НЕТ (ожидалось $expect) — действует умолчание сборки"
+        line="$line|$path: ABSENT (expected $expect) — the build default is in force"
       elif [ "$got" != "$expect" ]; then
         wrong=$(( wrong + 1 ))
-        line="$line|$path: $got вместо $expect"
+        line="$line|$path: got $got, expected $expect"
       fi
     done
 
     if [ "$missing" -gt 0 ] || [ "$wrong" -gt 0 ]; then
-      log "$CUR_NAME CONFIG DRIFT — отсутствует $missing, значение не то у $wrong ($CUR_IP):${line}
-    Прошивка от 14.10.2026 удалила всё, что отличалось от новых умолчаний. Починка: скопировать рабочий /etc/majestic.yaml на $CUR_IP и перезапустить S95majestic. Ничего не перезапущено."
+      log "$CUR_NAME CONFIG DRIFT — $missing absent, $wrong has the wrong value ($CUR_IP):${line}
+    The 14.10.2026 firmware dropped everything that differed from its new defaults. Fix: copy a working /etc/majestic.yaml to $CUR_IP and restart S95majestic. Nothing was restarted."
       return 0
     fi
     return 1

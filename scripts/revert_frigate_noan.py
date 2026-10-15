@@ -1,25 +1,27 @@
-"""Убирает `-an` из кухни: это МОЯ регрессия, и она оставлена не будет.
+"""Remove `-an` from the kitchen: it was MY regression and it will not stay.
 
-15.10.2026. Хронология, потому что она и есть урок:
+15.10.2026. The chronology, because the chronology IS the lesson:
 
-  * `-an` добавлен, чтобы прекратить цикл падений ffmpeg (`PT=60 bad cseq`).
-    Цикл действительно прекратился — 0 падений.
-  * Но после этого **процесс ffmpeg кухни перестал быть потребителем потока в
-    go2rtc**: у `kitchen` остался один потребитель (шлюз), тогда как у соседних
-    комнат их два. Выигрыш есть, а подключения нет.
-  * Две попытки откатить не сработали, потому что я угадывал отступ: в блоке
-    `input_args` строки с отступом **12** пробелов, а в обеих версиях скрипта
-    было 14. Обе отказы печатали «запись НЕ выполнена» и не трогали файл —
-    **это ровно та причина, по которой скрипт написан с проверкой каждой
-    замены, а не «просто замени».** Теперь текст взят из файла, а не из
-    головы: `repr` строк перед записью, см. печать ниже.
+  * `-an` was added to stop the ffmpeg crash loop (`PT=60 bad cseq`). The loop
+    did stop — zero crashes.
+  * But afterwards the kitchen's ffmpeg process **stopped being a consumer of the
+    go2rtc stream**: `kitchen` was left with one consumer (the gateway) where
+    the neighbouring rooms have two. A win, and no connection.
+  * Two attempts to revert it failed because I guessed the indentation: in the
+    `input_args` block the lines are indented **12** spaces, and both versions of
+    this script used 14. Both reverts printed "NOT WRITTEN" and left the file
+    untouched — **which is exactly why the script verifies every replacement
+    rather than "just replacing" it.** The text is now read from the file rather
+    than from memory: `repr` of the lines before writing, see the print below.
 
-Скрипт сверяет не только совпадение, но и КОНЕЧНЫЙ результат: если после
-правок в `input_args` кухни всё ещё есть `-an`, он не пишет файл.
+The script checks not only that the text matched but the END RESULT: if `-an`
+is still in the kitchen's `input_args` after the edits, it does not write the
+file.
 
-Оставлять в конфиге то, что не проверено и что я сам сломал, нельзя. Правильный
-способ убрать звук из NVR — `#video` в URL потока go2rtc (канал не создаётся
-вовсе), а не `-an` у потребителя; это отдельная правка и здесь не сделана.
+Leaving in the config something unverified that I broke myself is not an option.
+The correct way to drop sound from the NVR is `#video` in the go2rtc stream URL
+(the channel is never created), not `-an` on the consumer; that is a separate
+change and is not made here.
 """
 import shutil
 import sys
@@ -27,31 +29,31 @@ import sys
 PATH = "/config/config.yaml"
 BAK = "/config/config.yaml.bak.20261015.noan3"
 
-# Точный текст из файла: отступ 12 пробелов, не 14.
+# The exact text from the file: 12 spaces of indentation, not 14.
 BLOCK = (
-    "            # 15.10.2026: NVR не нужен звук, а его согласование роняло\n"
-    "            # ffmpeg в цикл (PT=60 bad cseq, unseverable timestamps), и\n"
-    "            # каждая переподключка отнимала у камеры ресурс на видео —\n"
-    "            # аудиоканал недокармливал и комната заикала.\n"
+    "            # 15.10.2026: the NVR does not need sound, and negotiating it\n"
+    "            # crashed ffmpeg in a loop (PT=60 bad cseq, unseverable\n"
+    "            # timestamps), and every reconnect spent camera resources on\n"
+    "            # video — the audio channel was underfed and the room stuttered.\n"
     "            - -an\n"
 )
 
 text = open(PATH, encoding="utf-8").read()
 shutil.copyfile(PATH, BAK)
-print("  бэкап: %s" % BAK)
+print("  backup: %s" % BAK)
 
 n = text.count(BLOCK)
 if n != 1:
-    print("  ПРОПУЩЕНО (совпадений %d)" % n)
-    print("  запись НЕ выполнена")
+    print("  SKIPPED (%d matches)" % n)
+    print("  NOT WRITTEN")
     sys.exit(1)
 text = text.replace(BLOCK, "", 1)
 
-# Проверка результата, а не только факта замены.
+# Check the result, not merely that a replacement happened.
 if "            - -an\n" in text:
-    print("  ПОСЛЕ ПРАВКИ `-an` ВСЁ ЕЩЁ ЕСТЬ — запись отменена")
+    print("  `-an` IS STILL THERE AFTER THE EDIT — write cancelled")
     sys.exit(1)
 
 open(PATH, "w", encoding="utf-8").write(text)
-print("  ок: -an и его комментарий убраны")
-print("  записано")
+print("  ok: -an and its comment are gone")
+print("  written")

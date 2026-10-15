@@ -553,7 +553,7 @@ def test_hint_silent_without_command_verb():
 
 def test_hint_silent_below_threshold():
     """An unknown device with no near match -> no suggestion at all: a wrong
-    name (посудомойку ~ подсветка = 0.44) is worse than none."""
+    name ("посудомойку" ~ "подсветка" = 0.44) is worse than none."""
     assert unresolved_hint("Выключи посудомойку.") == ""
 
 
@@ -988,8 +988,8 @@ def test_media_on_off_is_a_transport_call_not_a_dead_intent():
 
 
 def test_a_named_episode_is_a_library_request_not_a_track_skip():
-    """«Включай следующую серию "Темного зеркала" в гостиной» is a LIBRARY
-    item, not «the next track»: routed to media_next_track it switched a track
+    """A named episode — «включай следующую серию "Темного зеркала" в гостиной» —
+    is a LIBRARY item, not «the next track»: routed to media_next_track it switched a track
     on whatever box answered (field check 03.10.2026 19:32 — it reached the
     bedroom). It must escalate to L2, which owns media_search + media_play and
     the room from the escalation context. «Следующий ТРЕК» stays a transport

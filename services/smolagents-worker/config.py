@@ -72,7 +72,7 @@ EMBED_MODEL = os.getenv("EMBED_MODEL", "qwen3-embedding:0.6b")
 # SEED HOSTS ONLY: a box is matched to its HA entity by its own zeroconf name
 # (System.FriendlyName -> "LE-zal" == friendly_name "LE-zal"), so this is not a
 # room table — an IP change means editing one list, nothing else. Verified
-# 03.10.2026: .105 = LE-zal (гостиная), .118 = LE-spalnya (спальня),
+# 03.10.2026: .105 = LE-zal (living room), .118 = LE-spalnya (bedroom),
 # .245 = LE-Kitchen (кухня); the fourth box (LE-vlada) was OFFLINE and is not
 # in this list, which is why it is reported as unreachable rather than
 # silently absent.

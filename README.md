@@ -1,6 +1,6 @@
 # Voice Gateway
 
-![version](https://img.shields.io/badge/version-v2.39-blue)
+![version](https://img.shields.io/badge/version-v2.40-blue)
 [![tests](https://github.com/zavaruev/voice_gateway/actions/workflows/tests.yml/badge.svg)](https://github.com/zavaruev/voice_gateway/actions/workflows/tests.yml)
 ![python](https://img.shields.io/badge/python-3.12%2B-3776AB?logo=python&logoColor=white)
 ![backend](https://img.shields.io/badge/AI%20backend-Cascade-orange)
@@ -34,6 +34,7 @@ Two lessons from bringing the rooms up are worth stating here, because both cost
 
 - **`audio.volume` must be *applied*, not just written.** The OpenIPC web UI writes the value to `/etc/majestic.yaml` and keeps the old one in memory until you press apply. A camera left on `volume: 30` read `rms 4` (−77.8 dB) with `volume: 100` already sitting in the config file, and looked indistinguishable from dead hardware — a 700× gap from a healthy room that announced itself nowhere in the log. Re-reading the file is not evidence that a setting is in force.
 - **A room that does not wake and a room with nobody in it are indistinguishable from one measurement.** Every conclusion that a microphone was deaf came from a recording made while the room was empty. `CAMERA_VOSK_DUMP_<NAME>` (below) exists because that is the mistake you cannot catch by trying harder.
+- **Two rooms stutter and two do not, on identical hardware, identical firmware and identical config — because of where the access point is.** Every camera here runs on `wlan0`, and the WiFi signal strength orders the rooms exactly as throughput orders them: 78 and 77/63 deliver the stream at 1.02× of real time, 56 gives 0.84×, and 30 gives 0.29× with `play_audio` at ×25.7. The same link carries both directions (the outgoing stream and the incoming `POST /play_audio`), `majestic` is single-threaded, and when the link cannot keep up its output audio channel does not get data in time — `Device 0 is empty`, which is what stuttering *is*. Three days were spent comparing what was inside the cameras before anyone read `/proc/net/wireless`. **"Same hardware, same firmware, same config" is only what you checked.**
 
 See [`docs/REFERENCE.md`](docs/REFERENCE.md) → *Known Issues & Current Problems*.
 
@@ -46,7 +47,7 @@ See [`docs/REFERENCE.md`](docs/REFERENCE.md) → *Known Issues & Current Problem
 | L2 turn with a verified side effect | **3.2–4.0 s** |
 | Wake debounce | ~240 ms (2 of 3 chunks); a single chunk ≥ 0.68 fires immediately |
 | Wake window / watchdog | 15 s / 90 s |
-| Test suite | 615 tests, 19 files, ~11,900 lines |
+| Test suite | 635 tests, 19 files, ~12,300 lines |
 
 ---
 
@@ -85,15 +86,15 @@ Full environment table, backend variants, REST API and OTA: [`docs/REFERENCE.md`
 
 | File | Responsibility | Why it is separate |
 |---|---|---|
-| **`main.py`** (~3,980 lines) | Core: ESP32 WebSocket protocol, REST API, OTA, web UI, camera session startup | Single entry point for everything |
-| **`camera_client.py`** (~5,280 lines) | One `CameraSession` per stream: RTSP mic feed, wake word, cross-camera arbitration, replies over the camera's `/play_audio` | Cameras have their own transport and their own hard problem — the mic hears its own speaker |
-| **`engine.py`** (~480 lines) | Silero VAD + openWakeWord scoring — the "science" part, pure ONNX calls | Testable without a network, without a camera |
-| **`backends.py`** (~590 lines) | Who answers: `NanobotBackend` / `HermesBackend` / `CascadeBackend` | One interface — the brain is swappable with a single env var |
-| **`telegram_client.py`** (~1,180 lines) | Third request source: Telegram long-polling, chat allowlist, voice note → Whisper → the same backend → text reply (+ optional voice note) | No bot framework — three Bot API calls over the `aiohttp` the process already has; all main.py helpers injected (no import cycle) |
+| **`main.py`** (~3,990 lines) | Core: ESP32 WebSocket protocol, REST API, OTA, web UI, camera session startup | Single entry point for everything |
+| **`camera_client.py`** (~5,450 lines) | One `CameraSession` per stream: RTSP mic feed, wake word, cross-camera arbitration, replies over the camera's `/play_audio` | Cameras have their own transport and their own hard problem — the mic hears its own speaker |
+| **`engine.py`** (~570 lines) | Silero VAD + openWakeWord scoring — the "science" part, pure ONNX calls | Testable without a network, without a camera |
+| **`backends.py`** (~610 lines) | Who answers: `NanobotBackend` / `HermesBackend` / `CascadeBackend` | One interface — the brain is swappable with a single env var |
+| **`telegram_client.py`** (~1,190 lines) | Third request source: Telegram long-polling, chat allowlist, voice note → Whisper → the same backend → text reply (+ optional voice note) | No bot framework — three Bot API calls over the `aiohttp` the process already has; all main.py helpers injected (no import cycle) |
 | **`audio_utils.py`** (~220 lines) | `pack_ogg()` (Opus → Ogg for Whisper) and `is_valid_text()` (drops hallucinations and mic echoes of our own TTS) | Shared by both device paths |
 | **`services/jev-router/`** | **L1** — intent classifier, offline slot resolver, direct Home Assistant calls, weather, chat/expert proxy | ~0.1 s for a simple command, no LLM in the loop |
 | **`services/smolagents-worker/`** | **L2** — smolagents `CodeAgent` with HA / Qdrant / Hermes / weather tools, plus honesty vetoes | Multi-step tasks that must not lie about side effects |
-| **`tests/`** | 615 tests across 19 files | Pins the wake-gate bands, the protocol, the cascade contract, the Telegram source, the utterance endpointing and the side-effect verification |
+| **`tests/`** | 635 tests across 19 files | Pins the wake-gate bands, the protocol, the cascade contract, the Telegram source, the utterance endpointing and the side-effect verification |
 
 > Production (`docker-compose.yml`) runs `LLM_BACKEND=cascade` with **four cameras enabled** (`CAMERA_STREAMS=livingroom,kitchen,entrance1,camera-corridor1`, `DISABLE_CAMERAS=false`), all four decoding the wake word with vosk and playing replies over `/play_audio`; the ESP32 path remains the main one.
 
@@ -202,6 +203,35 @@ consumer: a watchdog must not perturb the single-threaded `majestic` it watches.
 first step restarts the gateway, so testing it the hard way is what once made it
 restart a healthy container seventeen times in a day.
 
+**Known gap — capture speed.** Two of the four production cameras sit at
+`play_audio` ×1.8 and ×25.7 and the watchdog calls both `healthy`: HTTP latency,
+stream presence and level are all normal. The signal that separates them is
+**capture speed** (`ffmpeg -i rtsp://… -t 15 -f null -`, read `speed=`), and the
+threshold is measured from both sides — healthy 1.01–1.02x, broken 0.29–0.40x,
+boundary somewhere at 0.8x. It is **not implemented yet**.
+
+### Repository gates
+
+    bash scripts/verify_endpoint.sh     # the full check, in one command
+    python3 scripts/check_lang.py --self-test && python3 scripts/check_lang.py
+    python3 scripts/check_doc_headings.py --self-test
+
+Two of these are about the documents and the source rather than the behaviour,
+and both exist because of a specific way of being wrong:
+
+- **`check_lang.py`** enforces the rule that prose is English and Cyrillic is
+  data. The distinction is what makes it usable: «компьютер», «включи свет» and
+  every other Russian string in this repository is payload, while the sentence
+  around it is documentation. It removes string literals by AST, so the L2 system
+  prompt and the `@tool` descriptions the model reads are never touched — those
+  are data too, and translating them would change model behaviour.
+- **`check_doc_headings.py`** catches a heading spliced to a copy of itself in
+  `AGENTS.md`. Three earlier versions of that check passed *while the defect was
+  present*, so the rule both gates follow is: **`--self-test` first, and a check
+  that has never been seen failing proves nothing.**
+
+Both run inside `verify_endpoint.sh` as step 1/7, before anything is built.
+
 ---
 
 ## One turn on an ESP32 satellite
@@ -288,13 +318,13 @@ voice_gateway/
 ├── services/
 │   ├── jev-router/         # cascade L1
 │   └── smolagents-worker/  # cascade L2
-├── tests/                  # 615 tests / 19 files
+├── tests/                  # 635 tests / 19 files
 └── docs/
     └── REFERENCE.md        # full config tables, REST API, known issues, changelog
 ```
 
 - **Configuration, REST API, environment variables, known issues and the full changelog:** [`docs/REFERENCE.md`](docs/REFERENCE.md)
-- **Tests:** 615 tests across 19 files covering engine scoring and wake gates, the camera audio track and its echo guards, the ESP32 protocol, cascade streaming, honesty vetoes, HA entity matching, router resolution, dialogue memory and the Telegram source (allowlist, ack vs final text, turn timeout, voice turns, `/room`). Run them inside the container — see [`docs/REFERENCE.md`](docs/REFERENCE.md#tests), the host Python usually lacks `opuslib` / `onnxruntime`. CI (`.github/workflows/tests.yml`) runs the same recipe on every push and PR.
+- **Tests:** 635 tests across 19 files covering engine scoring and wake gates, the camera audio track and its echo guards, the ESP32 protocol, cascade streaming, honesty vetoes, HA entity matching, router resolution, dialogue memory and the Telegram source (allowlist, ack vs final text, turn timeout, voice turns, `/room`). Run them inside the container — see [`docs/REFERENCE.md`](docs/REFERENCE.md#tests), the host Python usually lacks `opuslib` / `onnxruntime`. CI (`.github/workflows/tests.yml`) runs the same recipe on every push and PR.
 
 ---
 

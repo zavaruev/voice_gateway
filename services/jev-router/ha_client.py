@@ -1130,7 +1130,7 @@ def _prep_candidates(a: str) -> list[str]:
     if a.endswith("е"):           # улице -> улица, спальне -> спальня/спальня
         out.append(a[:-1] + "а")
         out.append(a[:-1] + "я")
-        out.append(a[:-1])         # коридоре -> коридор
+        out.append(a[:-1])         # "в коридоре" -> "коридор"
     return out
 
 

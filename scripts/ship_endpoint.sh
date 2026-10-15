@@ -21,21 +21,22 @@ BRANCH=feat/pause-endpoint
 
 cd "$REPO" || exit 1
 
-echo "=== 1/5 проверка ( gating stage ) ==="
+echo "=== 1/5 verify ( gating stage ) ==="
 bash scripts/verify_endpoint.sh
 RC=$?
 if [ "$RC" -ne 0 ]; then
   echo
-  echo "ПРОВЕРКА НЕ ПРОЙДЕНА. Ничего не коммичу, не пушу, не деплою."
-  echo "Пришлите вывод шага 4/5 — почти наверняка это арифметика в тесте."
+  echo "VERIFICATION DID NOT PASS. Nothing committed, pushed or deployed."
+  echo "Please send the output of step 4/5 — it is almost certainly test arithmetic."
   exit "$RC"
 fi
-echo "проверка зелёная"
+echo "verification is green"
 
 echo
-echo "=== 2/5 ветка + коммит ==="
-# Ветка создаётся ДО коммита: раньше коммит уезжал в локальный main,
-# а push падал "src refspec does not match any" — ветки не существовало.
+echo "=== 2/5 branch + commit ==="
+# The branch is created BEFORE the commit: used to be the other way round, so
+# the commit landed on the local main and the push failed with
+# "src refspec does not match any" — the branch did not exist.
 git checkout -b "$BRANCH" 2>/dev/null || git checkout "$BRANCH"
 git add camera_client.py main.py \
         tests/test_vad_endpoint.py tests/test_camera_client.py \
@@ -113,23 +114,23 @@ MSG
 git log --oneline -1
 
 echo
-echo "--- примечание к коммиту ---"
-echo "Прогоняется НЕ МОЕЙ сессией: инструмента запуска не было."
-echo "Проверка: bash scripts/verify_endpoint.sh (это и есть гейт выше)."
+echo "--- commit note ---"
+echo "Run by a DIFFERENT session: the writing session had no shell."
+echo "Verify with: bash scripts/verify_endpoint.sh (that is the gate above)."
 
 echo
-echo "=== 3/5 пуш в ветку (main не трогаем) ==="
+echo "=== 3/5 push the branch (main is left alone) ==="
 if git push -u origin "$BRANCH"; then
-  echo "ветка $BRANCH запушена — main не изменён"
+  echo "branch $BRANCH pushed — main is unchanged"
 else
-  echo "PUSH НЕ ПРОШЁ. Коммит остался только локально."
-  echo "  посмотреть: git log --oneline -1"
-  echo "  починить:    git push -u origin $(git rev-parse --abbrev-ref HEAD)"
+  echo "PUSH FAILED. The commit is local only."
+  echo "  look at: git log --oneline -1"
+  echo "  fix it:     git push -u origin $(git rev-parse --abbrev-ref HEAD)"
   FAIL=1
 fi
 
 echo
-echo "=== 4/5 пересборка и перезапуск шлюза ==="
+echo "=== 4/5 rebuild and restart the gateway ==="
 cd "$STACK" || exit 1
 docker compose up -d --no-deps --build --force-recreate voice_gateway
 sleep 75
@@ -137,30 +138,31 @@ docker logs voice_gateway --since 90s 2>&1 | grep -E "vosk wake-word|ICE=connect
 curl -s -m 10 http://127.0.0.1:18792/health; echo
 
 echo
-echo "=== 5/5 флаг оставлен ВЫКЛЮЧЕННЫМ — это намеренно ==="
+echo "=== 5/5 the flag is still OFF — deliberately ==="
 docker exec voice_gateway python3 -c "import sys;sys.path.insert(0,'/app');import camera_client;print('pause_endpoint =', camera_client.CameraConfig('x').pause_endpoint)"
 echo
-echo "Дальше — по одному шагу, когда захотите снять 7 секунд ожидания:"
-echo "  1) снять базовую линию (все завершения сейчас идут по лимиту):"
+echo "Next, one step at a time, when you want to take the 7 s wait out:"
+echo "  1) take a baseline (every ending right now is the cap):"
 echo "     docker logs voice_gateway --since 2h | grep 'UTTERANCE END' | tail -20"
-echo "  2) включить только гостиную:"
-echo "     # docker-compose.yml, рядом с WAKE_VOSK_MODEL_LIVINGROOM:"
+echo "  2) enable the living room only:"
+echo "     # docker-compose.yml, next to WAKE_VOSK_MODEL_LIVINGROOM:"
 echo "     - CAMERA_PAUSE_ENDPOINT_LIVINGROOM=true"
 echo "     cd $STACK && docker compose up -d --no-deps --build --force-recreate voice_gateway"
-echo "  3) сказать 3-5 команд и посмотреть:"
+echo "  3) say 3-5 commands and look:"
 echo "     docker logs voice_gateway --since 5m | grep 'UTTERANCE END'"
-echo "     ждать via pause (rms=... ref=... floor=... run=... speech=...)"
-echo "     и since boot: {'pause': N, 'cap': M} с M НЕ растущим"
-echo "  4) если Whisper начал резать фразы — подкрутить CAMERA_PAUSE_RATIO"
-echo "     поlogged floor/rms, без пересборки кода, только restart."
-echo "     Если ВСЁ в cap — опорный уровень не ловится при работающем"
-echo "     телевизоре, и это результат, а не повод крутить дальше."
+echo "     expect via pause (rms=... ref=... floor=... run=... speech=...)"
+echo "     and awake ends: {'pause': N, 'cap': M}  with M NOT growing"
+echo "  4) if Whisper starts cutting phrases, turn CAMERA_PAUSE_RATIO"
+echo "     using the logged floor/rms — no code rebuild, just a restart."
+echo "     If EVERYTHING is still capped, the reference level does not catch"
+echo "     the dip while the television is on — that is a result, not a reason"
+echo "     to keep tuning."
 
 echo
-echo "=== ИТОГ ==="
+echo "=== RESULT ==="
 if [ "$FAIL" -eq 0 ]; then
-  echo "  ПРОВЕРЕНО, ЗАКОММИЧЕНО, ЗАПУШЕНО, ЗАДЕПЛОЕНО."
+  echo "  VERIFIED, COMMITTED, PUSHED, DEPLOYED."
 else
-  echo "  ЕСТЬ НЕЗАВЕРШЁННОЕ — см. выше. Деплой уже мог состояться."
+  echo "  SOMETHING DID NOT FINISH — see above. The deploy may already have happened."
 fi
 exit "$FAIL"

@@ -1,34 +1,36 @@
 #!/usr/bin/env python3
-"""Проверка заголовков AGENTS.md на склейку. ДЕМОНСТРАЦИЯ, ЧТО ОНА ЛОВИТ.
+"""Check AGENTS.md headings for splice damage. A DEMONSTRATION OF WHAT IT CATCHES.
 
-Запускать из корня репозитория:  python3 scripts/check_doc_headings.py
+Run from the repository root:  python3 scripts/check_doc_headings.py
 
-История, почему файл существует. Сплей в AGENTS.md
-(`s[:i] + new + s[i:]`, где `new` уже заканчивается якорем) склеивает
-заголовок с копией себя же. Пять раз за 14–15.10.2026, и **дважды проверка,
-которую я запускал после этого, проходила при наличии дефекта:**
+Why this file exists. The splice in AGENTS.md (`s[:i] + new + s[i:]`, where
+`new` already ends with an anchor) glues a heading to a copy of itself. Five
+times on 14–15.10.2026, and **the check I ran afterwards passed while the defect
+was present, twice**:
 
-  * первая искала `**- **` — а склейка выглядит как `ФРАЗУ- **АТТЕНЦИОННЫЙ`,
-    дефис ПОСЛЕ звёзд, и под шаблон не подходила никогда;
-  * вторая ловила `- **` не в начале строки — но склеенная строка как раз
-    начинается с `- **`, просто содержит его дважды. Она ловила другой случай
-    (текст, приклеенный к концу предыдущей строки), а не этот.
+  * the first searched for `**- **` — but the splice reads `PHRASE- **ATTENTION`,
+    with the hyphen AFTER the asterisks, so the pattern never matched anything;
+  * the second caught `- **` not at the start of a line — but the spliced line
+    does start with `- **`, it just contains it TWICE. It caught a different case
+    (text glued to the end of the previous line), not this one;
+  * the third counted repeated headings by a key taken from the start of the
+    line — but the copy is on the SAME line, so the key was unique and no
+    repeat was visible.
 
-Отсюда правило, которое этот файл существует, чтобы применять: **проверка,
-которая ни разу не была замечена падающей на настоящем дефекте, ничего не
-значит.** Поэтому `--self-test` ниже сначала ломает строку так же, как ломает
-её сплей, и убеждается, что проверка это замечает. Если не замечает — скрипт
-падает сам, а не файл.
+Hence the rule this file exists to enforce: **a check that has never been seen
+failing means nothing.** So `--self-test` below first breaks a line exactly the
+way the splice breaks it and confirms the check notices. If it does not, the
+script fails — not the document.
 
-Три независимых признака, потому что они ловят разное:
+Three independent signals, because they catch different things:
 
-  1. `- **` не в начале строки — текст приклеен к концу предыдущей строки;
-  2. `- **` встречается в строке больше одного раза — заголовок склеен с копией
-     себя же (ровно то, что делает сплей);
-  3. два заголовка с одинаковым началом — один и тот же заголовок продублирован
-     целиком, в разных строках.
+  1. `- **` is not at the start of the line — text glued onto the previous line;
+  2. `- **` appears more than once in the line — a heading spliced with a copy
+     of itself (exactly what the splice does);
+  3. two headings with the same beginning — the same heading duplicated whole,
+     on different lines.
 
-Возвращает 1, если что-то нашёл, иначе 0.
+Returns 1 if it found anything, 0 if clean.
 """
 
 from __future__ import annotations
@@ -42,17 +44,17 @@ MARK = "- **"
 
 
 def _strip_code(line: str) -> str:
-    """Убрать ограждённые блоки и инлайновые кавычки.
+    """Drop fenced blocks and inline code spans.
 
-    Без этого проверка ругается сама на себя: заметка о шаблоне склейки
-    цитирует `- **` буквально, и каждая такая цитата выглядит как дефект.
-    Проверка, которая всегда падает, тоже бесполезна — её выключают.
+    Without this the check flags itself: the note about the splice pattern
+    quotes `- **` literally, and every such quote looks like a defect. A check
+    that always fails is just as useless as no check — it gets switched off.
     """
     return re.sub(r"`[^`]*`", "", line)
 
 
 def find_glue(lines: list[str]) -> list[tuple[int, str]]:
-    """Три независимых признака склейки, каждый со своим сообщением."""
+    """Three independent splice signals, each with its own message."""
     bad: list[tuple[int, str]] = []
     in_fence = False
     for i, raw in enumerate(lines, 1):
@@ -66,9 +68,9 @@ def find_glue(lines: list[str]) -> list[tuple[int, str]]:
         if n == 0:
             continue
         if not line.lstrip().startswith(MARK):
-            bad.append((i, f"текст приклеен к концу строки ({n}× «{MARK}» не в начале)"))
+            bad.append((i, f"text glued to the end of a line ({n}x '{MARK}' not at the start)"))
         elif n > 1:
-            bad.append((i, f"заголовок склеен с копией себя же ({n}× «{MARK}» в строке)"))
+            bad.append((i, f"heading spliced with a copy of itself ({n}x '{MARK}' in the line)"))
     heads = [
         (i, _strip_code(line).lstrip()[len(MARK):].split("**")[0])
         for i, line in enumerate(lines, 1)
@@ -78,31 +80,31 @@ def find_glue(lines: list[str]) -> list[tuple[int, str]]:
     for num, key in heads:
         key = key[:45]
         if key in seen:
-            bad.append((num, f"заголовок повторён (строка {seen[key]}): {key[:45]}"))
+            bad.append((num, f"heading repeated (line {seen[key]}): {key[:45]}"))
         else:
             seen[key] = num
     return bad
 
 
 def self_test() -> int:
-    """Проверяем ПРОВЕРКУ на заведомо битых образцах, до того как ей поверим."""
+    """Test the CHECK against known-broken samples before trusting it."""
     cases = [
-        ("заголовок склеен с копией себя", "- **A** текст- **A** текст", True),
-        ("дефис внутри, не в начале",       "  слово- **A** текст",      True),
-        ("один заголовок, чисто",            "- **A** текст",            False),
-        ("обычный текст",                    "  просто строка",          False),
-        ("два разных заголовка",             "- **A**\n- **B**",         False),
-        ("цитата шаблона в строке",          "  признак: `- **` тут",   False),
-        ("цитата в ограждённом блоке",       "  ```\n  - **x**- **x**\n  ```", False),
+        ("heading spliced with a copy of itself", "- **A** text- **A** text", True),
+        ("hyphen inside, not at the start",       "  word- **A** text",      True),
+        ("one heading, clean",                    "- **A** text",            False),
+        ("ordinary text",                         "  just a line",           False),
+        ("two different headings",                "- **A**\n- **B**",        False),
+        ("the pattern quoted in a line",          "  signal: `- **` here",   False),
+        ("the pattern quoted in a fence",         "  ```\n  - **x**- **x**\n  ```", False),
     ]
     fails = 0
     for name, sample, want in cases:
         got = bool(find_glue(sample.splitlines()))
-        ok = "ок" if got == want else "НЕ ЛОВИТ"
+        verdict = "ok" if got == want else "MISSED"
         if got != want:
             fails += 1
-        print(f"  self-test: {name:<38} ждём {str(want):<5} {ok}")
-    print(f"  self-test: {'все образцы пройдены' if not fails else f'ПРОВАЛЕНО: {fails}'}")
+        print(f"  self-test: {name:<38} want {str(want):<5} {verdict}")
+    print(f"  self-test: {'all samples passed' if not fails else f'FAILED: {fails}'}")
     return fails
 
 
@@ -111,18 +113,18 @@ def main() -> int:
         return 1 if self_test() else 0
 
     if not DOC.exists():
-        print(f"  нет файла: {DOC}")
+        print(f"  no such file: {DOC}")
         return 1
     lines = DOC.read_text(encoding="utf-8").splitlines()
     bad = find_glue(lines)
     heads = sum(1 for l in lines if l.lstrip().startswith(MARK))
     if bad:
-        print(f"  СКЛЕЙКА — {len(bad)} шт. в {DOC.name}:")
+        print(f"  SPLICE — {len(bad)} in {DOC.name}:")
         for num, why in bad:
-            print(f"    строка {num}: {why}")
+            print(f"    line {num}: {why}")
             print(f"      {lines[num - 1][:120]}")
         return 1
-    print(f"  {DOC.name}: заголовков {heads}, склеек нет")
+    print(f"  {DOC.name}: {heads} headings, no splices")
     return 0
 
 

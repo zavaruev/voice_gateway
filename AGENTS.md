@@ -837,11 +837,11 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
 
   | command | reply | time | state |
   |---|---|---|---|
-  | выключи свет | Выключила | 0.17 s | **off** |
-  | выключи свет | В гостиной уже выключено. | 0.10 s | off |
-  | включи свет | Включила | 0.17 s | **on** |
-  | включи свет | В гостиной уже включено. | 0.12 s | on |
-  | выключи свет | Выключила | 0.16 s | **off** |
+  | turn the light off | «Done» | 0.17 s | **off** |
+  | turn the light off | «It is already off in the living room.» | 0.10 s | off |
+  | turn the light on | «Done» | 0.17 s | **on** |
+  | turn the light on | «It is already on in the living room.» | 0.12 s | on |
+  | turn the light off | «Done» | 0.16 s | **off** |
 
   Two things this establishes, both of which had been argued about: the side
   effect is REAL (the entity id is `switch.living_room_light_swith_relay` — no
@@ -900,11 +900,11 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
   * **The default area was dropped for media, and only for media.** `if area_src == "default" and not media_noun and not thing_stem` sent `args={'service_data': {}}` — no area at all — so `_execute_media` guessed among four boxes and chose `le_vlada`. The lights take the default area in the same breath (`{'domain': ['light'], 'area': 'Living Room'}`), so the asymmetry was in this branch alone. The drop is now scoped to `_MEDIA_RELATIVE` (`volume_up/down/mute/set`): **«пауза» said in a room names exactly one player**, which is precisely the case the original reasoning excluded. Verified live: living room → `le_zal_2`, kitchen → `le_kitchen`, «громче» still drops the room and still follows `MEDIA_PREFER`.
 - **`/play_audio` ANSWERS 3-12x LATE, AND EVERY POST-PLAYBACK GUARD WAS TIMED FROM THE ANSWER. Measured 07.10.2026, HTTP 200 every time, identical PCM POSTed straight at the cameras:**
 
-  | аудио | кухня | гостиная |
+  | audio | kitchen | living room |
   |---|---|---|
-  | 1 с | 3.5 с (×3.0) | 5.0 с, и один раз **21.4 с** (×21) |
+  | 1 s | 3.5 s (×3.0) | 5.0 s, and once **21.4 s** (×21) |
   | 3 с | 8.7 с (×2.9) | 37.0 с (×12.3) |
-  | 6 с | 18.2 с (×3.0) | **нет ответа за 60 с** |
+  | 6 s | 18.2 s (×3.0) | **no answer within 60 s** |
 
   It is not a rate mismatch: 48000/16000 = 3.0 is a tempting match to the kitchen's ×3.0, but a 1 kHz tone declared `;rate=48000` and `;rate=16000` was heard at exactly 1000 Hz either way, so the camera honours the declared rate. The flat 30 s `ClientTimeout(total=30)` also timed out on a real reply (`08:50:07 play_audio failed: ` with an empty message — `asyncio.TimeoutError` stringifies to nothing), and the room spoke nothing at all.
   * **Three guards were computed from `time.time()` AFTER the response returned**, so the whole round trip was added to them. `_speaking_until` is the hard mic mute in `_feed_audio`, so **a 30 s answer muted the room for 30 s after the reply had finished playing** — and it would have broken the question window on the very turn it was added for. All three now read a single `sent_at` captured before the POST: `_speaking_until`, `GLOBAL_TTS_UNTIL`, `_wake_suppress_until`. The three tails stay different on purpose (`_ECHO_TAIL_S` 3.0 for the wake word, `_SPEAKER_SETTLE_S` 0.3 for inbound audio — `_is_echo` and `_echo_of_reply` identify our own voice without a blind window).
@@ -1042,7 +1042,7 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
 
 - **THE FOURTH CAMERA'S MIC IS SATURATED, AND NO GATEWAY FILTER RECOVERS IT. Measured 12.10.2026 ~13:50, `camera-corridor1` (192.168.22.165).** Reported as «в первом коридоре тишина». It is not silence and not a code bug: the input is **saturated by a constant low-frequency noise**.
 
-  | комната | rms | клип | <50 Гц | 50-150 | 150-300 | 300-1k | 1-3k | 3-8k |
+  | room | rms | clipped | <50 Hz | 50-150 | 150-300 | 300-1k | 1-3k | 3-8k |
   |---|---|---|---|---|---|---|---|---|
   | livingroom | 379 | 0.00% | 36.4 | 36.2 | 10.1 | 10.3 | 4.8 | 2.2 |
   | kitchen | 602 | 0.00% | 10.8 | 44.6 | 25.9 | 13.1 | 3.5 | 2.2 |
@@ -1062,10 +1062,10 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
 
 - **THE CORRIDOR CAMERA WAS THE CAMERA, NOT THE CORRIDOR. Settled 12.10.2026 by swapping the hardware.** The user replaced the .165 unit with the entrance camera **at the same spot**, which is the one experiment that separates the two.
 
-  | точка, камера | rms | клип | 150-300 Гц | 3-8 кГц |
+  | spot, camera | rms | clipped | 150-300 Hz | 3-8 kHz |
   |---|---|---|---|---|
-  | коридор, .165 (исходная) | 17 413 | **5.86%** | 13.7 | 0.0 |
-  | **коридор, .198 (новая)** | **510** | **0.00%** | **56.6** | 2.1 |
+  | corridor, .165 (the original) | 17 413 | **5.86%** | 13.7 | 0.0 |
+  | **corridor, .198 (the new one)** | **510** | **0.00%** | **56.6** | 2.1 |
 
   * **Same place, same mount, same config shape — 34x quieter and not one clipped sample.** The location was innocent. Nothing about the corridor needed changing.
   * **A loopback through this camera's own speaker proves the whole chain.** The envelope jumps from ~500 to **9 714** during the phrase (**19x the floor**, against the living room's proven 52x) at **0.08% clipping**, and vosk decodes the microphone's own recording as **`'как её включи свет в коридоре'`** — the command verbatim. For contrast, the SAME loopback on .165 gave `'в качестве скрытой'` raw, `'ха'` behind a high-pass, and **nothing at all** behind a band-pass.
@@ -1078,12 +1078,12 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
   * **The mistake, exactly.** The audio config of `.165` and a working camera is **identical** — `volume: 100`, `outputVolume`, `srate: 48000`, `speakerPin: 0`; `/proc/asound` empty on both; no audio modules, no extra config files, no voltage readouts. Finding nothing, I concluded "there is nothing to turn down". **Maximum is not the same as nothing to reduce** — and the direction that helps a saturated input is DOWN, which is exactly the direction I refused to consider. The kitchen had already proved this control works in both directions (30 → `rms 4`, 100 → `rms 410`).
   * **The measurement that settles it, on the same camera:**
 
-    | `audio.volume` | rms (прямой замер) | клип | вердикт |
+    | `audio.volume` | rms (direct capture) | clipped | verdict |
     |---|---|---|---|
-    | 100 | 10 579 – 27 166 | 1.8–7.7% | насыщение, декодер молчит |
-    | 70 | **~2 000 фон / 14 492 фраза** | **0.01%** | **работает** |
-    | 50 | 542 | 0.00% | работает |
-    | 20 | 73 | 0.00% | слишком тихо |
+    | 100 | 10 579 – 27 166 | 1.8–7.7% | saturated, the decoder is silent |
+    | 70 | **~2 000 background / 14 492 speech** | **0.01%** | **works** |
+    | 50 | 542 | 0.00% | works |
+    | 20 | 73 | 0.00% | too quiet |
 
     The loopback through its own speaker decodes **verbatim**: at 70 vosk returned **both** `'включи свет в коридоре'` and `'секунду занимаясь'`. Shown in the gateway's own instrument, `feed rms` is **639-729 with peak 1934** at volume 70 — squarely inside the healthy band (livingroom 324-394, kitchen 563-586, entrance1 919-1114). **Shipped value: `volume: 70`.**
   * **What the swap actually proved, read correctly this time.** Swapping hardware at the same spot separated the LOCATION from the CAMERA — that part was sound and worth doing. What I then over-read is the word "camera": **"the difference is carried by the unit" does not mean "the unit is faulty"**, because the unit carries its configuration too. Every measurement in that investigation was correct; the conclusion drawn from "the config is identical to a healthy camera's" was "so the hardware differs" when it should have been "so the difference is in this unit, and I have not yet found where."
@@ -1092,11 +1092,11 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
 
 - **ALL CAMERAS RETURNED TO THEIR ORIGINAL PLACES 12.10.2026; the configuration was restored and re-verified.** `camera-corridor1` → **192.168.22.165** again, `entrance1` **re-enabled** → 192.168.22.198. Four rooms back: livingroom, kitchen, entrance1, camera-corridor1.
 
-  | комната | floor | состояние |
+  | room | floor | state |
   |---|---|---|
   | livingroom | 0.0104 | здоров |
   | kitchen | 0.0156 | здоров |
-  | entrance1 | 0.0287 | здоров — камера снова слышит, `feed rms 1053-1095` |
+  | entrance1 | 0.0287 | healthy — the camera hears again, `feed rms 1053-1095` |
   | **camera-corridor1** | **0.0930** | **глуха: это та же .165** |
 
   * **The swap's conclusion survived the swap.** Back in its own mount, `.165` still measures **rms 10 579 with 1.78% clipping and the peak at 32 768** — against 400-640 and 0.00% everywhere else. The fault travels with the unit, exactly as the experiment showed.
@@ -1104,79 +1104,79 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
   * **The room is left fully configured so a replacement needs no further change** (stream, source URL with credentials + `#backchannel=1`, `/play_audio`, vosk model, `CAMERA_WEBRTC=false`, `_CORRIDOR_STREAMS`). Only the unit has to change.
   * 0 false wakes after the restore.
 
-- **ТРИ МОИ ПРОВЕРКИ ПОДРЯД БЫЛИ ЗЕЛЁНЫМИ ПРИ НАЛИЧИИ ДЕФЕКТА. 14–15.10.2026.**
+- **THREE OF MY CHECKS IN A ROW WERE GREEN WHILE THE DEFECT WAS PRESENT. 14–15.10.2026.**
 
-  Сплей в этот файл (`new + s[i:]`, где `new` уже заканчивается якорем) склеивает заголовок с копией себя же. Пять раз за 14–15.10.2026, и **три раза проверка, которую я запускал после этого, проходила при наличии дефекта:**
+  The splice into this file (`new + s[i:]`, where `new` already ends with an anchor) glues a heading to a copy of itself. Five times over 14–15.10.2026, and **three times the check I ran afterwards passed while the defect was present:**
 
-  1. первая искала `**- **` — а склейка выглядит как `ФРАЗУ- **АТТЕНЦИОННЫЙ`, дефис ПОСЛЕ звёзд, и под шаблон не подходила никогда;
-  2. вторая ловила «`- **` не в начале строки» — но склеенная строка как раз начинается с `- **`, просто содержит его **дважды**. Она ловила другой случай (текст, приклеенный к концу предыдущей строки), а не этот;
-  3. третья считала повторы заголовков по ключу из начала строки — а копия лежит **в той же строке**, поэтому ключ был один и повтора не виделось.
+  1. the first searched for `**- **` — but the splice reads `PHRASE- **ATTENTION`, with the hyphen AFTER the asterisks, so the pattern never matched anything;
+  2. the second caught "`- **` not at the start of a line" — but the spliced line does start with `- **`, it just contains it **twice**. It caught a different case (text glued to the end of the previous line), not this one;
+  3. the third counted repeated headings by a key taken from the start of the line — but the copy is on the SAME line, so the key was unique and no repeat was visible.
 
-  **Правильный признак склейки-заголовка: `- **` встречается в строке БОЛЬШЕ ОДНОГО РАЗА.** Плюс отдельный признак для текста, приклеенного к концу строки: `- **` не в начале.
+  **The correct signal for a spliced heading: `- **` appears in the line MORE THAN ONCE.** Plus a separate signal for text glued to the end of a line: `- **` not at the start.
 
-  Теперь это не заметка, а проверяемый инструмент: **`scripts/check_doc_headings.py`**, с `--self-test` на семи образцах, включая ловушки (цитата шаблона в строке и в ограждённом блоке — они не должны считаться дефектом, иначе проверка всегда падает и её выключают). Проверен **в обе стороны**: на испорченной копии находит ровно `заголовок склеен с копией себя же` и даёт код 1, на настоящем файле — 0 и код 0.
+  It is now a testable tool rather than a note: **`scripts/check_doc_headings.py`**, with `--self-test` over seven samples including traps (the pattern quoted in a line and in a fenced block — those must not count as defects, or the check always fails and gets switched off). Verified **in both directions**: on a corrupted copy it finds exactly `heading spliced with a copy of itself` and exits 1; on the real file, 0 findings and exit 0.
 
-  Здесь нет ничего нового по существу — это ровно тот класс, что в файле уже описан («защита, которая не может сработать, хуже отсутствующей»): заглушка `reached`, которая принимала `before != now` вместо `state == target`, `_tts_fetch` без лога, `assert count == 1` как доказательство, что правка легла туда, куда задумано. **Собственная проверка — тоже код, и к ней применима та же планка, что к остальному: сначала сломать ей файл и убедиться, что она это заметила, и только потом ей верить.**
+  There is nothing new in substance here — it is exactly the class this file already describes ("a guard that cannot fire is worse than none"): the `reached` stub that accepted `before != now` instead of `state == target`, a `_tts_fetch` with no logging, `assert count == 1` as proof that an edit landed where it was meant to. **A check is code too, and the same standard applies to it: break the file with it first and confirm it notices, and only then trust it.**
 
-- **ЗАИКАНИЕ БЫЛО НЕ В КАМЕРАХ, А В ИХ ВИДЕОСТОРОНЕ — И Я ДВАЖДЫ НАЗВАЛ ЭТО ЖЕЛЕЗОМ. 15.10.2026, сообщение пользователя: «в коридоре всё ещё не включает свет / страшно заикается».**
+- **THE STUTTER WAS NOT IN THE CAMERAS BUT IN THEIR VIDEO SIDE — AND I CALLED IT HARDWARE TWICE. 15.10.2026, user report: «the corridor still does not turn the light on / it stutters badly».**
 
-  **Настоящая причина, измеренная 15.10 в 11:53:** на камеру коридора `.247` шли **ДВА RTSP-производителя** — один для `camera-corridor1` (шлюз), второй для `corridor1` (NVR). `majestic` однопоточный, и при двух видеосессиях его выходной аудиоканал недокармливал: `MI_AO_IMPL_SendFrame: Device 0 is empty`. Кухня была в цикле падений ffmpeg у NVR с той же ценой. **Аппарат исправен.**
+  **The real cause, measured 15.10 at 11:53:** corridor camera `.247` was being fed by **TWO RTSP producers** — one for `camera-corridor1` (the gateway), one for `corridor1` (the NVR). `majestic` is single-threaded, and with two video sessions its output audio channel was underfed: `MI_AO_IMPL_SendFrame: Device 0 is empty`. The kitchen was in an ffmpeg crash loop at the NVR at the same price. **The hardware is fine.**
 
-  | комната | было | стало | отношение `play_audio` |
+  | room | before | after | `play_audio` ratio |
   |---|---|---|---|
-  | кухня | 1 потребитель, цикл падений | 2 потребителя, 0 падений | **×25.7 → ×7.2** (в 3.6 раза) |
-  | коридор | 2 производителя на одну камеру | 1 производитель, 2 потребителя | **×1.8 → ×1.1** |
+  | kitchen | 1 consumer, crash loop | 2 consumers, 0 crashes | **×25.7 → ×7.2** (3.6x better) |
+  | corridor | 2 producers on one camera | 1 producer, 2 consumers | **×1.8 → ×1.1** |
 
-  * **Разделитель оказался не в конфиге, а в числе потребителей, и он совпал с делением 2/2 идеально:**
+  * **The separator turned out not to be in the config but in the NUMBER OF CONSUMERS, and it matched the 2/2 split exactly:**
     ```
-    livingroom  2 потребителя  Lavf59 + Lavf61   x0.3   быстро
-    entrance1   2 потребителя  Lavf59 + Lavf61   x0.4   быстро
-    kitchen     1 потребитель                    x25.7  заикается
-    corridor    1 потребитель (+ ДУБЛЬ потока)    x1.8  заикается
+    livingroom  2 consumers  Lavf59 + Lavf61   x0.3   fast
+    entrance1   2 consumers  Lavf59 + Lavf61   x0.4   fast
+    kitchen     1 consumer                   x25.7  stutters
+    corridor    1 consumer (+ DUPLICATE feed)  x1.8   stutters
     ```
-    У быстрых камер NVR тянет поток стабильно; у медленных — либо вторым производителем, либо циклом аварий. Второй потребитель на Slow комнатах шёл с `127.0.0.1` и **старым** ffmpeg `Lavf59.27.100` — то есть это NVR, а не шлюз.
+    On the fast cameras the NVR pulls the stream steadily; on the slow ones it is either a second producer or a crash loop. The second consumer on the slow rooms came from `127.0.0.1` with an **old** ffmpeg, `Lavf59.27.100` — so it was the NVR, not the gateway.
 
-  * **Проверка причинности, а не догадка:** подключил второго стабильных потребителя (`ffmpeg -f null`) к кухне и коридору — отношение упало в 3.6 и 1.6 раза, **без единой правки в камере**. Потребители убраны, эффект воспроизведён на постоянной основе через NVR.
+  * **Cause checked, not guessed:** attaching a second steady consumer (`ffmpeg -f null`) to the kitchen and the corridor dropped the ratio by 3.6x and 1.6x, **with not one change on the camera**. The temporary consumers were removed and the effect was reproduced permanently through the NVR.
 
-  * **Две правки, обе в NVR, в камерах не тронуто ничего:**
-    1. **Коридор:** поток `corridor1` в go2rtc NVR переименован в `camera-corridor1` — то есть в тот, что уже читает шлюз. `corridor1` был именем, от которого go2rtc отказался ещё **11.10.2026**, и он **вернулся** после того, как его удаляли: сегодняшняя запись «дубль удалён» устарела. После рестарта NVR поток исчез сам, и на `.247` остался один производитель с двумя потребителями — ровно форма рабочих комнат.
-    2. **Кухня:** в `input_args` добавлен `-an`. В логах NVR был цикл `RTP: PT=60: bad cseq 0` → `Timestamps are unseverable` → `Non-monotonous DTS` → `exceeded fps limit. Exiting ffmpeg`. **`PT=60` — это полезная нагрузка АУДИО**, а NVR для детекции нужен только видеокадр. После `-an` падений 0.
+  * **Two changes, both in the NVR. Nothing on the cameras was touched:**
+    1. **Corridor:** the NVR's go2rtc stream `corridor1` was renamed to `camera-corridor1` — the one the gateway already reads. `corridor1` was a name go2rtc had already refused on **11.10.2026**, and it **came back** after being deleted: today's "duplicate removed" record was stale. After the NVR restart the stream vanished on its own, and `.247` was left with one producer and two consumers — exactly the shape of the working rooms.
+    2. **Kitchen:** `-an` added to `input_args`. The NVR log had the cycle `RTP: PT=60: bad cseq 0` → `Timestamps are unseverable` → `Non-monotonous DTS` → `exceeded fps limit. Exiting ffmpeg`. **`PT=60` is the AUDIO payload**, while detection only needs a video frame. After `-an`, zero crashes.
 
-  * **Правки конфига NVR делаются СКРИПТОМ, а не руками, и скрипт отказывается писать при непопадании.** `scripts/fix_frigate_nvr.py` требует, чтобы каждая из четырёх замен нашла свой текст **ровно один раз**, и при провале не пишет файл вовсе. Это сработало буквально: первая версия искала структуру с `input_args` в блоке `corridor1`, где его нет, и молчала бы, если бы не проверка. Файл принадлежит root, `sudo` без пароля нет — пишется через `docker exec frigate`, бэкап `/config/config.yaml.bak.20261015`.
+  * **NVR config edits are made BY SCRIPT, not by hand, and the script refuses to write on a mismatch.** `scripts/fix_frigate_nvr.py` requires each of its four replacements to find its text **exactly once**, and writes nothing at all on failure. That fired for real: the first version looked for a structure containing `input_args` inside the `corridor1` block, where there is none, and would have stayed silent without the check. The file is root-owned and there is no passwordless `sudo` — it is written through `docker exec frigate`, backup at `/config/config.yaml.bak.20261015`.
 
-  * **Два раза я назвал это железом и оба раза ошибся** — как уже сегодня с `.247` («кнопка применить») и с `.165`. Общий признак: **«одинаковое железо, одинаковая прошивка, одинаковый конфиг» — это не конец расследования, это только то, что я проверил.** Здесь нашёлся параметр, который я не смотрел вообще: сколько потоков тянет камера. Спросить «а кто ещё держит этот поток?» стоило бы сразу после того, как совпали прошивка и конфиг.
+  * **I called it hardware twice and was wrong both times** — as already today with `.247` ("the apply button") and with `.165`. The common sign: **"same hardware, same firmware, same config" is not the end of the investigation, it is only what I checked.** The parameter I never looked at was here: how many streams the camera is being asked for. Asking "who else is pulling this stream?" would have cost nothing once the firmware and the config matched.
 
-  * **КУХНЯ НЕ ДОЧИЛЕНА, И МОЯ ПРАВКА `-an` БЫЛА НЕ ТУДА.** По времени на 15.10:
-    * дубль производителя на `.247` **устранён и проверен**: один производитель на каждую камеру, NVR тянет `camera-corridor1` вторым потребителем, отношение коридора `×1.8 → ×1.1`;
-    * падения ffmpeg на кухне прекратились, но **потребитель NVR так и не появился**: `kitchen: exiting subprocess` повторяется каждые ~100 с, поэтому у кухни по-прежнему один потребитель — то самое медленное состояние. **Кухня не исправлена.**
-    * `-an` в `input_args` кухни был моей попыткой и **убран**: цикл он замедлил, но подключения не вернул, то есть был не причиной. Правильный способ убрать звук из NVR — `#video` в URL потока go2rtc (канал не создаётся вовсе), а не `-an` у потребителя; **эта правка не сделана.**
+  * **THE KITCHEN IS NOT FINISHED, AND MY `-an` EDIT WAS THE WRONG ONE.** As of 15.10:
+    * the duplicate producer on `.247` is **removed and verified**: one producer per camera, the NVR pulls `camera-corridor1` as its second consumer, the corridor ratio `×1.8 → ×1.1`;
+    * the kitchen's ffmpeg crashes stopped, but **the NVR consumer never appeared**: `kitchen: exiting subprocess` repeats every ~100 s, so the kitchen still has one consumer — exactly the slow state. **The kitchen is not fixed.**
+    * `-an` in the kitchen's `input_args` was my attempt and has been **removed**: it slowed the loop down but did not bring the connection back, so it was not the cause. The correct way to drop sound from the NVR is `#video` in the go2rtc stream URL (the channel is never created), not `-an` on the consumer; **that change has not been made.**
 
-  * **`scripts/fix_frigate_nvr.py` поймал МЕНЯ ДВАЖДЫ, и это его главная польза.** Первая версия искала структуру с `input_args` в блоке `corridor1`, где её нет; обе версии отката `-an` угадывали отступ (14 пробелов против фактических 12). Все три раза скрипт напечатал «запись НЕ выполнена» и файл не тронул. **Правка чужого конфига вручную здесь стоила бы тихой половины правки — а скрипт, который проверяет КОНЕЧНЫЙ результат, а не только факт замены, сделал это видимым сразу.** Текст для замен брать из файла (`repr` строк), а не из головы.
+  * **`scripts/fix_frigate_nvr.py` caught me TWICE, and that is its main value.** The first version looked for a structure containing `input_args` inside the `corridor1` block, where there is none; both versions of the `-an` revert guessed the indentation (14 spaces against an actual 12). All three times the script printed "NOT WRITTEN" and left the file alone. **Editing someone else's config by hand here would have cost half the edit silently — a script that checks the END result, not merely that a replacement happened, made it visible at once.** Take the text to replace from the file (`repr` of the lines), not from memory.
 
-  * **ПОРОГ ПО УРОВНЮ БЫЛ ВЫВЕДЕН НЕПРАВИЛЬНО, Я ЕГО ПОСТАВИЛ И СРАЗУ СНЯЛ. Пользователь попросил сначала проверить порог — и проверка его опровергла. 15.10.2026.**
+  * **THE LEVEL THRESHOLD WAS DERIVED WRONG; I INSTALLED IT AND REMOVED IT AGAIN IMMEDIATELY. The user asked me to verify the threshold first — and the verification refuted it. 15.10.2026.**
 
-    Сначала я вывел «полное разделение» и радовался: на 70 буферах пик у всех, давших расшифровку, был ≥ 13523, а у всех «мусорных» ≤ 8117, и между ними пусто. **Проверка по всем 88 буферам и всем четырём комнатам, с объективным признаком «есть ли транскрипт», показала, что разделения нет вообще:**
+    I first derived "complete separation" and was pleased about it: over 70 buffers the peak of every one that produced a transcript was ≥ 13523 and of every one I called garbage ≤ 8117, with nothing in between. **The check over all 88 buffers and all four rooms, with the objective criterion "does it have a transcript", showed there is no separation at all:**
 
     ```
     с расшифровкой (61):  пик от 3391 (коридор) и 9730 (гостиная)
     без расшифровки (27): пик до 32767
     ```
 
-    * **Две ошибки в выводе, и обе — в методе, а не в арифметике.**
-      1. **Я смотрел две комнаты из четырёх.** У прихожей фон втрое выше, и её настоящие команды обязаны были уйти ниже по пику — но я их не смотрел.
-      2. **Классифицировал «мусор» сам, глазами, по тому, похож ли текст на осмысленный.** Это не измерение, это моё мнение, записанное в столбец цифр. При честном признаке «есть транскрипт или нет» часть того, что я назвал мусором, оказалась **громкой настоящей речью**: `kitchen peak=32767 rms=7860` и `corridor peak=32767 rms=9385` — это не тишина, это провал распознавания на реальном сигнале, и это другой класс поломки.
-    * **По среднему уровню буфера разделения нет вообще — ни по пику, ни по `raw_rms`:**
+    * **Two errors in the conclusion, and both are in the method, not the arithmetic.**
+      1. **I looked at two rooms out of four.** The entrance has three times the ambient, so its real commands had to sit lower on peak — and I never looked at them.
+      2. **I classified "garbage" myself, by eye, on whether the text looked meaningful.** That is not a measurement, it is my opinion written into a column of numbers. Under the honest criterion, part of what I called garbage turned out to be **loud real speech**: `kitchen peak=32767 rms=7860` and `corridor peak=32767 rms=9385` are not silence, they are recognition failures on a real signal — a different class of fault.
+    * **On the whole-buffer level there is no separation at all — neither on peak nor on `raw_rms`:**
       ```
-      тишина (24):      469 … 1010
-      с расшифровкой:   553 … 12097
+      silence (24):          469 … 1010
+      with a transcript:     553 … 12097
       ```
-      Четырнадцать значений совпадают. Коридорная настоящая команда меряется `rms=553` — **ровно как выдуманная фраза из тишины.** Причина в том, что `raw_rms` усредняет 7-секундный буфер, и короткая команда в нём почти не двигает среднее.
-    * **Что установлено на настоящих файлах (шлюз пишет каждый utterance в `/tmp/utterances/`):** у двух реальных речевых буферов речь занимает **7.1% и 10.7% кадров выше 4× собственного фона**. То есть различает **доля кадров выше фона**, а не уровень буфера. Но измеренных файлов с тишиной у меня не осталось: `/tmp` очищается при каждом перезапуске, а я перезапускался.
-    * **Поэтому нового порога я не поставил.** Есть два класса измерений, и второй пуст. Ставить порог по двум файлам — это ровно то, чем я кончил предыдущий заход.
-    * **Что сделано вместо:** неверный гейт, поле конфига, ENV, счётчик и пять тестов **сняты полностью**; в коде осталась только заметка о том, что уровневый гейт STT писался и был удалён, с указанием причины. Состояние до моей правки восстановлено, новой регрессии нет. Тесты 640 → 635.
-    * **Урок формулируется прямо: «разделение полное» — это утверждение о МЕТОДЕ, а не о данных, и оно проверяется пересчётом на выборке, которую я не смотрел.** Я проверял порог на тех же данных, по которым его вывел. Проверка должна быть на ДРУГОЙ выборке — здесь на остальных двух комнатах, — и она опровергла вывод за одну минуту.
+      Fourteen values overlap. A real corridor command measures `rms=553` — **exactly what the hallucination from silence measured.** The reason is that `raw_rms` averages the whole 7 s buffer, and a short command barely moves the mean.
+    * **What IS established, on the real files (the gateway writes every utterance to `/tmp/utterances/`):** in two real speech buffers the speech occupies **7.1% and 10.7% of frames above 4x their own floor**. So the discriminator is the **fraction of frames above the floor**, not the buffer level. But I had no measured silence file left: `/tmp` is cleared on every restart, and I restarted.
+    * **So no new threshold was installed.** There are two classes of measurement and the second is empty. A threshold from two files is exactly how the last attempt went.
+    * **What was done instead:** the wrong gate, its config field, its env var, its counter and its five tests are **all removed**; only a note is left in the code saying that an STT level gate was written and deleted, with the reason. The state before my edit is restored and there is no new regression. Tests 640 → 635.
+    * **The lesson stated plainly: "the separation is complete" is a claim about the METHOD, not about the data, and it is checked by recomputing on a sample I did not look at.** I checked the threshold against the very data I derived it from. The check has to be on a DIFFERENT sample — here the other two rooms — and it refuted the conclusion in one minute.
 
-  * **КОМНАТА ОТВЕТИЛА НА ФРАЗУ, КОТОРОЙ НИКТО НЕ ПРОИЗНОСИЛ. Замерено 15.10.2026 18:25:25, сообщение пользователя: «последний диалог в коридоре, почему так неудачно».**
+  * **THE ROOM ANSWERED A SENTENCE NOBODY SPOKE. Measured 15.10.2026 18:25:25, user report: «the last dialogue in the corridor, why did it go so badly».**
 
     ```
     18:25:25.279  🎤 Whisper IN: 7.04s raw_rms=553 peak=3447 dB=-35.4 gain=9.5x
@@ -1185,26 +1185,26 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
     18:25:25.993  🗣 Post-wake command: 'и училась'
     ```
 
-    **Речи в буфере не было:** `raw_rms=553` — это фон коридора, а речь в этой же комнате меряется 3088–12533 (09:54 сегодня же — 12533). Декодер, которому скормили 7 с тишины, вернул **свою наиболее вероятную фразу вместо пустоты**, окно «ответ на наш вопрос» приняло это за ответ, и комната потратила два `play_audio`, отвечая на фразу, которую никто не говорил. Это ровно тот класс, что записан от 06.10 на кухне («а мёртвый микрофон — это одна выдуманная проба и одна выдуманная команда, обе из тишины»), и он был помечен как **нерешённый и ждущий своего случая**.
+    **There was no speech in that buffer:** `raw_rms=553` is the corridor's floor, while speech in that same room measures 3088–12533 (12533 earlier the same day). A decoder handed seven seconds of silence returned **its most likely phrase instead of nothing**, the window «an answer to our question» accepted it as an answer, and the room spent two `play_audio` calls replying to a sentence nobody said. This is exactly the class recorded from 06.10 about the kitchen ("a dead microphone is one hallucinated wake and one hallucinated command, both out of silence"), and it was filed as **unresolved and waiting for its case**.
 
-    * **Порог отделён измерением, а не выбран на глаз, и разделение полное.** По всем 70 замерам за сутки:
+    * **The threshold was separated by measurement, not chosen by eye, and the separation is complete.** Over all 70 measurements in the day:
 
       | | пик |
       |---|---|
-      | буферы, давшие рабочую расшифровку (49) | **13523 … 32767** |
-      | буферы, давшие мусор (17) | **2399 … 8117** |
+      | buffers that produced a usable transcript (49) | **13523 … 32767** |
+      | buffers that produced garbage (17) | **2399 … 8117** |
 
-      **Между 8117 и 13523 не оказалось ничего ни разу.** Порог `10000` — в 1.23× выше худшего пустого и в 1.35× ниже самой тихой рабочей команды. `CAMERA_STT_MIN_PEAK[_<NAME>]`, `0` = «unset, взять умолчание».
+      **Between 8117 and 13523 there was nothing at all, not once.** The threshold `10000` is 1.23x above the worst empty buffer and 1.35x below the quietest real command. `CAMERA_STT_MIN_PEAK[_<NAME>]`, `0` meaning "unset, take the default".
 
-    * **Меряется пик СЫРОГО аудио, а не нормализованного** — по той же причине, что и в гейте пробуждения: требование нормализации разрушает именно то, что декодер должен услышать.
+    * **It reads the peak of the RAW audio, not the normalised one** — for the same reason the wake gate does: normalising destroys exactly what the decoder has to hear.
 
-    * **Асимметрия ошибки выбрана в ту сторону, где дешевле.** Выбросить тихую настоящую команду — это одно лишнее «повторите». Впустить буфер из шума — это выдуманная фраза, произнесённая вслух, плюс секунды L2, плюс окно, занятое фразой, которой не было. **Тишина дешевле.**
+    * **The error is asymmetric by design, towards the cheaper side.** Dropping a quiet real command costs one extra «say it again». Letting a noise buffer into Whisper costs a hallucinated sentence spoken aloud, L2 seconds, and a window consumed by a phrase nobody uttered. **Silence is cheaper.**
 
-    * **Счётчик пропусков идёт в `vosk diag` как `stt_drop=`.** Гейт, который молча выбрасывает, неотличим от гейта, которого нет, — и это тот же класс, что `near=` и `muted`, которые обязаны печататься, чтобы измерение вообще существовало.
+    * **The drop count goes to `vosk diag` as `stt_drop=`.** A gate that discards silently is indistinguishable from a gate that is not running — the same class as `near=` and `muted`, which have to be printed for the measurement to exist at all.
 
-    * **Что гейт НЕ делает и почему это важно.** Он ничего не скажет о том, что происходило до STT, и не различает «пользователь молчал» и «камера принесла тишину». Второе — это сигнал скорости линка, и его ловит сторож по `play_audio` и по capture, а не этот порог.
+    * **What the gate does NOT do, and why that matters.** It says nothing about what happened before STT, and it cannot tell "the user was silent" from "the camera delivered silence". The second is a link-speed signal, and it is caught by the watchdog via `play_audio` and capture speed, not by this threshold.
 
-  * **ПРИЧИНА НАЙДЕНА: СИГНАЛ WiFi. Все четыре камеры работают по беспроводной связи, и порядок сигнала совпадает с порядком скорости идеально. Замерено 15.10.2026, пользователь ушёл и просил разобраться до конца.**
+  * **THE CAUSE WAS THE WiFi SIGNAL. All four cameras run over wireless, and the order of the signal matches the order of the speed exactly. Measured 15.10.2026; the user left and asked for it to be got to the bottom of.**
 
     ```
     комната          ip               сигнал/63   capture    play_audio
@@ -1214,66 +1214,66 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
     kitchen      192.168.22.232        30        0.29x      x25.7
     ```
 
-    **Корреляция строгая и по всем трём величинам сразу.** Коридор замерялся дважды: 64 → capture 0.40x, потом 56 → capture 0.84x. **Сигнал гуляет, и скорость идёт за ним в том же направлении** — это не совпадение расклада.
+    **The correlation is strict, and on all three quantities at once.** The corridor was measured twice: 64 → capture 0.40x, then 56 → capture 0.84x. **The signal wanders and the speed follows it in the same direction** — that is not a coincidence of the draw.
 
-    * **Все четыре на `wlan0`, провод не используется** (`eth0 state=down`). Одинаковы аппарат, прошивка, конфиг — и одинаков ТИП сети. Различается только КАЧЕСТВО линка, то есть **положение камеры относительно точки доступа.** Смета: кухня 30 из 63, это меньше половины гостиной.
-    * **Почему от слабого WiFi страдает именно звук, а не только видео.** Тот же самый линк несёт оба направления: исходящий поток камеры и входящий POST `/play_audio`. `majestic` однопоточный, поэтому когда линк не тянет, его выходной аудиоканал и не получает данных вовремя — `Device 0 is empty`. **Отсюда и заикание, и медленный отклик на команду, и невозможность обслужить второго потребителя со стороны NVR** (второй запрос — это уже видео, и он не проходит).
-    * **Это объясняет, почему «железо одинаковое, а ведёт себя по-разному» — и почему я не нашёл этого раньше.** Я сравнивал всё, что находится ВНУТРИ устройства: платформу, бинарник, `md5` конфига, CPU, настройки. **Ни разу не посмотрел на то, что вокруг него.** Три дня подряд я искал поломку в железе и прошивке, потому что сравнивал только их. Один `cat /proc/net/wireless` стоил бы всех этих сравнений.
-    * **Что с этим делать — по убыванию кореня.** Корень физический: перенести камеры ближе к точке доступа либо поставить репитер/меш-узел в коридоре и на кухне. Промежуточный, на нашей стороне и без железа: шлюз не ждёт ответа POST перед следующей фразой — тогда тишина между фразами схлопывается при любой скорости линка, **но сама скорость и причина, по которой NVR не может добавить потребителя, этим не лечатся.**
-    * **Порог для сторожа наконец выводим прямо, а не на глаз:** здоровая камера даёт 1.01–1.02x, сломанная 0.29–0.40x; граница где-то 0.8x. Сигнал — производная величина, и мерять надо скорость, а не его.
+    * **All four are on `wlan0`, no wire is used** (`eth0 state=down`). Hardware, firmware and config are identical — and so is the TYPE of network. What differs is only the link QUALITY, i.e. **the position of the camera relative to the access point.** For scale: the kitchen is 30 of 63, less than half the living room.
+    * **Why weak WiFi hurts the SOUND specifically, not only the video.** The same link carries both directions: the camera's outgoing stream and the incoming `POST /play_audio`. `majestic` is single-threaded, so when the link cannot keep up its output audio channel does not get data in time — `Device 0 is empty`. **Hence the stuttering, the slow response to a command, and the impossibility of serving a second consumer from the NVR** (a second request is already video, and it does not get through).
+    * **This explains why "the hardware is identical and yet it behaves differently" — and why I did not find it sooner.** I compared everything INSIDE the device: platform, binary, config `md5`, CPU, settings. **I did not once look at what surrounds it.** For three days running I looked for the fault in hardware and firmware because that is all I was comparing. One `cat /proc/net/wireless` was worth every one of those comparisons.
+    * **What to do about it — in order of how close to the root each measure is.** The root is physical: move the cameras closer to the access point, or put a repeater / mesh node in the corridor and the kitchen. Intermediate, on our side and with no hardware: the gateway does not wait for the POST to return before the next sentence — then the gap between sentences collapses at any link speed. **But the speed itself, and the reason the NVR cannot add a consumer, are not fixed by that.**
+    * **The watchdog threshold is finally derived rather than eyeballed:** a healthy camera gives 1.01–1.02x, a broken one 0.29–0.40x; the boundary is somewhere at 0.8x. The signal is a derived quantity — measure the speed, not the signal.
 
-  * **НЕДОСТАЮЩАЯ СВЯЗЬ, КОТОРУЮ Я НЕ ВИДЕЛ ВЕСЬ ДЕНЬ: СКОРОСТЬ ЗАХВАТА ПРЕДСКАЗЫВАЕТ ЗАИКАНИЕ. Замерено одним проходом по всем четырём, 15.10.2026.**
+  * **THE MISSING LINK I DID NOT SEE ALL DAY: CAPTURE SPEED PREDICTS THE STUTTER. Measured in one pass over all four, 15.10.2026.**
 
-    | комната | capture | `play_audio` | потребителей |
+    | room | capture | `play_audio` | consumers |
     |---|---|---|---|
-    | гостиная | **1.01x** | ×0.3 | 2 |
-    | прихожая | **1.01x** | ×0.4 | 2 |
-    | кухня | 0.396x | ×25.7 | 2 |
-    | коридор | 0.404x | ×1.8 | 1 |
+    | living room | **1.01x** | ×0.3 | 2 |
+    | entrance | **1.01x** | ×0.4 | 2 |
+    | kitchen | 0.396x | ×25.7 | 2 |
+    | corridor | 0.404x | ×1.8 | 1 |
 
-    Обе быстрые комнаты дают поток в реальном времени, обе медленные — на 40%. **Я весь день мерил `play_audio` (нужен звук, нужен человек) и ни разу не догадался померить `speed` захвата (нужен только ffmpeg и 15 секунд).** Это то самое измерение, которое стоило сделать после первых двух одинаковых результатов.
+    Both fast rooms deliver the stream in real time, both slow ones at 40%. **I spent the whole day measuring `play_audio` (it needs sound, it needs a person) and never once thought to measure capture `speed` (it needs only ffmpeg and fifteen seconds).** That is precisely the measurement worth making after the first two identical results.
 
-  * **Кухня доделана, и понадобились ДВЕ вещи, а не одна.** `input_args` с `-analyzeduration 10000000` — ffmpeg буферизовал 10 секунд потока до первого кадра, сторож NVR убивал его каждые ~100 с (`watchdog.kitchen Terminating the existing ffmpeg process`). После снятия аргументов кухня встала как остальные шесть. Но потребитель NVR так и не появился, потому что go2rtc отваливался по таймауту на `.232`, и камера отдавала поток на 6–27% реального времени. Помогла **перезагрузка питанием** (рестарт `majestic` не помог): после неё NVR подключился, у кухни стало 2 потребителя. **Обе меры по отдельности давали половину результата.**
+  * **The kitchen is finished, and it took TWO things, not one.** `input_args` with `-analyzeduration 10000000` — ffmpeg buffered ten seconds of stream before the first frame, and the NVR watchdog killed it every ~100 s (`watchdog.kitchen Terminating the existing ffmpeg process`). With the arguments removed the kitchen settled like the other six. But the NVR consumer still did not appear, because go2rtc was timing out on `.232` and the camera delivered the stream at 6–27% of real time. What helped was a **power cycle** (restarting `majestic` did not): after it the NVR connected and the kitchen went to 2 consumers. **Each measure on its own gave half the result.**
 
-  * **Почему две камеры медленные на 40% при идентичных прошивке, конфиге и платформе — НЕ ВЫЯСНЕНО.** Это честно открытый вопрос на следующий заход, и он уже сужен до одного числа на камеру. Всё остальное исключено измерением: платформа `INFINITY6B0 SSC009B`, бинарник `majestic` 2752844 от Oct 13 20:56, конфиг `md5` совпадает, CPU ниже, настройки те же, WebRTC выключен.
+  * **Why two cameras are slow at 40% with identical firmware, config and platform is NOT EXPLAINED.** That is an honestly open question for the next pass, and it is already narrowed to one number per camera. Everything else is excluded by measurement: platform `INFINITY6B0 SSC009B`, binary `majestic` 2752844 from Oct 13 20:56, config `md5` matches, CPU lower, settings the same, WebRTC off.
 
-  * **Сторожу не хватает ровно одного сигнала — и это измеримо без звука.** `camera_watchdog.sh` меряет HTTP-латентность, наличие потока и уровень, и по всем трём `×25.7` с `http 0.1 с` проходит как `healthy`. **Нужна скорость захвата:** `ffmpeg -i rtsp://... -t 15 -f null -` и взять `speed=`. Порог из обеих сторон замера: сломано 0.40–0.59x, норма 1.01x, то есть где-то 0.8x. **Сейчас такого измерения в стороже нет, и это следующая работа — не срочная, но без неё этот класс поломок будет выглядеть как «healthy».**
+  * **The watchdog is missing exactly one signal — and it is measurable without sound.** `camera_watchdog.sh` measures HTTP latency, stream presence and level, and on all three `×25.7` with `http 0.1 s` passes as `healthy`. **What is needed is capture speed:** `ffmpeg -i rtsp://... -t 15 -f null -` and read `speed=`. The threshold from both sides of the measurement: broken 0.40–0.59x, normal 1.01x, so somewhere at 0.8x. **There is no such measurement in the watchdog today, and that is the next piece of work — not urgent, but without it this class of fault will keep looking "healthy".**
 
-  * **Сторож этот класс не видит и не увидит:** он меряет HTTP-латентность, поток и уровень, а `×25.7` при `http 0.1 с` и живом потоке — это «healthy» по всем его критериям. Тот же урок, что и с `majestic restart`: **проверять отношение `play_audio` в КАЖДОЙ комнате, а не в одной.**
+  * **The watchdog cannot see this class and will not learn to:** it measures HTTP latency, stream and level, and `×25.7` with `http 0.1 s` and a live stream is "healthy" by all its criteria. The same lesson as with `majestic restart`: **check the `play_audio` ratio in EVERY room, not in one.**
 
-- **АППАРАТ БЫЛ ВИНОВАТ, А ВИНОВАТ БЫЛ НЕ ОН — ЗАПИСЬ ОСТАЁТСЯ КАК ПРИМЕР ТОГО, КАК Я ОШИБАЛСЯ. 15.10.2026.**
+- **THE HARDWARE WAS TO BLAME, AND IT WAS NOT — THE RECORD STAYS AS AN EXAMPLE OF HOW I WAS WRONG. 15.10.2026.**
 
-  Заголовок ниже я сформулировал так, будто камера неисправна. **Она исправна** — см. запись выше: виноваты были два RTSP-производителя на один аппарат и цикл падений ffmpeg у NVR. Числа ниже верные, вывод был неверный, и я держался его, пока пользователь дважды не сказал, что причина в другом. Не удаляю: «железо одинаковое, значит сломано» — ровно та мысль, которую этот файл уже дважды опроверг.
+  I wrote the heading below as if the camera were faulty. **It is not** — see the entry above: two RTSP producers on one unit and an ffmpeg crash loop at the NVR were to blame. The numbers below are correct, the conclusion drawn from them was not, and I held on to it until the user twice said the cause was something else. It stays: "the hardware is identical, therefore it is broken" is exactly the thought this file has already refuted twice.
 
   ```
   0.40 с звука →  1.02 с   накладной 0.62 с
   8.09 с звука → 22.45 с   накладной 14.36 с
   ```
-  Накладная **растёт пропорционально длине** (≈1.78x в обоих), то есть это не «задержка ответа», а проигрывание примерно на 56% от реальной скорости. Отношение при этом **не функция запроса**: два одинаковых POST на 48 кГц подряд дали ×3.49 и ×11.03.
+  The overhead **grows in proportion to length** (≈1.78x in both cases), so this is not "response latency" but playback at roughly 56% of real time. The ratio is meanwhile **not a function of the request**: two identical POSTs at 48 kHz in a row gave ×3.49 and ×11.03.
 
-  * **Камера сама называет причину в своём журнале ядра:**
+  * **The camera names the cause itself, in its own kernel log:**
     ```
     MI_AO_IMPL_SendFrame[2575]: Device 0 is empty !
     [MI_AO_IMPL_SendFrame:2641] Strat pcm out success!!!
     ```
-    Выходной аудиоканал пустеет и заполняется снова — это и есть «заикается». **Нормировать надо на объём звука, а не на абсолютный счёт:** гостиная 3 события на ~2.4 с звука = 1.25/с, коридор 40 на ~11 с = **3.6/с**. По абсолютному числу вывод был бы неверным, потому что гостиная просто меньше играла.
+    The output audio channel empties and fills again — that is what "stuttering" is. **It has to be normalised by the amount of audio, not by the absolute count:** the living room had 3 events over ~2.4 s of audio = 1.25/s, the corridor 40 over ~11 s = **3.6/s**. On the absolute count the conclusion would have been wrong, because the living room simply played less.
 
-  * **Лестница исчерпана, и каждая ступень проверена, а не предположена:**
-    | ступень | гостиная | коридор |
+  * **The ladder is exhausted, and every rung was checked rather than assumed:**
+    | rung | living room | corridor |
     |---|---|---|
-    | `S95majestic restart` | **×6–9 → ×0.3** | **×6–9 → ×1.7–2.9, ноль** |
-    | `reboot` по питанию | — | **ноль** |
-    | `audio.volume` / `outputVolume` / `srate` / `backchannel` | 100 / 80 / 48000 / true | **идентично до байта** |
-    | CPU majestic | 24.9% | 16.3% (**ниже**, не упирается в счёт) |
-    | WebRTC | выключен | выключен (второго аудиопути нет) |
-  * **Запрос шлюза корректен и уходит по правильному адресу** — `http://192.168.22.247/play_audio`, `data=pcm` с автоматическим `Content-Length`. Это НЕ та ошибка, что была 14.10 со слушанием `.165` вместо `.247`; проверено отдельно, потому что тот класс уже один раз стоил часа.
-  * **Проверка объявленной частоты НЕ ДАЛА РЕЗУЛЬТАТА, и вывод из неё делать нельзя.** Один и тот же клип 0.40 с: 48000 → ×11.03, 16000 → ×8.15, 24000 → ×1.80, 48000 снова → ×3.49. Клип слишком короткий, время HTTP-запроса в нём перекрывает эффект частоты, а разброс между двумя одинаковыми прогонами втрое больше разницы между частотами. Недокарм во всех четырёх попытках 2–4, без разделения.
+    | `S95majestic restart` | **×6–9 → ×0.3** | **×6–9 → ×1.7–2.9, nothing** |
+    | `reboot` (power cycle) | — | **nothing** |
+    | `audio.volume` / `outputVolume` / `srate` / `backchannel` | 100 / 80 / 48000 / true | **identical to the byte** |
+    | majestic CPU | 24.9% | 16.3% (**lower**, not CPU-bound) |
+    | WebRTC | off | off (no second audio path exists) |
+  * **The gateway's request is correct and goes to the right address** — `http://192.168.22.247/play_audio`, `data=pcm` with an automatic `Content-Length`. This is NOT the error of 14.10 where it listened to `.165` instead of `.247`; verified separately, because that class has already cost an hour once.
+  * **Checking the declared rate produced NO RESULT, and no conclusion may be drawn from it.** The same 0.40 s clip: 48000 → ×11.03, 16000 → ×8.15, 24000 → ×1.80, 48000 again → ×3.49. The clip is too short — the HTTP request time inside it swamps the rate effect, and the spread between two identical runs is three times the difference between the rates. Underrun was 2–4 on all four attempts, with no separation.
 
-  **Вывод: неисправность выходного аудиокаскада именно этого аппарата.** Компонент назвать нельзя — дальше камера, а измерить её выход нечем: микрофон в комнате насыщен (запись от 05.10.2026). Аппарат **наполовину глухой**: слышит (пробуждение, команда, отключение автоматики отработали), но отвечает с заиканием. **Замена — единственное, что до этого доходит**, и комната уже настроена под замену: поток, адрес с учётными данными и `#backchannel=1`, `/play_audio`, модель vosk, `CAMERA_WEBRTC=false`, коридорный AGC — меняется только юнит, как это уже было `.165` → `.247`.
+  **Conclusion: a fault in the output audio cascade of that particular unit.** The component cannot be named — it is inside the camera, and there is no way to measure its output: the room microphone is saturated (recording from 05.10.2026). The unit is **half deaf**: it hears (wake, command, dropping the automation all worked), but it answers with stuttering. **Replacement is the only thing that gets there**, and the room is already configured for a swap: stream, address with credentials and `#backchannel=1`, `/play_audio`, vosk model, `CAMERA_WEBRTC=false`, corridor AGC — only the unit changes, exactly as `.165` → `.247` already did.
 
-  **ОСТОРОЖНО на будущее: `majestic restart` лечит не всё, и один раз я это выдал за общее.** Перезапуск 14.10 сделал ×6–9 → ×0.3 в **гостиной**, и я написал «перезапуск вернул эндпоинт с ×6–×27 на ×0.0–×0.3» — не измерив коридор. Ответ пользователя «все ещё заикается» и был исправлением. **После перезапуска мерить отношение в КАЖДОЙ комнате, а не в одной.**
+  **BEWARE IN FUTURE: a `majestic restart` does not fix everything, and once I reported it as if it did.** The 14.10 restart took ×6–9 → ×0.3 in the **living room**, and I wrote that "the restart returned the endpoint from ×6–×27 to ×0.0–×0.3" without measuring the corridor. The user's answer, "it still stutters", was the correction. **After a restart, measure the ratio in EVERY room, not in one.**
 
-- **АТТЕНЦИОННЫЙ ПИК ЗАКРЫВАЛ ФРАЗУ ПОЛЬЗОВАТЕЛЯ, А Whisper ПОЛУЧАЛ СВИСТОК. Замерено 14.10.2026 17:39:47, сообщение пользователя: «последнее обращение сработало не нормально».**
+- **THE ATTENTION PIP CLOSED THE USER'S SENTENCE, AND WHISPER GOT A WHISTLE. Measured 14.10.2026 17:39:47, user report: «the last request did not work properly».**
 
   ```
   17:39:47.799  🔔 attention pip (vosk)      play_audio 0.40s audio in 2.18s (x5.5)
@@ -1282,14 +1282,14 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
   17:39:51.487  ❌ Whisper empty for 46080-byte (1.44s)
   17:39:56.807  🎯 Wake with no command — sending greeting
   ```
-  `ref=0.6123` — **пик внутри опорного окна**. Двухтоновый гудок 988/1319 Гц играет ровно тогда, когда пользователь начинает говорить, и его собственный спад уровня детектор паузы читает как конец фразы. Высказывание закрылось на пике, в буфере оказалось 1.44 с свиста при пике 32767, Whisper вернул пусто, и команда в буфер **не попала вообще**.
+  `ref=0.6123` — **a peak inside the reference window**. The two-tone beep at 988/1319 Hz plays exactly when the user starts speaking, and the pause detector reads its own level drop as the end of the sentence. The utterance closed on the peak, the buffer ended up holding 1.44 s of whistle at peak 32767, Whisper returned nothing, and the command **never reached the buffer at all**.
 
-  * **Правка 07.10.2026 «считать время от отправки, а не от ответа» применена ТОЛЬКО к пути ответа.** Три места вычисляли `_speaking_until` инлайн; фикс сделали в `_speak_pcm` (`sent_at`), а **оба сигнальных звука — `attention pip` и activation cue — остались с `time.time()` ПОСЛЕ POST.** Тот же сплей в трёх местах, и он разъехался ровно так же, как уже разъезжал в `_end_utterance` (см. запись от 04.10).
-  * **На медленном `/play_audio` это означает 2.18 с полностью живого микрофона**, пока камера играет в комнату громкий сигнал. Сегодня как раз такой случай: 0.4 с звука за 2.18 с ответа (x5.5) при норме x0.1–x1.1.
-  * **Не «починить mute» — разделить две сути с противоположными ценами ошибки:**
-    * `_speaking_until` — жёсткий `return` в `_feed_audio`. **Перебор = выбросить речь пользователя** (замерено 13.10.2026: пип 0.4 с с POST 6 с заглушал комнату на 6 с).
-    * `_tts_playing_until` — новое окно, единственный потребитель которого — детектор паузы. **Пропущенный кадр не может создать ложный конец**, он может лишь отложить настоящий на несколько кадров. Поэтому здесь окно можно сделать щедрым: открыть в `sent_at` (звук не может начаться раньше, чем начнут приходить байты тела) и растянуть на весь ответ — там и живёт неизвестность.
-  * **Одна функция `_arm_tts_inflight` / `_close_tts_inflight` на все три пути**, потому что инлайн-копии уже разъехались один раз. Проверено: 4 вызова arm, 4 close, 3 пути.
+  * **The 07.10.2026 fix "time it from the send, not from the response" was applied ONLY to the reply path.** Three places computed `_speaking_until` inline; the fix went into `_speak_pcm` (`sent_at`), while **both cue sounds — the `attention pip` and the activation cue — were left calling `time.time()` AFTER the POST.** The same duplication in three places, and it had drifted exactly the way `_end_utterance` had already drifted (see the 04.10 entry).
+  * **On a slow `/play_audio` that means 2.18 s of a perfectly live microphone** while the camera plays a loud signal into the room. Today was exactly that case: 0.4 s of audio for a 2.18 s response (×5.5), against a normal of ×0.1–×1.1.
+  * **Not "fix the mute" — separate the two things, whose errors cost in opposite directions:**
+    * `_speaking_until` — a hard `return` in `_feed_audio`. **Overshooting = discarding the user's speech** (measured 13.10.2026: a 0.4 s pip whose POST took 6 s muted the room for 6 s).
+    * `_tts_playing_until` — a new window whose only consumer is the pause detector. **A missed frame cannot create a false end**, it can only delay a real one by a few frames. So the window can be generous here: open it at `sent_at` (sound cannot start before body bytes begin arriving) and stretch it over the whole response — that is where the uncertainty lives.
+  * **One `_arm_tts_inflight` / `_close_tts_inflight` function for all three paths**, because the inline copies had already drifted once. Verified: 4 arm calls, 4 closes, 3 paths.
   * **Рядом вторая, отдельная поломка того же хода: `play_audio failed: ` с ПУСТЫМ сообщением.** `asyncio.TimeoutError` приводится к строке как пустая строка, поэтому строка 17:40:02 — единственное место, где было сказано, почему «Да?» не прозвучало, — не сказала ничего. Ровно тот класс, что записан 10.10.2026 для Whisper («`Whisper empty` должно означать „никто ничего не сказал“, а не „запрос не был отправлен“»); тот фикс этот путь обошёл. Теперь `{e!r}`.
 
   Четыре теста, 631 → 635. Отдельно проверяется, что окно **не сужается** более поздним коротким вызовом: два сигнала подряд иначе снова открывают дыру, пока первый ещё звучит.

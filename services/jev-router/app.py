@@ -1019,8 +1019,8 @@ async def _confirm_on_off_moved(
     state that therefore also "changed". Probed live against the running router
     before it was trusted:
 
-        кофеварка on -> off, не сдвинулась  ->  moved=['switch.coffemaker']   (wrong)
-        несуществующее устройство             ->  moved=['switch.нет_такого']   (wrong)
+        coffee maker on -> off, did not move  ->  moved=['switch.coffemaker']  (wrong)
+        a device that does not exist           ->  moved=['switch.нет_такого']  (wrong)
 
     So the first version would have accepted the very lie it was written to catch.
     An entity absent from the registry, `unavailable` or `unknown` is never

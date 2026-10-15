@@ -259,14 +259,14 @@ async def voice_ws(ws: WebSocket):
 async def admin_page(selected_mac: str = None):
     db = load_db()
     devices_menu = "".join([f"<a href='/?selected_mac={m}' style='display:block;padding:10px;border:1px solid #ccc;margin-bottom:5px;text-decoration:none;background:{'#0d6efd;color:white' if m==selected_mac else 'white'}'>{d.get('friendly_name') or m}</a>" for m, d in db.items()])
-    form = "<h3>Выберите устройство слева</h3>"
+    form = "<h3>Choose the device on the left</h3>"
     if selected_mac in db:
         c = db[selected_mac]
         form = f"""<form action='/save/{selected_mac}' method='post' style='background:white;padding:20px;'>
             <label>Имя:</label><br><input type='text' name='friendly_name' value='{c.get('friendly_name','')}' style='width:100%'><br><br>
-            <label><input type='checkbox' name='allowed' value='1' {'checked' if c.get('allowed') else ''}> Доступ разрешен</label><br><br>
+            <label><input type='checkbox' name='allowed' value='1' {'checked' if c.get('allowed') else ''}> Access allowed</label><br><br>
             <label>WebSocket URL:</label><br><input type='text' name='ws_url' value='{c.get('ws_url','')}' style='width:100%'><br><br>
-            <button type='submit' style='width:100%;padding:10px;background:green;color:white;'>Сохранить настройки</button>
+            <button type='submit' style='width:100%;padding:10px;background:green;color:white;'>Save settings</button>
         </form>"""
     return f"<html><head><meta charset='utf-8'></head><body style='font-family:sans-serif;display:flex;padding:20px;gap:20px;background:#f4f4f4;'><div style='width:300px;'>{devices_menu}</div><div style='flex:1;'>{form}</div></body></html>"
 
@@ -284,5 +284,5 @@ EOF
 docker build -t voice_gateway .
 
 echo "-------------------------------------------------------"
-echo "Успешно! Образ 'voice_gateway' собран с учетом спецификаций."
+echo "Done! The 'voice_gateway' image was built to spec."
 echo "-------------------------------------------------------"

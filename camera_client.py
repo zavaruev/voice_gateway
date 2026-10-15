@@ -2491,8 +2491,8 @@ class CameraSession:
                     # late tail re-fired the wake. Bounded by play_end+45s:
                     # an unbounded now+N per chunk let the burst push its own
                     # deadline forward indefinitely and muted the mic for
-                    # minutes after every dialogue (user: перестала
-                    # реагировать на компьютер).
+                    # minutes after every dialogue (user: «перестала
+                    # реагировать на компьютер»).
                     # Anchored to when playback ENDS, not to now.
                     #
                     # `min(now + 20, ...)` was a sliding deadline: while the reply
@@ -2638,9 +2638,9 @@ class CameraSession:
         not quiet and not clipped — it is LOW-FREQUENCY DOMINATED, and its SNR is
         15-20 dB worse than a healthy room in every band:
 
-            полоса      коридор     гостиная
-            0-3 кГц       +5.8 дБ    +25.9 дБ
-            3-7 кГц      +19.9 дБ    +35.0 дБ
+            band         corridor   livingroom
+            0-3 kHz      +5.8 dB    +25.9 dB
+            3-7 kHz     +19.9 dB    +35.0 dB
 
         **The microphone does pass high frequencies** — the +19.9 dB in 3-7 kHz
         is speech, clearly present. What is missing is margin, and the margin
@@ -2649,8 +2649,8 @@ class CameraSession:
         Replaying the camera's own speaker into its own mic (the loopback that
         worked on 12.10) through a correctly implemented filter:
 
-            без фильтра -> ['капля яда', 'включи']
-            ФВЧ 150 Гц  -> ['капля яда включи свет в коридоре', 'включай']
+            no filter      -> ['капля яда', 'включи']
+high-pass 150Hz -> ['капля яда включи свет в коридоре', 'включай']
 
         **A crude block-FFT filter rejected this outright** — it decoded to
         nothing, which is how I first concluded a high-pass would not help. It
@@ -4659,8 +4659,8 @@ class CameraSession:
                     if want_window and self._followup_chain >= _FOLLOWUP_CHAIN_MAX:
                         # Circuit breaker. Measured 13.10.2026 16:22-16:26 in
                         # `entrance1`: a turn in one room, then EIGHT consecutive
-                        # turns in the other that no one spoke for — 'А ну, блядь,
-                        # блядь…', 'Я долго', 'давайте всем' — each answered, each
+                        # turns in the other that no one spoke for — «А ну, блядь,
+                        # блядь…», «Я долго», «давайте всем» — each answered, each
                         # answer re-opening the window that let the next one in.
                         #
                         # `_is_echo` could not stop it and that is not a tuning

@@ -1,9 +1,12 @@
-"""Прогон боевого пути подачи на реальном куске, который видел декодер.
+"""Replay the production feed path over real bytes the decoder actually saw.
 
-Именно этот порядок важен и повторяет `_vad_process`: `begin()` один раз,
-`feed()` чанками по 2560 байт, БЕЗ `flush()` и без границ высказывания.
-Внешняя запись отвечает на другой вопрос: она упирается в рельс 32768,
-тогда как шлюз получает неискажённый сигнал (AGENTS.md, 14.10.2026).
+The ORDER is the point, and it reproduces `_vad_process`: `begin()` once,
+`feed()` in 2560-byte chunks, NO `flush()`, no utterance boundaries.
+
+An external recording answers a different question: it clips at the 32768 rail,
+while the gateway received an undistorted signal over the same seconds
+(AGENTS.md, 14.10.2026). Two different signals, so every offline reproduction
+built on the capture is invalid by construction.
 """
 import sys
 import time
@@ -15,7 +18,7 @@ MODEL = "config/vosk-model-small-ru-0.22"
 SR, CHUNK = 16000, 2560
 
 raw = open(PATH, "rb").read()
-print("  кусок: %.1f с, модель %s" % (len(raw) / 2 / SR, MODEL))
+print("  clip: %.1f s, model %s" % (len(raw) / 2 / SR, MODEL))
 
 m = VoskWakeMatcher(MODEL)
 m.begin()
@@ -24,12 +27,11 @@ t0 = time.time()
 for i in range(0, len(raw) - CHUNK, CHUNK):
     if m.feed(raw[i : i + CHUNK]):
         fired.append(i / 2 / SR)
-print("  прогон занял %.1f с" % (time.time() - t0))
-print("  СРАБАТЫВАНИЙ: %d" % len(fired))
+print("  replay took %.1f s" % (time.time() - t0))
+print("  TRIGGERS: %d" % len(fired))
 for t in fired:
-    print("    t=%6.1f с" % t)
+    print("    t=%6.1f s" % t)
 nm = m.near_misses
-print("  near_misses: %s" % (nm if nm else "— ничего похожего не декодировано"))
+print("  near_misses: %s" % (nm if nm else "— nothing remotely like it decoded"))
 print("  chunks: %s   triggers: %s   decodes: %s" % (
     getattr(m, "chunks", "?"), getattr(m, "triggers", "?"), getattr(m, "decodes", "?")))
-

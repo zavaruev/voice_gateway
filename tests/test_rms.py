@@ -5,7 +5,6 @@ tests feed synthetic int16 buffers and check RMS math, empty input and
 dtype handling — no model, no audio device. Docker-only (imports main,
 which pulls opuslib/av).
 """
-import sys
 from unittest.mock import MagicMock
 import numpy as np
 import pytest

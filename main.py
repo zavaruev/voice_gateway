@@ -3734,6 +3734,17 @@ async def start_camera_sessions():
                 # 15-25 s speaker delay and had no timer, so it discarded real
                 # commands 543 s and 923 s after the reply (measured
                 # 14.10.2026 in the corridor and the living room).
+                # Host directory for a labelled dump of every utterance
+                # (wav + manifest.jsonl carrying the verdict). "" => off.
+                # Needed because the in-container /tmp is a tmpfs and is wiped by
+                # every restart, which is why the STT level threshold had to be
+                # withdrawn on 15.10.2026: the silence samples were gone before
+                # they could be measured.
+                utterance_dump=(
+                    os.getenv(f"CAMERA_UTTERANCE_DUMP_{name.upper()}")
+                    or os.getenv("CAMERA_UTTERANCE_DUMP")
+                    or ""
+                ).rstrip("/"),
                 echo_repeat_horizon=float(
                     os.getenv(f"CAMERA_ECHO_REPEAT_HORIZON_{name.upper()}")
                     or os.getenv("CAMERA_ECHO_REPEAT_HORIZON")

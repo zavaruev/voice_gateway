@@ -167,6 +167,16 @@ _WAKE_REARM_DEBOUNCE_S = 3.0
 # has to sit above that, and **every distinct wake gets feedback.**
 _ATTENTION_MIN_GAP_S = 3.5
 
+# How many `/play_audio` POSTs may be outstanding for one room at once.
+#
+# Measured 16.10.2026 on the kitchen, whose link carries the stream at 15-36% of
+# real time: a 2.71 s clip took 7.01 s (x2.6) and a 5.54 s clip took 21.21 s
+# (x3.8), so the player sat inside `_speak_pcm` for the whole of each POST while
+# the camera was still busy with the PREVIOUS sentence. Two in flight is enough
+# to keep the speaker fed; more than that turns a slow link into a pile-up, and
+# the camera would be asked for audio it is already failing to play.
+_MAX_OUTSTANDING_PLAY_POSTS = 2
+
 # How long after the clip the camera speaker may still be sounding. /play_audio
 # returns as soon as the body is uploaded and the box then plays it in real
 # time, so the margin only has to cover the upload and the duration rounding.
@@ -1198,6 +1208,14 @@ class CameraConfig:
     # acoustic tail measured ~1.9 s, while a WebRTC-only room still depends on
     # the backchannel.
     echo_repeat_horizon: float = 0.0
+    # Host directory for a labelled dump of every utterance. "" => off (the
+    # legacy in-container `/tmp/utterances/` tmpfs dump still runs).
+    #
+    # Written 16.10.2026 because `/tmp` is a tmpfs: it is wiped by every restart,
+    # and that is precisely why the STT level threshold could not be derived on
+    # 15.10.2026 — the silence samples were gone before they could be measured,
+    # and the threshold built from what was left had to be removed again.
+    utterance_dump: str = ""
     # Minimum raw peak a chunk must reach for a decoded wake word to count.
     #
     # A decoder fed near-silence returns its most likely phrase, and for this
@@ -1369,6 +1387,14 @@ class CameraSession:
             config.wake_min_peak if config.wake_min_peak > 0 else _WAKE_MIN_PEAK
         )
         # 0 means "unset, use the default" like every other tuning value here.
+        self._utterance_dump = (config.utterance_dump or "").rstrip("/")
+        # POSTs still in flight for this room, and "something reached the speaker
+        # since we last looked" — see `_MAX_OUTSTANDING_PLAY_POSTS`.
+        self._play_tasks: set[asyncio.Task] = set()
+        self._play_completed_since_check = False
+        # Overlap `/play_audio` uploads between sentences of one reply. The cues
+        # and every single-clip caller bypass it via `wait=True`.
+        self._play_overlap = True
         self._echo_repeat_horizon = (
             config.echo_repeat_horizon
             if config.echo_repeat_horizon > 0
@@ -3734,22 +3760,51 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
     ) -> tuple[str | None, str | None]:
         wav = await asyncio.to_thread(self._encode_wav, buf_processed)
 
-        def _save_debug_wav(wav_data, ts):
-            """Best-effort dump of every utterance to /tmp/utterances/.
+        # Best-effort dump. Two destinations, and the reason is 15.10.2026:
+        # `/tmp/utterances/` inside the container is a tmpfs, it is wiped by every
+        # restart, and that is exactly why the STT level threshold could not be
+        # derived — the silence samples were gone before they were measured.
+        # `CAMERA_UTTERANCE_DUMP` points at a HOST directory that survives, and
+        # each file is accompanied by a manifest line written once the transcript
+        # is known, so a sample carries its own verdict and the two classes
+        # (usable transcript / noise) can be told apart without re-reading logs.
+        dump_path = ""
+        dump_dir = self._utterance_dump
+        if dump_dir:
+            try:
+                import os
 
-            Field debugging aid only: created lazily, failures swallowed —
-            a full tmpfs must never abort an STT round-trip.
-            """
-            import os
+                os.makedirs(dump_dir, exist_ok=True)
+                dump_path = os.path.join(
+                    dump_dir, f"{self.stream_name}_{int(time.time())}.wav"
+                )
 
-            os.makedirs("/tmp/utterances", exist_ok=True)
-            with open(f"/tmp/utterances/u_{ts}.wav", "wb") as f:
-                f.write(wav_data)
+                def _write(data, path=dump_path):
+                    with open(path, "wb") as f:
+                        f.write(data)
 
-        try:
-            await asyncio.to_thread(_save_debug_wav, wav, int(time.time()))
-        except Exception:
-            pass
+                await asyncio.to_thread(_write, wav)
+            except Exception as exc:                                    # noqa: BLE001
+                dump_path = ""
+                logger.warning(
+                    f"[{self.stream_name}] utterance dump failed: "
+                    f"{exc or type(exc).__name__}"
+                )
+        else:
+            # Keep the old tmpfs dump: it is free and it does not survive a
+            # restart, but it costs nothing and is useful inside a live session.
+            try:
+                import os
+
+                os.makedirs("/tmp/utterances", exist_ok=True)
+
+                def _save_debug_wav(wav_data, ts):
+                    with open(f"/tmp/utterances/u_{ts}.wav", "wb") as f:
+                        f.write(wav_data)
+
+                await asyncio.to_thread(_save_debug_wav, wav, int(time.time()))
+            except Exception:
+                pass
 
         logger.info(
             f"[{self.stream_name}] 🎤 Whisper IN: {duration_s:.2f}s "
@@ -3783,6 +3838,42 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
 
         uid_task.add_done_callback(_uid_done)
         txt = await stt_task
+
+        def _manifest(verdict: str) -> None:
+            """Append one self-describing line per utterance.
+
+            Written here rather than before the transcript because the verdict IS
+            the thing the threshold has to be derived from: on 15.10.2026 the
+            only "garbage" class available was three log lines, and every attempt
+            to classify them by eye produced a threshold that had to be removed
+            again the same day.
+            """
+            if not dump_path:
+                return
+            import json
+            import os
+
+            row = {
+                "ts": int(os.path.basename(dump_path).rsplit("_", 1)[-1][:-4]),
+                "room": self.stream_name,
+                "dur_s": round(float(duration_s), 3),
+                "raw_rms": int(stats.get("rms_raw") or 0),
+                "peak_raw": int(stats.get("peak_raw") or 0),
+                "rms_dB": round(float(stats.get("rms_dB") or 0.0), 1),
+                "gain": round(float(stats.get("gain_applied") or 0.0), 2),
+                "ns": int(stats.get("ns_applied") or 0),
+                "wav": os.path.basename(dump_path),
+                "text": (txt or "")[:120],
+                "verdict": verdict,
+            }
+            with open(os.path.join(dump_dir, "manifest.jsonl"), "a", encoding="utf-8") as f:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+        try:
+            await asyncio.to_thread(_manifest, "empty" if not txt else "transcript")
+        except Exception:                                                # noqa: BLE001
+            pass
+
         self._last_utt_peak = int(stats.get("peak_raw") or 0)
         # How long this utterance was, and when it ended. Both are needed to tell
         # the wake word's OWN audio from a command that followed it, by TIME
@@ -3810,6 +3901,10 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
                 )
             else:
                 logger.info(f"[{self.stream_name}] ❌ Rejected: '{txt[:60]}'")
+                try:
+                    await asyncio.to_thread(_manifest, "rejected")
+                except Exception:                                        # noqa: BLE001
+                    pass
             return None, None
 
         logger.info(f"[{self.stream_name}] ✅ Whisper OK: '{txt[:60]}'")
@@ -4667,6 +4762,14 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
                         else False
                     )
                     last_q = bool(is_q)
+                    # The POST is in the background now, so `_last_play_ok` is
+                    # only real once it comes back. Settling here — after this
+                    # sentence started and before anything reads the flag — keeps
+                    # the overlap AND the apology decision honest. The flag has
+                    # been read to suppress a second apology on top of a turn
+                    # that already spoke, and getting it wrong in either
+                    # direction has already shipped once.
+                    await self._settle_play_posts()
                     if self._last_play_ok:
                         # Something really reached the speaker, so a later failed
                         # sentence must not add an apology on top of it.
@@ -5338,7 +5441,51 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
             logger.warning(f"[{self.stream_name}] play_audio failed: {e!r}")
             return False
 
-    async def _speak_pcm(self, pcm: bytes, reply: str = "") -> bool:
+    async def _settle_play_posts(self) -> None:
+        """Wait for every outstanding `/play_audio` POST and fold in its result.
+
+        Called before anything reads `_last_play_ok`. That flag is what decides
+        whether a failed sentence gets an apology on top of a turn that already
+        spoke, so it has to be real when it is read — and with the POSTs running
+        in the background (see `_MAX_OUTSTANDING_PLAY_POSTS`) it is only real
+        once they have come back.
+        """
+        tasks = list(getattr(self, "_play_tasks", ()))
+        if not tasks:
+            return
+        self._play_tasks.clear()
+        for t in tasks:
+            try:
+                # `shield`, because being cancelled while draining must not tear
+                # down the uploads we are waiting to hear the verdict of.
+                ok = await asyncio.shield(t)
+            except asyncio.CancelledError:
+                # A cancelled upload is a DEAD upload, not a cancelled turn.
+                # `except Exception` does not catch this one — CancelledError
+                # derives from BaseException since 3.8 — so without this line a
+                # single cancelled task propagates out of the player loop and
+                # aborts the whole turn mid-reply.
+                ok = False
+            except Exception:                                            # noqa: BLE001
+                ok = False
+            if ok:
+                self._last_play_ok = True
+
+    async def _speak_pcm(
+        self, pcm: bytes, reply: str = "", wait: bool | None = None
+    ) -> bool:
+        """`wait=False` uploads in the background so the next sentence overlaps.
+
+        `wait=None` means "ask the session" (`_play_overlap`). It is NOT the same
+        as `wait=True`, and the distinction is deliberate: the player used to call
+        this with two positional arguments, and a third keyword broke every test
+        helper that mirrors the session by hand — the player's broad `except`
+        turned `got an unexpected keyword argument 'wait'` into
+        `TTS sentence failed`, i.e. a stub gap that read as a playback fault. That
+        has happened twice in this file already.
+        """
+        if wait is None:
+            wait = bool(getattr(self, "_play_overlap", False))
         sr = TTS_PLAY_RATE
         is_question = bool(_HAS_QUESTION_RE.search((reply or "").strip()))
         self._speaking = True
@@ -5391,113 +5538,143 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
             # `True` standing and suppress the apology for this one.
             self._last_play_ok = False
 
-            if self._play_audio_url:
-                # Preferred path: straight to the speaker at the right rate.
-                played = await self._play_audio_http(pcm)
-                if not played and self._out_track:
-                    # The backchannel is a real fallback when the session exists,
-                    # so this branch DID put audio somewhere.
-                    self._last_play_ok = True
-                    logger.warning(
-                        f"[{self.stream_name}] falling back to the go2rtc "
-                        f"backchannel — expect a ~6x pitch shift"
-                    )
-                elif not played:
-                    # Do NOT promise a fallback that does not exist. With
-                    # `CAMERA_WEBRTC=false` there is no backchannel, so the reply
-                    # is simply not spoken — and the log used to say it would be
-                    # replayed, which sent the reader looking for audio that was
-                    # never going to arrive. Measured 07.10.2026 08:50 on the
-                    # kitchen: `play_audio failed` after 30 s, then exactly this
-                    # line, then silence.
-                    logger.warning(
-                        f"[{self.stream_name}] /play_audio failed and no backchannel "
-                        f"exists (CAMERA_WEBRTC off) — the reply was NOT spoken"
-                    )
+            async def _post_and_close():
+                """Upload this sentence and arm the tails. Runs as a task when the
+                caller does not wait.
 
-            if not played:
-                # Fallback: the WebRTC sendonly track -> go2rtc -> ONVIF
-                # backchannel. Timed as before.
-                self._tts_play_end = time.time() + audio_dur
-                if self._out_track:
-                    self._out_track._last_play_duration = audio_dur
-                chunk_size = sr * 20 // 1000 * 2
-                for i in range(0, len(pcm), chunk_size):
-                    c = pcm[i : i + chunk_size]
-                    if len(c) < chunk_size:
-                        c += b"\x00" * (chunk_size - len(c))
+                Split out of `_speak_pcm` so the SAME code serves both the waiting
+                path (cues, single-clip replies, every other caller) and the
+                overlapping one — two inline copies of this block is precisely the
+                duplication that made the 07.10.2026 timing fix reach only the
+                reply path.
+                """
+                if self._play_audio_url:
+                    # Preferred path: straight to the speaker at the right rate.
+                    played = await self._play_audio_http(pcm)
+                    if not played and self._out_track:
+                        # The backchannel is a real fallback when the session exists,
+                        # so this branch DID put audio somewhere.
+                        self._last_play_ok = True
+                        logger.warning(
+                            f"[{self.stream_name}] falling back to the go2rtc "
+                            f"backchannel — expect a ~6x pitch shift"
+                        )
+                    elif not played:
+                        # Do NOT promise a fallback that does not exist. With
+                        # `CAMERA_WEBRTC=false` there is no backchannel, so the reply
+                        # is simply not spoken — and the log used to say it would be
+                        # replayed, which sent the reader looking for audio that was
+                        # never going to arrive. Measured 07.10.2026 08:50 on the
+                        # kitchen: `play_audio failed` after 30 s, then exactly this
+                        # line, then silence.
+                        logger.warning(
+                            f"[{self.stream_name}] /play_audio failed and no backchannel "
+                            f"exists (CAMERA_WEBRTC off) — the reply was NOT spoken"
+                        )
+
+                if not played:
+                    # Fallback: the WebRTC sendonly track -> go2rtc -> ONVIF
+                    # backchannel. Timed as before.
+                    self._tts_play_end = time.time() + audio_dur
                     if self._out_track:
-                        # We just push chunks asynchronously now; the pacing
-                        # is enforced inside AIVoiceOutputTrack.recv().
-                        await self._out_track.queue_frame(c, sr)
-            else:
-                # /play_audio returns as soon as the body is uploaded and the
-                # camera then plays it in real time, so the playback window
-                # starts AFTER the POST, not before it.
-                self._last_play_ok = True
-                self._tts_play_end = time.time() + audio_dur
-                if self._out_track:
-                    self._out_track._last_play_duration = audio_dur
+                        self._out_track._last_play_duration = audio_dur
+                    chunk_size = sr * 20 // 1000 * 2
+                    for i in range(0, len(pcm), chunk_size):
+                        c = pcm[i : i + chunk_size]
+                        if len(c) < chunk_size:
+                            c += b"\x00" * (chunk_size - len(c))
+                        if self._out_track:
+                            # We just push chunks asynchronously now; the pacing
+                            # is enforced inside AIVoiceOutputTrack.recv().
+                            await self._out_track.queue_frame(c, sr)
+                else:
+                    # /play_audio returns as soon as the body is uploaded and the
+                    # camera then plays it in real time, so the playback window
+                    # starts AFTER the POST, not before it.
+                    self._last_play_ok = True
+                    self._tts_play_end = time.time() + audio_dur
+                    if self._out_track:
+                        self._out_track._last_play_duration = audio_dur
 
-            # Suppress wake detection AND inbound commands only for the direct
-            # playback tail. The delayed TTS echo (returns via the mic 8-15s
-            # later) is now caught precisely by cross-correlation in _is_echo,
-            # so we no longer need a long blind lock that would also swallow
-            # the user's answer to a question.
-            #
-            # THIS is the assignment that actually set the mute, and it carried a
-            # 3 s echo tail (`1.5` for a question). Measured 05.10.2026 19:24:
-            # that tail is why «а теперь выключи» was lost — the utterance that
-            # got collected began at 19:24:27.2 with the mute ending at 19:24:27.3,
-            # so its first second was already gone and Whisper returned empty.
-            # It now ends with the audio. The WAKE word keeps its own tail
-            # (`_wake_suppress_until` below), where a «компьютер» decoded out of
-            # the speaker really would be a false wake; inbound AUDIO is
-            # recognised by _is_echo and _echo_of_reply, which need no blind
-            # window and do not need one to be correct.
-            ECHO_TAIL = _SPEAKER_SETTLE_S
-            # `sent_at`, not `time.time()`. This one was the last of the three and
-            # the worst: `_speaking_until` is the HARD mic mute in `_feed_audio`
-            # (`if time.time() < self._speaking_until: return`), so a POST that
-            # answers 30 s late did not just delay a timestamp — it muted the
-            # microphone for 30 s AFTER the reply had finished playing, which is
-            # exactly the "camera stops hearing me" report and it would have broken
-            # the question window (07.10.2026) on the very turn it was added for.
-            # Caught by measuring it rather than by reading it: a 2 s clip with a
-            # 30 s response produced `_speaking_until = 1032.3` against an audio
-            # end of 1002.0.
-            self._speaking_until = sent_at + audio_dur + ECHO_TAIL
-            self._close_tts_inflight(audio_dur)
-            global GLOBAL_TTS_UNTIL
-            # Was `audio_dur + echo_tail` (up to 3 s), and it is the SECOND place
-            # the same 3 s tail bit: it drops the finished transcript outright with
-            # "TTS playback active (echo guard)", so even after the mic unmuted a
-            # follow-up spoken right after the answer was thrown away. It is a
-            # cross-camera guard, so it cannot use _is_echo (which is per session),
-            # but the transcript-level `_echo_of_reply` check below identifies our
-            # own voice in the text and is what should decide.
-            # `sent_at`, not `time.time()`: see the measurement above. The response
-            # can arrive many seconds after the speaker started, and the guard has
-            # to describe the AUDIO, not the HTTP round trip.
-            GLOBAL_TTS_UNTIL = sent_at + audio_dur + ECHO_TAIL
-            global _GLOBAL_TTS_BY, _GLOBAL_TTS_DUR
-            _GLOBAL_TTS_DUR = audio_dur
-            _GLOBAL_TTS_BY = (
-                f"{self.stream_name} '{reply[:40]}' pcm={len(pcm)}B "
-                f"dur={audio_dur:.2f}s sr={sr}"
-            )
-            # Suppress the decoder for the playback plus a SHORT tail. This used to be
-            # `audio_dur + 15.0`, which is the direct cause of "after the first
-            # trigger the word stops working": a reply finished at T blocked
-            # every «компьютер» until T+18, and the user's next two attempts
-            # were decoded and thrown away. The delayed room return is not this
-            # timer's job — `_is_echo` drops it by cross-correlation in
-            # `_feed_audio` (and extends suppression by up to 20 s when, and
-            # only when, a correlation actually matches).
-            self._wake_suppress_until = sent_at + audio_dur + _ECHO_TAIL_S
+                # Suppress wake detection AND inbound commands only for the direct
+                # playback tail. The delayed TTS echo (returns via the mic 8-15s
+                # later) is now caught precisely by cross-correlation in _is_echo,
+                # so we no longer need a long blind lock that would also swallow
+                # the user's answer to a question.
+                #
+                # THIS is the assignment that actually set the mute, and it carried a
+                # 3 s echo tail (`1.5` for a question). Measured 05.10.2026 19:24:
+                # that tail is why «а теперь выключи» was lost — the utterance that
+                # got collected began at 19:24:27.2 with the mute ending at 19:24:27.3,
+                # so its first second was already gone and Whisper returned empty.
+                # It now ends with the audio. The WAKE word keeps its own tail
+                # (`_wake_suppress_until` below), where a «компьютер» decoded out of
+                # the speaker really would be a false wake; inbound AUDIO is
+                # recognised by _is_echo and _echo_of_reply, which need no blind
+                # window and do not need one to be correct.
+                ECHO_TAIL = _SPEAKER_SETTLE_S
+                # `sent_at`, not `time.time()`. This one was the last of the three and
+                # the worst: `_speaking_until` is the HARD mic mute in `_feed_audio`
+                # (`if time.time() < self._speaking_until: return`), so a POST that
+                # answers 30 s late did not just delay a timestamp — it muted the
+                # microphone for 30 s AFTER the reply had finished playing, which is
+                # exactly the "camera stops hearing me" report and it would have broken
+                # the question window (07.10.2026) on the very turn it was added for.
+                # Caught by measuring it rather than by reading it: a 2 s clip with a
+                # 30 s response produced `_speaking_until = 1032.3` against an audio
+                # end of 1002.0.
+                self._speaking_until = sent_at + audio_dur + ECHO_TAIL
+                self._close_tts_inflight(audio_dur)
+                global GLOBAL_TTS_UNTIL
+                # Was `audio_dur + echo_tail` (up to 3 s), and it is the SECOND place
+                # the same 3 s tail bit: it drops the finished transcript outright with
+                # "TTS playback active (echo guard)", so even after the mic unmuted a
+                # follow-up spoken right after the answer was thrown away. It is a
+                # cross-camera guard, so it cannot use _is_echo (which is per session),
+                # but the transcript-level `_echo_of_reply` check below identifies our
+                # own voice in the text and is what should decide.
+                # `sent_at`, not `time.time()`: see the measurement above. The response
+                # can arrive many seconds after the speaker started, and the guard has
+                # to describe the AUDIO, not the HTTP round trip.
+                GLOBAL_TTS_UNTIL = sent_at + audio_dur + ECHO_TAIL
+                global _GLOBAL_TTS_BY, _GLOBAL_TTS_DUR
+                _GLOBAL_TTS_DUR = audio_dur
+                _GLOBAL_TTS_BY = (
+                    f"{self.stream_name} '{reply[:40]}' pcm={len(pcm)}B "
+                    f"dur={audio_dur:.2f}s sr={sr}"
+                )
+                # Suppress the decoder for the playback plus a SHORT tail. This used to be
+                # `audio_dur + 15.0`, which is the direct cause of "after the first
+                # trigger the word stops working": a reply finished at T blocked
+                # every «компьютер» until T+18, and the user's next two attempts
+                # were decoded and thrown away. The delayed room return is not this
+                # timer's job — `_is_echo` drops it by cross-correlation in
+                # `_feed_audio` (and extends suppression by up to 20 s when, and
+                # only when, a correlation actually matches).
+                self._wake_suppress_until = sent_at + audio_dur + _ECHO_TAIL_S
+                return True
+
+            # Wait, or hand it to the background. The cues and every single-clip
+            # caller keep the old behaviour; the player opts into overlapping so
+            # the next sentence's bytes reach the camera while this one is still
+            # being consumed. On a link carrying the stream at 15-36% of real time
+            # the gap between sentences was the whole of the stutter: the log shows
+            # a 2.71 s clip taking 7.01 s and the next sentence's POST not starting
+            # until that finished (measured 16.10.2026, kitchen).
+            if wait:
+                played = await _post_and_close()
+                self._last_play_ok = bool(played)
+            else:
+                if len(self._play_tasks) >= _MAX_OUTSTANDING_PLAY_POSTS:
+                    # Bounded. Two in flight is enough to keep the speaker fed;
+                    # more turns a slow link into a pile-up of audio the camera
+                    # is already failing to play.
+                    await self._settle_play_posts()
+                t = asyncio.create_task(_post_and_close())
+                self._play_tasks.add(t)
+                t.add_done_callback(self._play_tasks.discard)
         except Exception as e:
             logger.warning(f"[{self.stream_name}] playback error: {e}")
 
         self._speaking = False
-
         return is_question

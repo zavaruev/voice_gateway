@@ -1118,6 +1118,25 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
 
   There is nothing new in substance here — it is exactly the class this file already describes ("a guard that cannot fire is worse than none"): the `reached` stub that accepted `before != now` instead of `state == target`, a `_tts_fetch` with no logging, `assert count == 1` as proof that an edit landed where it was meant to. **A check is code too, and the same standard applies to it: break the file with it first and confirm it notices, and only then trust it.**
 
+- **THE KITCHEN'S STUTTER TRACES TO ONE LINK MEASUREMENT, AND EVERY SYMPTOM DOWNSTREAM OF IT FOLLOWS. Measured 16.10.2026 16:07-16:09.**
+
+  Three direct captures, twelve seconds each, straight off the camera:
+
+  ```
+  speed=0.149   speed=0.357   speed=0.198
+  ```
+
+  **The stream arrives at 15-36% of real time.** Earlier the same day: 0.189, and on 15.10 0.29. `play_audio` ran ×1.9…×6.8 over 14 calls (median ×3.4) — 4.99 s of audio took 17.86 s of room time.
+
+  * **Our own stretched playback is read as speech.** 18.5 s, 17.9 s and 21.2 s of playback in a row, so the VAD opened an utterance every ~6-7 s and `awake ends` climbed to `{'pause': 4, 'cap': 7}` — the endpoint contributing almost nothing while the cap did everything.
+  * **Whisper transcribed our own stretched playback as «хи хи»** (16:07:58) and the router dispatched it as a command, which produced two more slow replies and re-opened the follow-up window.
+  * **Three 7-second buffers of near-silence went to Whisper and all three returned empty** (`raw_rms=715/684/688`, `peak=3538/2818/2925`). This is precisely the case `CAMERA_STT_MIN_PEAK` was meant to catch and which was withdrawn on 15.10.2026 for a wrong threshold. **It is not being re-added with a guessed number.**
+
+  * **`/tmp` is a tmpfs, and that is why the threshold could not be derived.** The in-container utterance dump is wiped by every restart, so the silence samples were gone before they could be measured. `CAMERA_UTTERANCE_DUMP[_<NAME>]` now points at a HOST directory, and every sample carries its own verdict in `manifest.jsonl` — written after the transcript is known, because the verdict IS the thing the threshold has to be separated on, and the 15.10 attempt classified "garbage" by eye and produced a threshold that had to be removed the same day.
+  * **The player no longer blocks on the upload between sentences.** `_speak_pcm(..., wait=False)` hands the POST to a task, bounded by `_MAX_OUTSTANDING_PLAY_POSTS = 2`, and `_settle_play_posts()` drains it before anything reads `_last_play_ok` — so the apology decision stays honest while sentence N+1 reaches the camera during sentence N.
+  * **`wait=None` means "ask the session", not `wait=True`.** The first version added a third keyword to the player's call and broke every hand-built test session; the player's broad `except` turned `got an unexpected keyword argument 'wait'` into `TTS sentence failed`, i.e. a stub gap wearing a playback fault's name. That has happened twice in this file already.
+  * **A cancelled upload was able to abort the whole turn.** `except Exception` does not catch `CancelledError` — it derives from `BaseException` since 3.8 — so one cancelled task propagated out of the drain and out of the player loop. Found by a test, not by reading.
+
 - **OUR OWN PLAYBACK ENDED THE UTTERANCE, AND THE FIX OF 14.10 GUARDED THE DECISION BUT NOT THE EVIDENCE. Measured 16.10.2026 08:22:47, kitchen.**
 
   ```

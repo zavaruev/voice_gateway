@@ -1,0 +1,5 @@
+# Labelled utterance samples for deriving the STT level threshold.
+# These are recordings of the user's own rooms; they are measurement data, not
+# source. Nothing here belongs in the repository.
+*
+!.gitignore

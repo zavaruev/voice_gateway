@@ -3483,3 +3483,112 @@ def test_a_short_chain_still_gets_its_window():
         "a limit below 2 would break 'what time?' -> 'and in Berlin?' after the "
         "very first follow-up"
     )
+
+
+# ---------------------------------------------------------------------------
+# Overlapping `/play_audio` POSTs, and the bounded drain.
+# ---------------------------------------------------------------------------
+# Measured 16.10.2026 on the kitchen: a 2.71 s clip took 7.01 s (x2.6) and the
+# next sentence's POST did not start until that returned. The player therefore sat
+# inside `_speak_pcm` for the whole of each upload, and on a link carrying the
+# stream at 15-36% of real time the gap between sentences was the stutter.
+#
+# The POST runs as a task and the next sentence starts immediately, bounded to
+# `_MAX_OUTSTANDING_PLAY_POSTS`. Two invariants make that safe, and each is a test.
+
+
+def _play_session():
+    s = CameraSession.__new__(CameraSession)
+    s.stream_name = "kitchen"
+    s._play_tasks = set()
+    s._last_play_ok = False
+    s._out_track = None
+    s._play_overlap = True
+    return s
+
+
+def test_the_session_asks_for_overlap_and_the_cues_opt_out():
+    """`wait=None` must ask the session, not default to True.
+
+    The player used to call `_speak_pcm(pcm, sent)` with two positional
+    arguments; adding a third keyword broke every hand-built test session, and the
+    player's broad `except` reported that as `TTS sentence failed` — a stub gap
+    wearing a playback fault's name. The call signature must not move.
+    """
+    s = _play_session()
+    assert s._play_overlap is True
+    import inspect
+
+    params = inspect.signature(CameraSession._speak_pcm).parameters
+    assert params["wait"].default is None, (
+        "a default of True silently disables the overlap for every caller that "
+        "passes nothing"
+    )
+
+
+def test_the_overlap_is_bounded():
+    """More than the cap drains first.
+
+    A slow link plus unbounded POSTs is a pile-up: the camera would be asked for
+    audio it is already failing to play, and each request holds a connection.
+    """
+    cap = camera_client._MAX_OUTSTANDING_PLAY_POSTS
+    assert cap >= 1, "a cap of zero would serialise and defeat the change"
+
+    async def run():
+        s = _play_session()
+        for _ in range(cap + 1):
+            s._play_tasks.add(asyncio.create_task(asyncio.sleep(5)))
+        assert len(s._play_tasks) >= cap, "the guard would never fire"
+        await s._settle_play_posts()
+        return len(s._play_tasks)
+
+    assert asyncio.run(run()) == 0, "settle must drain, not peek"
+
+
+def test_settle_folds_results_into_last_play_ok():
+    """`_last_play_ok` gates the apology: a failed sentence must not silence a
+    turn that already spoke, and a turn that spoke nothing must still apologise."""
+
+    async def run(ok):
+        s = _play_session()
+        for good in ok:
+            s._play_tasks.add(asyncio.create_task(asyncio.sleep(0, result=good)))
+        await s._settle_play_posts()
+        return s._last_play_ok
+
+    assert asyncio.run(run([True, False])) is True, (
+        "a sentence that reached the speaker was lost"
+    )
+    assert asyncio.run(run([False, False])) is False, (
+        "a turn where nothing played must report nothing played"
+    )
+
+
+def test_settle_survives_a_post_that_raised():
+    """One dead upload must not swallow the verdict of the others."""
+
+    async def run():
+        s = _play_session()
+        bad = asyncio.create_task(asyncio.sleep(0))
+        bad.cancel()
+        s._play_tasks.add(bad)
+        s._play_tasks.add(asyncio.create_task(asyncio.sleep(0, result=True)))
+        await s._settle_play_posts()
+        return s._last_play_ok
+
+    assert asyncio.run(run()) is True
+
+
+def test_a_cue_still_waits_for_its_own_upload():
+    """The cues keep the old behaviour on purpose.
+
+    `_play_attention` is what this whole class of bug started with: the pip was
+    being read as an utterance. Making it fire-and-forget would put the pip's
+    guard back in the hands of a task nobody awaits.
+    """
+    import inspect
+
+    src = inspect.getsource(CameraSession._play_attention)
+    assert "_arm_tts_inflight" in src, "the pip must still arm the endpoint guard"
+    assert "wait=False" not in src, "the pip must not be sent to the background"

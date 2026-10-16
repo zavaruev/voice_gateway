@@ -17,6 +17,7 @@ The constraint that outranks latency: if the reference cannot be established
 back to the cap. Slower is recoverable; a chopped command is a wrong command.
 """
 
+import camera_client
 import inspect
 import os
 
@@ -408,3 +409,159 @@ def test_no_floor_means_no_pause():
     ep = _PauseEndpoint(noise_mult=2.5, noise=_NoiseFloor())
     verdicts = [ep.feed(0.0001)[0] for _ in range(10)]
     assert all(v == "speech" for v in verdicts), verdicts
+
+
+# ---------------------------------------------------------------------------
+# Our own playback must not be able to END an utterance — measured 16.10.2026.
+# ---------------------------------------------------------------------------
+# Kitchen, 08:22, the attention pip:
+#
+#   08:22:44.971  pip POST starts        (0.40 s of audio at 48 kHz)
+#   08:22:47.070  POST returns            x5.2 — the camera is audibly playing
+#                                         for the WHOLE 2.07 s
+#   08:22:47.770  _tts_playing_until expires
+#   08:22:47.792  VAD UTTERANCE END via pause      <-- 22 ms later
+#
+# 22 ms is under one 160 ms frame, so the endpoint needed ZERO new frames: the
+# six dip frames it fired on were already in its counter, accumulated BEFORE the
+# pip started. The buffer it committed was 3.12 s of which ~2.07 s was our own
+# pip at peak=32767; Whisper answered `Whisper empty` and the command was lost.
+#
+# The playback window guards the DECISION (`time.time() >= _tts_playing_until`)
+# but the detector is not fed while it is open, so the counter freezes instead of
+# being cleared. Clearing it can only DELAY an end — the safe direction.
+
+# SIX speech frames, not five: `min_speech_frames` is 5, and the production trace
+# ended on `speech=9`. With fewer than five the endpoint could not fire at all —
+# the test would pass on the BROKEN code for the wrong reason, which is the trap
+# this repository has already fallen into twice.
+# The kitchen runs the NOISE-FLOOR mode, not the windowed reference, and the test
+# has to use the same one. Measured on the failing turn: `floor=0.0137
+# thresh=0.0344` — i.e. `noise_mult=2.5` against a tracked room floor.
+#
+# The distinction is not cosmetic. In windowed mode the reference is the 80th
+# percentile of a trailing window, so a long pause FILLS the window with quiet,
+# the reference collapses onto the pause level, and the pause becomes
+# unfindable — four dip frames, then silence, then "speech" forever. That is the
+# long-documented windowed-reference bug, and it is exactly why this room uses
+# the noise floor. Testing the windowed mode here would test a path the room does
+# not run, and would have "passed" for a reason that has nothing to do with the fix.
+#
+# Twelve speech frames: in noise mode every frame counts, so this yields
+# `speech=12`; the production line reported `speech=9`, which is the same order.
+_PIP_SPEECH = [0.050, 0.048, 0.052, 0.049, 0.051, 0.047,
+               0.050, 0.048, 0.052, 0.049, 0.051, 0.047]   # «компьютер»
+_PIP_DIP = [0.012] * 5                          # the tail before the pip opens
+_ROOM_FLOOR = 0.016
+_NOISE_MULT = 2.5                               # -> thresh 0.040, as measured
+
+
+def _session_with_endpoint(run_frames=6):
+    """A session on the noise-floor path, with a seeded floor.
+
+    Built by hand so the test touches no network and no VAD; the arm path's only
+    real dependency is the endpoint object.
+    """
+    noise = _NoiseFloor()
+    for _ in range(30):
+        noise.feed(_ROOM_FLOOR)
+    s = CameraSession.__new__(CameraSession)
+    s.stream_name = "kitchen"
+    s._endpoint = _PauseEndpoint(
+        run_frames=run_frames, noise_mult=_NOISE_MULT, noise=noise
+    )
+    s._tts_playing_until = 0.0
+    return s
+
+
+def _feed(ep, values):
+    return [ep.feed(v)[0] for v in values]
+
+
+def test_the_fixture_reproduces_the_production_numbers():
+    """Guard the fixture itself.
+
+    Twice while writing this, the test data did not reproduce the production
+    turn and the test passed on the broken code for the wrong reason: five speech
+    frames are worth `speech=2` once the utterance anchor has taken four of them,
+    which is below `min_speech_frames`, so the endpoint could not fire at all.
+    A regression test must reproduce the exact state that fails.
+    """
+    s = _session_with_endpoint()
+    _feed(s._endpoint, _PIP_SPEECH + _PIP_DIP)
+    assert s._endpoint._run == len(_PIP_DIP)
+    assert s._endpoint._speech_frames >= s._endpoint.min_speech_frames, (
+        "the fixture cannot reach min_speech_frames, so nothing can fire"
+    )
+    assert s._endpoint.noise.value > 0.0, "an unseeded floor reports no pause at all"
+
+
+def test_playback_arm_clears_the_stale_dip_run():
+    """The regression, in the shape it actually happened on 16.10.2026.
+
+    Goes through `_arm_tts_inflight` on purpose. An earlier version called
+    `_PauseEndpoint.forget_dip()` directly, which PASSES on the unfixed tree
+    because the method exists there — it tested the method, not the wiring.
+    A test that cannot fail is worse than no test.
+    """
+    s = _session_with_endpoint()
+    ep = s._endpoint
+
+    _feed(ep, _PIP_SPEECH + _PIP_DIP)
+    assert ep._run == len(_PIP_DIP), f"expected the dip run to be waiting, got {ep._run}"
+
+    # Our own pip starts. The camera will be audibly playing for ~2 s afterwards.
+    s._arm_tts_inflight(1_000.0, 0.40)
+
+    assert ep._run == 0, (
+        "the dip run survived our own playback: it was counted before the "
+        "speaker opened, and the endpoint fires the moment the window closes "
+        "— measured 16.10.2026 08:22, kitchen, 22 ms after the window expired"
+    )
+
+
+def test_playback_arm_keeps_the_speech_evidence():
+    """`min_speech_frames` must not have to be earned twice.
+
+    Clearing the whole detector would reset `_speech_frames`, and a sentence
+    interrupted by our own playback could then not end on its pause at all — it
+    would fall to the duration cap on every such turn.
+    """
+    s = _session_with_endpoint()
+    ep = s._endpoint
+    _feed(ep, [0.050] * 12)
+    speech_before = ep._speech_frames
+
+    s._arm_tts_inflight(1_000.0, 0.40)
+
+    assert ep._speech_frames == speech_before, "the speech count must survive"
+
+
+def test_the_window_is_armed_from_the_send_not_the_response():
+    """`sent_at` is 1000.0 and "now" is real time, so the window must open at
+    1000.0 — computed after the POST it would be ~0 and the pip would be
+    unprotected for its whole duration. The 07.10.2026 finding, pinned."""
+    s = _session_with_endpoint()
+    s._arm_tts_inflight(1_000.0, 0.40)
+    assert s._tts_playing_until == 1_000.0 + camera_client._TTS_START_GUARD_S, (
+        "the playback window must be anchored to the send, not to the response"
+    )
+
+
+def test_a_real_pause_after_playback_still_ends_the_utterance():
+    """The point of the fix is to DELAY, not to disable.
+
+    Without this, the regression test above would pass just as well on a detector
+    that never ends on a pause at all — a worse fault than the one being fixed.
+    """
+    s = _session_with_endpoint()
+    ep = s._endpoint
+    _feed(ep, [0.050] * 12 + [0.012] * 5)
+
+    s._arm_tts_inflight(1_000.0, 0.40)
+
+    verdicts = _feed(ep, [0.012] * 6)
+    assert "end" in verdicts, (
+        "after our playback a genuine pause must still end the utterance — "
+        "the fix is meant to cost latency, not the endpoint"
+    )

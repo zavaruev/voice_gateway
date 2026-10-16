@@ -1118,6 +1118,34 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
 
   There is nothing new in substance here — it is exactly the class this file already describes ("a guard that cannot fire is worse than none"): the `reached` stub that accepted `before != now` instead of `state == target`, a `_tts_fetch` with no logging, `assert count == 1` as proof that an edit landed where it was meant to. **A check is code too, and the same standard applies to it: break the file with it first and confirm it notices, and only then trust it.**
 
+- **OUR OWN PLAYBACK ENDED THE UTTERANCE, AND THE FIX OF 14.10 GUARDED THE DECISION BUT NOT THE EVIDENCE. Measured 16.10.2026 08:22:47, kitchen.**
+
+  ```
+  08:22:44.261  VOSK WAKE trig='компьютер' conf='компьютер'
+  08:22:44.971  attention pip (vosk)
+  08:22:47.070  play_audio 0.40s audio in 2.07s (x5.2)
+  08:22:47.770  _tts_playing_until expires
+  08:22:47.792  VAD UTTERANCE END dur=3120ms via pause (run=6 speech=9)
+  08:22:47.813  Whisper IN: 3.12s raw_rms=6540 peak=32767 dB=-14.0
+  08:22:49.056  Post-wake retry raw signal
+  08:22:50.858  Whisper empty
+  08:22:54.002  Wake with no command — sending greeting
+  ```
+
+  **22 ms is under one 160 ms frame, so the endpoint used ZERO frames of new evidence.** `_vad_process` does not feed the detector while `time.time() < _tts_playing_until` (line ~2850), so the six dip frames it fired on were already in its counter, counted BEFORE the pip opened. The window delayed the decision by 0.70 s and the stale counter completed it the instant the window closed.
+
+  * **The buffer it committed was two-thirds our own pip.** 0.40 s of audio posted over 2.07 s of wall time means ~2.07 s of the 3.12 s buffer is the pip, at `peak=32767`. Whisper was handed a railed two-tone squeal and returned nothing; the command, which was in the room, never became a transcript. The user heard the greeting instead.
+  * **The 14.10.2026 fix was half applied, and the surrounding code says so.** `_arm_tts_inflight` unified the window across the three playback paths, but it sets ONLY `_tts_playing_until`. The hard mic mute `_speaking_until` is still computed per path from `time.time()` AFTER the POST — so the microphone was fully open for the whole 2.07 s in which the camera was audible. The pip path's own comment records the decision ("measured from AFTER the POST") and the 13.10 measurement that motivated it; what it does not record is that the cost is only acceptable while the endpoint cannot fire on the beep.
+  * **Fix: `_PauseEndpoint.forget_dip()`, called from `_arm_tts_inflight`.** It clears `_run` and nothing else. `_speech_frames`, `_ref` and `_anchor` describe the ROOM and were gathered while the human was speaking; clearing them would make `min_speech_frames` earnable only twice and the reference unfindable.
+  * **Why this and not a mute from `sent_at`.** That is the other obvious fix and it is the one already measured as harmful: 13.10.2026, a 0.4 s pip whose POST took 6 s muted the room for 6 s and swallowed the speech. A stale counter costs a false end; over-muting costs the command. Clearing the counter can only DELAY an end, which degrades to the 7 s cap — the direction this file already calls safe.
+
+  * **The regression test failed to be a regression test THREE times, and each reason is the same class as the bug it was written for.**
+    1. It called `_PauseEndpoint.forget_dip()` **directly**, which passes on the unfixed tree because the method exists there — it tested the method, not the wiring. It now goes through `_arm_tts_inflight`.
+    2. It fed **six** speech frames expecting `speech=6`. The first `anchor_frames` (4) build the utterance anchor and are not counted, so six frames yield **three** — below `min_speech_frames=5`, and the endpoint could not fire at all. **A test that cannot fail is worse than none.**
+    3. It used the **windowed** reference while the kitchen runs `noise_mult=2.5`. In windowed mode a long pause fills the trailing window with quiet, the reference collapses onto the pause level and the pause becomes unfindable after four frames — so "a real pause must still end the utterance" failed on BOTH trees while testing a path this room does not run.
+
+    Each was found by running the test against the pre-fix tree, which is now routine: **`1 failed` on the old tree — exactly the regression — and green on the new one.** The four other new tests pass on both by design; they guard the fix against over-correcting into a detector that never ends on a pause.
+
 - **THE STUTTER WAS NOT IN THE CAMERAS BUT IN THEIR VIDEO SIDE — AND I CALLED IT HARDWARE TWICE. 15.10.2026, user report: «the corridor still does not turn the light on / it stutters badly».**
 
   **The real cause, measured 15.10 at 11:53:** corridor camera `.247` was being fed by **TWO RTSP producers** — one for `camera-corridor1` (the gateway), one for `corridor1` (the NVR). `majestic` is single-threaded, and with two video sessions its output audio channel was underfed: `MI_AO_IMPL_SendFrame: Device 0 is empty`. The kitchen was in an ffmpeg crash loop at the NVR at the same price. **The hardware is fine.**

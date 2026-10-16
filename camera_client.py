@@ -843,6 +843,44 @@ class _PauseEndpoint:
         self._run = 0
         self._speech_frames = 0
 
+    def forget_dip(self) -> None:
+        """Drop the accumulated dip run, keeping the speech count.
+
+        Called when OUR OWN audio starts. The run counter is evidence collected
+        BEFORE our speaker opened — it describes a room we were not playing into —
+        and the endpoint is not fed while the playback window is open (the window
+        guards the decision, `time.time() >= self._tts_playing_until`). So the
+        counter sits still during our playback and the first quiet frame after it
+        completes a run that began before the pip.
+
+        Measured 16.10.2026 08:22 on the kitchen, the attention pip:
+
+            08:22:44.971  pip POST starts          (0.40 s of audio)
+            08:22:47.070  POST returns            x5.2 — the camera is audibly
+                                                playing for the WHOLE 2.07 s
+            08:22:47.770  _tts_playing_until expires
+            08:22:47.792  VAD UTTERANCE END via pause   <-- 22 ms later
+
+        22 ms is under one 160 ms frame, so the endpoint did not need a single
+        new frame of evidence: the six dip frames it used were already in the
+        counter. The buffer it committed was 3.12 s of which ~2.07 s was our own
+        pip at `peak=32767`, Whisper answered `Whisper empty`, and the user's
+        command — which was in the room — never reached the transcript.
+
+        **Why this is safe and the mute is not.** The obvious alternative is to
+        mute the mic for the whole pip, and the pip path deliberately does not:
+        measured 13.10.2026, a 0.4 s pip whose POST took 6 s muted the room for
+        6 s and swallowed the user's speech. Here the cost of a stale counter is
+        a false end; the cost of over-muting is the command. Clearing the counter
+        can only DELAY an end, which degrades to the duration cap — the direction
+        this file already calls the safe one.
+
+        `_speech_frames` is deliberately kept: "a human spoke" stays true, so
+        `min_speech_frames` does not have to be earned a second time and a
+        sentence with a pause in the middle of it still ends on the pause.
+        """
+        self._run = 0
+
     def _feed_noise(self, rms: float) -> tuple[str, str]:
         """Pause = below `noise_mult` x the tracked room floor.
 
@@ -4917,6 +4955,21 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
         self._tts_playing_until = max(
             getattr(self, "_tts_playing_until", 0.0), sent_at + _TTS_START_GUARD_S
         )
+        # The window above stops the endpoint from DECIDING on our own audio, but
+        # it does not stop its EVIDENCE from being stale: the detector is not fed
+        # while the window is open, so a dip run counted before the playback
+        # started simply waits and completes on the first quiet frame afterwards.
+        # Measured 16.10.2026 08:22, the kitchen attention pip — the utterance
+        # ended 22 ms after the window expired, i.e. on zero new frames, and the
+        # buffer was two-thirds our own pip at the rail. See `_PauseEndpoint.
+        # forget_dip` for the full trace.
+        #
+        # `getattr` because every test helper that builds a session by hand must
+        # not need updating for a new method, and a missing one must not take the
+        # live audio path down.
+        forget = getattr(self._endpoint, "forget_dip", None) if getattr(self, "_endpoint", None) else None
+        if callable(forget):
+            forget()
 
     def _close_tts_inflight(self, duration: float) -> None:
         """Called once the response is in: the camera may still be finishing."""

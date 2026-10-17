@@ -326,6 +326,19 @@ CI (`.github/workflows/tests.yml`) runs this exact recipe inside the built image
 
 ## Changelog
 
+- **2.42** — Two gates, added because the documentation could be wrong and nothing said so. No behaviour change.
+  - **`scripts/check_doc_numbers.py`** — README line counts, suite size and the version badge, checked against the repository. "Update the README" is the last step of every task and the step nobody re-reads, so its numbers decay silently; `v2.41` shipped counts that were already drifting. A README claiming 615 tests when the suite runs 645 is worse than one claiming nothing, because it is believed.
+    - **It found a real gap on its first run:** `vosk_wake.py` was in the repository layout with no row in the component table.
+    - **The tolerance is derived from the precision written**, not chosen: `~12,540` may be off by 1%, `~570` by 2%, and a number written without `~` is checked exactly. A flat fudge factor is a licence to be wrong.
+    - **The suite count is passed in from the pytest run that already happened** rather than starting a second one.
+  - **`scripts/check_env_wiring.py`** — every variable in the `voice_gateway` environment block must be reachable in the code, through `os.getenv`, `os.environ.get`, or the per-room dynamic prefix `f"CAMERA_PAUSE_ENDPOINT_{name…}"`. A variable nobody reads is the quietest failure in this stack: the container starts, the flag looks enabled, and nothing happens.
+    - **The dynamic prefix has to be resolved.** A literal search reports twenty-eight false positives on the first run, which is how a gate gets switched off.
+    - **Scope is one service on purpose** — the compose file also defines `jev-router` and `smolagents-worker`, whose variables are read by their own code.
+    - **It currently finds nothing**, so the proof is in the file: `--self-test` demands one unreadable name fail and four reachable ones pass, and adding `CAMERA_PAUSE_RAITIO_KITCHEN=0.55` to the live compose file fails with exit 1 while the revert passes.
+  - **A check that verifies doc identifiers exist in the tree was considered and rejected.** Of twelve apparent misses, nine were external — Home Assistant area names, a vosk model file, tool names — so that gate would have been almost entirely false positives.
+  - **Two defects in the new gates, both found by their own self-tests:** a prefix regex that required a closing quote where the next character is `{`, and a self-test listing the same name in both its must-fail and must-pass sets.
+  - All four gates run in `verify_endpoint.sh` — the first three as step 1/7 before anything is built, the numbers at step 6/7 where pytest has already run. Suite unchanged at 645.
+
 - **2.41** — Our own playback was ending utterances, and the measurement data needed to fix the rest could not be collected because `/tmp` is a tmpfs.
   - **The endpoint fired on evidence gathered before our speaker opened.** `_vad_process` does not feed the pause detector while the playback window is open, so a dip run counted before the pip began simply waited and completed on the first quiet frame after it. Measured 16.10.2026 on the kitchen: the utterance ended **22 ms after the window expired** — under one 160 ms frame, i.e. on zero new evidence — and the committed buffer was 3.12 s of which ~2.07 s was our own pip at `peak=32767`. Whisper returned nothing and the room said the greeting.
   - **`_PauseEndpoint.forget_dip()`, called from `_arm_tts_inflight`** — clears `_run` and nothing else. `_speech_frames`, `_ref` and `_anchor` describe the room and survive. Not a mute from `sent_at`: measured 13.10.2026, a 0.4 s pip whose POST took 6 s muted the room for 6 s and swallowed the command. A stale counter costs a false end; over-muting costs the command.

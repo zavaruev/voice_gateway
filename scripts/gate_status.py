@@ -42,6 +42,7 @@ import os
 import re
 import subprocess
 import sys
+from datetime import timedelta
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -128,6 +129,40 @@ def record(results: dict[str, dict]) -> None:
         print("  (could not append to logs/gates.jsonl — continuing)")
 
 
+def load_history() -> list[dict]:
+    if not HISTORY.exists():
+        return []
+    try:
+        return [json.loads(l) for l in HISTORY.read_text(encoding="utf-8").splitlines() if l.strip()]
+    except Exception:                                                  # noqa: BLE001
+        return []
+
+
+def window_stats(gate: str, rows: list[dict], since: datetime) -> tuple[int, int]:
+    """(runs, fires) for one gate inside the window.
+
+    Both numbers are needed and they mean opposite things. `fires` is how often
+    the gate earned its keep. `runs` is whether it is running at all — a gate
+    that never fires because the tree is clean is fine, and a gate that never
+    RUNS protects nothing while still looking like protection. Reporting only
+    the first one is what made "last fired" useless as a health signal.
+    """
+    runs = fires = 0
+    for r in rows:
+        if r.get("gate") != gate:
+            continue
+        try:
+            ts = datetime.strptime(r["ts"], "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+        except Exception:                                              # noqa: BLE001
+            continue
+        if ts < since:
+            continue
+        runs += 1
+        if r.get("code"):
+            fires += 1
+    return runs, fires
+
+
 def last_fired(gate: str) -> str:
     """The most recent run of this gate that returned non-zero.
 
@@ -139,10 +174,8 @@ def last_fired(gate: str) -> str:
     hand-written first row would be exactly the kind of invented fact this
     repository has been corrected for repeatedly.
     """
-    if not HISTORY.exists():
-        return "unrecorded"
     try:
-        rows = [json.loads(l) for l in HISTORY.read_text(encoding="utf-8").splitlines() if l.strip()]
+        rows = load_history()
     except Exception:                                                  # noqa: BLE001
         return "unreadable"
     if not rows:
@@ -157,6 +190,8 @@ def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(add_help=False)
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--no-record", action="store_true")
+    ap.add_argument("--days", type=int, default=7,
+                    help="window for the RUNS/FIRES columns")
     args = ap.parse_args(argv)
 
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
@@ -175,9 +210,13 @@ def main(argv: list[str]) -> int:
         results[name] = {"code": code, "finding": finding + note, "ts": now}
 
     unregistered = [g for g in discover() if g not in GATES]
+    rows = load_history()
+    since = datetime.now(timezone.utc) - timedelta(days=max(0, args.days))
 
     if not args.no_record:
         record(results)
+
+    stats = {n: window_stats(n, rows, since) for n in GATES}
 
     if args.json:
         print(json.dumps(
@@ -185,13 +224,22 @@ def main(argv: list[str]) -> int:
             ensure_ascii=False, indent=2))
     else:
         w = max(len(g) for g in GATES) + 2
+        head = f"  {'GATE'.ljust(w)}{'NOW':<6}{f'RUNS/{args.days}D':<12}{'FIRES':<7}{'RATE':<8}{'LAST FIRED':<18}WHAT IT CATCHES"
         print()
-        print(f"  {'GATE'.ljust(w)}{'NOW':<6}{'LAST FIRED':<18}WHAT IT CATCHES")
-        print(f"  {'-' * (w + 6 + 18 + 46)}")
+        print(head)
+        print(f"  {'-' * (len(head) - 2)}")
         for name in sorted(GATES):
             r = results[name]
+            runs, fires = stats[name]
             mark = "ok" if r["code"] == 0 else "FAIL"
-            print(f"  {name.ljust(w)}{mark:<6}{last_fired(name):<18}{GATES[name][0]}")
+            # NORUN only where it means something: a window nobody ran in says
+            # nothing about any one gate, and showing it while exiting 0 is a
+            # mark and an exit code disagreeing on the same page.
+            if runs == 0 and any(runs for runs, _ in stats.values()):
+                mark = "NORUN"
+            rate = f"{fires / runs:.0%}" if runs else "-"
+            print(f"  {name.ljust(w)}{mark:<6}{runs:<12}{fires:<7}{rate:<8}"
+                  f"{last_fired(name):<18}{GATES[name][0]}")
             if r["code"]:
                 print(f"  {'':<{w}}{'':<6}{'':<18}  -> {r['finding']}")
             elif r["finding"] and r["finding"] not in GATES[name][0]:
@@ -207,7 +255,17 @@ def main(argv: list[str]) -> int:
         print()
 
     failed = [n for n, r in results.items() if r["code"]]
-    return 1 if (failed or unregistered) else 0
+    # A registered gate with NO run in the window, while its neighbours have runs,
+    # is the failure this whole script exists to catch: it exists, it is wired in,
+    # and it protects nothing because nothing executes it. Scoped to "while its
+    # neighbours ran" so that a fresh clone with an empty history is not reported
+    # as four broken gates on the first ever run.
+    any_runs = any(runs for runs, _ in stats.values())
+    not_run = [n for n, (runs, _) in stats.items() if runs == 0] if any_runs else []
+    if not_run:
+        print(f"  NOT RUN in the last {args.days} d: {', '.join(not_run)}")
+
+    return 1 if (failed or unregistered or not_run) else 0
 
 
 if __name__ == "__main__":

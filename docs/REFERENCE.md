@@ -326,6 +326,13 @@ CI (`.github/workflows/tests.yml`) runs this exact recipe inside the built image
 
 ## Changelog
 
+- **2.44** — Gates are now counted, not just listed. `RUNS` matters more than `FIRES`.
+  - **`gate_status.py` grew `RUNS/Nd`, `FIRES` and `RATE` columns**, aggregated from `logs/gates.jsonl` over a window (`--days`, default 7).
+  - **The two numbers mean opposite things.** A gate that never fires because the tree is clean is working. A gate that never **runs** protects nothing while still sitting in the repository looking like protection — so `NORUN` exits non-zero.
+  - **`NORUN` is only raised when the gate's neighbours DID run in the window**, so a fresh clone with an empty history is not reported as four broken gates. Verified by running against a history file with one gate's rows removed: that gate shows `NORUN`, the line `NOT RUN in the last 7 d: check_env_wiring` prints, exit 1, and restoring the history returns 0.
+  - **One self-inflicted inconsistency, caught before shipping:** the `NORUN` mark was shown whenever the window was empty for everyone, while the exit code stayed 0. A mark and an exit code that disagree on the same page are worse than neither — `NORUN` is now shown only where it changes the result.
+  - Suite unchanged at 645.
+
 - **2.43** — One screen for the gates, and a history of when each last caught something.
   - **`scripts/gate_status.py`** — runs every gate, prints one table (verdict, what it catches, when it last fired) and ends `verify_endpoint.sh`. Four gates printing four blocks is readable; eight is not, and the failure is not cosmetic: a gate whose result scrolls off screen is a gate that stops being run, and then it protects nothing while still being in the repository.
   - **"Last fired" is read from `logs/gates.jsonl`, not maintained by hand.** A hand-written column is a number in a document, which is exactly what `check_doc_numbers.py` exists to stop. Before the history began the column reads `unrecorded`, not `never`, because two of these gates had already demonstrably fired — and nothing is backfilled, because an invented row is the kind of fact this project keeps being corrected for.

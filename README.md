@@ -1,6 +1,6 @@
 # Voice Gateway
 
-![version](https://img.shields.io/badge/version-v2.43-blue)
+![version](https://img.shields.io/badge/version-v2.44-blue)
 [![tests](https://github.com/zavaruev/voice_gateway/actions/workflows/tests.yml/badge.svg)](https://github.com/zavaruev/voice_gateway/actions/workflows/tests.yml)
 ![python](https://img.shields.io/badge/python-3.12%2B-3776AB?logo=python&logoColor=white)
 ![backend](https://img.shields.io/badge/AI%20backend-Cascade-orange)
@@ -256,7 +256,7 @@ and both exist because of a specific way of being wrong:
 
 ### One table, and a recorded history
 
-    python3 scripts/gate_status.py
+    python3 scripts/gate_status.py [--days 7]
 
 Four gates printing four blocks is readable; eight is not, and the failure is not
 cosmetic — **a gate whose result scrolls off the screen is a gate that stops being
@@ -264,12 +264,19 @@ run**, and then it protects nothing while still being in the repository. So
 `verify_endpoint.sh` ends with one table: every gate, its verdict now, what it
 catches, and **when it last caught something**.
 
-That last column is read from `logs/gates.jsonl`, which every run appends to. It
-is deliberately not a hand-maintained column — that would be a number in a
-document, which is precisely what `check_doc_numbers.py` exists to stop. Before
-that history began it reads `unrecorded` rather than `never`, because two of these
-gates had already demonstrably fired; nothing is backfilled, because an invented
-first row is the kind of fact this project keeps being corrected for.
+The history columns are read from `logs/gates.jsonl`, which every run appends to.
+They are deliberately not hand-maintained — a typed-in number is exactly what
+`check_doc_numbers.py` exists to stop. Before that history began the column reads
+`unrecorded` rather than `never`, because two of these gates had already
+demonstrably fired; nothing is backfilled, because an invented row is the kind of
+fact this project keeps being corrected for.
+
+**`RUNS` matters more than `FIRES`, and they mean opposite things.** A gate that
+never fires because the tree is clean is working. A gate that never **runs**
+protects nothing while still looking like protection — and the second is the
+failure this whole table exists to catch, so it is marked `NORUN` and exits
+non-zero. `NORUN` is only raised when a gate's neighbours *did* run in the window,
+so a fresh clone with no history is not reported as four broken gates.
 
 `gate_status.py` also treats **an unregistered `check_*.py` as a failure**. A gate
 that exists and is not wired into the runner is indistinguishable from no gate at

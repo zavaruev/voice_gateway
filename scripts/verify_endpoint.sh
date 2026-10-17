@@ -33,6 +33,9 @@ if python3 scripts/check_doc_headings.py --self-test >/dev/null 2>&1 \
 else
   bad "check_doc_headings — spliced headings in AGENTS.md"
 fi
+# The one number the filesystem cannot answer is the test COUNT, and step 6/7
+# has already run the suite by the time this would matter. So it is checked there
+# instead, from the pytest output, rather than starting a second run here.
 
 cd "$STACK" || exit 1
 step "2/7 build the test image"
@@ -88,6 +91,17 @@ elif echo "$R5" | grep -qE "error"; then
 else
   ok "no failures"
   echo "$R5" | tail -1
+  # The README's counts are typed by hand at the end of a task and decayed
+  # silently for two releases before anything verified them. The suite size is
+  # taken from THIS run — no second pytest invocation.
+  TESTS=$(echo "$R5" | grep -oE '[0-9]+ passed' | tail -1 | grep -oE '[0-9]+')
+  if [ -n "$TESTS" ] && cd "$REPO" \
+     && python3 scripts/check_doc_numbers.py --tests "$TESTS"; then
+    ok "check_doc_numbers ($TESTS tests)"
+  else
+    bad "check_doc_numbers — README counts do not match the repository"
+  fi
+  cd "$STACK" || exit 1
 fi
 
 step "7/7 the flag defaults OFF and the detector counts correctly"

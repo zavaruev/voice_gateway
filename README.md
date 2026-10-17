@@ -1,6 +1,6 @@
 # Voice Gateway
 
-![version](https://img.shields.io/badge/version-v2.42-blue)
+![version](https://img.shields.io/badge/version-v2.43-blue)
 [![tests](https://github.com/zavaruev/voice_gateway/actions/workflows/tests.yml/badge.svg)](https://github.com/zavaruev/voice_gateway/actions/workflows/tests.yml)
 ![python](https://img.shields.io/badge/python-3.12%2B-3776AB?logo=python&logoColor=white)
 ![backend](https://img.shields.io/badge/AI%20backend-Cascade-orange)
@@ -254,8 +254,31 @@ and both exist because of a specific way of being wrong:
   repository layout with no row in the component table. The suite size is passed
   in from the pytest run rather than starting a second one.
 
+### One table, and a recorded history
+
+    python3 scripts/gate_status.py
+
+Four gates printing four blocks is readable; eight is not, and the failure is not
+cosmetic — **a gate whose result scrolls off the screen is a gate that stops being
+run**, and then it protects nothing while still being in the repository. So
+`verify_endpoint.sh` ends with one table: every gate, its verdict now, what it
+catches, and **when it last caught something**.
+
+That last column is read from `logs/gates.jsonl`, which every run appends to. It
+is deliberately not a hand-maintained column — that would be a number in a
+document, which is precisely what `check_doc_numbers.py` exists to stop. Before
+that history began it reads `unrecorded` rather than `never`, because two of these
+gates had already demonstrably fired; nothing is backfilled, because an invented
+first row is the kind of fact this project keeps being corrected for.
+
+`gate_status.py` also treats **an unregistered `check_*.py` as a failure**. A gate
+that exists and is not wired into the runner is indistinguishable from no gate at
+all, which is the same shape as the bug in `check_lang.py`'s own first self-test,
+where the sample passed on the code it was meant to refute.
+
 All four run inside `verify_endpoint.sh` — the first three as step 1/7, before
-anything is built, and the numbers at step 6/7 where pytest has already run.
+anything is built, and the numbers at step 6/7 where pytest has already run. The
+summary goes last, once the test count exists.
 
 ---
 

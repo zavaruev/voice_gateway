@@ -326,6 +326,13 @@ CI (`.github/workflows/tests.yml`) runs this exact recipe inside the built image
 
 ## Changelog
 
+- **2.43** — One screen for the gates, and a history of when each last caught something.
+  - **`scripts/gate_status.py`** — runs every gate, prints one table (verdict, what it catches, when it last fired) and ends `verify_endpoint.sh`. Four gates printing four blocks is readable; eight is not, and the failure is not cosmetic: a gate whose result scrolls off screen is a gate that stops being run, and then it protects nothing while still being in the repository.
+  - **"Last fired" is read from `logs/gates.jsonl`, not maintained by hand.** A hand-written column is a number in a document, which is exactly what `check_doc_numbers.py` exists to stop. Before the history began the column reads `unrecorded`, not `never`, because two of these gates had already demonstrably fired — and nothing is backfilled, because an invented row is the kind of fact this project keeps being corrected for.
+  - **An unregistered `check_*.py` is a failure.** A gate that exists and is not wired into the runner is indistinguishable from no gate at all — the same shape as the bug in `check_lang.py`'s own first self-test, where the sample passed on the code it was meant to refute.
+  - **The summary runs LAST**, once pytest has produced the test count, because the first version of it ran `check_doc_numbers` without `--tests` and so in a weaker mode than the pipeline: a README claiming 600 tests against a real 645 passed the runner and failed only in `verify_endpoint.sh`. A check that runs differently from how it is used is not a check. Without the count the row now says so on PASS, where it can actually be noticed.
+  - Suite unchanged at 645.
+
 - **2.42** — Two gates, added because the documentation could be wrong and nothing said so. No behaviour change.
   - **`scripts/check_doc_numbers.py`** — README line counts, suite size and the version badge, checked against the repository. "Update the README" is the last step of every task and the step nobody re-reads, so its numbers decay silently; `v2.41` shipped counts that were already drifting. A README claiming 615 tests when the suite runs 645 is worse than one claiming nothing, because it is believed.
     - **It found a real gap on its first run:** `vosk_wake.py` was in the repository layout with no row in the component table.

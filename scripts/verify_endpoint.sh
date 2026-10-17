@@ -184,5 +184,13 @@ else
   echo "  THERE ARE ERRORS — see FAIL above. Do NOT enable the flag in production."
 fi
 
+# The gate summary goes LAST, once pytest has run and the test count exists, so
+# `check_doc_numbers` is verified against the same number the suite just reported
+# rather than in a weaker mode. One screen, every gate, and a recorded history of
+# when each last caught something.
+export VOICE_GATEWAY_TEST_COUNT="${TESTS:-}"
+python3 "$REPO/scripts/gate_status.py"
+[ $? -ne 0 ] && FAIL=1
+
 docker rm -f "$CTR" >/dev/null 2>&1
 exit "$FAIL"

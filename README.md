@@ -1,6 +1,6 @@
 # Voice Gateway
 
-![version](https://img.shields.io/badge/version-v2.40-blue)
+![version](https://img.shields.io/badge/version-v2.41-blue)
 [![tests](https://github.com/zavaruev/voice_gateway/actions/workflows/tests.yml/badge.svg)](https://github.com/zavaruev/voice_gateway/actions/workflows/tests.yml)
 ![python](https://img.shields.io/badge/python-3.12%2B-3776AB?logo=python&logoColor=white)
 ![backend](https://img.shields.io/badge/AI%20backend-Cascade-orange)
@@ -34,7 +34,8 @@ Two lessons from bringing the rooms up are worth stating here, because both cost
 
 - **`audio.volume` must be *applied*, not just written.** The OpenIPC web UI writes the value to `/etc/majestic.yaml` and keeps the old one in memory until you press apply. A camera left on `volume: 30` read `rms 4` (−77.8 dB) with `volume: 100` already sitting in the config file, and looked indistinguishable from dead hardware — a 700× gap from a healthy room that announced itself nowhere in the log. Re-reading the file is not evidence that a setting is in force.
 - **A room that does not wake and a room with nobody in it are indistinguishable from one measurement.** Every conclusion that a microphone was deaf came from a recording made while the room was empty. `CAMERA_VOSK_DUMP_<NAME>` (below) exists because that is the mistake you cannot catch by trying harder.
-- **Two rooms stutter and two do not, on identical hardware, identical firmware and identical config — because of where the access point is.** Every camera here runs on `wlan0`, and the WiFi signal strength orders the rooms exactly as throughput orders them: 78 and 77/63 deliver the stream at 1.02× of real time, 56 gives 0.84×, and 30 gives 0.29× with `play_audio` at ×25.7. The same link carries both directions (the outgoing stream and the incoming `POST /play_audio`), `majestic` is single-threaded, and when the link cannot keep up its output audio channel does not get data in time — `Device 0 is empty`, which is what stuttering *is*. Three days were spent comparing what was inside the cameras before anyone read `/proc/net/wireless`. **"Same hardware, same firmware, same config" is only what you checked.**
+- **Two rooms stutter and two do not, on identical hardware, identical firmware and identical config — because of where the access point is.** Every camera here runs on `wlan0`, and the WiFi signal orders the rooms: 80/64 and 77/63 are the two fast rooms, 60/42 the corridor, and the kitchen has been seen at both 30/63 (0.29×) and 1.06× on the same hardware. `majestic` is single-threaded and one link carries both directions — the outgoing stream and the incoming `POST /play_audio` — so when it cannot keep up its output audio channel does not get data in time: `Device 0 is empty`, which is what stuttering *is*. Three days were spent comparing what was inside the cameras before anyone read `/proc/net/wireless`. **"Same hardware, same firmware, same config" is only what you checked.**
+- **RETRACTED (17.10.2026): "capture speed predicts the stutter" — it predicts only the capture side.** Measured on the same day: the corridor delivers its stream at 0.96–0.79× while its `/play_audio` runs at ×4.45, with `Send-Q` 0 and no unread peer anywhere. Playback has its own cause and its own signature, and the two have to be measured separately. This sentence was written into 2.40 and it was wrong.
 
 See [`docs/REFERENCE.md`](docs/REFERENCE.md) → *Known Issues & Current Problems*.
 
@@ -47,7 +48,7 @@ See [`docs/REFERENCE.md`](docs/REFERENCE.md) → *Known Issues & Current Problem
 | L2 turn with a verified side effect | **3.2–4.0 s** |
 | Wake debounce | ~240 ms (2 of 3 chunks); a single chunk ≥ 0.68 fires immediately |
 | Wake window / watchdog | 15 s / 90 s |
-| Test suite | 635 tests, 19 files, ~12,300 lines |
+| Test suite | 645 tests, 19 files, ~12,540 lines |
 
 ---
 
@@ -86,15 +87,15 @@ Full environment table, backend variants, REST API and OTA: [`docs/REFERENCE.md`
 
 | File | Responsibility | Why it is separate |
 |---|---|---|
-| **`main.py`** (~3,990 lines) | Core: ESP32 WebSocket protocol, REST API, OTA, web UI, camera session startup | Single entry point for everything |
-| **`camera_client.py`** (~5,450 lines) | One `CameraSession` per stream: RTSP mic feed, wake word, cross-camera arbitration, replies over the camera's `/play_audio` | Cameras have their own transport and their own hard problem — the mic hears its own speaker |
+| **`main.py`** (~4,000 lines) | Core: ESP32 WebSocket protocol, REST API, OTA, web UI, camera session startup | Single entry point for everything |
+| **`camera_client.py`** (~5,680 lines) | One `CameraSession` per stream: RTSP mic feed, wake word, cross-camera arbitration, replies over the camera's `/play_audio` | Cameras have their own transport and their own hard problem — the mic hears its own speaker |
 | **`engine.py`** (~570 lines) | Silero VAD + openWakeWord scoring — the "science" part, pure ONNX calls | Testable without a network, without a camera |
 | **`backends.py`** (~610 lines) | Who answers: `NanobotBackend` / `HermesBackend` / `CascadeBackend` | One interface — the brain is swappable with a single env var |
 | **`telegram_client.py`** (~1,190 lines) | Third request source: Telegram long-polling, chat allowlist, voice note → Whisper → the same backend → text reply (+ optional voice note) | No bot framework — three Bot API calls over the `aiohttp` the process already has; all main.py helpers injected (no import cycle) |
 | **`audio_utils.py`** (~220 lines) | `pack_ogg()` (Opus → Ogg for Whisper) and `is_valid_text()` (drops hallucinations and mic echoes of our own TTS) | Shared by both device paths |
 | **`services/jev-router/`** | **L1** — intent classifier, offline slot resolver, direct Home Assistant calls, weather, chat/expert proxy | ~0.1 s for a simple command, no LLM in the loop |
 | **`services/smolagents-worker/`** | **L2** — smolagents `CodeAgent` with HA / Qdrant / Hermes / weather tools, plus honesty vetoes | Multi-step tasks that must not lie about side effects |
-| **`tests/`** | 635 tests across 19 files | Pins the wake-gate bands, the protocol, the cascade contract, the Telegram source, the utterance endpointing and the side-effect verification |
+| **`tests/`** | 645 tests across 19 files | Pins the wake-gate bands, the protocol, the cascade contract, the Telegram source, the utterance endpointing and the side-effect verification |
 
 > Production (`docker-compose.yml`) runs `LLM_BACKEND=cascade` with **four cameras enabled** (`CAMERA_STREAMS=livingroom,kitchen,entrance1,camera-corridor1`, `DISABLE_CAMERAS=false`), all four decoding the wake word with vosk and playing replies over `/play_audio`; the ESP32 path remains the main one.
 
@@ -173,6 +174,16 @@ an arbitrary point inside the word. `VOSK WAKE` logs both numbers
 (`peak=` and `window=<window max>/<threshold>`) so the number in the log is the
 number the decision was made on.
 
+`CAMERA_UTTERANCE_DUMP[_<NAME>]` is a fourth instrument, aimed at the STT side
+rather than the wake side: it writes **every** utterance to a host directory as a
+wav plus one `manifest.jsonl` line carrying `dur`, `raw_rms`, `peak_raw`, `dB`,
+`gain`, the transcript and the verdict — and the verdict is written **after** the
+transcript is known, because that is what the sample is for. A level threshold for
+STT was attempted and withdrawn on 15.10.2026 for want of both classes of sample;
+this is what makes obtaining them routine. It must point at a **host** directory:
+the in-container `/tmp/utterances/` dump is a tmpfs and is wiped by every restart,
+which is exactly why the samples were not there to measure.
+
 `CAMERA_VOSK_DUMP_<NAME>=<dir>` appends the decoder's actual input to
 `<dir>/<NAME>.raw`, after any wake-path filter and before `feed()`, capped at
 64 MB (~33 min per room) and flushed every chunk so the file can be copied out of
@@ -203,12 +214,13 @@ consumer: a watchdog must not perturb the single-threaded `majestic` it watches.
 first step restarts the gateway, so testing it the hard way is what once made it
 restart a healthy container seventeen times in a day.
 
-**Known gap — capture speed.** Two of the four production cameras sit at
-`play_audio` ×1.8 and ×25.7 and the watchdog calls both `healthy`: HTTP latency,
-stream presence and level are all normal. The signal that separates them is
-**capture speed** (`ffmpeg -i rtsp://… -t 15 -f null -`, read `speed=`), and the
-threshold is measured from both sides — healthy 1.01–1.02x, broken 0.29–0.40x,
-boundary somewhere at 0.8x. It is **not implemented yet**.
+**Known gap — capture speed.** A camera can be healthy on every signal the watchdog
+measures and still be ×4.45 on `/play_audio`: HTTP latency, stream presence and
+level are normal while the speaker takes four times the audio length. **Capture
+speed separates the two classes on the capture side** (measured 17.10.2026, three
+12 s captures per room: 1.08 / 1.08 / 1.08 fast, 0.96 / 0.74 / 0.79 degraded) but
+it says nothing about playback, which has its own cause. It is **not implemented
+yet**, and it would not have caught the corridor.
 
 ### Repository gates
 
@@ -260,6 +272,7 @@ Everything here exists to avoid listening to garbage.
 - **Two echo guards** — a hard one (while TTS frames are queued, the mic is not fed at all) and a correlational one, `_is_echo()`, which cross-checks the incoming mic chunk against a ring buffer of recently played audio. The correlator is **bounded by `_ECHO_HORIZON_S`** (8 s after playback ends): the 3–40 s late return that once justified a wide lag sweep belonged to the ONVIF backchannel, which is no longer in the path. Unbounded, it did not just miss echoes — it counted room noise as our own voice and held the wake gate shut for as long as the noise lasted.
 - **Wake-gate cascade** (before any wake fires): own-playback guard → appliance hold (sustained background like a vacuum demands a confident score) → quiet-source hold → distant-source veto (a through-wall copy must not beat the real room) → clipping-bang / crest-factor gates → debounce (2 qualifying chunks out of the last 3) → STT-confirm → **cross-camera arbiter** (the first detector becomes the interaction owner; a room ≥5× louder may steal a not-yet-dispatched wake).
 - **Whisper only inside a wake window.** Ambient speech from a TV never reaches STT — this is the main defence against false bills and wasted latency.
+- **The player does not wait for the upload before the next sentence.** `/play_audio` answers 3–12× late on a weak link, and the player used to sit inside that call for the whole of it, so the gap between sentences was the gap between uploads. The POST runs as a task, bounded by `_MAX_OUTSTANDING_PLAY_POSTS = 2` — a slow link plus unbounded requests is a pile-up of audio the camera is already failing to play — and `_settle_play_posts()` drains them before anything reads `_last_play_ok`, which is what decides whether a failed sentence adds an apology. The **cues keep the waiting behaviour on purpose**: the attention pip is what this class of bug started with.
 - **Answer** goes to the camera's `/play_audio` endpoint as raw mono s16le with the rate in the `Content-Type` header (`;rate=48000`). The ONVIF/go2rtc backchannel is a **fallback only** and it is pitch-broken — the camera advertises PCMU/8000 and then plays it at 48 kHz, so replies come out ~6× too fast. Set `CAMERA_WEBRTC[_<NAME>]=false` for a room that has `/play_audio`: the session carries no audio this gateway uses, and every `webrtc/offer` makes go2rtc rebuild the producer, which fills the **camera's** send queue and blocks it.
 
 ---
@@ -318,13 +331,13 @@ voice_gateway/
 ├── services/
 │   ├── jev-router/         # cascade L1
 │   └── smolagents-worker/  # cascade L2
-├── tests/                  # 635 tests / 19 files
+├── tests/                  # 645 tests / 19 files
 └── docs/
     └── REFERENCE.md        # full config tables, REST API, known issues, changelog
 ```
 
 - **Configuration, REST API, environment variables, known issues and the full changelog:** [`docs/REFERENCE.md`](docs/REFERENCE.md)
-- **Tests:** 635 tests across 19 files covering engine scoring and wake gates, the camera audio track and its echo guards, the ESP32 protocol, cascade streaming, honesty vetoes, HA entity matching, router resolution, dialogue memory and the Telegram source (allowlist, ack vs final text, turn timeout, voice turns, `/room`). Run them inside the container — see [`docs/REFERENCE.md`](docs/REFERENCE.md#tests), the host Python usually lacks `opuslib` / `onnxruntime`. CI (`.github/workflows/tests.yml`) runs the same recipe on every push and PR.
+- **Tests:** 645 tests across 19 files covering engine scoring and wake gates, the camera audio track and its echo guards, the ESP32 protocol, cascade streaming, honesty vetoes, HA entity matching, router resolution, dialogue memory and the Telegram source (allowlist, ack vs final text, turn timeout, voice turns, `/room`). Run them inside the container — see [`docs/REFERENCE.md`](docs/REFERENCE.md#tests), the host Python usually lacks `opuslib` / `onnxruntime`. CI (`.github/workflows/tests.yml`) runs the same recipe on every push and PR.
 
 ---
 

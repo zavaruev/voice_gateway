@@ -228,6 +228,8 @@ yet**, and it would not have caught the corridor.
     bash scripts/verify_endpoint.sh     # the full check, in one command
     python3 scripts/check_lang.py --self-test && python3 scripts/check_lang.py
     python3 scripts/check_doc_headings.py --self-test
+    python3 scripts/check_env_wiring.py --self-test
+    python3 scripts/check_doc_numbers.py --tests <N>
 
 Two of these are about the documents and the source rather than the behaviour,
 and both exist because of a specific way of being wrong:
@@ -240,10 +242,20 @@ and both exist because of a specific way of being wrong:
   are data too, and translating them would change model behaviour.
 - **`check_doc_headings.py`** catches a heading spliced to a copy of itself in
   `AGENTS.md`. Three earlier versions of that check passed *while the defect was
-  present*, so the rule both gates follow is: **`--self-test` first, and a check
-  that has never been seen failing proves nothing.**
+  present*, so the rule every gate here follows is: **`--self-test` first, and a
+  check that has never been seen failing proves nothing.**
+- **`check_env_wiring.py`** catches an environment variable set in
+  `docker-compose.yml` that the code never reads — the quietest failure in this
+  stack, because the container starts, the flag looks enabled, and nothing
+  happens. It resolves the per-room scheme (`f"CAMERA_PAUSE_ENDPOINT_{name…}"`),
+  without which it would report twenty-eight false positives on the first run.
+- **`check_doc_numbers.py`** catches README numbers that have drifted from the
+  repository. It found a real gap on its first run: `vosk_wake.py` was in the
+  repository layout with no row in the component table. The suite size is passed
+  in from the pytest run rather than starting a second one.
 
-Both run inside `verify_endpoint.sh` as step 1/7, before anything is built.
+All four run inside `verify_endpoint.sh` — the first three as step 1/7, before
+anything is built, and the numbers at step 6/7 where pytest has already run.
 
 ---
 

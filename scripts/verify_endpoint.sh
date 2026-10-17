@@ -33,6 +33,12 @@ if python3 scripts/check_doc_headings.py --self-test >/dev/null 2>&1 \
 else
   bad "check_doc_headings — spliced headings in AGENTS.md"
 fi
+if python3 scripts/check_env_wiring.py --self-test >/dev/null 2>&1 \
+   && python3 scripts/check_env_wiring.py; then
+  ok "check_env_wiring"
+else
+  bad "check_env_wiring — an environment variable is set but never read"
+fi
 # The one number the filesystem cannot answer is the test COUNT, and step 6/7
 # has already run the suite by the time this would matter. So it is checked there
 # instead, from the pytest output, rather than starting a second run here.

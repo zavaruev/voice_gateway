@@ -980,6 +980,11 @@ def _rate_session():
     s = CameraSession.__new__(CameraSession)
     s.stream_name = "cam"
     s._min_audio_rate = 0.5
+    # The second threshold, added 19.10.2026. Listed here for the reason this
+    # helper exists at all: it builds a session by hand, so a new attribute
+    # simply is not there, and the AttributeError surfaces inside the live audio
+    # path rather than as a clear failure. That has happened to this file before.
+    s._audio_rate_ok = 0.8
     s._starve_restarts = 3
     s._rate_bytes = 0
     s._rate_start = 0.0
@@ -1027,6 +1032,113 @@ async def test_healthy_stream_asks_for_nothing():
         assert await s._account_audio_rate(0) is False
     assert s.heals == 0
     assert s._rate_starved == 0
+
+
+@pytest.mark.asyncio
+async def test_a_heal_that_only_reaches_seventy_percent_is_not_a_recovery():
+    """"Not starving" and "well" are different questions, and one number for
+    both of them made a broken room announce itself as fixed.
+
+    Measured 19.10.2026 on `entrance1`, 08:33-08:47, in this order:
+
+        AUDIO STARVED: 1%  ->  audio rate recovered: 70%
+        AUDIO STARVED: 10% ->  audio rate recovered: 50%
+        AUDIO STARVED: 45% ->  AUDIO STARVED: 41%
+
+    Every "recovery" reset the counter, so the budget was never exhausted, and
+    the gateway never reached the line that names `/etc/init.d/S95majestic
+    restart` — the lever measured to fix exactly this state on 07.10.2026. The
+    room looped all day and the operator was told, 30-odd times, that it had
+    recovered.
+    """
+    s = _rate_session()
+    now = _set_rate(s, 0.70)    # above the 0.5 starve floor, below the 0.8 bar
+    with patch("camera_client.time.time", return_value=now):
+        assert await s._account_audio_rate(0) is True   # a heal is still worth trying
+    assert s.heals == 1
+    assert s._rate_starved == 1, (
+        "70% reset the starvation counter — the room is not healthy and the "
+        "budget must keep running down"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_heal_that_reaches_the_bar_is_a_recovery():
+    """The counterweight. Raising the bar must not turn every dip into an alarm:
+    a stream that comes back properly is a recovery, and says so."""
+    s = _rate_session()
+    now = _set_rate(s, 0.05)
+    with patch("camera_client.time.time", return_value=now):
+        await s._account_audio_rate(0)
+    assert s._rate_starved == 1
+
+    # Patch to exactly what `_set_rate` returns. It rewinds `_rate_start` to 1.0,
+    # so adding anything to the clock widens the window and the ratio comes out
+    # lower than the one asked for — a 0.90 window measured over 60 s reports
+    # 60% and lands in the DEGRADED band. That is not hypothetical: it is how
+    # this test failed the first time, and it made the escalation test below
+    # pass for the wrong reason.
+    now = _set_rate(s, 0.90)
+    with patch("camera_client.time.time", return_value=now):
+        assert await s._account_audio_rate(0) is False
+    assert s.heals == 1, "a verified recovery must not also trigger a heal"
+    assert s._rate_starved == 0
+
+
+@pytest.mark.asyncio
+async def test_a_room_stuck_in_the_degraded_band_reaches_the_escalation():
+    """The consequence of the two above: oscillating 1% <-> 70% must arrive at
+    the message that names the remedy, because before it never did.
+
+    The SHAPE is the point. It is identical to four consecutive starving windows
+    — heal, heal, escalate, heal — which is what "degraded counts as not
+    recovered" means operationally: the room gets the same three attempts and
+    the same operator message as one that delivers nothing at all. Before this
+    change a room at 70% reset the counter and could stay there silently.
+    """
+    s = _rate_session()
+    results = []
+    for ratio in (0.01, 0.70, 0.70, 0.70):
+        # `_set_rate`'s own clock, never `+ i * 20`: see the note in the test
+        # above. A widened window turns these into 0.007 and 0.47, which are
+        # STARVED rather than degraded, and the test would still pass — on the
+        # wrong branch, testing nothing.
+        now = _set_rate(s, ratio)
+        with patch("camera_client.time.time", return_value=now):
+            results.append(await s._account_audio_rate(0))
+    assert results == [True, True, False, True], results
+    assert s.heals == 3
+    # and the 4th window started counting from 1 again — the reset after escalation
+    assert s._rate_starved == 1
+
+
+def test_the_ok_rate_sits_in_the_gap_between_measured_rooms():
+    """0.8 is derived from both sides, so the test carries the measurements.
+
+    Capture speed, three 12 s samples per room, 19.10.2026, paired with the
+    ICMP loss measured over the same minutes:
+
+        livingroom  1.08  1.08  1.08   loss  0.0%   <- healthy
+        corridor    0.71  0.48  0.30   loss  5.8%   <- broken
+        kitchen     0.55  0.41  0.29   loss 17.1%   <- broken
+        entrance1   0.027 0.0016 0.0013 loss 59.6%  <- broken
+
+    Every healthy sample is above 1.0 and every broken one below 0.71, so the
+    separating bar can sit anywhere in 0.71..1.01 and 0.8 is inside it. The
+    15.10.2026 pass independently put the same boundary between 0.59 and 1.01.
+
+    Note the third column: ICMP loss badly UNDERSTATES the damage. A room can
+    answer 94% of pings while delivering a third of its stream, which is why the
+    watchdog and this watchdog both measure delivered bytes and not reachability.
+    """
+    healthy = (1.08, 1.08, 1.08)
+    broken = (0.71, 0.48, 0.30, 0.55, 0.41, 0.29, 0.027, 0.0016, 0.0013)
+    bar = _rate_session()._audio_rate_ok
+    assert 0.8 == bar, "the derived bar moved — re-measure both sides first"
+    assert max(broken) < bar < min(healthy), (
+        f"bar {bar} no longer separates: healthy min {min(healthy)}, "
+        f"broken max {max(broken)}"
+    )
 
 
 @pytest.mark.asyncio

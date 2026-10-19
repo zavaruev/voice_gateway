@@ -1259,6 +1259,17 @@ class CameraSession:
     dead go2rtc stream. Lifetime: start() -> _run() reconnect loop -> stop().
     """
 
+    # CLASS-LEVEL defaults, not only instance ones, because several test
+    # helpers build a session with `CameraSession.__new__` and assign fields by
+    # hand — an attribute that exists only in `__init__` simply is not there on
+    # such an instance, and the AttributeError then surfaces inside the live
+    # audio path instead of as a clear failure. That exact shape has bitten this
+    # file before (`_StubVosk` raised it from inside `_vad_process`), so a new
+    # attribute has to be readable off the class to be safe.
+    _audio_rate_ok = 0.8
+    _min_audio_rate = 0.5
+    _starve_restarts = 3
+
     def __init__(self, config: CameraConfig, backend=None):
         if not re.match(r"^[a-zA-Z0-9_-]+$", config.stream_name):
             raise ValueError(f"Invalid stream_name: {config.stream_name}")
@@ -1291,10 +1302,30 @@ class CameraSession:
 
         self.go2rtc_source_url = config.go2rtc_source_url
         self._heal_stalls = config.heal_stalls
-        # Rate-watchdog knobs: below 50% of real time for 20 s counts as starved
-        # (measured healthy 100-170%, measured broken 3-6%), and after 3 heal
-        # attempts we stop pretending and report a camera reboot is needed.
+        # Rate-watchdog knobs. TWO thresholds, because "not starving" and "well"
+        # are different questions and the file conflated them for a week.
+        #
+        # `_min_audio_rate` (0.5) is the STARVE floor: below it the stream is
+        # broken and a heal is worth attempting. `_audio_rate_ok` (0.8) is the bar
+        # a heal must clear before it is BELIEVED.
+        #
+        # They were one number, so a room that starved, healed and came back at
+        # 70% was logged as `audio rate recovered: 70%`, the counter was reset,
+        # and the room collapsed again — the loop ran all day and the gateway
+        # never reached the escalation that names the real remedy. Measured
+        # 19.10.2026 on `entrance1`, 08:33-08:47: `AUDIO STARVED: 1%` ->
+        # `recovered: 70%` -> `AUDIO STARVED: 10%` -> `recovered: 50%` ->
+        # `AUDIO STARVED: 45%`, in that order, with the counter never reaching
+        # its budget once.
+        #
+        # 0.8 is DERIVED from the two sides, not chosen. Capture measured at
+        # 12 s per sample, 19.10.2026: healthy 1.08, 1.08, 1.08 (livingroom);
+        # every broken room below it — corridor 0.71, 0.48, 0.30; kitchen 0.55,
+        # 0.41, 0.29; entrance1 0.027, 0.0016, 0.0013. The 15.10.2026 pass put
+        # the same boundary between 0.59 and 1.01. So the gap is 0.71..1.01 and
+        # 0.8 sits inside it with room on both sides.
         self._min_audio_rate = 0.5
+        self._audio_rate_ok = 0.8
         self._starve_restarts = 3
         self._wake_threshold = config.wake_threshold
         # vosk wake-word config, read in __init__ because _init_audio_processing()
@@ -2050,7 +2081,8 @@ class CameraSession:
         self._rate_start = now
         self._rate_check = now
 
-        if ratio >= self._min_audio_rate:
+        if ratio >= self._audio_rate_ok:
+            # Verified recovery. The heal did something and the stream says so.
             if self._rate_starved:
                 logger.info(
                     f"[{self.stream_name}] audio rate recovered: "
@@ -2059,12 +2091,32 @@ class CameraSession:
             self._rate_starved = 0
             return False
 
-        self._rate_starved += 1
-        logger.warning(
-            f"[{self.stream_name}] ⚠ AUDIO STARVED: {ratio*100:.0f}% of real "
-            f"time (min {self._min_audio_rate*100:.0f}%), attempt "
-            f"{self._rate_starved}/{self._starve_restarts}"
-        )
+        if ratio >= self._min_audio_rate:
+            # The band between the two thresholds: the stream is arriving, and it
+            # is arriving badly. Measured on 19.10.2026 this is where a wedged
+            # `majestic` sits — the corridor at 0.30-0.71, the kitchen at
+            # 0.29-0.55 — and it is BELOW what the wake path needs, because the
+            # decoder is fed a stretched stream.
+            #
+            # It used to be called "recovered" here. That is the whole defect:
+            # calling it recovered reset the counter, so a room oscillating
+            # between 1% and 70% never exhausted its budget and the gateway never
+            # reached the line that names `majestic restart`. Now the counter
+            # keeps climbing and the heal keeps trying, which is the only honest
+            # description of a room at 70%.
+            self._rate_starved += 1
+            logger.warning(
+                f"[{self.stream_name}] ⚠ AUDIO DEGRADED: {ratio*100:.0f}% of real "
+                f"time (want {self._audio_rate_ok*100:.0f}%), heal "
+                f"{self._rate_starved}/{self._starve_restarts}"
+            )
+        else:
+            self._rate_starved += 1
+            logger.warning(
+                f"[{self.stream_name}] ⚠ AUDIO STARVED: {ratio*100:.0f}% of real "
+                f"time (min {self._min_audio_rate*100:.0f}%), attempt "
+                f"{self._rate_starved}/{self._starve_restarts}"
+            )
         if self._rate_starved >= self._starve_restarts:
             # ffmpeg restarts and stream re-registration did not help.
             #
@@ -3865,6 +3917,27 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
                 "wav": os.path.basename(dump_path),
                 "text": (txt or "")[:120],
                 "verdict": verdict,
+                # `verdict` is WHISPER'S OUTCOME and is NOT the class an STT level
+                # gate needs. Measured 19.10.2026 over 48 labelled samples: the
+                # "transcript" side contained «какаякакаякакая» at raw_rms=1090,
+                # which is the room floor with nothing in it, and the "empty" side
+                # contained three buffers at rms 7483-10264 with peak 32768, which
+                # is loud clipped speech the recogniser failed on.
+                #
+                # So the two sides overlap on every statistic tried: buffer peak
+                # (40 of 40 transcripts sit inside the empty range) and the
+                # fraction of frames above the sample's own floor (transcripts
+                # 0.000..0.703 against empties 0.000..0.300). That is the second
+                # time a threshold has been removed for this reason (15.10.2026)
+                # and the cause is identical: the criterion was "did Whisper
+                # return something", which is a fact about a MODEL, not about
+                # the room.
+                #
+                # `label` is for a human: "speech" / "silence" / "" (unknown).
+                # Empty by default, and anything deriving a threshold from this
+                # file must refuse to substitute `verdict` for it — that
+                # substitution is the mistake, twice.
+                "label": "",
             }
             with open(os.path.join(dump_dir, "manifest.jsonl"), "a", encoding="utf-8") as f:
                 f.write(json.dumps(row, ensure_ascii=False) + "\n")

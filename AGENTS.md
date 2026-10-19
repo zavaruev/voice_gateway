@@ -1798,7 +1798,33 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
 
   * **STILL OPEN AND NOT MINE:** `entrance1`'s audio feed to the gateway collapses from 08:15 — 18–19 `feed rms` lines a minute becomes 7, 2, 7, 1, 11, 8, with pauses up to **81 s**. That is a dying stream, not a slow one, and this change does not address it.
 
-  - **`DRY_RUN` MUST BE SILENT ABOUT NOTHING, OR IT VERIFIES NOTHING.** It logged `would: docker restart` and `would: re-register`, but the two steps that touch the **physical camera** — restart `majestic` and reboot — were called through `[ "$DRY_RUN" = "1" ] ||` and logged nothing. So the single capability worth proving (restarting `majestic` on a room that had just been granted its SSH key) left no evidence in the dry run. Both now go through `act()`. Verified: the full four-step ladder prints, the container's `StartedAt` does not move, and both cameras' uptimes keep climbing (132 and 42 min) instead of resetting — which is the only proof that a reboot did not happen.
+  - **"NOT STARVING" AND "WELL" WERE ONE NUMBER, SO A BROKEN ROOM ANNOUNCED ITSELF AS FIXED. Measured 19.10.2026, `entrance1`, 08:33-08:47.** The rate watchdog's loop, verbatim and in order:
+
+  ```
+  ⚠ AUDIO STARVED: 1% of real time (min 50%), attempt 1/3
+  audio rate recovered: 70% of real time
+  ⚠ AUDIO STARVED: 10% of real time (min 50%), attempt 2/3
+  audio rate recovered: 50% of real time
+  ⚠ AUDIO STARVED: 45% of real time (min 50%), attempt 1/3
+  ```
+
+  Every "recovery" reset the starve counter, so the budget never ran out and the gateway **never reached the line that names `/etc/init.d/S95majestic restart`** — the lever measured on 07.10.2026 to fix exactly this state in two rooms at once. The room looped for hours and the operator was told, dozens of times, that it had recovered.
+
+  * **Two thresholds now: `_min_audio_rate` = 0.5 stays the starve floor, `_audio_rate_ok` = 0.8 is the bar a heal must CLEAR to be believed.** The band between them logs `⚠ AUDIO DEGRADED`, keeps the counter running and still attempts a heal, so a room at 70% is described honestly and reaches the same three attempts and the same message as one delivering nothing.
+
+  * **0.8 is derived from both sides, and the test carries the measurements.** Capture, three 12 s samples per room, paired with ICMP over the same minutes: healthy `1.08 ×3` (livingroom); broken — corridor `0.71/0.48/0.30`, kitchen `0.55/0.41/0.29`, entrance1 `0.027/0.0016/0.0013`. Every healthy sample is above 1.0 and every broken one below 0.71, so the separating bar can sit anywhere in **0.71..1.01** and 0.8 is inside it. The 15.10.2026 pass put the same boundary between 0.59 and 1.01.
+
+  * **ICMP UNDERSTATES THE DAMAGE BY A LOT, and my earlier reading of it was wrong.** Loss over the same minutes: livingroom **0%**, corridor **5.8%**, kitchen **17%**, entrance1 **59.6%** — against capture at 100%, ~50%, ~40% and **0.1-2.7%**. A camera can answer 94% of pings while delivering a third of its stream, and `entrance1` was answering 40% of pings while delivering **nothing**. The router and the go2rtc host from the same host: **0%**. So "contiguous blocks, therefore the box and not the air" was a conclusion about ICMP, which is not the signal that carries the audio.
+
+  * **What is still NOT solved, and this change does not claim to solve it:** `entrance1` delivers 0.1-2.7% of real time and its feed to the gateway collapses (18-19 `feed rms` lines a minute becomes 0-16, pauses up to **81 s**). A `majestic restart` is the documented first rung and needs SSH, which is down on that camera. **Radio-versus-box is still not separated**: `iw` does not exist on these cameras and SSH fails exactly where it would be read.
+
+  * **THE STT THRESHOLD IS STILL NOT DERIVABLE, AND NOW WE KNOW WHY INSTEAD OF GUESSING AGAIN.** 48 labelled samples exist. On the objective criterion "does it have a transcript" the classes **do not overlap-separate on anything tried**: buffer peak puts **40 of 40** transcripts inside the empty range (2388..32767 against 2345..32767), and the fraction of frames above the sample's own floor gives transcripts `0.000..0.703` against empties `0.000..0.300`.
+
+    The reason is that **the criterion is Whisper's outcome, which is a fact about a model.** The "transcript" side contains «какаякакаякакая» at `raw_rms=1090` — the room floor with nothing in it. The "empty" side contains three buffers at `rms` 7483-10264 with peak 32768 — loud clipped speech the recogniser failed on. That is the same mistake that removed the gate on 15.10.2026, so the manifest now carries a separate `"label"` field for a human ("speech" / "silence" / "") and documents in place that anything deriving a threshold from that file **must not substitute `verdict` for it**. No threshold is shipped, because shipping one is what was retracted twice.
+
+  * **Two of my own errors inside this change, both caught by a test that could actually fail.** (1) `_rate_session()` builds a session with `__new__`, so the new `_audio_rate_ok` was simply absent and the `AttributeError` surfaced inside the live audio path — the fix is a **class-level default**, not a helper edit, because several helpers build sessions by hand and the file has been bitten by this shape before. (2) `_set_rate()` rewinds `_rate_start` to 1.0, so patching the clock to `now + 20` widens the window to 60 s and a 0.90 window reports **60%**; that made my own regression test fail, and had made the escalation test **pass on the wrong branch**. Both are the same species as the rest of this file: an assertion that agrees with the answer rather than with the code path.
+
+- **`DRY_RUN` MUST BE SILENT ABOUT NOTHING, OR IT VERIFIES NOTHING.** It logged `would: docker restart` and `would: re-register`, but the two steps that touch the **physical camera** — restart `majestic` and reboot — were called through `[ "$DRY_RUN" = "1" ] ||` and logged nothing. So the single capability worth proving (restarting `majestic` on a room that had just been granted its SSH key) left no evidence in the dry run. Both now go through `act()`. Verified: the full four-step ladder prints, the container's `StartedAt` does not move, and both cameras' uptimes keep climbing (132 and 42 min) instead of resetting — which is the only proof that a reboot did not happen.
 
 ## REST API
 

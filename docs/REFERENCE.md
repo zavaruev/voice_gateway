@@ -326,6 +326,15 @@ CI (`.github/workflows/tests.yml`) runs this exact recipe inside the built image
 
 ## Changelog
 
+- **2.46** — "Not starving" and "well" are now two numbers. A room delivering 2% of real time had been announcing itself as recovered at 70%.
+  - **`_audio_rate_ok` (0.8) is the bar a heal must clear to be believed; `_min_audio_rate` (0.5) stays the starve floor.** The band between them logs `⚠ AUDIO DEGRADED`, keeps the starve counter running and still attempts a heal — so the escalation that names `/etc/init.d/S95majestic restart` becomes reachable, which it was not.
+  - **Why:** `entrance1`, 19.10.2026 08:33-08:47, looped `AUDIO STARVED: 1%` → `recovered: 70%` → `STARVED: 10%` → `recovered: 50%` → `STARVED: 45%`. Each recovery reset the counter, so the budget never ran out.
+  - **0.8 is derived, and a test carries the measurements.** Healthy capture `1.08 ×3`; broken `0.71/0.48/0.30`, `0.55/0.41/0.29`, `0.027/0.0016/0.0013`. The separating bar can sit anywhere in 0.71..1.01.
+  - **ICMP loss understates the damage badly** — livingroom 0%, corridor 5.8%, kitchen 17%, entrance1 59.6%, against capture at 100%/50%/40%/**0.1-2.7%**. The router and go2rtc host from the same host are at 0%. Reachability is not the signal that carries the audio.
+  - **Class-level defaults** for the new attributes, because several test helpers build a session with `__new__` and an instance-only attribute surfaces as an `AttributeError` inside the live audio path.
+  - **The STT threshold stays uninstalled, now with the reason measured rather than suspected.** Over 48 samples the classes do not separate on buffer peak (40 of 40 transcripts inside the empty range) or on frame fraction (transcripts 0.000..0.703, empties 0.000..0.300), because the criterion is **Whisper's outcome**: «какаякакаякакая» at `raw_rms=1090` is labelled a transcript, and three buffers at `rms` 7483-10264 are labelled empty. The manifest now carries a human `"label"` field and says in place that a threshold must not substitute `verdict` for it.
+  - Suite 650 -> 657. Still failing and unrelated: `test_wake_ring_buffer.py::test_ring_buffer_scores_identically` in a full run only, verified on the pre-change tree too.
+
 - **2.45** — The microphone mute was sized to the HTTP round trip, not to the sound. A 0.4 s beep cost the room 3.7 s of hearing.
   - **`_arm_playback_timing(sent_at, duration, audible=True)` is now the only place that writes `_tts_play_end` or a playback mute**, across the attention pip, the activation cue and the reply path.
   - **The 07.10.2026 timing fix had missed this field and both cue paths.** It moved `_speaking_until`, `GLOBAL_TTS_UNTIL` and `_wake_suppress_until` onto `sent_at` — in the reply path only. Four more inline copies still read `time.time()` after the response, which is indistinguishable while `/play_audio` answers in 0.08 s and is 2.47 s of deaf room now.

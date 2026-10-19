@@ -328,7 +328,34 @@ async def _tie_light_automation(
             continue
         attrs = s.get("attributes") or {}
         name = str(attrs.get("friendly_name") or "")
-        if "off" not in name.lower():
+        # Direction-aware, and this is the whole fix.
+        #
+        # The rule is: DISARM the automation that would UNDO the command the user
+        # just gave, and leave armed the one that agrees with it. «включи свет»
+        # wants the motion sensor's "light on" automation live and its "light
+        # off" one disarmed; «выключи свет» is the mirror.
+        #
+        # The first version filtered on `"off" in name` and used
+        # `want_enabled = not want_on`, so it only ever considered the OFF-named
+        # automations. Measured 19.10.2026 10:32, `camera-corridor1`, after a
+        # manual «выключи»:
+        #
+        #     10:32:31  automations ENABLED for manual control  (the two OFF ones)
+        #     10:45:48  corridor1 -> off        (the command, delivered)
+        #     10:46:23  corridor1 -> on         <- 35 s later, by the sensor
+        #     10:47:44  corridor1 -> off
+        #     10:46:23  corridor1 -> on
+        #     10:48:22  corridor1 -> off
+        #
+        # The command worked and the light still came back, every 40-80 s. The
+        # automations that turn it ON are `automation.corridor1_light_on` and
+        # `automation.corridor2_light_on`, both still armed — and the old code
+        # could not have found them, because it required the word "off".
+        #
+        # Whole-word matching, not substring: "on" is inside "motion", "corridor"
+        # and "button", and this house has 14 automations.
+        opposing = re.compile(r"\boff\b" if want_on else r"\bon\b", re.IGNORECASE)
+        if not opposing.search(name):
             continue
         token_in_name = [t for t in tokens if t in name.lower()]
         if not token_in_name:
@@ -356,11 +383,19 @@ async def _tie_light_automation(
             )
             continue
         seen_off.append(name)
-        # Desired automation state is the INVERSE of the light's: a lamp switched
-        # on by hand has its sensor disarmed. The first version compared the
-        # current state to the LIGHT's state and so skipped precisely the case it
-        # existed for — the armed automation on an already-lit lamp.
-        want_enabled = not want_on
+        # Every automation that reached this line is, by construction, one that
+        # would UNDO the user's command — `opposing` selected nothing else. So
+        # the wanted state is the same in both directions: DISARM IT.
+        #
+        # Nothing here re-arms anything, and that is the correct shape rather than
+        # a missing half. The automation that AGREES with the lamp is simply
+        # never selected: «включи свет» leaves the motion-ON sensor armed and
+        # disarms the motion-OFF one, «выключи свет» is the mirror. That is the
+        # behaviour asked for on 14.10.2026, and it needed no "re-arm" branch —
+        # the first version invented one, `want_enabled = not want_on`, and it
+        # enabled exactly the automations that switch the lamp back to the state
+        # the user just took it out of.
+        want_enabled = False
         enabled = str(s.get("state", "")).lower() == "on"
         if enabled == want_enabled:
             continue  # already in the state we are asking for
@@ -384,7 +419,7 @@ async def _tie_light_automation(
         # how the `area_id` bug above survived a live test.
         logger.info(
             "light automation tie: подходящих автоматик нет или они уже в нужном "
-            "состоянии (токены=%s, комнаты=%s, найдено OFF-имён=%s)",
+            "состоянии (токены=%s, комнаты=%s, найдено=%s)",
             sorted(tokens), sorted(wanted_areas), seen_off or "—",
         )
     return touched
@@ -1159,8 +1194,33 @@ async def confirm_on_off_one_read(
         ent = by_id.get(eid)
         if not ent:
             continue              # not in the registry: nothing to have moved
-        if str(ent.get("state", "")).lower() == target:
-            unproven.append(eid)
+        # **No power sensor, and this is the whole point of this function.**
+        #
+        # There is no instrument behind this entity, so a read that does not
+        # show the target is NOT an observation of failure — it is the absence
+        # of one. Measured twice on the living-room relay, 11.10.2026: sent
+        # 18:38:27.968, physically `on` at 18:41:23; sent 18:38:46.345,
+        # physically `off` at 18:41:42. The relay sat at its old value for the
+        # whole three minutes and only read the new one when it physically
+        # acted — so for these lamps `state` is truthful but LATE, and HA is
+        # not writing anything on our behalf either.
+        #
+        # The first version only called an un-reached sensorless entity
+        # `unproven` when the state happened to already equal the target, and
+        # let it fall through to `unmoved` otherwise — which is what produced
+        # the complaint report on 19.10.2026, corridor, 10:32:
+        #
+        #     verify settled want=off moved=[] unmoved=['switch.corridor1_light_switch_relay']
+        #     speaking: 'Не получилось: устройство не переключилось.'
+        #
+        # Both relays were `off` within three minutes (`last_changed` 10:35:54
+        # and 10:35:49 against a 10:32:31 call). The room contradicted the
+        # switch, in front of the user, about a command that had worked.
+        #
+        # `_on_off_verdict` already answers `""` for an all-unproven read — the
+        # comment there records the same three-minute measurement. The verdict
+        # was never the bug; the classification above it was.
+        unproven.append(eid)
     return reached, (unproven or None)
 
 

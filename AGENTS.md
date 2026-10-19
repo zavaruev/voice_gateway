@@ -1847,6 +1847,26 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
 
   * **The same night proved v2.45:** pip `0.40s audio in 0.55s (x1.4)` on a camera that managed ×6.4 earlier the same day, and `dur=2480ms via pause` where the cap is 7040 ms. The mute is sized to the beep again.
 
+- **THE CORRIDOR LIGHT DID NOT STAY OFF, AND THE ROOM SAID IT FAILED WHEN IT DID NOT. Measured 19.10.2026 10:32-10:48, `camera-corridor1`. Two separate defects, and the second one is the older mistake in this file repeating.**
+
+  ```
+  10:32:31  HassTurnOff свет: 2 target(s) corridor1=on, corridor2=on
+  10:32:33  speaking: 'Выключила.'   +   'Не получилось: устройство не переключилось.'
+  10:35:49  corridor2 -> off        <- 3 min 18 s later: it worked
+  10:35:54  corridor1 -> off
+  10:45:48  corridor1 -> off
+  10:46:23  corridor1 -> on         <- 35 s later, by the motion sensor
+  10:47:44  corridor1 -> off
+  10:47:49  corridor1 -> on
+  10:48:22  corridor1 -> off
+  ```
+
+  * **«ВЫКЛЮЧИ» БЫЛО ОТМЕНЕНО ЧЕРЕЗ 35 СЕКУНД.** `_tie_light_automation` отбирал автоматики по `"off" in name` и ставил `want_enabled = not want_on`. На «выключи» это **включало** OFF-автоматики, а `automation.corridor1_light_on` и `corridor2_light_on` — те, что возвращают свет, — он в принципе не мог увидеть, потому что требовал слово «off». Правило теперь: **глушить то, что ОТМЕНЯЕТ команду пользователя**. Совпадение по целому слову ON/OFF, не подстрокой: `"on"` есть внутри `motion`, `corridor`, `button`, а автоматик в доме 14. Всё, что дошло до вызова, глушится; согласующаяся автоматика просто не отбирается, поэтому ветки «взвести обратно» не нужно и её нет.
+
+  * **РЕЛЕ БЕЗ ДАТЧИКА ПИТАНИЯ, ЧИТАЮЩЕЕ СТАРОЕ ЗНАЧЕНИЕ, СЧИТАЛОСЬ ОТКАЗОМ.** `confirm_on_off_one_read` помечал `unproven` только когда состояние УЖЕ равнялось цели, иначе сущность проваливалась в `unmoved`. Замерино на том же реле 11.10.2026: команда в 18:38:27.968, физически `on` в **18:41:23**; команда в 18:38:46.345, физически `off` в **18:41:42**. Реле три минуты показывало старое значение и читало новое только когда физически сработало — то есть для этих ламп `state` правдив, но **опоздал**. Нет датчика — нет прибора, и чтение «не цель» это **отсутствие** наблюдения, а не наблюдение об отказе. `_on_off_verdict` на такой случай всегда отвечал `""` — вердикт никогда не был багом, багом была классификация над ним.
+
+  * **Я СНАЧАЛА ПОПЫТАЛСЯ ПРИБОРА ИЗ РЕГИСТРАТОРА, И УБРАЛ ЕГО.** Регистратор HA не содержит оптимистичной записи, и сравнение дало бы другой класс. **Полевое НЕ покрывает**: на 2.5 с HA ещё ничего не записала, регистратор и состояние совпадали, проверка решила **ничего**, заплатив сетевым вызовом на каждое чтение. Прибор, который не решает случай, ради которого написан, — ровно та ошибка, которую этот файл документирует.
+
 - **`DRY_RUN` MUST BE SILENT ABOUT NOTHING, OR IT VERIFIES NOTHING.** It logged `would: docker restart` and `would: re-register`, but the two steps that touch the **physical camera** — restart `majestic` and reboot — were called through `[ "$DRY_RUN" = "1" ] ||` and logged nothing. So the single capability worth proving (restarting `majestic` on a room that had just been granted its SSH key) left no evidence in the dry run. Both now go through `act()`. Verified: the full four-step ladder prints, the container's `StartedAt` does not move, and both cameras' uptimes keep climbing (132 and 42 min) instead of resetting — which is the only proof that a reboot did not happen.
 
 ## REST API

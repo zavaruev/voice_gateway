@@ -2530,8 +2530,13 @@ def test_colour_is_a_device_only_inside_the_light_state_construction():
 #
 # Reported 14.10.2026: the corridor lamp is driven by a motion sensor, and someone
 # working at a desk does not move enough, so the sensor decides the room is empty
-# and switches the light off. «включи свет» must disarm that automation and
-# «выключи свет» must re-arm it.
+# and switches the light off. «включи свет» must disarm that automation.
+#
+# The second half of that sentence — «выключи свет» must re-arm it — was wrong
+# from the day it was written, and cost the lamp coming back every 40-80 s until
+# 19.10.2026. The rule is not "re-arm the sensor", it is "disarm whatever would
+# UNDO the command". See
+# test_turning_the_light_off_disarms_the_automation_that_would_turn_it_back_on.
 
 def _automation_ha(relay_state="off", auto_state="on"):
     """A HA stub carrying one relay and the two automations beside it."""
@@ -2593,27 +2598,136 @@ def test_turning_the_light_on_disarms_its_motion_automation():
         "be disarmed"
     )
     assert not any("corridor1_light_on" in e for _, _, e in ha.services), (
-        "the ON automation does nothing harmful and must be left alone"
+        "the motion-ON automation AGREES with a lamp the user just switched on, "
+        "so it must be left armed and untouched"
     )
     assert not any("entrance" in e for _, _, e in ha.services), (
         "another room's automation must not be touched by a corridor command"
     )
 
 
-def test_turning_the_light_off_rearms_the_automation():
+def test_a_sensorless_relay_that_still_reads_the_old_value_is_never_a_failure():
+    """The false «Не получилось», measured 19.10.2026 10:32 on the corridor:
+
+        verify settled want=off moved=[] unmoved=['switch.corridor1_light_switch_relay']
+        speaking: 'Не получилось: устройство не переключилось.'
+
+    and both relays were `off` three minutes later, `last_changed` 10:35:54 and
+    10:35:49 against a 10:32:31 call. The room contradicted the switch, in front
+    of the user, about a command that had worked.
+
+    The first version let a sensorless entity fall through to `unmoved` unless
+    the state happened to already equal the target. `_on_off_verdict` has always
+    answered `""` for an all-unproven read — the verdict was never the bug, the
+    classification above it was.
+    """
+    import asyncio
+
+    mod = _router_app()
+
+    class _HA:
+        async def get_states(self, force=False):
+            return [{
+                "entity_id": "switch.corridor1_light_switch_relay",
+                "state": "on", "attributes": {},
+            }]
+
+        async def call_service(self, *a, **k):
+            return {"ok": True, "changed": [], "error": ""}
+
+    mod.ha = _HA()
+    moved, unproven = asyncio.run(
+        mod.confirm_on_off_one_read(
+            ["switch.corridor1_light_switch_relay"], "off", delay=0.0
+        )
+    )
+    assert moved == []
+    assert unproven == ["switch.corridor1_light_switch_relay"], (
+        "no power sensor means there is no instrument behind this entity, and a "
+        "read that does not show the target is the ABSENCE of an observation, "
+        "not an observation of failure — measured 2:55 and 2:56 on this relay"
+    )
+    # And that is what makes the room say nothing at all rather than complain.
+    assert mod._on_off_verdict(moved, [], unproven) == ""
+
+
+def test_a_power_sensor_that_contradicts_the_target_is_not_unproven():
+    """The opposite direction, and the one that must not be softened.
+
+    Where a sensor EXISTS and disagrees, something was observed. That is the
+    only shape in which a refusal is supportable, and it must stay distinct
+    from the sensorless case above.
+    """
+    import asyncio
+
+    mod = _router_app()
+
+    class _HA:
+        async def get_states(self, force=False):
+            return [
+                {"entity_id": "switch.corridor1_light_switch_relay",
+                 "state": "off", "attributes": {}},
+                {"entity_id": "sensor.corridor1_power",
+                 "state": "0", "attributes": {"device_class": "power",
+                                               "unit_of_measurement": "W"}},
+            ]
+
+        async def call_service(self, *a, **k):
+            return {"ok": True, "changed": [], "error": ""}
+
+    mod.ha = _HA()
+    moved, unproven = asyncio.run(
+        mod.confirm_on_off_one_read(
+            ["switch.corridor1_light_switch_relay"], "on", delay=0.0
+        )
+    )
+    assert moved == [], "1072 W is not agreement with an `on` target"
+    assert unproven is not None, (
+        "a sensor that has not started drawing is still 'not yet observed' — "
+        "the 2 min 56 s lag means it cannot be called a failure either"
+    )
+
+
+def test_turning_the_light_off_disarms_the_automation_that_would_turn_it_back_on():
+    """The mirror of the ON case, and the one that was actually broken.
+
+    Measured 19.10.2026 10:32, `camera-corridor1`, after a manual «выключи»
+    whose light command succeeded and whose answer was «Не получилось»:
+
+        10:32:31  automations ENABLED for manual control (the two OFF ones)
+        10:45:48  corridor1 -> off      (the command, delivered)
+        10:46:23  corridor1 -> on       <- 35 s later, by the sensor
+        10:47:44  corridor1 -> off
+        10:47:49  corridor1 -> on
+        10:48:22  corridor1 -> off
+
+    The command worked and the light came back every 40-80 s. The automations
+    that turn it ON are `automation.corridor1_light_on` and
+    `automation.corridor2_light_on`, and the old code could not have found them
+    at all: it required the word "off" in the name and set
+    `want_enabled = not want_on`, so on «выключи» it ENABLED the OFF automations
+    and left the ON ones armed.
+    """
     import asyncio
 
     mod = _router_app()
     mod.LIGHT_AUTOMATION_ROOMS = ("corridor",)
-    ha = _automation_ha(auto_state="off")
+    ha = _automation_ha(auto_state="on")
     mod.ha = ha
     asyncio.run(
         mod._tie_light_automation(
             ha.areas, ["switch.corridor1_light_switch_relay"], False
         )
     )
-    assert ("automation", "turn_on", "automation.corridor2_light_off_2") in ha.services, (
-        "handing the lamp back means re-arming the sensor"
+    assert ("automation", "turn_off", "automation.corridor1_light_on") in ha.services, (
+        "the sensor that turns this lamp back ON must be disarmed, or the "
+        "user's «выключи» is undone within the minute"
+    )
+    assert not any(
+        ("automation", "turn_on", e) in ha.services for _, _, e in ha.services
+    ), (
+        "«выключи» must not ENABLE anything: the automation that agrees with "
+        "the lamp is simply left alone, never re-armed"
     )
 
 

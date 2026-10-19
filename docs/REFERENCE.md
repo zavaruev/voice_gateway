@@ -326,6 +326,32 @@ CI (`.github/workflows/tests.yml`) runs this exact recipe inside the built image
 
 ## Changelog
 
+- **2.48** — The corridor light stayed off for 40 seconds, and the room said «Не получилось» about a command that worked. Two independent defects, both measured.
+  - **A manual «выключи свет» was undone by the motion sensor within the minute.** The relay history, one hour, no intervention:
+
+    ```
+    10:45:48  corridor1 -> off        (the command, delivered)
+    10:46:23  corridor1 -> on         <- 35 s later, by the sensor
+    10:47:44  corridor1 -> off
+    10:47:49  corridor1 -> on
+    10:48:22  corridor1 -> off
+    ```
+
+    `_tie_light_automation` filtered automations on `"off" in name` and set `want_enabled = not want_on`, so on «выключи» it **enabled** the OFF automations and never even looked at `automation.corridor1_light_on` / `corridor2_light_on`, which are what turn the lamp back on. The rule is now "disarm whatever would UNDO the command" — direction-aware whole-word match on ON/OFF (`"on"` is inside `motion`, `corridor`, `button`, and the house has 14 automations), and every automation that reaches the call is disarmed. The agreeing one is simply never selected, so no re-arm branch is needed and none exists.
+
+  - **A sensorless relay that still read its old value was reported as a failure.** `confirm_on_off_one_read` called an entity `unproven` only when the state already equalled the target, and let it fall through to `unmoved` otherwise:
+
+    ```
+    verify settled want=off moved=[] unmoved=['switch.corridor1_light_switch_relay']
+    speaking: 'Не получилось: устройство не переключилось.'
+    ```
+
+    Both relays were `off` three minutes later (`last_changed` 10:35:54 and 10:35:49 against a 10:32:31 call). With no power sensor there is no instrument, so an un-reached read is the **absence** of an observation, not an observation of failure. `_on_off_verdict` has always answered `""` for an all-unproven read — the verdict was never the bug, the classification above it was.
+
+  - **I tried a recorder-based discriminator first and removed it.** HA's recorder does not contain the optimistic write, so comparing `/api/states` against it would have caught a different class. It does **not** catch the field case: at 2.5 s HA had not written anything yet, so recorder and state agreed and the check decided nothing while adding a network call per read. Shipping an instrument that cannot decide the case it was written for is the failure this project keeps being corrected for.
+
+  - Six new tests. Three fail on the pre-fix tree: the automation direction, the sensorless old-value read (including that the room then says nothing at all), and the power-sensor case that must **not** be softened into `unproven`.
+
 - **2.47** — «выключи» in the corridor now turns off the corridor lights. It used to cost fifty seconds and move nothing.
   - **The chain, 19.10.2026 10:17, all of it clean except one branch:**
 

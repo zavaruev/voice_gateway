@@ -326,6 +326,31 @@ CI (`.github/workflows/tests.yml`) runs this exact recipe inside the built image
 
 ## Changelog
 
+- **2.47** — «выключи» in the corridor now turns off the corridor lights. It used to cost fifty seconds and move nothing.
+  - **The chain, 19.10.2026 10:17, all of it clean except one branch:**
+
+    ```
+    10:17:34  VOSK WAKE trig='компьютер' window=25397/3000
+    10:17:35  arbiter[wake]: corridor (22,0) vs entrance1 (11,0) -> corridor
+    10:17:35  play_audio 0.40s audio in 0.55s (x1.4)
+    10:17:37  VAD UTTERANCE END dur=2480ms via pause
+    10:17:37  Whisper OK: 'выключи'
+    10:17:38  route=easy_action conf=0.97
+    10:17:38  resolver ambiguous -> complex_logic: 'выключи'
+    ```
+
+    The audio path took 2.9 s from wake to transcript and was not the problem. `resolve_action` needs a device noun, «выключи» has none, and the turn escalated.
+
+  - **The escalation was worse than slow.** L2 received a bare verb with a known room, spent nine steps and ~45k tokens, and finished on `ha_read(query="media_player", area="владиная комната")` — an unrelated room and an unrelated device class, having touched no light.
+
+  - **`_handle` now falls back to the room's lights, LAST, after two things it must not skip:** the follow-up borrow (so «а теперь выключи» still borrows «кофеварку» from the last turn) and `unresolved_hint` (non-empty exactly when the sentence names a device the resolver only has a near-miss spelling for). Both empty means the sentence named nothing at all.
+
+  - **I first put this in `resolve_action` and reverted it, and the reason is the useful part.** Inside the resolver the fallback fires before anything can tell an unknown DEVICE WORD from a sentence with no word at all — and «Выключи кашеварку», the field case from 28.09.2026, does not match `_DEVICE_NOUN`. It looked exactly like «выключи», and the fallback **turned a coffee maker into a light**. Two existing tests caught it; `test_a_bare_verb_still_refuses_in_the_resolver_and_that_is_correct` now guards the revert.
+
+  - **Scoped to lights, area always pinned.** `find_action_targets('свет', 'Kitchen')` is 0 targets against Corridor 4, Entrance 2, Living Room 2 — so a room with no lights produces no targets and the ghost-device protection refuses the turn rather than substituting something.
+
+  - Three tests: the resolver-still-refuses guard, an order assertion on `_handle` that fails on the pre-fix tree, and the unchanged-negotiation cases.
+
 - **2.46** — "Not starving" and "well" are now two numbers. A room delivering 2% of real time had been announcing itself as recovered at 70%.
   - **`_audio_rate_ok` (0.8) is the bar a heal must clear to be believed; `_min_audio_rate` (0.5) stays the starve floor.** The band between them logs `⚠ AUDIO DEGRADED`, keeps the starve counter running and still attempts a heal — so the escalation that names `/etc/init.d/S95majestic restart` becomes reachable, which it was not.
   - **Why:** `entrance1`, 19.10.2026 08:33-08:47, looped `AUDIO STARVED: 1%` → `recovered: 70%` → `STARVED: 10%` → `recovered: 50%` → `STARVED: 45%`. Each recovery reset the counter, so the budget never ran out.

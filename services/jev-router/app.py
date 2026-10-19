@@ -1369,6 +1369,52 @@ async def _handle(req: RouteRequest):
                     )
                     text, call = borrowed, retry
         if call is None:
+            # LAST RESORT, and it lives HERE rather than inside `resolve_action`
+            # for a reason that cost a regression test to find: inside the
+            # resolver this fires before anything can tell an unknown DEVICE WORD
+            # from a sentence with no word at all, and «Выключи кашеварку» —
+            # the field case from 28.09.2026 — does not match `_DEVICE_NOUN`, so
+            # it looked exactly like «выключи» and the fallback turned a coffee
+            # maker into a light.
+            #
+            # Here, both of those have already been tried and failed:
+            #   * the borrow above, which is what a follow-up needs, so
+            #     «а теперь выключи» still borrows «кофеварку» from the last turn
+            #     and never reaches this line;
+            #   * `unresolved_hint`, non-empty precisely when the sentence DOES
+            #     name a device the resolver only has a near-miss spelling for.
+            #
+            # Both empty means the sentence named nothing at all. Measured
+            # 19.10.2026 10:17, corridor camera:
+            #
+            #     10:17:37  Whisper OK: 'выключи'
+            #     10:17:38  route=easy_action conf=0.97
+            #     10:17:38  resolver ambiguous -> complex_logic: 'выключи'
+            #
+            # The audio path was clean — pip 0.55 s, utterance ended in 2.48 s via
+            # `pause` — and the turn died here anyway. The escalation was worse
+            # than slow: L2 spent nine steps and ~45k tokens on a bare verb and
+            # ended reading `media_player` in an unrelated room («владиная
+            # комната»), having touched no light. Fifty seconds of monologue and
+            # no switch.
+            #
+            # Scoped to lights, and the area is always pinned: a room with no
+            # lights produces no targets downstream and the ghost-device
+            # protection refuses the turn rather than substituting something.
+            # Measured the same day: `find_action_targets('свет', 'Kitchen')` is
+            # 0 targets, against Corridor 4, Entrance 2, Living Room 2 — so the
+            # kitchen keeps escalating and never guesses the coffee maker.
+            near = unresolved_hint(text)
+            if not hint and not near and area_hint:
+                lit = resolve_action(f"{text} свет", area_hint)
+                if lit is not None:
+                    logger.info(
+                        "resolver last resort: no device named, room known -> "
+                        "%s: %r -> %s %s",
+                        req.stream_name, text[:60], lit.tool, lit.args,
+                    )
+                    text, call = f"{text} свет", lit
+        if call is None:
             logger.info("resolver ambiguous -> complex_logic: %r", text[:80])
             route, reason = "complex_logic", "resolver_ambiguous"
             ctx = unresolved_hint(text)  # «кашеварку» -> «кофеварка», or ""

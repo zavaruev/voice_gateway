@@ -1824,6 +1824,29 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
 
   * **Two of my own errors inside this change, both caught by a test that could actually fail.** (1) `_rate_session()` builds a session with `__new__`, so the new `_audio_rate_ok` was simply absent and the `AttributeError` surfaced inside the live audio path — the fix is a **class-level default**, not a helper edit, because several helpers build sessions by hand and the file has been bitten by this shape before. (2) `_set_rate()` rewinds `_rate_start` to 1.0, so patching the clock to `now + 20` widens the window to 60 s and a 0.90 window reports **60%**; that made my own regression test fail, and had made the escalation test **pass on the wrong branch**. Both are the same species as the rest of this file: an assertion that agrees with the answer rather than with the code path.
 
+- **A BARE VERB WITH A KNOWN ROOM WAS ESCALATED, AND THE ESCALATION WAS WORSE THAN SLOW. Measured 19.10.2026 10:17, `camera-corridor1`.** The user said «выключи» and nothing moved:
+
+  ```
+  10:17:37.932  ✅ Whisper OK: 'выключи'
+  10:17:38.574 router route=easy_action conf=0.97 reason=- text='выключи'
+  10:17:38.575  🔀 [Cascade] route=complex_logic conf=0.969 reason=resolver_ambiguous
+  ```
+
+  **The audio path was clean and 2.9 s end to end** — pip 0.55 s (v2.45 working exactly as designed), utterance ended in 2.48 s via `pause`, one transcript, no retry. The turn died on one branch: `resolve_action` needs a device noun and «выключи» has none. Measured side by side, in the router container:
+
+  ```
+  'выключи'                  -> None (эскалация)
+  'выключи свет'             -> intent__HassTurnOff  {domain:['light'], area:'Corridor'}
+  ```
+
+  * **AND THE ESCALATION PRODUCED NOTHING.** L2 spent **nine steps and ~45 000 tokens** on a bare verb with a known room and ended on `ha_read(query="media_player", area="владиная комната")` — a different room and a different device class — having touched no light. The gateway played eight sentences over fifty seconds. The user heard a monologue and the switch stayed on. **A turn that escalates to nothing is worse than one that refuses.**
+
+  * **THE FIX BELONGS IN `_handle`, NOT IN `resolve_action`, AND I GOT THAT WRONG FIRST.** Put in the resolver, the fallback fires before anything can distinguish an unknown DEVICE WORD from a sentence with no word at all — and «Выключи кашеварку» (field case 28.09.2026) does not match `_DEVICE_NOUN`. It looked exactly like «выключи», and the fallback **turned a coffee maker into a light**. Two existing tests caught it. It now sits in `_handle`, after the follow-up borrow and after `unresolved_hint`, and both must be empty: a follow-up still borrows «кофеварку» from the last turn, and a sentence with a near-miss device word still escalates with its hint.
+
+  * **SCOPED TO LIGHTS AND THE AREA IS ALWAYS PINNED.** `find_action_targets('свет', area)`: Corridor **4** (two relays plus two network-LED facets), Entrance 2, Living Room 2, **Kitchen 0**. So the kitchen keeps escalating and never guesses the coffee maker — measured, not assumed.
+
+  * **The same night proved v2.45:** pip `0.40s audio in 0.55s (x1.4)` on a camera that managed ×6.4 earlier the same day, and `dur=2480ms via pause` where the cap is 7040 ms. The mute is sized to the beep again.
+
 - **`DRY_RUN` MUST BE SILENT ABOUT NOTHING, OR IT VERIFIES NOTHING.** It logged `would: docker restart` and `would: re-register`, but the two steps that touch the **physical camera** — restart `majestic` and reboot — were called through `[ "$DRY_RUN" = "1" ] ||` and logged nothing. So the single capability worth proving (restarting `majestic` on a room that had just been granted its SSH key) left no evidence in the dry run. Both now go through `act()`. Verified: the full four-step ladder prints, the container's `StartedAt` does not move, and both cameras' uptimes keep climbing (132 and 42 min) instead of resetting — which is the only proof that a reboot did not happen.
 
 ## REST API

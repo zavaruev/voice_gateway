@@ -6,6 +6,7 @@ because the host has no fastapi — app.py is never imported here.
 """
 
 import contextlib
+import inspect
 import os
 import sys
 
@@ -2656,6 +2657,62 @@ def test_an_automation_already_in_the_wanted_state_is_left_alone():
 # a room that was added without it.
 
 LIVE_CAMERA_STREAMS = ("livingroom", "kitchen", "entrance1", "camera-corridor1")
+
+
+def test_a_bare_verb_still_refuses_in_the_resolver_and_that_is_correct():
+    """`resolve_action` must keep returning None for «выключи».
+
+    The fix for the 19.10.2026 field case lives in `_handle`, NOT here, and
+    putting it here was tried and reverted: inside the resolver the fallback
+    fires before anything can tell an unknown DEVICE WORD from a sentence with
+    no word at all, and «Выключи кашеварку» — the field case from 28.09.2026 —
+    does not match `_DEVICE_NOUN`. It looked exactly like «выключи», and the
+    fallback turned a coffee maker into a light.
+
+    So this test is the regression guard for that revert: if someone puts the
+    light fallback back inside `resolve_action`, this fails before the
+    kitchen does.
+    """
+    assert resolve_action("выключи", "camera-corridor1") is None
+    assert resolve_action("Выключи кашеварку.", "kitchen") is None
+    assert resolve_action("а теперь выключи", "livingroom") is None
+
+
+def test_the_bare_verb_fallback_is_the_last_thing_handle_tries():
+    """`_handle` must reach for the room's lights only AFTER both of these
+    have failed, and never when either says the sentence DID name something:
+
+        10:17:37  Whisper OK: 'выключи'
+        10:17:38  route=easy_action conf=0.97
+        10:17:38  resolver ambiguous -> complex_logic: 'выключи'
+
+    The audio path was clean — pip 0.55 s, utterance ended in 2.48 s via
+    `pause` — and the turn still died there. The escalation was worse than
+    slow: L2 spent nine steps and ~45k tokens on a bare verb and ended reading
+    `media_player` in an unrelated room («владиная комната»), touching no
+    light. Fifty seconds of monologue and no switch.
+    """
+    import app as jev_router_app
+
+    src = inspect.getsource(jev_router_app._handle)
+    borrow = src.find("borrowed = ")
+    near = src.find("near = unresolved_hint(text)")
+    lit = src.find('resolve_action(f"{text} свет"')
+    assert borrow and near and lit, (
+        "the borrow, the near-miss check and the light fallback must all be "
+        f"present: borrow={borrow} near={near} light={lit}"
+    )
+    assert borrow < near < lit, (
+        "order matters and is the whole guard: a follow-up must BORROW first "
+        f"({borrow}), an unknown device word must be NAMED first ({near}), and "
+        f"only a sentence that named nothing may reach the lights ({lit})"
+    )
+    # And both must be required, not merely present.
+    tail = src[near:lit]
+    assert "if not hint and not near and area_hint:" in tail, (
+        "the fallback must be gated on all three: no borrowed device, no "
+        "near-miss device word, and a known room"
+    )
 
 
 def test_every_live_camera_room_has_a_default_area():

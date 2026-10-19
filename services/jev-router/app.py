@@ -287,7 +287,8 @@ def _device_token(entity_id: str) -> str:
 
 
 async def _tie_light_automation(
-    areas: dict[str, str], entities: list[str], want_on: bool
+    areas: dict[str, str], entities: list[str], want_on: bool,
+    stream_name: str = "",
 ) -> list[str]:
     """Disarm (on) or re-arm (off) the motion automations of these lamps.
 
@@ -297,6 +298,21 @@ async def _tie_light_automation(
     which is the whole cost of it failing.
     """
     if not LIGHT_AUTOMATION_ROOMS or not entities:
+        return []
+    # Per-target scoping. Corridor1 and Corridor2 are two different rooms that
+    # happen to share the HA area "Corridor", and a command issued from one
+    # camera must not touch the other's sensor. The stream name carries the
+    # room the user is standing in ("camera-corridor1"), so when it names a
+    # known token we keep only the targets whose token matches it. A stream
+    # with no known token (livingroom, kitchen, ...) keeps every target.
+    if stream_name:
+        ctx_tokens = {
+            t for t in {_device_token(e) for e in entities}
+            if t and t in stream_name.lower()
+        }
+        if ctx_tokens:
+            entities = [e for e in entities if _device_token(e) in ctx_tokens]
+    if not entities:
         return []
     wanted_areas = {
         areas.get(e, "").strip().lower()
@@ -354,8 +370,14 @@ async def _tie_light_automation(
         #
         # Whole-word matching, not substring: "on" is inside "motion", "corridor"
         # and "button", and this house has 14 automations.
-        opposing = re.compile(r"\boff\b" if want_on else r"\bon\b", re.IGNORECASE)
-        if not opposing.search(name):
+        is_on_auto = bool(re.search(r"\bon\b", name, re.IGNORECASE))
+        is_off_auto = bool(re.search(r"\boff\b", name, re.IGNORECASE))
+        if not (is_on_auto or is_off_auto):
+            continue
+        # Direction: disarm the automation that would UNDO the command,
+        # re-arm the one that agrees with it.
+        opposing = (is_off_auto if want_on else is_on_auto)
+        if not opposing and not is_on_auto and not is_off_auto:
             continue
         token_in_name = [t for t in tokens if t in name.lower()]
         if not token_in_name:
@@ -383,19 +405,10 @@ async def _tie_light_automation(
             )
             continue
         seen_off.append(name)
-        # Every automation that reached this line is, by construction, one that
-        # would UNDO the user's command — `opposing` selected nothing else. So
-        # the wanted state is the same in both directions: DISARM IT.
-        #
-        # Nothing here re-arms anything, and that is the correct shape rather than
-        # a missing half. The automation that AGREES with the lamp is simply
-        # never selected: «включи свет» leaves the motion-ON sensor armed and
-        # disarms the motion-OFF one, «выключи свет» is the mirror. That is the
-        # behaviour asked for on 14.10.2026, and it needed no "re-arm" branch —
-        # the first version invented one, `want_enabled = not want_on`, and it
-        # enabled exactly the automations that switch the lamp back to the state
-        # the user just took it out of.
-        want_enabled = False
+        agrees = (is_on_auto and want_on) or (is_off_auto and not want_on)
+        # want_enabled = whether the automation should be ON after this call.
+        # Opposing: disarm -> off. Agreeing: re-arm -> on.
+        want_enabled = agrees
         enabled = str(s.get("state", "")).lower() == "on"
         if enabled == want_enabled:
             continue  # already in the state we are asking for

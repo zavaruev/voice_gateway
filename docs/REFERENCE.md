@@ -326,6 +326,15 @@ CI (`.github/workflows/tests.yml`) runs this exact recipe inside the built image
 
 ## Changelog
 
+- **2.45** — The microphone mute was sized to the HTTP round trip, not to the sound. A 0.4 s beep cost the room 3.7 s of hearing.
+  - **`_arm_playback_timing(sent_at, duration, audible=True)` is now the only place that writes `_tts_play_end` or a playback mute**, across the attention pip, the activation cue and the reply path.
+  - **The 07.10.2026 timing fix had missed this field and both cue paths.** It moved `_speaking_until`, `GLOBAL_TTS_UNTIL` and `_wake_suppress_until` onto `sent_at` — in the reply path only. Four more inline copies still read `time.time()` after the response, which is indistinguishable while `/play_audio` answers in 0.08 s and is 2.47 s of deaf room now.
+  - **`audible=False` when the POST failed and there is no backchannel: nothing sounded, so nothing is muted.** A timed-out POST used to mute the room for the whole timeout — measured `play_audio failed: TimeoutError()` at 08:10:13 on a reply that was never spoken.
+  - **A late return is no longer the blind window's job.** `_is_echo` runs on the mic feed and drops our own audio by cross-correlation; its horizon is `_ECHO_HORIZON_S` = 8 s past `_tts_play_end`, more than any measured POST latency. Shrinking the window hands the late return to the layer that can identify it instead of paying for it with the user's speech.
+  - **One deliberate exception, commented in place:** the WebRTC backchannel fallback still dates playback from the response, because that branch QUEUES onto a paced track rather than posting a body — measured 3-40 s late, which is why the horizon is 8 s wide. A source check asserts exactly one such write and that it lives in that branch.
+  - **Five tests; four fail on the pre-fix tree with the measured numbers** — 1.31 s of mute for a 0.4 s pip answered in 0.60 s, 0.7 s of mute for a cue that never played, playback end 1.10 s away for 0.5 s of audio answered in 0.60 s, and two response-clock writes. The fifth passes on both by design: it guards against over-correcting into a room that hears its own pip.
+  - Suite 645 -> 653. `tests/test_wake_ring_buffer.py::test_ring_buffer_scores_identically` fails in a full run and passes alone; **verified failing on the pre-fix tree too**, so it is pre-existing test isolation and not this change.
+
 - **2.44** — Gates are now counted, not just listed. `RUNS` matters more than `FIRES`.
   - **`gate_status.py` grew `RUNS/Nd`, `FIRES` and `RATE` columns**, aggregated from `logs/gates.jsonl` over a window (`--days`, default 7).
   - **The two numbers mean opposite things.** A gate that never fires because the tree is clean is working. A gate that never **runs** protects nothing while still sitting in the repository looking like protection — so `NORUN` exits non-zero.

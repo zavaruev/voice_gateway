@@ -1771,7 +1771,34 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
   60 s of kitchen background, 100 ms chunks: rms min 318 / median **389** / p90 439 / max 1498, chunk peak median 1282. Spectrum: **60.4 % of the energy is 20-200 Hz** — the permanent appliance hum the `ns_rms_gate` below exists to strip. **A room this size needs `audio.volume` at 100**; the living room's mic reads 50 as `rms 9`, which is silence.
   * **Do not touch `CAMERA_NS_RMS_GATE` on this evidence.** NS applies only while `rms_raw < ns_rms_gate`, and the gate is **400** in both rooms while the measured ambient is 389 (kitchen) and 416-424 (living room) — so on these numbers NS is effectively never applied in either room. That was not true before the volume change: at 30 % the kitchen's ambient was ~117, so a quiet utterance sat under 400 and did get NS. **The regime changed under the gate, not the gate's logic** — but the gate was set to protect a *distant* command, and whether one still arrives at that level is a question only a real kitchen utterance can answer. Watch `Whisper IN: … raw_rms=… ns=0|1` from the first real command and decide from that number, not from this paragraph.
   * `~/.ssh/voice_watchdog_ed25519` is now authorised on **192.168.22.232** as well, so `cam_ssh_ok` passes for the kitchen and the watchdog's camera-side steps (restart `majestic`, then reboot) are reachable there for the first time. `dropbear`'s `authorized_keys` is the file — the key was installed with paramiko over the password `root`/`2441`, since `sshpass` is not on this host.
-- **`DRY_RUN` MUST BE SILENT ABOUT NOTHING, OR IT VERIFIES NOTHING.** It logged `would: docker restart` and `would: re-register`, but the two steps that touch the **physical camera** — restart `majestic` and reboot — were called through `[ "$DRY_RUN" = "1" ] ||` and logged nothing. So the single capability worth proving (restarting `majestic` on a room that had just been granted its SSH key) left no evidence in the dry run. Both now go through `act()`. Verified: the full four-step ladder prints, the container's `StartedAt` does not move, and both cameras' uptimes keep climbing (132 and 42 min) instead of resetting — which is the only proof that a reboot did not happen.
+- **A 0.4-SECOND BEEP WAS MUTING THE ROOM FOR 3.7 SECONDS, AND THE MUTE WAS SIZED TO THE HTTP ROUND TRIP.** Measured 19.10.2026 on `entrance1`, after the user said it was bad in the kitchen and the entrance at once and not the corridor.
+
+  ```
+  08:09:41  VOSK WAKE trig='компьютер'
+  08:09:44  play_audio 0.40s audio in 2.47s (x6.2)
+  08:09:48  VAD UTTERANCE END dur=7040ms via cap 7s
+  08:09:49  Whisper OK: 'компьютер компьютер'
+  08:10:13  play_audio failed: TimeoutError()
+            /play_audio failed and no backchannel exists — the reply was NOT spoken
+  ```
+
+  * **The arithmetic comes from a dump that was already on disk.** `utterance_samples/` existed for exactly this and was not opened first: the wake turn's 7.04 s buffer, per second — `rms 1036` / `11172, 7675, 14694` / `1039, 1073` / `2587`. The wake was at 08:09:41, the buffer opened at 08:09:48, its first second is the room floor and the command is the loud part. The pip is 0.4 s; the mute ended at `41 + 2.47 + 0.4 + 0.3` = **08:09:47.7**, one frame before the utterance opened. `drop[muted=73]` that hour.
+
+  * **`_speaking_until` is checked in `_feed_audio` BEFORE `_is_echo`**, so that window is the only thing keeping our own audio out of the buffer — and the only thing that can discard the user's. Both cue paths computed it from `time.time()` taken AFTER the POST. The 07.10.2026 fix had already moved the reply path onto `sent_at`; **four more inline copies still read the response clock**, which is indistinguishable while `/play_audio` answers in 0.08 s and is 2.47 s of deaf room now. `_arm_playback_timing` is the one definition.
+
+  * **`audible=False` when the POST failed with no backchannel.** Nothing sounded, so nothing is muted — and this was the worse half: the mute was computed from `time.time()` twenty seconds after a timed-out POST, silencing the room for a sound that did not exist.
+
+  * **A late return is now `_is_echo`'s job, and that is not a hope.** The horizon it checks is `_ECHO_HORIZON_S` = 8 s past `_tts_play_end`, wider than any POST latency measured here. Shrinking the blind window hands the late return to the layer that can identify it instead of paying for it with the user's speech. The one exception is the WebRTC backchannel, which QUEUES onto a paced track rather than posting a body and returns 3–40 s late; it stays on the response clock and a source check asserts exactly one such write and that it lives in that branch.
+
+  * **MY OWN ERROR CAME FIRST, AND IT IS THE PART WORTH KEEPING.** I reported the kitchen as clean — median ×0.30, zero excursions — from a script that parsed `logs/gateway.log` with **no date filter**, so it averaged every day the file holds. Today the same command reads ×2.5…×8.2. **An aggregate over an undated window answers a different question and looks exactly like an answer.**
+
+  * **I blamed the overlap change I had shipped the previous day, and cleared it by measurement.** The attention pip is a fixed 0.40 s clip on the `wait=True` path, i.e. no overlap at all, and per-day medians from the rotated log show the kitchen at ×3.2 on 14.10 and ×5.1 on 16.10 — before the change. Overlap exonerated, not assumed.
+
+  * **ON THE SIGNAL I WAS PARTLY RIGHT FOR THE WRONG REASON, AND THE USER WAS RIGHT TO PUSH.** Router and go2rtc host from the same host: **0% loss**. Cameras: livingroom 0%, corridor 16%, kitchen 48%, entrance1 68% — and the losses arrive in **contiguous blocks** (entrance1 lost `Seq 27,28,30`, then `98…120` in a row), which is a device that stops answering, not a radio that fades. `iw` does not exist on these cameras and SSH is exactly what fails, so **radio-versus-box is still not separated.**
+
+  * **STILL OPEN AND NOT MINE:** `entrance1`'s audio feed to the gateway collapses from 08:15 — 18–19 `feed rms` lines a minute becomes 7, 2, 7, 1, 11, 8, with pauses up to **81 s**. That is a dying stream, not a slow one, and this change does not address it.
+
+  - **`DRY_RUN` MUST BE SILENT ABOUT NOTHING, OR IT VERIFIES NOTHING.** It logged `would: docker restart` and `would: re-register`, but the two steps that touch the **physical camera** — restart `majestic` and reboot — were called through `[ "$DRY_RUN" = "1" ] ||` and logged nothing. So the single capability worth proving (restarting `majestic` on a room that had just been granted its SSH key) left no evidence in the dry run. Both now go through `act()`. Verified: the full four-step ladder prints, the container's `StartedAt` does not move, and both cameras' uptimes keep climbing (132 and 42 min) instead of resetting — which is the only proof that a reboot did not happen.
 
 ## REST API
 

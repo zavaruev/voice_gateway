@@ -5081,6 +5081,63 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
             time.time() + duration + _SPEAKER_SETTLE_S,
         )
 
+    def _arm_playback_timing(
+        self, sent_at: float, duration: float, *, audible: bool = True
+    ) -> None:
+        """Describe WHEN OUR OWN AUDIO SOUNDS, from when it was SENT.
+
+        One definition for all three playback paths, for the reason
+        `_arm_tts_inflight` is one: the 07.10.2026 timing fix reached
+        `_speaking_until`, `GLOBAL_TTS_UNTIL` and `_wake_suppress_until` and
+        MISSED `_tts_play_end` and both cue paths, because there were four more
+        inline copies computing the same thing from a different clock.
+
+        What this fixes, measured 19.10.2026 on the entrance hall from
+        `utterance_samples/manifest.jsonl` and the log together:
+
+            08:09:41  VOSK WAKE trig='компьютер'
+            08:09:44  play_audio 0.40s audio in 2.47s (x6.2)     <- the pip
+            08:09:48  VAD UTTERANCE END dur=7040ms via cap 7s
+            08:09:49  Whisper OK: 'компьютер компьютер'
+
+        The pip is 0.4 s of audio. The response took 2.47 s. The cue computed
+        `_speaking_until` from `time.time()` AFTER the POST, so the microphone —
+        a hard `return` in `_feed_audio`, checked BEFORE `_is_echo` — was closed
+        for 3.7 s from the wake. The utterance opened at 08:09:48, one frame
+        after the mute expired, and its first second was the room floor
+        (rms 1036) before the user's speech arrived; Whisper had two copies of
+        the wake word and no command. `drop[muted=73]` on the room that hour.
+
+        **A cue whose upload takes 3 s of the room's hearing is not a cue, and
+        the cost is asymmetric.** Over-muting discards the user; under-muting
+        leaks a beep into the buffer. Both are real, so the error is not hidden
+        by making the window longer.
+
+        `audible=False` means nothing was played at all — the POST failed and
+        there is no backchannel. That case is not rare and it was the worse one:
+        `play_audio failed: TimeoutError()` on the same room at 08:10:13 meant
+        the cue still computed `time.time() + 0.7` from twenty seconds later, so
+        a reply that was never spoken muted the room for twenty seconds.
+
+        A late return is no longer this function's problem, and that is not a
+        guess. `_is_echo` runs on the mic feed and drops our own audio by
+        cross-correlation; the horizon it checks is `_ECHO_HORIZON_S` = 8 s past
+        `_tts_play_end`, which is more than any POST latency measured here
+        (2.47 s the slow end). Shrinking the blind window therefore hands the
+        late return to the layer that can identify it, instead of paying for it
+        with the user's speech.
+        """
+        end = sent_at + duration
+        # Always recorded, even when silent: `_is_echo` decides whether it may
+        # believe a correlation by how long ago playback ENDED, and a room that
+        # played nothing still needs that clock to say so.
+        self._tts_play_end = max(getattr(self, "_tts_play_end", 0.0), end)
+        if not audible:
+            return
+        stop = end + _SPEAKER_SETTLE_S
+        if stop > self._speaking_until:
+            self._speaking_until = stop
+
     async def _play_attention(self, reason: str = ""):
         now = time.time()
         if now - self._last_attention < _ATTENTION_MIN_GAP_S:
@@ -5125,10 +5182,17 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
             # BEFORE the POST: the camera can start sounding as soon as the body
             # starts arriving, which on a slow endpoint is seconds before the
             # response — measured 14.10.2026, 2.18 s for 0.4 s of audio.
-            self._arm_tts_inflight(time.time(), duration)
+            #
+            # `sent_at`, kept, because everything below describes the AUDIO from
+            # the moment it left. It used to be read again as `time.time()` after
+            # the response, and that one re-read cost the room 2.47 s of hearing
+            # on 19.10.2026 — see `_arm_playback_timing`.
+            sent_at = time.time()
+            self._arm_tts_inflight(sent_at, duration)
             if self._out_track:
                 self._out_track._last_play_duration = duration
-            if not await self._play_audio_http(pcm) and self._out_track:
+            played = await self._play_audio_http(pcm)
+            if not played and self._out_track:
                 await self._out_track.queue_frame(pcm, sr)
             # The pip's own acoustic echo returns via the mic seconds later and
             # can re-trigger the decoder — but `_is_echo` already drops it by
@@ -5143,24 +5207,32 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
             self._wake_suppress_until = max(
                 self._wake_suppress_until, time.time() + _ECHO_TAIL_S
             )
-            # Mute the mic for the WHOLE pip, measured from AFTER the POST.
+            # Mute the mic for the WHOLE pip, measured from when it was SENT.
             #
-            # It was `now + 0.35`, and both halves of that were wrong: the pip is
-            # `duration = 0.4` s, and `now` was captured at the top of this
-            # function, before /play_audio was even called. Measured 05.10.2026
+            # It used to add a 3 s echo tail on top of the clip, and that is what
+            # swallowed the start of a natural follow-up. Measured 05.10.2026
             # 21:06: the last frames of our own pip leaked into the mic at the rail
             # (32767), the VAD read that as speech and opened an utterance, and the
             # buffer it built was [silence, PIP, silence] — Whisper transcribed the
             # beep as «пап», the router escalated a 1-word turn to L2 and spent 8 s
             # on it, and the user's actual command was not in the buffer at all.
             # So the room did not "fail to try": it was handed a beep.
-            played_at = time.time()
-            self._tts_play_end = max(
-                getattr(self, "_tts_play_end", 0.0), played_at + duration
+            #
+            # And it used to be measured from the RESPONSE, not from the send.
+            # `now + 0.35` captured at function entry was the first version of
+            # that mistake; `played_at = time.time()` after the POST was the
+            # correction, and on a camera that answers in 0.08 s the two are the
+            # same line. They stopped being the same line on 19.10.2026, when the
+            # entrance hall answered a 0.4 s pip in 2.47 s and the difference
+            # between "sized to the beep" and "sized to the HTTP" became 3.7 s of
+            # a deaf room. `_arm_playback_timing` carries the measurement.
+            #
+            # `audible` is False when the POST failed with no backchannel to fall
+            # back on: nothing sounded, so the microphone must stay open. It used
+            # to be muted anyway, from twenty seconds after a timed-out POST.
+            self._arm_playback_timing(
+                sent_at, duration, audible=played or bool(self._out_track)
             )
-            delay = played_at + duration + _SPEAKER_SETTLE_S
-            if delay > self._speaking_until:
-                self._speaking_until = delay
             self._close_tts_inflight(duration)
         except Exception as exc:
             logger.warning(f"[{self.stream_name}] attention error: {exc}")
@@ -5183,16 +5255,19 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
             duration = len(pcm) / (2 * TTS_PLAY_RATE)
             if self._out_track:
                 self._out_track._last_play_duration = duration
-            played_at = time.time()
-            self._arm_tts_inflight(played_at, duration)
-            if not await self._play_audio_http(pcm) and self._out_track:
+            # One clock for this function, taken before the POST and used for
+            # everything below. It was read twice — once here for the inflight
+            # guard and once again after the response for the mute — so the two
+            # halves of ONE cue disagreed by however long the camera took to
+            # answer. Same defect as the pip, and fixed by the same helper.
+            sent_at = time.time()
+            self._arm_tts_inflight(sent_at, duration)
+            played = await self._play_audio_http(pcm)
+            if not played and self._out_track:
                 await self._out_track.queue_frame(pcm, TTS_PLAY_RATE)
-            self._tts_play_end = max(
-                getattr(self, "_tts_play_end", 0.0), played_at + duration
+            self._arm_playback_timing(
+                sent_at, duration, audible=played or bool(self._out_track)
             )
-            delay = time.time() + duration + _SPEAKER_SETTLE_S
-            if delay > self._speaking_until:
-                self._speaking_until = delay
             self._close_tts_inflight(duration)
         except Exception as exc:
             # Was `except Exception: pass`, which made this path untestable and
@@ -5510,29 +5585,38 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
         # chunk reaches the decoder) and `_echo_of_reply` on the transcript. The
         # wake word keeps its own longer tail (`_wake_suppress_until`), because a
         # decoded «компьютер» out of the speaker really is a false wake.
+        # ONE clock for this whole function, taken before anything is sent. It used to
+        # be read three times — at the mute, at the inflight guard, and again
+        # inside the POST closure for the tails — so three timestamps that are
+        # supposed to describe one clip were anchored to three different
+        # moments, and only two of them were before the upload. `_post_and_close`
+        # is a closure over exactly this variable for that reason.
+        sent_at = time.time()
         queued = self._out_track.queue_seconds() if self._out_track else (
             len(pcm) / (TTS_PLAY_RATE * 2)
         )
-        self._speaking_until = time.time() + queued + _SPEAKER_SETTLE_S
+        self._arm_playback_timing(sent_at, queued)
         # Same reason as the two cues, and for the same reason this is a separate
         # window from the mute above: the endpoint must not hear the reply either.
-        self._arm_tts_inflight(time.time(), queued)
+        self._arm_tts_inflight(sent_at, queued)
         try:
             # Record the audio we are about to play so the mic feed can later
             # be checked for our own echo (cross-correlation in _is_echo).
             self._store_tts_echo(pcm)
 
             audio_dur = len(pcm) / (sr * 2)
-            # When the POST was SENT, not when it answered. Measured 07.10.2026:
-            # `/play_audio` returns HTTP 200 but takes 3-5x the audio length on the
-            # kitchen and 5x, 12x and >60 s on the living room (1 s -> 5.0 s,
+            # `sent_at` is the one taken at the top of this function, before
+            # anything was sent. It used to be re-read HERE, after `_store_tts_echo`
+            # and the `queued` computation, so the mute above and the tails inside
+            # the POST closure were anchored to two different moments of the same
+            # clip. The measurement that forced the original move, 07.10.2026:
+            # `/play_audio` returns HTTP 200 but takes 3-5x the audio length on
+            # the kitchen and 5x, 12x and >60 s on the living room (1 s -> 5.0 s,
             # 3 s -> 37.0 s, 6 s -> no answer within 60 s). Timing the post-playback
             # guards from the RESPONSE therefore added that whole latency to them:
-            # `GLOBAL_TTS_UNTIL` and `_wake_suppress_until` below are computed from
-            # this stamp, so a 30 s response muted the cross-room guard for 30 s
-            # AFTER the reply had finished playing. A real report on 07.10.2026
-            # 08:50 — the reply POST timed out at 30 s and the room never spoke it.
-            sent_at = time.time()
+            # a 30 s response muted the cross-room guard for 30 s AFTER the reply
+            # had finished playing. A real report on 07.10.2026 08:50 — the reply
+            # POST timed out at 30 s and the room never spoke it.
             played = False
             # Reset first, so an exception below cannot leave the previous turn's
             # `True` standing and suppress the apology for this one.
@@ -5574,7 +5658,16 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
 
                 if not played:
                     # Fallback: the WebRTC sendonly track -> go2rtc -> ONVIF
-                    # backchannel. Timed as before.
+                    # backchannel. Timed as before, and deliberately NOT switched
+                    # to `sent_at` the way every other write of this field now is.
+                    # That branch has different physics: the clip is QUEUED onto a
+                    # track that paces it, so when it starts sounding is a property
+                    # of the queue, not of the moment it was handed over — and the
+                    # measured return on this path is 3-40 s late, which is the
+                    # whole reason `_ECHO_HORIZON_S` is 8 s wide. Sizing it from
+                    # the send would claim the audio finished before it began.
+                    # Every other path posts to `/play_audio`, where the body is
+                    # the whole clip and it is audible as it arrives.
                     self._tts_play_end = time.time() + audio_dur
                     if self._out_track:
                         self._out_track._last_play_duration = audio_dur
@@ -5588,11 +5681,20 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
                             # is enforced inside AIVoiceOutputTrack.recv().
                             await self._out_track.queue_frame(c, sr)
                 else:
-                    # /play_audio returns as soon as the body is uploaded and the
-                    # camera then plays it in real time, so the playback window
-                    # starts AFTER the POST, not before it.
+                    # `/play_audio` returns as soon as the body is uploaded, so
+                    # the sound belongs to the SENT moment, not the answered one.
+                    #
+                    # The comment above this branch used to assert the opposite —
+                    # "the playback window starts AFTER the POST" — and that
+                    # premise is what made `_tts_play_end` the one field the
+                    # 07.10.2026 fix missed, because it looked deliberate. The
+                    # consequence is measurable: the entrance hall answers a 0.4 s
+                    # pip in 2.47 s (19.10.2026), so every timestamp taken here
+                    # sat 2.47 s late — which is what pushed `_is_echo`'s horizon
+                    # open long after the sound, and is the shape of the 07.10
+                    # "room noise counted as our own echo" fault.
                     self._last_play_ok = True
-                    self._tts_play_end = time.time() + audio_dur
+                    self._arm_playback_timing(sent_at, audio_dur)
                     if self._out_track:
                         self._out_track._last_play_duration = audio_dur
 

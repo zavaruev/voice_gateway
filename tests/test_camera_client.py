@@ -8,6 +8,7 @@ without av the whole `pytest tests/` run fails at collection, so run the
 """
 import asyncio
 import os
+import re
 import time
 import pytest
 import inspect
@@ -236,6 +237,204 @@ async def test_the_mic_is_muted_while_a_reply_plays_with_no_webrtc_track():
     s._feed_audio = lambda pcm, rate=16000: fed.append(pcm)
     await CameraSession._feed_audio(s, b"\x01\x02" * 160)
     assert fed == []
+
+
+class _SlowResp:
+    """A `/play_audio` response that arrives late.
+
+    The delay is real time, because the whole point of the tests below is that
+    a LATE RESPONSE MUST NOT REACH THE MIC GUARD — a stub that answered
+    instantly would pass on the broken code and prove nothing. Measured
+    19.10.2026, entrance hall: 0.4 s of audio answered in 2.47 s.
+    """
+
+    def __init__(self, delay: float, status: int = 200):
+        self.delay = delay
+        self.status = status
+
+    async def __aenter__(self):
+        await asyncio.sleep(self.delay)
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _SlowHttp:
+    def __init__(self, delay: float, status: int = 200):
+        self.delay = delay
+        self.status = status
+        self.calls = []
+
+    def post(self, url, data=None, headers=None, auth=None, timeout=None):
+        self.calls.append({"url": url, "data": data})
+        return _SlowResp(self.delay, self.status)
+
+
+@pytest.mark.asyncio
+async def test_a_slow_play_audio_response_does_not_mute_the_room_for_the_latency():
+    """The cue mute must be sized to the BEEP, not to the HTTP round trip.
+
+    `_feed_audio` returns on `_speaking_until` BEFORE it ever reaches
+    `_is_echo`, so that window is the only thing keeping our own audio out of
+    the buffer — and it is also the only thing that can throw the user's speech
+    away.
+
+    Measured 19.10.2026 on the entrance hall, from the log and
+    `utterance_samples/manifest.jsonl` together:
+
+        08:09:41  VOSK WAKE trig='компьютер'
+        08:09:44  play_audio 0.40s audio in 2.47s (x6.2)
+        08:09:48  VAD UTTERANCE END dur=7040ms via cap 7s
+        08:09:49  Whisper OK: 'компьютер компьютер'
+
+    A 0.4 s pip answered in 2.47 s produced a 3.7 s mute, the utterance opened
+    one frame after it expired, and its first second was the room floor
+    (rms 1036) before the command arrived. Whisper had two copies of the wake
+    word and no command; `drop[muted=73]` on the room that hour.
+    """
+    s = _make_http_session()
+    s.http_session = _SlowHttp(0.6)
+    s._out_track = None
+    s._last_attention = 0.0
+
+    before = time.time()
+    await s._play_attention("vosk")
+    span = s._speaking_until - before
+
+    pip_dur = 0.4
+    assert span < pip_dur + camera_client._SPEAKER_SETTLE_S + 0.15, (
+        f"the mute ran {span:.2f}s for a {pip_dur}s pip whose POST took 0.60s — "
+        f"the HTTP latency is in the window again"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_cue_that_never_played_leaves_the_microphone_open():
+    """Nothing sounded, so nothing may be muted.
+
+    Measured 19.10.2026, same room, half a minute later:
+
+        08:10:13  play_audio failed: TimeoutError()
+        08:10:13  /play_audio failed and no backchannel exists — the reply was NOT spoken
+
+    A reply that was never spoken still computed the cue's mute from
+    `time.time()` AFTER the failure — so a twenty-second timeout silenced the
+    room for twenty seconds, for a sound that did not exist. This is the
+    direction that costs the user, and it is the one a "make the window bigger"
+    fix cannot reach.
+    """
+    s = _make_http_session()
+    s.http_session = _SlowHttp(0.25, status=500)
+    s._out_track = None
+    s._speaking_until = 0.0
+    s._tts_play_end = 0.0
+    s._last_attention = 0.0
+
+    await s._play_attention("vosk")
+
+    assert s._speaking_until == 0.0, (
+        "the cue was never played and the room is muted anyway — "
+        f"{s._speaking_until - time.time():.1f}s from now"
+    )
+    # The playback clock still advances, so `_is_echo` can say "nothing has
+    # been playing for N seconds" instead of believing a stale window.
+    assert s._tts_play_end > time.time()
+
+
+@pytest.mark.asyncio
+async def test_a_played_cue_is_still_muted_for_its_whole_length():
+    """The counterweight to the two tests above.
+
+    Shrinking the window is only correct while something still keeps our own
+    audio out of the buffer, and for the DIRECT return that something is this
+    mute — `_is_echo` needs a correlation, and the pip is a loud two-tone at
+    the rail (measured 14.10.2026: last frames at peak 32767, Whisper handed the
+    beep and transcribed it as «пап»). This passes on the broken code too, by
+    design: it is the guard against over-correcting into a room that hears its
+    own pip.
+    """
+    s = _make_http_session()
+    s.http_session = _FakeHttp(200)
+    s._out_track = None
+    s._last_attention = 0.0
+
+    before = time.time()
+    await s._play_attention("vosk")
+
+    assert s._speaking_until - before >= 0.4 - 0.05, (
+        f"a 0.4s pip only muted for {s._speaking_until - before:.2f}s — "
+        f"the tail of it will reach Whisper"
+    )
+    assert s._speaking_until > time.time()
+
+
+@pytest.mark.asyncio
+async def test_playback_end_is_the_end_of_the_audio_not_the_end_of_the_response():
+    """`_tts_play_end` is the one field the 07.10.2026 timing fix missed.
+
+    It is not cosmetic: `_is_echo` decides whether it may believe a correlation
+    by how long ago playback ENDED, and a correlation it believes extends
+    `_wake_suppress_until`. A late write therefore keeps a room's noise claimable
+    as our own echo for exactly as long as the camera took to answer — the shape
+    of the 07.10.2026 "room noise counted as our own echo" fault, on a camera
+    that now answers 30x slower than it did then.
+    """
+    s = _make_http_session()
+    s.http_session = _SlowHttp(0.6)
+    s._out_track = None
+    s._tts_play_end = 0.0
+
+    before = time.time()
+    await s._speak_pcm(b"\x03\x04" * 24000, "сказано")   # 0.5 s @ 48 kHz
+
+    assert s._tts_play_end - before < 0.5 + 0.15, (
+        f"playback end is {s._tts_play_end - before:.2f}s away for 0.5s of audio "
+        f"whose POST took 0.60s — the echo horizon is open by the latency"
+    )
+
+
+def test_every_playback_path_anchors_to_a_sent_timestamp_not_the_response():
+    """Three paths, one rule, and this file has already watched them drift.
+
+    The 07.10.2026 fix moved `_speaking_until`, `GLOBAL_TTS_UNTIL` and
+    `_wake_suppress_until` onto `sent_at` — in the REPLY path only. The two cue
+    paths and the reply's `_tts_play_end` kept reading `time.time()` afterwards,
+    which was indistinguishable while `/play_audio` answered in 0.08 s and is
+    2.47 s of deaf room now.
+
+    The check reads the source rather than the behaviour because there is no
+    single call site to exercise: the drift was four inline copies in three
+    methods. The one deliberate exception is the WebRTC backchannel fallback,
+    which queues onto a paced track and is commented in place.
+    """
+    src = inspect.getsource(camera_client)
+    lines = src.splitlines()
+    late = [
+        i for i, line in enumerate(lines)
+        if re.search(r"_tts_play_end\s*=\s*(?!max\()\S*time\.time\(\)", line)
+    ]
+    # Exactly ONE write may still read the response clock, and only where the
+    # clip was queued onto a paced track instead of posted. Asserting on a line
+    # NUMBER would break every time a comment is added above it; asserting the
+    # count plus the branch it lives in states the rule and survives edits.
+    assert len(late) == 1, (
+        f"{len(late)} writes of _tts_play_end still use the response clock: "
+        f"{[i + 1 for i in late]}"
+    )
+    context = "\n".join(lines[max(0, late[0] - 40):late[0]])
+    assert "backchannel" in context, (
+        "the one remaining response-clock write is not the WebRTC backchannel "
+        "fallback, which is the only case where the audio is queued rather than "
+        "posted and so cannot be dated to the send"
+    )
+
+    for name in ("_play_attention", "_play_activation_sound", "_speak_pcm"):
+        body = inspect.getsource(getattr(CameraSession, name))
+        assert "time.time()" in body, f"{name} has no clock at all — the pattern changed"
+        assert re.search(
+            r"_speaking_until\s*=\s*(?!\s*max).*time\.time\(\)", body
+        ) is None, f"{name} still sizes a mute from the response"
 
 
 @pytest.mark.asyncio

@@ -1945,8 +1945,22 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
 
     **The camera delivered 97-99 % of real time while the gateway received 41 %.** The loss is DOWNSTREAM of go2rtc, not on the camera's WiFi. Two honest limits on that sentence: the watchdog samples every 180 s and the fault lasted 40 s, so the fault window itself was not sampled — only the minutes around it; and the 15:06 pass has NO capture= value at all, because the gateway's heal re-registered the producer and the counter restarted (the negative-delta case, correctly ignored).
 
-    * **So the repeater is aimed at a link that no measurement has shown to be broken.** The camera→go2rtc leg was the healthiest number in the whole series. Whatever is losing the audio, it is between go2rtc and the gateway, or inside the gateway's own reader — and a repeater on the camera's side of the house would not touch it.
-    * **And the `slow-capture` state still has no slow side on a real room**, so it stays report-only. It is not a dead instrument: it is the only passive measure of the camera's own delivery, and it is what turned "the link is slow" from an assertion into a number — 97-99 % where the 15.10 table said 0.29-0.40x.
+    * **RETRACTED 20.10.2026 21:50, and the retraction is the point.** "The loss is DOWNSTREAM of go2rtc, not on the camera's WiFi" was read off samples that MISSED the fault: the watchdog samples every 180 s and the fault lasts ~40 s, so the camera→go2rtc leg looked perfect at every sampled minute. The watchdog's own counter caught it on 21:49:17 — `capture=3913/6461 B/s`, **61 %** — with the gateway's leg simultaneously at 1-80 %. **So the camera's uplink DOES drop, and the repeater is aimed at the right link after all.** The earlier claim was a conclusion drawn from samples that could not contain the event — the same mistake this file warns about elsewhere: «a conclusion drawn from a partial file is not a conclusion».
+    * **What the two instruments together DO say, and it is enough to act on:** the camera's uplink and the gateway's leg degrade TOGETHER, and the gateway's remedy for that (an ffmpeg restart plus a stream re-register) cannot make a camera's WiFi faster. Measured 20.10.2026 18:48-18:51, `camera-corridor1`, the user's own words cut in half by our own heal:
+
+      ```
+      18:48:16  VAD SPEECH START rms=0.347        <- the user is speaking
+      18:48:21  ⚠ AUDIO STARVED: 45%  ->  heal: DELETE + re-register, reconnect 3s
+      18:48:34  VOSK WAKE 'компьютер'  triggers=1
+      18:48:38  VOSK WAKE 'компьютер'  triggers=2    <- the word again, from the leftovers
+      18:48:41  ⚠ AUDIO DEGRADED: 72%  ->  reconnect
+      18:48:47  VOSK WAKE 'компьютер'  triggers=3    <- and again
+      18:48:55  Whisper IN: 7.04s raw_rms=574  ->  «Субтитры сделал DimaTorzok» -> rejected
+      18:49:19  play_audio failed: TimeoutError()  ->  the reply was NOT spoken
+      ```
+
+      Every wake fire resets the VAD and clears the speech buffer — the AGENTS.md says so of the re-arm debounce — so three fires for one word destroy the command three times, and the buffer that finally reaches Whisper is silence. The room then greets, and its GREETING does not get out either, because the corridor's `/play_audio` timed out. **The camera is not "reacting badly to компьютер": the link is flapping, our heal restarts the stream in the middle of the sentence, and the room's answers are timing out.**
+    * **And the `slow-capture` state still has no slow side on a real room**, so it stays report-only. It is not a dead instrument: it is the only passive measure of the camera's own delivery, and 21:49:17 is exactly the number that was missing — the camera leg at 61 % while every sampled minute said 99 %.
 
 - **THE ACKNOWLEDGEMENT PIP DESTROYED THE COMMAND, AND WHISPER ANSWERED A TWO-TONE BEEP WITH A ONE-WORD COMMAND. Measured 20.10.2026 17:03, `camera-corridor1`.**
 

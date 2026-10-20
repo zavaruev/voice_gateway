@@ -1962,6 +1962,28 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
       Every wake fire resets the VAD and clears the speech buffer — the AGENTS.md says so of the re-arm debounce — so three fires for one word destroy the command three times, and the buffer that finally reaches Whisper is silence. The room then greets, and its GREETING does not get out either, because the corridor's `/play_audio` timed out. **The camera is not "reacting badly to компьютер": the link is flapping, our heal restarts the stream in the middle of the sentence, and the room's answers are timing out.**
     * **And the `slow-capture` state still has no slow side on a real room**, so it stays report-only. It is not a dead instrument: it is the only passive measure of the camera's own delivery, and 21:49:17 is exactly the number that was missing — the camera leg at 61 % while every sampled minute said 99 %.
 
+- **THE CORRIDOR WAS IN A REBOOT LOOP, AND THE LOOP IS WHAT "ПЛОХО РЕАГИРУЕТ НА КОМПЬЮТЕР" LOOKED LIKE. Measured 20.10.2026 20:12-20:35.**
+
+  The report: the corridor camera does not react to «компьютер». The decoder is not the cause — it fired on the word every time it was spoken. The chain, all of it measured:
+
+  ```
+  20:12       камера перезагрузилась (uptime 618 с к 20:22)
+  20:18-20:22 heal: DELETE + re-register -> HTTP 200, и снова 0 байт
+  20:21:26    RTSP audio: 0 байт за соединение — ffmpeg: DESCRIBE failed: 404Not Found
+  20:22:27    🔴 CAMERA AUDIO DEAD (0%)
+  20:23        прямой RTSP с камеры: speed=1.08x  (камера ЗДОРОВА)
+  20:28        HTTP камеры 0.95 с (у гостиной 0.089), ping RTT 5.7-221 мс при 0 % потерь
+  ```
+
+  **Three separate faults, and the camera is not the first of them.**
+
+  * **OUR OWN LADDER WAS REBOOTING THE CAMERA EVERY THIRTEEN MINUTES.** `scripts/camera_watchdog.sh` logged, for the corridor: step 3 (restart majestic) at 23:02, 23:11, 23:24 and step 4 (reboot over SSH) at 23:03, 23:13, 23:26. The ladder's own cooldown is `MIN_GAP_S` = 300 s, and the reboot is the only step that is neither cheap nor reversible. A reboot does **not** repair a weak WiFi link — the link quality flapped 58 -> 62 -> 74 while the camera was up, and the ping RTT swung 5.7 -> 221 ms — and it takes the room's hearing away while the camera boots: a camera that answers HTTP but not RTSP is BOOTING, not broken, so for the first minute or two of every reboot the gateway hears nothing at all. **The symptom was exactly the report: the room did not answer «компьютер».** The reboot now has its own cooldown (`REBOOT_MIN_GAP_S`, 1 h) and says so in the log instead of looping.
+  * **THE HEALTHY SIDE OF THE LINK IS NOT HEALTHY.** The camera's own HTTP answers in 0.95 s against 0.089 s in the living room, and its ping RTT swings 5.7 -> 221 ms with zero packet loss. The other rooms are not clean either — the kitchen's ping was 39-130 ms — so the whole house's WiFi is noisy at this moment, and the corridor is the worst link in it (58 against 77-79). **The repeater is aimed at the right thing, and no restart of anything in this house will make a radio link better.**
+  * **A FALSE POSITIVE IN MY OWN NEW STATE, caught and fixed the same hour.** The `slow-capture` state reported `SLOW CAPTURE ?/6506 B/s` — a state with no number in it — because the hit counter was read from disk and raised the state on a pass that could not measure the rate at all (go2rtc had just re-registered the producer and the counter had restarted). The state is now raised **only** on a pass that measured the rate and found it slow; a missing measurement is not a decision, and it never was.
+
+  * **AND THE WATCHDOG WAS RUNNING FIVE COPIES AT ONCE.** The ladder takes minutes (sleeps between the steps, waits for the camera to come back) and the cron fires every three, so the instances overlapped: at 23:36 five copies were running, each with its own ladder, each able to restart `majestic` and reboot the camera. The overlap is what turned one bad room into a reboot every thirteen minutes. The script now takes an exclusive `flock` and **leaves** when another instance is working — a queue of watchdogs is a queue of ladders, and the ladder ends in a reboot.
+  * **WHAT ACTUALLY BROKE THE CAMERA: ITS AUDIO STAGE, AND `majestic` CAME BACK THE ROOM.** The stream was dead with `DESCRIBE failed: 404Not Found` and go2rtc's producer `recv=None` — while a direct RTSP read from the camera gave `speed=1.08x`. The camera was up and streaming; **go2rtc could not attach to it.** A restart of `majestic` on the camera brought the producer straight back (`recv=9540068`, two consumers, the backchannel m-line present in the SDP, and the gateway's feed flowing again). So the wedge was in the camera's own media stack — the one this file has recorded for years as `MI_AO_IMPL_SendFrame: Device 0 is empty` — and not in the WiFi, the credentials or the gateway. **The watchdog's step 3 is exactly this lever; it is what the room needed, and the loop around it is what stopped it from being applied once.**
+
 - **THE ACKNOWLEDGEMENT PIP DESTROYED THE COMMAND, AND WHISPER ANSWERED A TWO-TONE BEEP WITH A ONE-WORD COMMAND. Measured 20.10.2026 17:03, `camera-corridor1`.**
 
   The report: «выключи свет в гостиной» in the corridor, and the room said «На кухне уже выключено».

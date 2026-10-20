@@ -81,6 +81,13 @@ WEDGE_S="${WEDGE_S:-6.0}"
 CONFIRM_N="${CONFIRM_N:-3}"
 CONFIRM_GAP_S="${CONFIRM_GAP_S:-20}"
 MIN_GAP_S="${MIN_GAP_S:-300}"       # per camera: never retry more often
+# The ladder's per-camera cooldown, for the steps that are cheap and reversible.
+# The REBOOT gets a much longer one of its own — see the step 4 comment: a
+# reboot does not repair a weak WiFi link, it only takes the room's hearing
+# away while the camera boots. Measured 20.10.2026: the corridor was rebooted
+# every thirteen minutes and the symptom was exactly that the camera stopped
+# answering «компьютер».
+REBOOT_MIN_GAP_S="${REBOOT_MIN_GAP_S:-3600}"
 
 # Audio-starvation detection. The gateway logs one `AUDIO STARVED` line per 20 s
 # window while a room's delivered audio is below its threshold, so a room that has
@@ -139,6 +146,25 @@ log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$LOG" 2>/dev/null || true; }
 # a dry run says exactly which step would have fired.
 DRY_RUN="${DRY_RUN:-0}"
 mkdir -p "$STAMP_DIR" 2>/dev/null || true
+
+# ONE INSTANCE AT A TIME.
+#
+# The ladder takes minutes (sleeps between the steps, waits for the camera to
+# come back) and the cron fires every three, so without a lock the instances
+# overlap. Measured 20.10.2026 23:36: FIVE copies were running at once, each
+# with its own ladder, each able to restart `majestic` and reboot the camera —
+# and the overlap is what turned a single bad room into a reboot every
+# thirteen minutes.
+#
+# `flock -n` is non-blocking on purpose: the instance that arrives while
+# another is working must LEAVE, not queue behind it. A queue of watchdogs is
+# a queue of ladders, and the ladder ends in a reboot.
+LOCK_FILE="${LOCK_FILE:-$STAMP_DIR/.camera_watchdog.lock}"
+exec 9>"$LOCK_FILE" 2>/dev/null || true
+if ! flock -n 9 2>/dev/null; then
+  log "another instance is already running — leaving it the room"
+  exit 0
+fi
 
 act() {
   if [ "$DRY_RUN" = "1" ]; then
@@ -593,22 +619,21 @@ classify() {
         if capture_rate_is_slow "$rate" "$base"; then
           cap_hits=$(( cap_hits + 1 ))
           echo "$cap_hits" >"$cap_file" 2>/dev/null || true
+          if [ "$cap_hits" -ge "$CAPTURE_RATE_MIN_HITS" ]; then
+            STATE="slow-capture"
+            return 0
+          fi
         else
           # Only a measurement that PROVES the rate is healthy clears the counter.
           rm -f "$cap_file" 2>/dev/null || true
           cap_hits=0
         fi
       fi
-      # The counter is the memory. A pass that could not measure the rate (the
-      # window is 30 s and the confirmation loop re-classifies every 20 s) must
-      # NOT clear a state that has already been established — the first version
-      # raised `slow-capture` and then, in the very same pass, re-classified to
-      # healthy, so the room "recovered on its own" before the ladder was
-      # reached. The state is only cleared by a healthy MEASUREMENT.
-      if [ "$cap_hits" -ge "$CAPTURE_RATE_MIN_HITS" ]; then
-        STATE="slow-capture"
-        return 0
-      fi
+      # The state is raised ONLY on a pass that measured the rate and found it
+      # slow. A counter read from disk cannot raise it on its own: the first
+      # version did, and a pass with no measurement at all (the counter reset
+      # when go2rtc re-registered the producer) reported
+      # `SLOW CAPTURE ?/6506 B/s` — a state with no number in it.
     fi
     # Last gate before healthy, and only while the stream is up: with no stream
     # there is no level to read and dead-stream/wedged already route correctly.
@@ -683,6 +708,20 @@ select_camera() {
       ;;
   esac
   return 0
+}
+
+# May this camera be rebooted now?
+#
+# The ladder's own MIN_GAP_S covers the cheap, reversible steps. A reboot is
+# neither: it does not repair a weak WiFi link (measured 20.10.2026, the
+# corridor was rebooted every thirteen minutes and the link quality kept
+# flapping 58 -> 62 -> 74), and every reboot takes the room's hearing away
+# while the camera boots — its RTSP stream is not up for the first minute or
+# two, and a camera that answers HTTP but not RTSP is BOOTING, not broken.
+reboot_allowed() {
+  local last="${1:-0}" now="${2:-0}" gap="${3:-3600}"
+  [ "$last" -gt 0 ] 2>/dev/null || return 0
+  [ $(( now - last )) -ge "$gap" ] 2>/dev/null
 }
 
 # --- self-test ----------------------------------------------------------------
@@ -761,6 +800,24 @@ run_self_test() {
   if [ -n "$CAPTURE_RATE_BPS" ]; then
     echo "  FAIL: a re-created producer must not produce a rate"; fails=$((fails+1))
   fi
+
+  # The reboot cooldown, both directions. A camera that was rebooted a minute
+  # ago must not be rebooted again: the reboot does not repair a weak link
+  # (measured 20.10.2026, the corridor was rebooted every thirteen minutes and
+  # its microphone was offline for the first minutes after each boot), and the
+  # symptom is exactly that the room stopped answering «компьютер».
+  if ! reboot_allowed 0 1000 3600; then
+    echo "  FAIL: a camera that was never rebooted must be allowed"; fails=$((fails+1))
+  fi
+  if reboot_allowed 900 1000 3600; then
+    echo "  FAIL: a camera rebooted 100 s ago must NOT be rebooted again"
+    fails=$((fails+1))
+  fi
+  if ! reboot_allowed 100 4000 3600; then
+    echo "  FAIL: a camera rebooted 3900 s ago must be allowed again"
+    fails=$((fails+1))
+  fi
+
 
   rm -rf "$tmp" 2>/dev/null || true
   if [ "$fails" -eq 0 ]; then
@@ -932,7 +989,32 @@ for item in $STILL; do
 
   # Step 4: reboot. Reached only when restarting the service did not help.
   # ONVIF Reboot is not implemented on OpenIPC, so this is SSH or nothing.
+  #
+  # **AND IT MUST NOT REPEAT.** Measured 20.10.2026, `camera-corridor1`: the
+  # ladder rebooted the camera at 23:03, 23:13 and 23:26 — every thirteen
+  # minutes, forever. A reboot does NOT fix a weak WiFi link (the link quality
+  # flapped 58 -> 62 -> 74 and the ping RTT swung 5.7 -> 221 ms while the
+  # camera was up), and every reboot takes the room's microphone offline for
+  # the minute or two the camera needs before its RTSP stream comes up — a
+  # camera that answers HTTP but not RTSP is BOOTING, not broken. So the loop
+  # did not repair the room; it took the room's hearing away on a schedule,
+  # which is exactly the reported symptom: «камера в коридоре плохо реагирует
+  # на компьютер».
+  #
+  # So a reboot is a LAST resort with a long cooldown, and the gap is much
+  # longer than the ladder's own MIN_GAP_S: the other steps are cheap and
+  # reversible, a reboot is neither.
+  reboot_stamp="${STAMP_DIR}/.camera_watchdog_reboot_$CUR_STREAM"
+  last_reboot=0
+  [ -f "$reboot_stamp" ] && read -r last_reboot <"$reboot_stamp" 2>/dev/null || last_reboot=0
+  now_s=$(date +%s)
+  if ! reboot_allowed "$last_reboot" "$now_s" "$REBOOT_MIN_GAP_S"; then
+    log "$CUR_NAME step 4 SKIPPED: rebooted $(( now_s - last_reboot ))s ago, the next one is in $(( REBOOT_MIN_GAP_S - (now_s - last_reboot) ))s — a reboot does not fix a weak link, it only takes the room's hearing away while the camera boots"
+    log "  summary: still_bad=[$CUR_NAME:$CUR_IP:$CUR_STREAM ] — the link, not the camera, is the suspect (repeater/Access Point)"
+    continue
+  fi
   log "$CUR_NAME step 4: reboot over SSH — last resort, and probably wrong"
+  date +%s >"$reboot_stamp" 2>/dev/null || true
   act cam_ssh 'nohup sh -c "sleep 1; reboot" >/dev/null 2>&1 &'
   wait_healthy $((WAIT_UP_S / 15)) 15 || { log "  $CUR_NAME did not come back"; continue; }
   sleep 20

@@ -1931,6 +1931,23 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
     * `read -r pbytes ptime <"$prev_file" 2>/dev/null || pbytes=""; ptime=""` does **not** do what it looks like — the `;` ends the `||` list, so the reset runs unconditionally and the values just read are always thrown away. The rate was never computed and the gate was silently inert. The self-test caught it; a live run would not have, because "no rate" and "no problem" look the same in a log.
     * The state was raised from the current sample and then **cleared inside the same pass**, because the confirmation loop re-classifies every 20 s and the measurement window is 30 s. The room "recovered on its own" before the ladder was reached. The hit counter IS the memory now: only a measurement that PROVES the rate healthy clears it.
 
+  * **THE SECOND SIDE OF THAT THRESHOLD IS STILL UNMEASURED, AND THE CORRIDOR'S REAL FAULT IS NOT WHERE THE MEASUREMENT POINTS. Measured 20.10.2026 15:00-15:09, two instruments, one window.**
+
+    ```
+    ВРЕМЯ ХОСТА (MSK) | сторож: capture= (камера->go2rtc) | шлюз: (go2rtc->шлюз)
+    15:00:19             | 6375/6461 B/s (98%)                | —
+    15:03:18             | 6283/6461 B/s (97%)                | —
+    15:05:10             | —                                  | 41%
+    15:05:30             | —                                  | 61%
+    15:05:50             | —                                  | 80%
+    15:09:18             | 6422/6461 B/s (99%)                | —
+    ```
+
+    **The camera delivered 97-99 % of real time while the gateway received 41 %.** The loss is DOWNSTREAM of go2rtc, not on the camera's WiFi. Two honest limits on that sentence: the watchdog samples every 180 s and the fault lasted 40 s, so the fault window itself was not sampled — only the minutes around it; and the 15:06 pass has NO capture= value at all, because the gateway's heal re-registered the producer and the counter restarted (the negative-delta case, correctly ignored).
+
+    * **So the repeater is aimed at a link that no measurement has shown to be broken.** The camera→go2rtc leg was the healthiest number in the whole series. Whatever is losing the audio, it is between go2rtc and the gateway, or inside the gateway's own reader — and a repeater on the camera's side of the house would not touch it.
+    * **And the `slow-capture` state still has no slow side on a real room**, so it stays report-only. It is not a dead instrument: it is the only passive measure of the camera's own delivery, and it is what turned "the link is slow" from an assertion into a number — 97-99 % where the 15.10 table said 0.29-0.40x.
+
 - **THE SAME REQUEST GAVE TWO ANSWERS FROM TWO CAMERAS, AND THE CAUSE WAS THE ROOM THE CAMERA STANDS IN. Measured 20.10.2026 09:20, fixed 12:26-12:33.**
 
   ```

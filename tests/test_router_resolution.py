@@ -1357,6 +1357,151 @@ def test_a_genuinely_absent_device_still_refuses_without_escalating():
     assert err is None
 
 
+# --- the same request from two rooms (20.10.2026 09:20) ----------------------
+#
+#     09:20:51  stream=entrance1  'Выключи кофеварку.'
+#               -> «no_target:кофеварка: в реестре HA нет такого устройства»
+#     09:21:19  stream=kitchen     'выключи кофеварку'
+#               -> on/off HassTurnOff кофеварка: 1 target(s) switch.coffemaker=on
+#
+# The ONLY difference was the room the satellite stands in. The coffee maker is
+# the only one in the house and it lives in the kitchen, so the area filter
+# (Entrance) hid it — and the refusal was a FALSE statement: the device is in
+# the registry, in another room.
+#
+# The rule that fixes it: a device named UNIQUELY is not bound to the room the
+# user happens to be standing in. The room may narrow an AMBIGUOUS name, and
+# only when it came from the satellite's default room — a room the user SPOKE
+# is a hard constraint.
+
+_COFFEE_STATES = [
+    {"entity_id": "switch.coffemaker", "state": "on",
+     "attributes": {"friendly_name": "coffeemaker"}},
+    {"entity_id": "switch.coffemaker_child_lock", "state": "off",
+     "attributes": {"friendly_name": "coffemaker Child lock"}},
+    {"entity_id": "switch.entrance_light_switch_relay", "state": "off",
+     "attributes": {"friendly_name": "entrance_light_switch Relay"}},
+]
+
+_COFFEE_AREAS = {
+    "switch.coffemaker": "Kitchen",
+    "switch.coffemaker_child_lock": "Kitchen",
+    "switch.entrance_light_switch_relay": "Entrance",
+}
+
+
+class _HAWithAreas(_DeadHA):
+    """`_DeadHA` with a real area map, so the room filter has something to say."""
+
+    def __init__(self, states, areas, result=None):
+        super().__init__(states=states, result=result)
+        self._areas = areas
+
+    async def get_entity_areas(self):
+        return self._areas
+
+
+@pytest.mark.asyncio
+async def test_a_uniquely_named_device_is_found_from_another_room():
+    """The field case: the same request, two cameras, two answers."""
+    mod = _router_app()
+    mod.ha = _HAWithAreas(_COFFEE_STATES, _COFFEE_AREAS, {"ok": True})
+    mod.confirm_on_off_one_read = _all_reached_ids
+    call = resolve_action("выключи кофеварку", "entrance1")
+    assert call.area_source == "default", (
+        "the room came from the satellite, not from the user — that is what makes "
+        "the difference between a constraint and a hint"
+    )
+    sentence, err = await mod._execute_action(call, "выключи кофеварку")
+    assert err is None, f"unexpected error: {err!r}"
+    assert sentence != "Не нашла такого устройства. Может, уточните название?", (
+        "the coffee maker is the only one in the house and it is IN the registry"
+    )
+    called = [args.get("name") for _, args in mod.ha.calls]
+    assert "switch.coffemaker" in called, (
+        f"the only coffee maker in the house must be reached from any room: {mod.ha.calls}"
+    )
+    assert "switch.coffemaker_child_lock" not in called, (
+        "the child lock is a facet of the device, not a second target"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_room_the_user_spoke_is_still_a_hard_constraint():
+    """«включи кофеварку в прихожей» must NOT reach the kitchen's coffee maker.
+
+    The room that narrows an ambiguous name is the one the USER said. The
+    satellite's default room is a hint about where they are standing, not a
+    statement about what they meant.
+    """
+    mod = _router_app()
+    mod.ha = _HAWithAreas(_COFFEE_STATES, _COFFEE_AREAS, {"ok": True})
+    call = resolve_action("выключи кофеварку в прихожей", "kitchen")
+    assert call.area_source == "explicit"
+    sentence, err = await mod._execute_action(call, "выключи кофеварку в прихожей")
+    assert not mod.ha.calls, (
+        f"a room the user named is a constraint: {mod.ha.calls}"
+    )
+    assert err is not None and "device_elsewhere" in str(err.get("error")), (
+        f"the refusal must name the real reason: {err!r}"
+    )
+    assert "kitchen" in str(err.get("error")), (
+        "naming the room the device is in is what actually helps the reader"
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_ambiguous_device_in_another_room_refuses_with_the_real_reason():
+    """Two kettles, one in the kitchen and one in the bedroom, asked from the
+    entrance: the room cannot decide, and the refusal must not claim that no
+    such device exists."""
+    states = [
+        {"entity_id": "switch.kettle", "state": "on",
+         "attributes": {"friendly_name": "kettle"}},
+        {"entity_id": "switch.bedroom_kettle", "state": "on",
+         "attributes": {"friendly_name": "bedroom kettle"}},
+    ]
+    areas = {"switch.kettle": "Kitchen", "switch.bedroom_kettle": "Bedroom"}
+    mod = _router_app()
+    mod.ha = _HAWithAreas(states, areas, {"ok": True})
+    call = resolve_action("выключи чайник", "entrance1")
+    sentence, err = await mod._execute_action(call, "выключи чайник")
+    assert not mod.ha.calls, f"an ambiguous target must not be guessed: {mod.ha.calls}"
+    assert err is not None and "device_elsewhere" in str(err.get("error")), (
+        f"the refusal must name the real reason: {err!r}"
+    )
+    assert sentence is None or "устройства" not in str(sentence), (
+        "the device exists — saying otherwise is a false statement"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_typo_now_reaches_the_real_coffee_maker():
+    """«Включи кафеварку» — the STT typo of 04.10.2026.
+
+    It used to be refused, and the refusal was defended as "the ghost-device
+    protection". But the protection is about a device ABSENT from the registry
+    (a free model would then invent one), and the coffee maker is not absent:
+    the alias table has carried «кафевар» -> «coffee» since 29.09.2026, and the
+    worker's copy of the table matches it too — so the L2 path has always read
+    the typo as the coffee maker while L1 refused it. The two paths now agree.
+
+    The gate that matters is untouched: a word that matches NOTHING in the
+    registry is still refused deterministically (the test above).
+    """
+    mod = _router_app()
+    states = [dict(s, state="off") for s in _COFFEE_STATES]
+    mod.ha = _HAWithAreas(states, _COFFEE_AREAS, {"ok": True})
+    mod.confirm_on_off_one_read = _all_reached_ids
+    call = resolve_action("включи кафеварку", "livingroom")
+    sentence, err = await mod._execute_action(call, "включи кафеварку")
+    assert err is None, f"unexpected error: {err!r}"
+    called = [args.get("name") for _, args in mod.ha.calls]
+    assert "switch.coffemaker" in called, (
+        f"the typo names a real device and must reach it: {mod.ha.calls}"
+    )
+
+
 # --- a follow-up carries the action but not the target (05.10.2026) ----------
 #
 # After «включи свет», «а теперь выключи» is a verb with nothing to apply it to.

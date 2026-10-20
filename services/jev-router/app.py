@@ -72,10 +72,12 @@ from ha_client import (
     dedupe_device_facets,
     describe_entity,
     find_action_targets,
+    find_action_targets_anywhere,
     find_entity,
     find_media_targets,
     media_fingerprint,
     media_no_movement_answer,
+    ordinal_digit,
     volume_unverifiable,
     MEDIA_ACTIVE,
     MEDIA_PREFER,
@@ -625,6 +627,44 @@ async def _execute_action(
                     states, area_map, call.hint, call.args.get("area")
                 )
             )
+            # A device named UNIQUELY is not bound to the room the user happens
+            # to be standing in. Measured 20.10.2026 09:20, the SAME request
+            # from two cameras:
+            #
+            #     09:20:51  stream=entrance1  'Выключи кофеварку.'
+            #               -> «no_target:кофеварка: в реестре HA нет такого устройства»
+            #     09:21:19  stream=kitchen     'выключи кофеварку'
+            #               -> on/off HassTurnOff кофеварка: 1 target(s) switch.coffemaker=on
+            #
+            # The only difference was the room the SATELLITE stands in: the area
+            # filter (Entrance) hid the only coffee maker in the house. And the
+            # refusal was a false statement — the device IS in the registry, in
+            # the kitchen. The same shape as 12.10.2026 («a lamp in the registry
+            # refused because a weaker global lookup said нет»), one level up:
+            # here it is the ROOM that vetoed a device the name lookup found.
+            #
+            # The room may narrow an AMBIGUOUS name, and only when it came from
+            # the satellite's default room — a room the user SPOKE is a hard
+            # constraint («включи свет в коридоре» must never reach the kitchen
+            # lamp). An ordinal is excluded too: «свет 1» names a NUMBERED
+            # instance, and the action path refuses rather than guessing which
+            # room's "1" was meant (02.10.2026, corridor1/corridor2).
+            if (
+                not targets
+                and call.hint
+                and call.area_source != "explicit"
+                and not ordinal_digit(call.hint)
+            ):
+                elsewhere = dedupe_device_facets(
+                    find_action_targets_anywhere(states, call.hint)
+                )
+                if len(elsewhere) == 1:
+                    targets = elsewhere
+                    logger.info(
+                        "  «%s» назван однозначно и лежит не в комнате говорящего — "
+                        "беру его: %s",
+                        call.hint, elsewhere[0].get("entity_id"),
+                    )
             # Deterministic refusal: a device absent from the whole registry
             # must never reach L2 — a free model happily «включает» ghost
             # devices (field case: «Включи кафеварку», STT typo + wrong name).
@@ -643,26 +683,55 @@ async def _execute_action(
             # happened to hand back, while the real lamp sat unconsidered.
             # **A gate that can veto a device the authoritative lookup found is
             # not a gate, it is a second opinion with worse tools.**
-            if call.hint and not targets and find_entity(states, call.hint, None) is None:
-                # A media CONTENT word is not a device name. «включи следующую
-                # серию черного зеркала» reaches here with hint «серию» — the
-                # noun matches `RE_MEDIA_NOUN`, but `resolve_action` only takes
-                # the media branch when the thing resolves to a `media_player`,
-                # which a title never does, so it falls through to
-                # `HassTurnOn`. Field case 04.10.2026 19:22: the answer was
-                # «Не нашла такого устройства» for a request the L2 tools
-                # (`media_search` / `media_play`) exist to serve. Refusing here
-                # also blocks escalation, so route it to L2 instead.
-                if RE_MEDIA_NOUN.search(text_hint):
+            if call.hint and not targets:
+                # The gate must ask the SAME alias-aware question the finder
+                # asks. `find_entity` does not know the «кофевар» -> «coffee»
+                # alias, so on 20.10.2026 it reported that the coffee maker was
+                # absent from a registry it is in.
+                elsewhere = dedupe_device_facets(
+                    find_action_targets_anywhere(states, call.hint)
+                )
+                if not elsewhere and find_entity(states, call.hint, None) is None:
+                    # A media CONTENT word is not a device name. «включи следующую
+                    # серию черного зеркала» reaches here with hint «серию» — the
+                    # noun matches `RE_MEDIA_NOUN`, but `resolve_action` only takes
+                    # the media branch when the thing resolves to a `media_player`,
+                    # which a title never does, so it falls through to
+                    # `HassTurnOn`. Field case 04.10.2026 19:22: the answer was
+                    # «Не нашла такого устройства» for a request the L2 tools
+                    # (`media_search` / `media_play`) exist to serve. Refusing here
+                    # also blocks escalation, so route it to L2 instead.
+                    if RE_MEDIA_NOUN.search(text_hint):
+                        return None, {
+                            "ok": False,
+                            "error": (
+                                f"media_content_word:{call.hint}: это название "
+                                "контента, а не устройство; поиск и запуск — в L2 "
+                                "(media_search / media_play)"
+                            ),
+                        }
+                    return "Не нашла такого устройства. Может, уточните название?", None
+                if elsewhere:
+                    # It IS in the registry — just not in this room, and not
+                    # uniquely. «В реестре HA нет такого устройства» here is a
+                    # false statement, and it sends the reader to the wrong
+                    # place; naming the rooms is what actually helps.
+                    rooms = sorted({
+                        (area_map.get(e.get("entity_id", ""), "") or "?").lower()
+                        for e in elsewhere
+                    })
+                    logger.warning(
+                        "  «%s» есть, но не в этой комнате и не однозначно: %d шт. "
+                        "в %s — нужна комната",
+                        call.hint, len(elsewhere), rooms,
+                    )
                     return None, {
                         "ok": False,
                         "error": (
-                            f"media_content_word:{call.hint}: это название "
-                            "контента, а не устройство; поиск и запуск — в L2 "
-                            "(media_search / media_play)"
+                            f"device_elsewhere:{call.hint}: {len(elsewhere)} шт. "
+                            f"в {rooms}, нужна комната"
                         ),
                     }
-                return "Не нашла такого устройства. Может, уточните название?", None
             if not call.args.get("area") and len(targets) > 1:
                 # No room in the utterance and several devices match —
                 # acting would mean guessing which one.

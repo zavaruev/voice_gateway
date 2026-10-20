@@ -627,6 +627,57 @@ def ordinal_digit(text: str) -> str:
     return ""
 
 
+def _hints_for(hint: str) -> set[str]:
+    """The bilingual expansion of a spoken device word.
+
+    «кофеварка» -> {кофеварка, coffee}; «чайник» -> {чайник, kettle, boiler}.
+    Shared by the room-scoped and the room-free lookups, because a gate that
+    asks a DIFFERENT question than the finder is a second opinion with worse
+    tools (measured 20.10.2026: the gate's `find_entity` did not know the
+    «кофевар» alias and so reported that a coffee maker was absent from the
+    registry while it was standing there, in another room).
+    """
+    hint_l = (hint or "").lower().strip()
+    hints: set[str] = {hint_l}
+    for stem, lats in _HINT_LAT.items():
+        if stem in hint_l or hint_l in stem:
+            hints.update(lats)
+    return hints
+
+
+def _onoff_name_match(e: dict, hints: set[str], digit: str) -> bool:
+    """Does this entity's name match the spoken device word, ignoring the room?"""
+    eid = e.get("entity_id", "")
+    if eid.split(".", 1)[0] not in _ONOFF_DOMAINS:
+        return False
+    if str(e.get("state", "")).lower() not in ("on", "off"):
+        return False
+    name = (e.get("attributes", {}) or {}).get("friendly_name") or ""
+    hay = f"{eid} {name}".lower()
+    if digit and digit not in hay:
+        return False
+    return any(h in hay for h in hints)
+
+
+def find_action_targets_anywhere(
+    states: list[dict],
+    hint: str,
+) -> list[dict]:
+    """Every on/off-switchable entity whose NAME matches, with no room at all.
+
+    The room-free half of `find_action_targets`. It answers a different
+    question on purpose, and the caller needs both: to find a UNIQUELY named
+    device that lives in another room, and to tell an honest refusal from a
+    false one.
+    """
+    hint_l = (hint or "").lower().strip()
+    if not hint_l:
+        return []
+    hints = _hints_for(hint_l)
+    digit = ordinal_digit(hint_l)
+    return [e for e in states if _onoff_name_match(e, hints, digit)]
+
+
 def find_action_targets(
     states: list[dict],
     area_map: dict[str, str],
@@ -646,10 +697,7 @@ def find_action_targets(
     hint_l = (hint or "").lower().strip()
     if not hint_l:
         return []
-    hints: set[str] = {hint_l}
-    for stem, lats in _HINT_LAT.items():
-        if stem in hint_l or hint_l in stem:
-            hints.update(lats)
+    hints = _hints_for(hint_l)
 
     area_n = _norm(area)
     # Registry map not loaded -> substring fallback on the haystack, in both
@@ -666,17 +714,11 @@ def find_action_targets(
 
     out: list[dict] = []
     for e in states:
+        if not _onoff_name_match(e, hints, digit):
+            continue
         eid = e.get("entity_id", "")
-        if eid.split(".", 1)[0] not in _ONOFF_DOMAINS:
-            continue
-        if str(e.get("state", "")).lower() not in ("on", "off"):
-            continue
         name = (e.get("attributes", {}) or {}).get("friendly_name") or ""
         hay = f"{eid} {name}".lower()
-        if digit and digit not in hay:
-            continue
-        if not any(h in hay for h in hints):
-            continue
         if area_n:
             if area_map:
                 # Registry area is authoritative; entity without an area

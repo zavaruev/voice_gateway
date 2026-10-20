@@ -2086,6 +2086,29 @@ class CameraSession:
         up, down = 16000 // g, rate // g
         return resample_poly(arr, up, down).astype(np.int16).tobytes()
 
+    def _loud_chunks_in_window(self) -> int:
+        """How many chunks of the wake window are at least as loud as the bar.
+
+        The window's PEAK cannot tell a VOICE from a CLICK: a click is one
+        sample-wide transient and its peak is on the rail, so it passes any
+        peak-based bar. Measured 20.10.2026 18:48, `camera-corridor1`: two of
+        the three wake fires were on clicks (window=26210/3000 and
+        32767/3000 while the room's own level was rms 442-535), and each fire
+        wiped the speech buffer — so the user's command was destroyed twice by
+        noise.
+
+        A voice is SUSTAINED: many chunks, and a much higher RMS than the
+        floor. This counter is the measurement of that, and it is logged on
+        every wake so the threshold can be derived from the room's own numbers
+        instead of argued.
+        """
+        try:
+            return sum(
+                1 for p in self._vosk_peak_win if p >= self._wake_min_peak
+            )
+        except Exception:
+            return 0
+
     def _user_is_talking(self, now: float) -> bool:
         """Is the user talking to THIS room right now?
 
@@ -3232,6 +3255,8 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
                         f"peak={int(np.abs(s16).max())} "
                         f"window={int(max(self._vosk_peak_win))}"
                         f"/{self._wake_min_peak} "
+                        f"loud={self._loud_chunks_in_window()}"
+                        f"/{len(self._vosk_peak_win)} "
                         f"triggers={self._vosk_wake.triggers} "
                         f"decodes={self._vosk_wake.decodes}"
                     )

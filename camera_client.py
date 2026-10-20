@@ -176,6 +176,13 @@ _ATTENTION_MIN_GAP_S = 3.5
 # «выключи» to a two-tone beep, and the room then spoke about the coffee
 # maker. A wait of 0.8 s is enough for that command to become visible.
 _ATTENTION_SPEECH_GUARD_S = 0.8
+# How long the rate heal may be deferred while the user is talking.
+#
+# The heal restarts the audio pipeline, and a restart in the middle of a
+# sentence destroys the command — measured 20.10.2026 18:48, `camera-corridor1`,
+# where the word was cut in half and then decoded three times. The cap exists
+# because a room that is truly dead must still recover on its own.
+_HEAL_DEFER_MAX_S = 30.0
 
 # How many `/play_audio` POSTs may be outstanding for one room at once.
 #
@@ -1286,6 +1293,8 @@ class CameraSession:
     # session raised AttributeError from inside the live audio path on the
     # first version of this.
     _speech_starts = 0
+    # When the rate heal was first deferred because the user was talking.
+    _heal_deferred_since = 0.0
 
     def __init__(self, config: CameraConfig, backend=None):
         if not re.match(r"^[a-zA-Z0-9_-]+$", config.stream_name):
@@ -1401,6 +1410,8 @@ class CameraSession:
         # wake word just silently never fires.
         self._rate_bytes = 0
         self._rate_start = 0.0
+        # When the heal was first deferred because the user was talking.
+        self._heal_deferred_since = 0.0
         self._rate_check = 0.0
         self._rate_ratio = 1.0
         self._rate_starved = 0
@@ -2075,6 +2086,19 @@ class CameraSession:
         up, down = 16000 // g, rate // g
         return resample_poly(arr, up, down).astype(np.int16).tobytes()
 
+    def _user_is_talking(self, now: float) -> bool:
+        """Is the user talking to THIS room right now?
+
+        The wake window is the signal that works in a room whose VAD never
+        reports silence: the corridor's floor keeps `speech=True` indefinitely
+        (consec>100 observed), so the VAD's flag cannot say "somebody is
+        talking" there — the wake word can, because it is a real event.
+        """
+        return (
+            getattr(self, "_wake_detected", False)
+            and (now - getattr(self, "_last_wake_fired_at", 0.0)) < self._wake_timeout
+        )
+
     async def _account_audio_rate(self, nbytes: int) -> bool:
         """Accumulate delivered audio against wall clock; return True if the
         stream should be restarted.
@@ -2106,7 +2130,38 @@ class CameraSession:
                     f"{ratio*100:.0f}% of real time"
                 )
             self._rate_starved = 0
+            self._heal_deferred_since = 0.0
             return False
+
+        # THE HEAL WAITS FOR THE USER TO STOP TALKING.
+        #
+        # The heal restarts the audio pipeline, and a restart in the middle of a
+        # sentence destroys the command. Measured 20.10.2026 18:48,
+        # `camera-corridor1`: the user started speaking at 18:48:16, the rate
+        # watchdog declared 45 % at 18:48:21 and re-registered the stream, and
+        # the word that came at 18:48:32 was cut in half and then decoded three
+        # times — each fire wiping the speech buffer, so the command never
+        # reached Whisper at all.
+        #
+        # And the heal does not even fix this fault: the watchdog's camera
+        # restart at 22:08:42 did not either (the room was still starved at
+        # 22:09:07). A 41-80 % rate is a WEAK LINK, not a dead producer, and
+        # no restart makes a camera's WiFi faster. So the disruptive step waits
+        # for a quiet moment, bounded — a room that is truly dead must still
+        # recover.
+        if self._user_is_talking(now):
+            if not self._heal_deferred_since:
+                self._heal_deferred_since = now
+            waited = now - self._heal_deferred_since
+            if waited < _HEAL_DEFER_MAX_S:
+                logger.info(
+                    f"[{self.stream_name}] ⏸ heal deferred {waited:.0f}s/"
+                    f"{_HEAL_DEFER_MAX_S:.0f}s: пользователь говорит — перезапуск "
+                    "потока разрезал бы команду (20.10.2026 18:48)"
+                )
+                return False
+        else:
+            self._heal_deferred_since = 0.0
 
         if ratio >= self._min_audio_rate:
             # The band between the two thresholds: the stream is arriving, and it

@@ -1059,6 +1059,10 @@ def _rate_session():
     s._rate_ratio = 1.0
     s._rate_starved = 0
     s.heals = 0
+    s._heal_deferred_since = 0.0
+    s._wake_detected = False
+    s._last_wake_fired_at = 0.0
+    s._wake_timeout = 60.0
 
     async def _heal():
         s.heals += 1
@@ -1177,6 +1181,74 @@ async def test_a_room_stuck_in_the_degraded_band_reaches_the_escalation():
     assert s.heals == 3
     # and the 4th window started counting from 1 again — the reset after escalation
     assert s._rate_starved == 1
+
+
+@pytest.mark.asyncio
+async def test_the_heal_waits_for_the_user_to_stop_talking():
+    """A restart in the middle of a sentence destroys the command.
+
+    Measured 20.10.2026 18:48, `camera-corridor1`:
+
+        18:48:16  VAD SPEECH START rms=0.347        <- the user is speaking
+        18:48:21  ⚠ AUDIO STARVED: 45%  ->  heal: DELETE + re-register, reconnect 3s
+        18:48:34  VOSK WAKE 'компьютер'  triggers=1
+        18:48:38  VOSK WAKE 'компьютер'  triggers=2
+        18:48:47  VOSK WAKE 'компьютер'  triggers=3
+        18:48:55  Whisper IN: 7.04s raw_rms=574  ->  nothing but a hallucination
+
+    The word was cut in half, then decoded three times, and each fire wiped the
+    speech buffer — so the command never reached Whisper at all.
+
+    And the heal does not even fix this fault: the watchdog's camera restart at
+    22:08:42 did not either (the room was still starved at 22:09:07). A 41-80 %
+    rate is a WEAK LINK, not a dead producer, and no restart makes a camera's
+    WiFi faster. So the disruptive step waits for a quiet moment — bounded,
+    because a room that is truly dead must still recover.
+    """
+    s = _rate_session()
+    # The user is in an exchange with this room.
+    s._wake_detected = True
+    now = _set_rate(s, 0.01)
+    s._last_wake_fired_at = now
+    with patch("camera_client.time.time", return_value=now):
+        assert await s._account_audio_rate(0) is False
+    assert s.heals == 0, "the heal restarted the audio pipeline mid-sentence"
+    assert s._rate_starved == 0, (
+        "a deferred attempt is not an attempt: the counter counts what was "
+        "actually tried, or the escalation message would claim a re-register "
+        "that never happened"
+    )
+
+    # The user stopped talking: the heal runs.
+    s._wake_detected = False
+    now = _set_rate(s, 0.01)
+    with patch("camera_client.time.time", return_value=now):
+        await s._account_audio_rate(0)
+    assert s.heals == 1, "with nobody talking the heal must run"
+
+
+@pytest.mark.asyncio
+async def test_the_heal_deferral_is_bounded():
+    """A room that is truly dead must still recover on its own.
+
+    The deferral waits for the user, but a user who never stops talking must not
+    be able to keep a dead stream dead forever.
+    """
+    s = _rate_session()
+    s._wake_detected = True
+    now = _set_rate(s, 0.01)
+    s._last_wake_fired_at = now
+    with patch("camera_client.time.time", return_value=now):
+        await s._account_audio_rate(0)
+    assert s.heals == 0
+    # The cap: the interaction continues, but the wait runs out.
+    late = now + camera_client._HEAL_DEFER_MAX_S + 1
+    s._rate_bytes = int(40 * 16000 * 2 * 0.01)
+    s._rate_start = 1.0
+    s._rate_check = 1.0
+    with patch("camera_client.time.time", return_value=late):
+        await s._account_audio_rate(0)
+    assert s.heals == 1, "the deferral must not be able to keep a dead room dead"
 
 
 def test_the_ok_rate_sits_in_the_gap_between_measured_rooms():

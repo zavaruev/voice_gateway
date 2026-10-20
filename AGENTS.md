@@ -1978,6 +1978,23 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
 
     One target, corridor1's lamp, corridor1's automation — and corridor2's relay and BOTH of its automations untouched. 165 router tests, the new ones covering the narrowing, the named room winning over the satellite's, and the status LED no longer being a lamp.
 
+  * **THE TWO RULES DO NOT FIGHT, AND THE ORDER IS WHAT MAKES IT SO — checked, because the obvious reading says they must.** The room scoping keeps the devices whose token is in the stream name and, **when there are none, keeps EVERYTHING** (`return mine or targets`). A uniquely named device in another room therefore survives it: the coffee maker's token is `coffeemaker`, it is not in `camera-corridor1`, so nothing of the camera's room was among the candidates and the candidate was kept.
+
+    Measured on the live registry, 20.10.2026 16:31, every stream:
+
+    ```
+    camera-corridor1  включи кофеварку  -> switch.coffemaker
+    camera-corridor1  включи свет       -> switch.corridor1_light_switch_relay
+    entrance1         включи кофеварку  -> switch.coffemaker
+    entrance1         включи свет       -> switch.entrance_light_switch_relay
+    kitchen           включи кофеварку  -> switch.coffemaker
+    kitchen           включи свет       -> ПУСТО -> отказ (в кухне лампы нет)
+    livingroom        включи кофеварку  -> switch.coffemaker
+    livingroom        включи свет       -> switch.living_room_light_swith_relay
+    ```
+
+    And live, 16:33, from the corridor: «включи кофеварку» -> `1 target(s) switch.coffemaker`, `ok=True`, «Включаю.» — with the corridor's own lamp NOT in the list. **A narrowing that could drop a device the user named by name would be a worse bug than the one it fixes**, so the "keep everything when nothing of my room is there" half is load-bearing, not a convenience.
+
 - **THE MOTION AUTOMATION WAS LEFT HALF DEAD BY EVERY VOICE COMMAND, AND THE FIX IS AN OVERRIDE THAT ENDS WHEN THE ROOM EMPTIES. Measured 20.10.2026 12:46-12:55, fixed 15:44.**
 
   The report: in the corridor, the motion sensor stopped switching the light.

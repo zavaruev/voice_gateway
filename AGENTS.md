@@ -1948,6 +1948,51 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
     * **So the repeater is aimed at a link that no measurement has shown to be broken.** The camera→go2rtc leg was the healthiest number in the whole series. Whatever is losing the audio, it is between go2rtc and the gateway, or inside the gateway's own reader — and a repeater on the camera's side of the house would not touch it.
     * **And the `slow-capture` state still has no slow side on a real room**, so it stays report-only. It is not a dead instrument: it is the only passive measure of the camera's own delivery, and it is what turned "the link is slow" from an assertion into a number — 97-99 % where the 15.10 table said 0.29-0.40x.
 
+- **THE MOTION AUTOMATION WAS LEFT HALF DEAD BY EVERY VOICE COMMAND, AND THE FIX IS AN OVERRIDE THAT ENDS WHEN THE ROOM EMPTIES. Measured 20.10.2026 12:46-12:55, fixed 15:44.**
+
+  The report: in the corridor, the motion sensor stopped switching the light.
+
+  ```
+  12:46:58  «Включи свет»   -> ON-автоматизации вооружены, OFF-разоружены
+  12:55:07  «выключи свет»  -> ON-разоружены, OFF-вооружены
+  ```
+
+  The state after the second command was the one the rule produces: **the "motion -> on" half disarmed and the "no motion -> off" half armed** — and `automation.corridor2_light_on` had not fired since the PREVIOUS DAY, while the sensor was working perfectly. The rule disarms the half that would undo the command and re-arms the other, and **there is no path back to a pair that is armed together** — so every voice command left the automation permanently half dead. The 14.10.2026 design it replaced had exactly that path («выключи свет» возвращает автоматику), and my v2.48/v2.49 change removed it.
+
+  * **What the four automations actually are** (read from HA's own config, `/api/config/automation/config/{id}`):
+
+    | entity | alias | trigger | action |
+    |---|---|---|---|
+    | corridor1_light_on | Corridor1 light ON | **occupied** | turn_on реле 1 |
+    | corridor2_light_on | Corridor2 light ON | **occupied** | turn_on реле 2 |
+    | corridor2_light_off | Corridor2 light OFF | **not_occupied** | turn_off реле 2 |
+    | corridor2_light_off_2 | **Corridor1 light OFF** | **not_occupied** | turn_off реле 1 |
+
+    The pair is by DEVICE, not by the name: corridor1's OFF automation is the one ALIASED «Corridor1 light OFF» but named `corridor2_light_off_2`. The token matching of 14.10.2026 handles that correctly, and the test asserts it.
+  * **AND THE HA QUEUE IS ~3 min 21 s, WHICH IS WHAT MADE IT LOOK LIKE THE SENSOR FOUGHT THE USER.** The router's disarm reaches HA three and a half minutes later:
+
+    ```
+    12:46:59  роутер вооружил ON-половину   ->  12:50:20  HA: on
+    12:55:07  роутер разоружил ON-половину  ->  12:58:29  HA: off
+    12:57:12  датчик движения включил свет — разоружение ещё не дошло
+    ```
+
+    So the light came back on two minutes after «выключи свет» because the disarm was still in the queue. **A verdict about a room whose automations act three minutes later must be about what was OBSERVED, never about what was requested.**
+  * **THE RULE: a manual command is an OVERRIDE, and it ends when the room empties.** The disarm is only needed while the automation's own trigger is true — the "motion -> on" half must stay down while somebody is in the corridor (otherwise it cancels the manual «выключи», the 19.10.2026 report), and the "no motion -> off" half must stay down while the room looks empty (otherwise it kills a lamp the user just switched on, the 14.10.2026 report). So each disarmed half is handed back the moment its own trigger stops being true, and the pair is restored WHOLE.
+  * **The sensor is found through the automation's trigger, and the trigger names a DEVICE, not an entity.** The trigger's `entity_id` is the device registry's hex id, and this HA build has no REST endpoint for the entity registry (`/api/config/entity_registry/list` answers 404). `device_entities()` is a template function and renders over REST, so the device's entities are reachable and the occupancy binary_sensor among them is the one that decides. Measured: `device_entities('900e8678…')` -> `binary_sensor.corridor1_move_sensor_occupancy` among six entities.
+  * **The two corridor lamps are two rooms, so the override is per ROOM and each has its own sensor** — `binary_sensor.corridor1_move_sensor_occupancy` and `binary_sensor.corridor2_move_sensor_occupancy`. The key is the device token, because both lamps share the HA area `Corridor` and an area-keyed record would disarm one room's sensor because of the other.
+  * **Verified live, 20.10.2026 15:44, from `camera-corridor1`:**
+
+    ```
+    15:44:51  ручное управление: automation.corridor2_light_on разоружена до освобождения комнаты (датчик binary_sensor.corridor2_move_sensor_occupancy)
+    15:44:51  ручное управление: automation.corridor1_light_on разоружена до освобождения комнаты (датчик binary_sensor.corridor1_move_sensor_occupancy)
+    15:44:52  автоматизации света corridor2 возвращены датчику: комната пуста
+    15:44:52  автоматизации света corridor1 возвращены датчику: комната пуста
+    ```
+
+    The room emptied one second later and both automations were back; all four are `on` and firing again (`last_triggered` 15:45-15:48). 163 router tests, the new ones covering the record, the hold while the room is occupied, the restore when it empties, and the re-armed automation not staying on the override list.
+  * **The limit, stated: if the sensor cannot be resolved, the automation STAYS disarmed.** A wrong sensor would restore it at the wrong moment, and a half-armed pair is the failure this whole entry is about — so the conservative branch is the old behaviour, not a guess.
+
 - **THE SAME REQUEST GAVE TWO ANSWERS FROM TWO CAMERAS, AND THE CAUSE WAS THE ROOM THE CAMERA STANDS IN. Measured 20.10.2026 09:20, fixed 12:26-12:33.**
 
   ```

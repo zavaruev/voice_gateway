@@ -309,6 +309,57 @@ class HAClient:
             self._states_at = now
         return self._states
 
+    async def get_automation_config(self, config_id: str) -> dict | None:
+        """The automation's own configuration.
+
+        Its `triggers` name the DEVICE that fires it, which is how a manually
+        disarmed automation can be handed back to the sensor that owns it: the
+        disarm is only needed while that trigger is true.
+
+        Returns None on any failure — the caller then leaves the automation
+        disarmed rather than guessing which sensor it belongs to.
+        """
+        sess = await self._sess()
+        try:
+            async with sess.get(
+                f"{self.url}/api/config/automation/config/{config_id}",
+                headers=self._headers(),
+            ) as resp:
+                if resp.status != 200:
+                    logger.error("HA automation config HTTP %s", resp.status)
+                    return None
+                return await resp.json(content_type=None)
+        except Exception as e:
+            logger.error("HA automation config error: %s", e)
+            return None
+
+    async def device_entities(self, device_id: str) -> list[str]:
+        """The entity ids of one device, via HA's own template function.
+
+        The automation trigger names a DEVICE, and the device's occupancy
+        binary_sensor is the thing whose state decides when a manual override
+        may end. There is no REST endpoint for the device registry on this
+        HA build (`/api/config/entity_registry/list` answers 404), but
+        `device_entities()` is a template function and renders over REST.
+        """
+        sess = await self._sess()
+        template = "{{ device_entities('%s') | join(',') }}" % device_id
+        try:
+            async with sess.post(
+                f"{self.url}/api/template",
+                json={"template": template},
+                headers=self._headers(),
+            ) as resp:
+                if resp.status != 200:
+                    logger.error("HA template HTTP %s", resp.status)
+                    return []
+                raw = await resp.text()
+        except Exception as e:
+            logger.error("HA template error: %s", e)
+            return []
+        raw = raw.strip().strip("'\"")
+        return [e for e in raw.split(",") if e]
+
     async def get_history(self, entity_id: str, hours: int = 24) -> list | None:
         """REST /api/history/period/{t0}?filter_entity_id=... (manifest mapping).
 

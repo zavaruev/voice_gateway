@@ -139,7 +139,12 @@ async def lifespan(app: FastAPI):
     mem_task = asyncio.ensure_future(memory.ensure_collections())
     mem_ok = await _retry_memory(mem_task)
     logger.info("qdrant collections: %s", "ok" if mem_ok else "FAILED (memory off)")
-    yield
+    # Hands a manually disarmed motion automation back when its room empties.
+    override_task = asyncio.ensure_future(_restore_light_automations())
+    try:
+        yield
+    finally:
+        override_task.cancel()
     await classifier.embedder.close()
     await ha.close()
 
@@ -288,6 +293,143 @@ def _device_token(entity_id: str) -> str:
     return m.group(1) if m else ""
 
 
+# Automations that a manual light command disarmed, and the occupancy sensor
+# that decides when the disarm may end.
+#
+# THE RULE, and the two reports it reconciles:
+#
+#   19.10.2026: «выключи свет» must not be cancelled 35 s later by the motion
+#                sensor (it was, and the light came back on its own).
+#   20.10.2026: a voice command must not leave the motion automation half
+#                dead — after «выключи свет» the "motion -> on" half stayed
+#                disarmed FOREVER and the sensor could no longer switch the
+#                light on in the corridor.
+#
+# Both hold if the manual command is an OVERRIDE that lasts only while the
+# room is occupied: the sensor's own trigger is what is being overruled, and
+# the automation is handed back the moment that trigger stops being true —
+# i.e. when the room empties. The sensor then works for the next person.
+#
+# Keyed by the device token (corridor1 / corridor2), because those are the
+# rooms: the two corridor lamps share the HA area "Corridor" and are two
+# different rooms with two different sensors.
+_LIGHT_OVERRIDE: dict[str, dict] = {}
+_LIGHT_OVERRIDE_TICK_S = 30
+
+
+def _forget_light_override(token: str, automation_entity_id: str) -> None:
+    """An automation that was re-armed by a command is no longer overridden."""
+    rec = _LIGHT_OVERRIDE.get(token)
+    if not rec:
+        return
+    rec.get("automations", set()).discard(automation_entity_id)
+    if not rec.get("automations"):
+        _LIGHT_OVERRIDE.pop(token, None)
+
+
+async def _occupancy_sensor_of(automation_entity_id: str) -> str:
+    """The occupancy sensor that fires this automation, if it can be found.
+
+    The automation's trigger names a DEVICE, not an entity: the trigger's
+    `entity_id` is the device registry's hex id, and this HA build has no REST
+    endpoint for the entity registry (`/api/config/entity_registry/list`
+    answers 404). `device_entities()` is a template function and renders over
+    REST, so the device's entities are reachable — and the occupancy
+    binary_sensor among them is the thing whose state says whether the room is
+    empty.
+
+    Returns "" when it cannot be resolved, and then the automation simply
+    stays disarmed: a wrong sensor would restore it at the wrong moment.
+    """
+    states = await ha.get_states()
+    cfg_id = ""
+    for s in states:
+        if s.get("entity_id") == automation_entity_id:
+            cfg_id = str((s.get("attributes") or {}).get("id") or "")
+            break
+    if not cfg_id:
+        return ""
+    cfg = await ha.get_automation_config(cfg_id)
+    if not cfg:
+        return ""
+    for trig in cfg.get("triggers") or []:
+        if str(trig.get("type") or "") not in ("occupied", "not_occupied"):
+            continue
+        dev = str(trig.get("device_id") or "")
+        if not dev:
+            continue
+        for eid in await ha.device_entities(dev):
+            if (
+                eid.startswith("binary_sensor.")
+                and "occupancy" in eid
+                and "battery" not in eid
+            ):
+                return eid
+    return ""
+
+
+async def _note_light_override(token: str, automation_entity_id: str) -> None:
+    """Remember that a manual command disarmed this automation."""
+    if not token:
+        return
+    rec = _LIGHT_OVERRIDE.get(token)
+    if rec is None:
+        rec = {"sensor": "", "automations": set()}
+        _LIGHT_OVERRIDE[token] = rec
+    rec["automations"].add(automation_entity_id)
+    if not rec.get("sensor"):
+        rec["sensor"] = await _occupancy_sensor_of(automation_entity_id)
+    logger.info(
+        "  ручное управление: %s разоружена до освобождения комнаты (датчик %s)",
+        automation_entity_id, rec.get("sensor") or "не найден",
+    )
+
+
+async def _restore_light_automations_once() -> list[str]:
+    """One pass: hand back the overrides whose room is empty.
+
+    The whole pair goes back at once, because a half-armed pair is what broke
+    the corridor: the "motion -> on" half stayed disarmed and the sensor could
+    not switch the light on any more.
+    """
+    restored: list[str] = []
+    if not _LIGHT_OVERRIDE:
+        return restored
+    states = await ha.get_states(force=True)
+    by_id = {str(s.get("entity_id")): s for s in states}
+    for token, rec in list(_LIGHT_OVERRIDE.items()):
+        sensor = by_id.get(str(rec.get("sensor") or ""))
+        if not sensor:
+            continue
+        if str(sensor.get("state", "")).lower() != "off":
+            continue  # somebody is still in the room
+        for eid in sorted(rec.get("automations") or ()):
+            try:
+                await ha.call_service("automation", "turn_on", {"entity_id": eid})
+                restored.append(eid)
+            except Exception as exc:
+                logger.warning(
+                    "  возврат автоматизации %s не удался: %r", eid, exc
+                )
+        _LIGHT_OVERRIDE.pop(token, None)
+        logger.info(
+            "  автоматизации света %s возвращены датчику: комната пуста", token
+        )
+    return restored
+
+
+async def _restore_light_automations() -> None:
+    """The watcher: one pass every `_LIGHT_OVERRIDE_TICK_S` seconds."""
+    while True:
+        try:
+            await asyncio.sleep(_LIGHT_OVERRIDE_TICK_S)
+            await _restore_light_automations_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("возврат автоматизаций света: %r", exc)
+
+
 async def _tie_light_automation(
     areas: dict[str, str], entities: list[str], want_on: bool,
     stream_name: str = "",
@@ -421,6 +563,16 @@ async def _tie_light_automation(
                 {"entity_id": eid},
             )
             touched.append(eid)
+            # The manual command is an OVERRIDE, not a permanent change: the
+            # automation is handed back when the room empties. See
+            # _LIGHT_OVERRIDE — the two reports this reconciles are 19.10.2026
+            # («выключи» must not be cancelled by the sensor) and 20.10.2026 (a
+            # voice command must not leave the automation half dead).
+            token = token_in_name[0] if token_in_name else ""
+            if want_enabled:
+                _forget_light_override(token, eid)
+            else:
+                await _note_light_override(token, eid)
             logger.info(
                 "  light automation tie: %s %s (%s) — ручное управление светом",
                 "включена" if want_enabled else "выключена", name, eid,

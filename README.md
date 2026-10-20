@@ -1,6 +1,6 @@
 # Voice Gateway
 
-![version](https://img.shields.io/badge/version-v2.52-blue)
+![version](https://img.shields.io/badge/version-v2.53-blue)
 [![tests](https://github.com/zavaruev/voice_gateway/actions/workflows/tests.yml/badge.svg)](https://github.com/zavaruev/voice_gateway/actions/workflows/tests.yml)
 ![python](https://img.shields.io/badge/python-3.12%2B-3776AB?logo=python&logoColor=white)
 ![backend](https://img.shields.io/badge/AI%20backend-Cascade-orange)
@@ -48,7 +48,7 @@ See [`docs/REFERENCE.md`](docs/REFERENCE.md) → *Known Issues & Current Problem
 | L2 turn with a verified side effect | **3.2–4.0 s** |
 | Wake debounce | ~240 ms (2 of 3 chunks); a single chunk ≥ 0.68 fires immediately |
 | Wake window / watchdog | 15 s / 90 s |
-| Test suite | 663 tests, 19 files, ~13,194 lines |
+| Test suite | 666 tests, 19 files, ~13,329 lines |
 
 ---
 

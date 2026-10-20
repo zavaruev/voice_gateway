@@ -2712,6 +2712,141 @@ def test_colour_is_a_device_only_inside_the_light_state_construction():
 # UNDO the command". See
 # test_turning_the_light_off_disarms_the_automation_that_would_turn_it_back_on.
 
+def _motion_automation_ha(relay_state="off", sensor_state="on", auto_state="on",
+                        on_auto_state="on"):
+    """A HA stub with one lamp, its two motion automations AND the sensor.
+
+    The sensor is what decides when a manual override may end, and the
+    automation's trigger names the DEVICE, not the entity — the trigger's
+    `entity_id` is the device registry's hex id. So the stub answers
+    `get_automation_config` and `device_entities` the way HA does.
+    """
+
+    class _HA:
+        def __init__(self):
+            self.services = []
+            self.sensor_state = sensor_state
+            self.areas = {
+                "switch.corridor1_light_switch_relay": "Corridor",
+                "automation.corridor2_light_off_2": "Corridor",   # "Corridor1 light OFF"
+                "automation.corridor1_light_on": "Corridor",     # "Corridor1 light ON"
+            }
+
+        async def get_entity_areas(self):
+            return dict(self.areas)
+
+        async def get_states(self, force=False):
+            return [
+                {"entity_id": "switch.corridor1_light_switch_relay",
+                 "state": relay_state, "attributes": {}},
+                {"entity_id": "automation.corridor2_light_off_2",
+                 "state": auto_state,
+                 "attributes": {"friendly_name": "Corridor1 light OFF",
+                                "id": "cfg-off"}},
+                {"entity_id": "automation.corridor1_light_on",
+                 "state": on_auto_state,
+                 "attributes": {"friendly_name": "Corridor1 light ON",
+                                "id": "cfg-on"}},
+                {"entity_id": "binary_sensor.corridor1_move_sensor_occupancy",
+                 "state": self.sensor_state, "attributes": {}},
+            ]
+
+        async def get_automation_config(self, config_id):
+            return {"id": config_id,
+                    "triggers": [{"type": "occupied", "device_id": "dev-corridor1"}]}
+
+        async def device_entities(self, device_id):
+            return [
+                "sensor.corridor1_move_sensor_battery",
+                "binary_sensor.corridor1_move_sensor_occupancy",
+                "binary_sensor.corridor1_move_sensor_battery_low",
+            ]
+
+        async def call_service(self, domain, service, data):
+            self.services.append((domain, service, data.get("entity_id", "")))
+            return {"ok": True, "changed": [], "error": ""}
+
+    return _HA()
+
+
+@pytest.mark.asyncio
+async def test_a_manual_command_records_the_override_and_its_sensor():
+    """«выключи свет» disarms the "motion -> on" half and says WHEN it may come
+    back: the occupancy sensor of THAT room."""
+    mod = _router_app()
+    mod.LIGHT_AUTOMATION_ROOMS = ("corridor",)
+    ha = _motion_automation_ha()
+    mod.ha = ha
+    mod._LIGHT_OVERRIDE.clear()
+    await mod._tie_light_automation(
+        ha.areas, ["switch.corridor1_light_switch_relay"], False
+    )
+    assert ("automation", "turn_off", "automation.corridor1_light_on") in ha.services, (
+        "the sensor that would switch the light back on must stand down"
+    )
+    rec = mod._LIGHT_OVERRIDE["corridor1"]
+    assert rec["sensor"] == "binary_sensor.corridor1_move_sensor_occupancy", (
+        f"the override must name the sensor that ends it: {rec}"
+    )
+    assert "automation.corridor1_light_on" in rec["automations"]
+
+
+@pytest.mark.asyncio
+async def test_the_disarmed_automation_comes_back_when_the_room_empties():
+    """The 20.10.2026 complaint: after «выключи свет» the motion automation was
+    half dead FOREVER and the sensor could not switch the light on any more.
+
+    The manual command holds while somebody is in the room — the 19.10.2026
+    report, «выключи» must not be cancelled 35 s later — and the automation
+    goes back as soon as the room empties.
+    """
+    mod = _router_app()
+    mod.LIGHT_AUTOMATION_ROOMS = ("corridor",)
+    ha = _motion_automation_ha()
+    mod.ha = ha
+    mod._LIGHT_OVERRIDE.clear()
+    await mod._tie_light_automation(
+        ha.areas, ["switch.corridor1_light_switch_relay"], False
+    )
+    ha.services.clear()
+
+    # Somebody is still in the corridor: the manual command holds.
+    assert await mod._restore_light_automations_once() == []
+    assert ha.services == [], (
+        "the sensor must not undo the manual command while the room is occupied"
+    )
+
+    # The room emptied: the automation goes back to the sensor.
+    ha.sensor_state = "off"
+    restored = await mod._restore_light_automations_once()
+    assert restored == ["automation.corridor1_light_on"], (
+        f"the automation must come back when the room empties: {restored}"
+    )
+    assert ("automation", "turn_on", "automation.corridor1_light_on") in ha.services
+    assert not mod._LIGHT_OVERRIDE, "the override must be cleared once it ended"
+
+
+@pytest.mark.asyncio
+async def test_a_re_armed_automation_is_no_longer_overridden():
+    """«включи свет» re-arms the "motion -> on" half, so it must not be listed
+    as overridden any more — otherwise the watcher would re-arm it again later
+    and the manual override would outlive its own reason."""
+    mod = _router_app()
+    mod.LIGHT_AUTOMATION_ROOMS = ("corridor",)
+    ha = _motion_automation_ha(on_auto_state="off")
+    mod.ha = ha
+    mod._LIGHT_OVERRIDE.clear()
+    await mod._tie_light_automation(
+        ha.areas, ["switch.corridor1_light_switch_relay"], True
+    )
+    assert ("automation", "turn_on", "automation.corridor1_light_on") in ha.services
+    rec = mod._LIGHT_OVERRIDE.get("corridor1")
+    if rec is not None:
+        assert "automation.corridor1_light_on" not in rec["automations"], (
+            "an automation that was just re-armed is not overridden"
+        )
+
+
 def _automation_ha(relay_state="off", auto_state="on"):
     """A HA stub carrying one relay and the two automations beside it."""
     import asyncio

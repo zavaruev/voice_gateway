@@ -166,6 +166,16 @@ _WAKE_REARM_DEBOUNCE_S = 3.0
 # second wake is refused instead of its beep being hidden. So the pip limit only
 # has to sit above that, and **every distinct wake gets feedback.**
 _ATTENTION_MIN_GAP_S = 3.5
+# How long the acknowledgement pip WAITS before deciding whether it may sound.
+#
+# The pip is scheduled by the wake word, and the user says the command right
+# after the wake word — so the pip lands on the command unless it waits and
+# looks. Measured 20.10.2026 17:03, `camera-corridor1`: the pip was requested
+# 8 ms before the user's command started, and the buffer it produced held the
+# beep (988/1319 Hz, at the rail) and no speech at all — Whisper answered
+# «выключи» to a two-tone beep, and the room then spoke about the coffee
+# maker. A wait of 0.8 s is enough for that command to become visible.
+_ATTENTION_SPEECH_GUARD_S = 0.8
 
 # How many `/play_audio` POSTs may be outstanding for one room at once.
 #
@@ -1269,6 +1279,13 @@ class CameraSession:
     _audio_rate_ok = 0.8
     _min_audio_rate = 0.5
     _starve_restarts = 3
+    # How many utterances the VAD has opened, and how many at the last wake
+    # word. The acknowledgement pip reads them to decide whether the user is
+    # ALREADY speaking (measured 20.10.2026 17:03, the pip destroyed the
+    # command), so they have to be readable off the class — a hand-built
+    # session raised AttributeError from inside the live audio path on the
+    # first version of this.
+    _speech_starts = 0
 
     def __init__(self, config: CameraConfig, backend=None):
         if not re.match(r"^[a-zA-Z0-9_-]+$", config.stream_name):
@@ -2876,6 +2893,10 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
                 self._last_speech_at = now
                 if not self._vad_has_speech:
                     if win_speech >= 3 and not self._processing_utterance:
+                        # Counted, because "the user started speaking AFTER the
+                        # wake word" is what decides whether our acknowledgement
+                        # pip may sound at all — see `_play_attention`.
+                        self._speech_starts += 1
                         logger.info(
                             f"[{self.stream_name}] VAD SPEECH START rms={orig_rms} "
                             f"(pre-roll {_PREROLL_FRAMES * 0.16:.1f}s)"
@@ -3619,6 +3640,23 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
         # slate.
         self._vad_has_speech = False
         self._vad_speech_buf.clear()
+        # How many times the VAD has opened an utterance. The wake word is
+        # remembered here, so the acknowledgement pip can tell "the user is
+        # ALREADY speaking" from "the room is quiet" — the pip must not land on
+        # the command. Measured 20.10.2026 17:03, `camera-corridor1`:
+        #
+        #     17:03:38.358  VOSK WAKE 'компьютер'
+        #     17:03:39.074  🔔 attention pip (vosk)
+        #     17:03:39.082  VAD SPEECH START        <- the command, 8 ms later
+        #     17:03:41.192  Whisper IN: 2.48s raw_rms=11144 peak=32767
+        #     17:03:41.814  Whisper OK: 'выключи'
+        #
+        # The buffer held the PIP (988 Hz then 1319 Hz, at the rail) and no
+        # speech at all: the user's sentence was never recorded, and Whisper
+        # turned a two-tone beep into a one-word command. The bare verb then
+        # borrowed the previous turn's device — the coffee maker — and the room
+        # answered «На кухне уже выключено».
+        self._speech_starts_at_wake = self._speech_starts
         # Drop the pre-roll too. After a WAKE WORD the utterance starts at the
         # wake — that is what makes this path immune to the confirmation latency
         # the pre-roll exists to cover — so audio from BEFORE the wake word is not
@@ -3629,11 +3667,15 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
         # the utterance where the speech did.
         self._preroll.clear()
         self._vad_speech_consecutive = 0
+        # How many utterances the VAD has opened SINCE THE WAKE WORD. It is
+        # reset here, so the acknowledgement pip can tell "the user is ALREADY
+        # speaking" from "the room is quiet" — see `_play_attention`.
+        self._speech_starts = 0
         if getattr(self, "_endpoint", None) is not None:
             self._endpoint.reset()
         self._vad_silence_frames = 0
         if self._attention_pip:
-            asyncio.create_task(self._play_attention(reason))
+            asyncio.create_task(self._play_attention(reason, guard_speech=True))
         # Bare 'компьютер' with no follow-up used to end in eternal silence (pip
         # only). After a short pause greet so the user knows they were heard.
         # Cap ownership: if nobody responds to pip + greeting, release other
@@ -4051,7 +4093,7 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
                 self._last_fire_ts = time.time()
                 self._wake_detected = True
                 self._wake_expires = time.time() + self._wake_timeout
-                asyncio.create_task(self._play_attention("oww"))
+                asyncio.create_task(self._play_attention("oww", guard_speech=True))
                 # Confirmed without an inline command? Greet as well.
                 self._schedule_wake_greeting()
             else:
@@ -4497,7 +4539,7 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
             if not cmd:
                 self._wake_detected = True
                 self._wake_expires = time.time() + self._wake_timeout
-                asyncio.create_task(self._play_attention("processor_kw"))
+                asyncio.create_task(self._play_attention("processor_kw", guard_speech=True))
                 return
             self._processor.set_state(AgentState.SPEAKING)
             await self._call_nanobot(cmd)
@@ -5155,7 +5197,8 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
         )
 
     def _arm_playback_timing(
-        self, sent_at: float, duration: float, *, audible: bool = True
+        self, sent_at: float, duration: float, *, audible: bool = True,
+        played_until: float = 0.0,
     ) -> None:
         """Describe WHEN OUR OWN AUDIO SOUNDS, from when it was SENT.
 
@@ -5201,6 +5244,21 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
         with the user's speech.
         """
         end = sent_at + duration
+        if played_until > end:
+            # The camera plays the body AS IT ARRIVES, so the sound can outlast
+            # the clip's own duration: measured 20.10.2026 17:03, a 0.40 s pip
+            # took 0.88 s to upload and was STILL PLAYING at 1.2 s after the
+            # send (the endpoint stretches it). The mute was sized by the clip
+            # (0.40 s) and the last 0.45 s of the beep reached the microphone
+            # at the rail, straight into the STT buffer.
+            #
+            # `played_until` is the POST's return: the camera cannot have
+            # finished playing before it has received everything, so that is a
+            # sound lower bound on the end of the sound. Only the pip passes it,
+            # because the pip is the one that plays over the user's speech — and
+            # it only plays into a quiet room now (see `_play_attention`), so a
+            # long mute costs nothing.
+            end = played_until
         # Always recorded, even when silent: `_is_echo` decides whether it may
         # believe a correlation by how long ago playback ENDED, and a room that
         # played nothing still needs that clock to say so.
@@ -5211,7 +5269,42 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
         if stop > self._speaking_until:
             self._speaking_until = stop
 
-    async def _play_attention(self, reason: str = ""):
+    async def _play_attention(self, reason: str = "", *, guard_speech: bool = False):
+        """The acknowledgement pip.
+
+        `guard_speech` is set ONLY where the pip acknowledges a WAKE WORD, i.e.
+        where the user is about to say the command. The other cues answer a
+        finished utterance («готов» -> the room acknowledges) or a session
+        event, and they must sound.
+        """
+        now = time.time()
+        # THE PIP MUST NOT LAND ON THE COMMAND.
+        #
+        # The pip is an acknowledgement of the WAKE WORD, and the user says the
+        # command right after the wake word — so the pip is scheduled exactly
+        # when the command is being spoken. Measured 20.10.2026 17:03 on
+        # `camera-corridor1`: the pip was requested at 17:03:39.074 and the
+        # user's command started 8 ms later; the pip's own sound (988 Hz then
+        # 1319 Hz, at the rail) filled the 2.48 s buffer, the user's speech was
+        # not in it AT ALL, and Whisper returned «выключи» — a hallucination
+        # from a two-tone beep. The bare verb then borrowed the previous turn's
+        # device and the room answered about the coffee maker.
+        #
+        # Two rules, and the second one only works because of the first:
+        #   * the pip waits `_ATTENTION_SPEECH_GUARD_S` before deciding, so a
+        #     command that starts right after the wake is VISIBLE;
+        #   * if the user started speaking in the meantime, the pip is DROPPED.
+        #     The room stays silent until the answer, and the answer is the only
+        #     thing the user needed anyway.
+        if guard_speech:
+            await asyncio.sleep(_ATTENTION_SPEECH_GUARD_S)
+            if self._speech_starts > 0:
+                logger.info(
+                    f"[{self.stream_name}] 🔇 attention pip skipped ({reason}): "
+                    "пользователь уже говорит — пип лёг бы на команду "
+                    "(20.10.2026 17:03, буфер был пипом, а не речью)"
+                )
+                return
         now = time.time()
         if now - self._last_attention < _ATTENTION_MIN_GAP_S:
             # Was silent, and that is user-visible: the wake fires, the camera
@@ -5304,7 +5397,8 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
             # back on: nothing sounded, so the microphone must stay open. It used
             # to be muted anyway, from twenty seconds after a timed-out POST.
             self._arm_playback_timing(
-                sent_at, duration, audible=played or bool(self._out_track)
+                sent_at, duration, audible=played or bool(self._out_track),
+                played_until=time.time(),
             )
             self._close_tts_inflight(duration)
         except Exception as exc:

@@ -1948,6 +1948,37 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
     * **So the repeater is aimed at a link that no measurement has shown to be broken.** The camera→go2rtc leg was the healthiest number in the whole series. Whatever is losing the audio, it is between go2rtc and the gateway, or inside the gateway's own reader — and a repeater on the camera's side of the house would not touch it.
     * **And the `slow-capture` state still has no slow side on a real room**, so it stays report-only. It is not a dead instrument: it is the only passive measure of the camera's own delivery, and it is what turned "the link is slow" from an assertion into a number — 97-99 % where the 15.10 table said 0.29-0.40x.
 
+- **THE ACKNOWLEDGEMENT PIP DESTROYED THE COMMAND, AND WHISPER ANSWERED A TWO-TONE BEEP WITH A ONE-WORD COMMAND. Measured 20.10.2026 17:03, `camera-corridor1`.**
+
+  The report: «выключи свет в гостиной» in the corridor, and the room said «На кухне уже выключено».
+
+  ```
+  17:03:38.358  VOSK WAKE trig='компьютер'
+  17:03:39.074  🔔 attention pip (vosk)
+  17:03:39.082  VAD SPEECH START           <- the command, 8 ms after the pip
+  17:03:39.958  play_audio 0.40s audio in 0.88s (x2.2)
+  17:03:41.188  VAD UTTERANCE END dur=2480ms via pause
+  17:03:41.192  Whisper IN: 2.48s raw_rms=11144 peak=32767
+  17:03:41.814  Whisper OK: 'выключи'
+  17:03:42.527  speaking: 'На кухне уже выключено.'
+  ```
+
+  **The camera never heard the sentence.** The transcript is one word because the BUFFER held the pip, not the speech — measured on the dumped wav of that very utterance:
+
+  ```
+  0.00-0.85 s   rms  789   пик 31 Hz              <- the room floor
+  0.90-1.40 s   rms 22355  пик 984 Hz  peak 32768  <- the pip, first tone
+  1.45-1.56 s   rms 22024  пик 1312 Hz peak 32768  <- the pip, second tone
+  1.60-2.45 s   rms  2068  пик 1312 Hz             <- the pip's tail
+  ```
+
+  988 Hz then 1319 Hz is the attention pip's exact pair (`_play_attention` builds it), 5.3 % of the samples are on the rail, and there is no speech anywhere in the file. Whisper turned a two-tone beep into «выключи» — and a bare verb then borrows the PREVIOUS turn's device, which was the coffee maker («выключи кофеварку» 12 s earlier), and the coffee maker is in the kitchen. So the answer was honest about what was heard and completely wrong about what was said.
+
+  * **TWO DEFECTS, and the first one is the design error.** The pip acknowledges the WAKE WORD, and the user says the command right after the wake word — so the pip is scheduled exactly when the command is being spoken. The race was 8 ms wide. **A sound we make ourselves cannot be kept out of the STT buffer by muting: the camera plays the body AS IT ARRIVES, so the sound starts before the POST returns, and it lasts as long as the upload takes (x1.5-x6.2 measured).** The mute could either be long enough to cover it — and then it discards the user's speech, which is the 19.10.2026 harm — or short enough not to, and then the beep's tail lands in the buffer. Both are real, and the AGENTS.md entry of 14.10.2026 already said so: «over-muting discards the user; under-muting leaks a beep into the buffer».
+  * **THE FIX IS ABOUT THE NOISE, NOT THE WINDOW: the pip stands down when the user is already speaking.** It waits `_ATTENTION_SPEECH_GUARD_S` = 0.8 s — long enough for a command that starts right after the wake to become visible — and if the VAD opened an utterance in the meantime, the pip is DROPPED and the room stays silent until the answer, which is the only thing the user needed anyway. The VAD's speech-start counter is what says "the user is already talking", and it is recorded per class as well as per instance: a session built by hand with `CameraSession.__new__` raised `AttributeError` from inside the live audio path on the first version.
+  * **And the mute now covers the SOUND, which is the upload and not the clip.** `sent_at + duration` was 0.7 s of window for a pip that was still sounding 1.2 s after the send: 0.45 s of beep at the rail reached the microphone. The truth is `max(sent_at + duration, when_the_upload_returned) + settle`, and the clip's duration must NOT be added on top — that double count is what the 19.10.2026 rule was really fighting.
+  * **The 19.10.2026 test was right about the harm and wrong about the fix, and it was rewritten rather than worked around.** It asserted that the HTTP latency must not be in the mute window, because a 2.47 s upload had produced a 3.7 s deaf room and the command was lost. But the latency IS how long the pip sounds; the answer is not a shorter window but a pip that does not play over the user's speech at all. The replacement tests assert the new physics (the mute covers the upload, without the double count) and the new rule (no upload, no mute, when the user is speaking).
+
 - **THE HA AREA IS COARSER THAN THE ROOM, AND A COMMAND IN THE CORRIDOR TOUCHED BOTH CORRIDOR LAMPS. Measured 20.10.2026 12:46, fixed 16:21.**
 
   The report: «по включи свет в коридоре должна включаться только corridor1_light_switch и его автоматизация отключаться, а corridor2_light_switch и его автоматизация — это другое помещение».

@@ -272,40 +272,107 @@ class _SlowHttp:
 
 
 @pytest.mark.asyncio
-async def test_a_slow_play_audio_response_does_not_mute_the_room_for_the_latency():
-    """The cue mute must be sized to the BEEP, not to the HTTP round trip.
+async def test_the_pip_mute_covers_the_sound_and_not_less():
+    """The mute must cover the SOUND, and the sound lasts as long as the upload.
 
-    `_feed_audio` returns on `_speaking_until` BEFORE it ever reaches
-    `_is_echo`, so that window is the only thing keeping our own audio out of
-    the buffer — and it is also the only thing that can throw the user's speech
-    away.
+    The camera plays the body AS IT ARRIVES, so a 0.4 s pip whose upload takes
+    2.47 s is SOUNDING for 2.47 s. A mute sized to the clip alone (0.4 s) is
+    2 s short, and the tail of the beep reaches the microphone at the rail.
 
-    Measured 19.10.2026 on the entrance hall, from the log and
-    `utterance_samples/manifest.jsonl` together:
+    Measured 20.10.2026 17:03, `camera-corridor1`, from the dump of the very
+    utterance that failed:
 
-        08:09:41  VOSK WAKE trig='компьютер'
-        08:09:44  play_audio 0.40s audio in 2.47s (x6.2)
-        08:09:48  VAD UTTERANCE END dur=7040ms via cap 7s
-        08:09:49  Whisper OK: 'компьютер компьютер'
+        0.90-1.40 s  пик 984 Hz,  rms 22355,  peak 32768   <- the pip
+        1.45-1.56 s  пик 1312 Hz, rms 22024,  peak 32768   <- its second tone
+        1.60-2.45 s  всё ещё 1312 Hz, rms 2068             <- its tail
 
-    A 0.4 s pip answered in 2.47 s produced a 3.7 s mute, the utterance opened
-    one frame after it expired, and its first second was the room floor
-    (rms 1036) before the command arrived. Whisper had two copies of the wake
-    word and no command; `drop[muted=73]` on the room that hour.
+    The upload took 0.88 s and the sound was still going 1.2 s after the send.
+    The old window (the clip's duration) covered 0.7 s of it, so 0.45 s of beep
+    at the rail went into the STT buffer and the user's sentence was not in it
+    at all.
+
+    What this test used to assert — that the HTTP latency must NOT be in the
+    window — was the 19.10.2026 rule, and it was right about the harm (a
+    3.7 s deaf room lost the user's command) but it fixed it by under-muting
+    instead: `post + clip + settle` double-counts, because the upload's
+    duration IS when the audio finishes playing. The rule that replaced it is
+    stronger and is about the noise, not the window: the pip is not played at
+    all when the user is already speaking (see the next test), so a long mute
+    can no longer discard anybody's words.
     """
     s = _make_http_session()
     s.http_session = _SlowHttp(0.6)
     s._out_track = None
     s._last_attention = 0.0
 
-    before = time.time()
     await s._play_attention("vosk")
-    span = s._speaking_until - before
+    # Measured from the end of the upload, because that is when the sound ends:
+    # the camera cannot have finished playing before it has received
+    # everything. (The call itself starts 0.8 s earlier — the pip waits that
+    # long to see whether the user is speaking.)
+    after = time.time()
+    tail = s._speaking_until - after
 
-    pip_dur = 0.4
-    assert span < pip_dur + camera_client._SPEAKER_SETTLE_S + 0.15, (
-        f"the mute ran {span:.2f}s for a {pip_dur}s pip whose POST took 0.60s — "
-        f"the HTTP latency is in the window again"
+    assert tail >= camera_client._SPEAKER_SETTLE_S - 0.05, (
+        f"the mute ends {tail:.2f}s after the upload — the tail of the beep "
+        "reaches the microphone and lands in the STT buffer"
+    )
+    assert tail < camera_client._SPEAKER_SETTLE_S + 0.3, (
+        f"the mute ends {tail:.2f}s after the upload — the clip's own duration "
+        "must not be added on top of the upload, that is the double count the "
+        "19.10.2026 rule was fighting"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_pip_is_dropped_when_the_user_is_already_speaking():
+    """The pip is an acknowledgement of the WAKE WORD, and the user says the
+    command right after the wake word — so the pip must not sound at all.
+
+    Measured 20.10.2026 17:03, `camera-corridor1`: the pip was requested at
+    17:03:39.074 and the user's command started 8 ms later. The buffer held the
+    pip (988 Hz then 1319 Hz, at the rail) and NO speech, Whisper returned the
+    one word «выключи», the bare verb borrowed the previous turn's device — the
+    coffee maker — and the room answered «На кухне уже выключено».
+
+    So the pip waits long enough to SEE the command, and then stands down.
+    """
+    s = _make_http_session()
+    s.http_session = _SlowHttp(0.01)
+    s._out_track = None
+    s._last_attention = 0.0
+    # An utterance opened since the wake word: the user is already talking.
+    s._speech_starts = 1
+
+    await s._play_attention("vosk", guard_speech=True)
+
+    assert not s.http_session.calls, (
+        f"the pip was uploaded while the user was speaking: {s.http_session.calls}"
+    )
+    assert s._speaking_until <= time.time(), (
+        "a pip that never sounded must not mute the room"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_ack_pip_is_not_suppressed_by_the_speech_guard():
+    """The guard belongs to the WAKE WORD pip only.
+
+    «готов» is an utterance the user has ALREADY finished, and the room
+    acknowledges it with a pip. The guard is about a pip that would land on a
+    command still being spoken, and it must not silence the answer to a
+    finished sentence.
+    """
+    s = _make_http_session()
+    s.http_session = _SlowHttp(0.01)
+    s._out_track = None
+    s._last_attention = 0.0
+    s._speech_starts = 1  # the utterance the user just finished
+
+    await s._play_attention("ack")
+
+    assert s.http_session.calls, (
+        "the acknowledgement of a finished sentence must not be suppressed"
     )
 
 

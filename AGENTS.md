@@ -1931,6 +1931,50 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
     * `read -r pbytes ptime <"$prev_file" 2>/dev/null || pbytes=""; ptime=""` does **not** do what it looks like — the `;` ends the `||` list, so the reset runs unconditionally and the values just read are always thrown away. The rate was never computed and the gate was silently inert. The self-test caught it; a live run would not have, because "no rate" and "no problem" look the same in a log.
     * The state was raised from the current sample and then **cleared inside the same pass**, because the confirmation loop re-classifies every 20 s and the measurement window is 30 s. The room "recovered on its own" before the ladder was reached. The hit counter IS the memory now: only a measurement that PROVES the rate healthy clears it.
 
+- **THE SAME REQUEST GAVE TWO ANSWERS FROM TWO CAMERAS, AND THE CAUSE WAS THE ROOM THE CAMERA STANDS IN. Measured 20.10.2026 09:20, fixed 12:26-12:33.**
+
+  ```
+  09:20:51  stream=entrance1  'Выключи кофеварку.'
+            -> no_target:кофеварка: в реестре HA нет такого устройства
+  09:21:19  stream=kitchen     'выключи кофеварку'
+            -> on/off HassTurnOff кофеварка: 1 target(s) switch.coffemaker=on
+  ```
+
+  The ONLY difference was the room the camera stands in. The coffee maker is the only one in the house and it lives in the kitchen, so the area filter (Entrance) hid it — and the refusal was a FALSE statement: the device is in the registry, in another room.
+
+  * **The rule: a device named UNIQUELY is not bound to the room the user is standing in.** The room may narrow an AMBIGUOUS name, and only when it came from the satellite's default room — a room the user SPOKE is a hard constraint («включи свет в коридоре» must never reach the kitchen lamp). An ordinal is excluded too: «свет 1» names a NUMBERED instance, and the action path refuses rather than guessing which room's "1" was meant (02.10.2026, corridor1/corridor2).
+  * **THE REFUSAL WAS ALSO A LIE, AND NOW IT NAMES THE REAL REASON.** «в реестре HA нет такого устройства» was false twice over: the device exists, and the gate's own instrument (`find_entity`, a global lookup) does not know the «кофевар» -> «coffee» alias the finder uses. A gate that asks a DIFFERENT question than the finder is a second opinion with worse tools — 12.10.2026 said that about `find_entity`, and the same shape sits one level up in the area filter. The gate now uses the same alias-aware matcher, and a device that exists but is not in this room gives `device_elsewhere: N шт. в [rooms], нужна комната`: the rooms are NAMED, because that is what helps the reader.
+  * **THE MATCHER REFUSED THE ENTITY BY AREA WHILE THE SERVICE WAS STILL CALLED — and the room said «не получилось» about a coffee maker that was being switched on.** Measured 20.10.2026 12:26, `stream=entrance1`, `intent__HassTurnOn` with `name='switch.coffemaker'`, `area='Entrance'`:
+
+    ```
+    call switch.coffemaker -> ok=False claimed=None
+    HA call failed: No entities were in the area (given name 'switch.coffemaker', area 'Entrance', domains switch)
+    ```
+
+    The service WAS called: the appliance turned on **+3 min 25 s** later — the same queue every other command to it has — while the room was told that nothing happened. So the `area` slot has to be DROPPED when the device was found by name alone and lives outside the satellite's room: an entity id does not need a room to be matched. The media path had already learned this («пауза коди во владиной комнате», 06.10.2026); the on/off path had not.
+  * **The answer must name the room of the DEVICE, not the room of the camera.** «В прихожей уже выключено» about a coffee maker standing in the kitchen is a lie of another kind: the user can see the device and cannot see the satellite's room.
+  * **The typo case changed direction, and that is the point.** «Включи кафеварку» (STT typo, 04.10.2026) used to be refused, and the refusal was defended as "the ghost-device protection". But the protection is about a device ABSENT from the registry (a free model would then invent one), and the coffee maker is not absent: the alias table has carried «кафевар» -> «coffee» since 29.09.2026, and the worker's copy of the table matches it too — so L2 has always read the typo as the coffee maker while L1 refused it. The two paths now agree, and a word that matches NOTHING in the registry is still refused deterministically.
+  * Verified live, 20.10.2026 12:30-12:33, `stream=entrance1`:
+
+    ```
+    12:30:53  «кофеварка» назван однозначно и лежит не в комнате говорящего — беру его: switch.coffemaker
+    12:30:53  call switch.coffemaker -> ok=True claimed=[{'name': 'coffeemaker', 'type': 'entity', 'id': 'switch.coffemaker'}]
+    12:30:54  verify settled want=on moved=['switch.coffemaker']
+    12:31:51  call switch.coffemaker -> ok=True   (выключить)
+    12:31:52  verify want=off moved=['switch.coffemaker'] — proved by the power sensor on the first read
+    ```
+
+    The claimed list carries the ENTITY and no area — the matcher was given no room to refuse. State restored afterwards: the coffee maker is off and drawing 0 W.
+  * **A SEPARATE MEASUREMENT, worth keeping: the appliance acts ~2.5-3.5 MINUTES after the call.** The transitions of 20.10.2026:
+
+    ```
+    09:01:33  команда «включи»   ->  09:04:55  on
+    09:21:19  команда «выключи»  ->  09:24:40  off
+    12:26:00  команда «включи»  ->  12:29:25  on   (этой строке матчер ответил ОТКАЗОМ)
+    ```
+
+    So a refusal at the matcher level and a device that is nonetheless switching on CAN COEXIST — which is exactly the shape of «не получилось, устройство не отреагировало» for a command that did work. **A verdict about a device that acts three minutes later must be about what was OBSERVED, never about what was requested.**
+
 ## REST API
 
 | Path | Method | Purpose |

@@ -1424,6 +1424,35 @@ async def test_a_uniquely_named_device_is_found_from_another_room():
     assert "switch.coffemaker_child_lock" not in called, (
         "the child lock is a facet of the device, not a second target"
     )
+    # The satellite's room must NOT be handed to HA's matcher. Measured
+    # 20.10.2026 12:26: with `area: "Entrance"` the matcher answered «No
+    # entities were in the area (given name 'switch.coffemaker', area
+    # 'Entrance', domains switch)» — and the SERVICE was still called, so the
+    # coffee maker turned on +3 min 25 s later while the room was told it had
+    # failed. An entity id does not need a room to be matched.
+    for _, args in mod.ha.calls:
+        assert "area" not in args, (
+            f"the room of the satellite is a hint, not a constraint: {args}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_the_answer_names_the_room_of_the_device_not_the_room_of_the_camera():
+    """«В прихожей уже выключено» about a coffee maker in the kitchen is a lie.
+
+    The satellite's room is where the user is standing; the room in the answer
+    is where the device is. The user can see the device and cannot see the
+    satellite's room, so the wrong one is exactly the wrong one to say.
+    """
+    mod = _router_app()
+    states = [dict(s, state="off") for s in _COFFEE_STATES]
+    mod.ha = _HAWithAreas(states, _COFFEE_AREAS, {"ok": True})
+    call = resolve_action("выключи кофеварку", "entrance1")
+    sentence, err = await mod._execute_action(call, "выключи кофеварку")
+    assert err is None, f"unexpected error: {err!r}"
+    assert sentence == "На кухне уже выключено.", (
+        f"the answer must name the room of the device: {sentence!r}"
+    )
 
 
 @pytest.mark.asyncio

@@ -606,6 +606,9 @@ async def _execute_action(
     if call.tool.startswith("media__"):
         return await _execute_media(call)
     states: list[dict] | None = None
+    # True when the device was found by name alone and lives OUTSIDE the
+    # satellite's room. The matcher must then not be given that room.
+    target_outside_area = False
     if call.tool in _ONOFF_TOOLS:
         states = await ha.get_states(force=True)
         if not states:
@@ -660,6 +663,20 @@ async def _execute_action(
                 )
                 if len(elsewhere) == 1:
                     targets = elsewhere
+                    # The satellite's room is a hint about where the user is
+                    # standing, and HA's matcher takes the `area` slot as a HARD
+                    # filter: with `area: "Entrance"` it answered "No entities
+                    # were in the area (given name 'switch.coffemaker', area
+                    # 'Entrance', domains switch)" — 20.10.2026 12:26, measured.
+                    #
+                    # The service was STILL called (the appliance turned on
+                    # +3 min 25 s later, the same queue as every other command
+                    # to it) while the router reported a failure, so the room
+                    # said «Не получилось включить кофеварку» about a coffee
+                    # maker that was, in fact, being switched on. The slot has
+                    # to go: we have already resolved the entity to an exact id,
+                    # and an id does not need a room to be matched.
+                    target_outside_area = True
                     logger.info(
                         "  «%s» назван однозначно и лежит не в комнате говорящего — "
                         "беру его: %s",
@@ -804,8 +821,18 @@ async def _execute_action(
             if targets and not todo:
                 # Every matched device is already in the requested state:
                 # tell the truth instead of pretending we changed something.
+                #
+                # The room in the answer is the room of the DEVICE, not the room
+                # of the satellite: «В прихожей уже выключено» about a coffee
+                # maker standing in the kitchen is a lie of another kind, and
+                # the satellite's room is the one the user cannot see.
                 word = "включено" if want_on else "выключено"
-                area_ph = _area_phrase(call.args.get("area") or "")
+                dev_area = ""
+                if targets:
+                    dev_area = (
+                        area_map.get(targets[0].get("entity_id", ""), "") or ""
+                    )
+                area_ph = _area_phrase(dev_area or call.args.get("area") or "")
                 sentence = f"{area_ph} уже {word}." if area_ph else f"Уже {word}."
                 return sentence, None
             if len(todo) > _MAX_ONOFF_TARGETS:
@@ -843,6 +870,15 @@ async def _execute_action(
                     # registry entry so the matcher targets exactly what was
                     # resolved, and the next iteration starts from clean args.
                     args = dict(call.args)
+                    # The room the satellite stands in is not a constraint on a
+                    # device the user named, and HA's matcher treats `area` as a
+                    # hard filter: it refused the entity by AREA while the
+                    # service was called anyway, so the room said «не получилось»
+                    # about a device that was being switched on. Measured
+                    # 20.10.2026 12:26, `camera-corridor1`/`entrance1` and
+                    # `switch.coffemaker`.
+                    if target_outside_area:
+                        args.pop("area", None)
                     # `name` gets the ENTITY ID, not the friendly_name: HA's
                     # matcher only accepts the concatenated friendly name for
                     # some entities — field check 02.10.2026, «corridor1_light_

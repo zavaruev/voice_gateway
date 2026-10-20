@@ -95,12 +95,38 @@ MIN_GAP_S="${MIN_GAP_S:-300}"       # per camera: never retry more often
 # chunks/s against 6.25/s for over 15 minutes, producing a line every 20 s.
 STARVE_WINDOW_S="${STARVE_WINDOW_S:-300}"
 STARVE_MIN_HITS="${STARVE_MIN_HITS:-3}"
+
+# Capture rate, measured on the camera→go2rtc leg WITHOUT adding a consumer.
+#
+# The 15.10.2026 plan was `ffmpeg -i rtsp://<camera> -t 15 -f null -` and to read
+# `speed=`, and it was never implemented, because that command is a SECOND
+# consumer on a single-threaded majestic and a watchdog must not perturb what it
+# watches. The same quantity is available for free: go2rtc already holds the
+# camera's RTSP session and counts the bytes of every track it receives
+# (`98 OPUS/48000/2, bytes=…` on the producer), so reading its counter twice,
+# N seconds apart, measures the delivery rate of an ALREADY OPEN link.
+#
+# Measured 20.10.2026, 30 s window, all four rooms: 6424-6428 B/s of OPUS, a
+# spread of 0.06 % across rooms whose microphone levels differ 2.7x — the
+# encoder is CBR here, so the byte rate is a usable proxy for "fraction of real
+# time" (the gateway's own ratio is the same quantity on the go2rtc→gateway leg).
+#
+# The bar is 80 % of the room's OWN best observed rate, not of a constant: the
+# constant is a property of the encoder, and the encoder is not what is being
+# watched. 80 % is the gateway's own `_audio_rate_ok`, measured from both sides
+# (healthy 1.08x, broken ≤ 0.71x).
+CAPTURE_RATE_ENABLED="${CAPTURE_RATE_ENABLED:-1}"
+CAPTURE_RATE_PCT="${CAPTURE_RATE_PCT:-80}"
+CAPTURE_RATE_MIN_HITS="${CAPTURE_RATE_MIN_HITS:-2}"
+CAPTURE_RATE_MIN_DT="${CAPTURE_RATE_MIN_DT:-30}"
+CAPTURE_RATE_STAMPS="$STAMP_DIR/.camera_watchdog_capture"
 GW_SETTLE_S="${GW_SETTLE_S:-90}"    # settle time after restarting the gateway
 SETTLE_S="${SETTLE_S:-30}"
 WAIT_UP_S="${WAIT_UP_S:-150}"       # how long a reboot may take to come back
 
 CUR_NAME="?"; CUR_IP="?"; CUR_STREAM="?"
 CAM_LATENCY="?"; STATE="?"
+CAM_CAPTURE_BPS=""; CAM_CAPTURE_BASE=""
 
 log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$LOG" 2>/dev/null || true; }
 
@@ -456,6 +482,80 @@ audio_starved_hits() {
   printf '%s\n' "$lines" | tail -1 | grep -q "AUDIO STARVED" || { echo 0; return 0; }
   printf '%s\n' "$lines" | grep -c "AUDIO STARVED" 2>/dev/null || echo 0
 }
+
+# The OPUS track's byte counter on the producer side: the camera→go2rtc leg.
+capture_bytes() {
+  curl -s -m 10 "$GO2RTC/api/streams?src=$1" 2>/dev/null | python3 -c '
+import json, re, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+prod = (d.get("producers") or [{}])[0]
+for rec in prod.get("receivers") or []:
+    m = re.match(r"\d+\s+OPUS", str(rec))
+    b = re.search(r"bytes=(\d+)", str(rec))
+    if m and b:
+        print(int(b.group(1)))
+        break
+'
+}
+
+# True (exit 0) when the measured rate is BELOW the bar for this room.
+# An empty measurement, or a room with no baseline yet, is NEVER a decision:
+# there is nothing to compare, and guessing is what this script has done wrong
+# before.
+capture_rate_is_slow() {
+  local rate="${1:-}" base="${2:-}"
+  [ -n "$rate" ] && [ -n "$base" ] || return 1
+  [ "$base" -gt 0 ] 2>/dev/null || return 1
+  [ "$rate" -lt $(( base * CAPTURE_RATE_PCT / 100 )) ] 2>/dev/null
+}
+
+# Sets CAPTURE_RATE_BPS (the rate since the previous pass) and CAPTURE_BASE_BPS
+# (the room's own best observed rate). Both are empty when there is not enough
+# to say anything, and an empty value is NEVER a decision.
+#
+# The baseline is a rolling maximum, so an encoder that raises its bitrate does
+# not make the room look slow, and the counter restarting (the producer was
+# re-created) shows up as a negative delta and is ignored.
+capture_rate() {
+  CAPTURE_RATE_BPS=""; CAPTURE_BASE_BPS=""
+  local cur prev_file best_file now pbytes="" ptime="" best="" dt=0
+  prev_file="${CAPTURE_RATE_STAMPS}_$CUR_STREAM.prev"
+  best_file="${CAPTURE_RATE_STAMPS}_$CUR_STREAM.best"
+  cur="$(capture_bytes "$CUR_STREAM")" || return 1
+  [ -n "$cur" ] || return 1
+  now="$(date +%s)"
+  if [ -f "$prev_file" ]; then
+    # `read ... || pbytes=""; ptime=""` does NOT do what it looks like: the `;`
+    # ends the `||` list, so the reset runs unconditionally and the values just
+    # read are always thrown away. The first version of this function had that
+    # and the rate was never computed — the self-test caught it.
+    if read -r pbytes ptime <"$prev_file" 2>/dev/null; then
+      :
+    else
+      pbytes=""; ptime=""
+    fi
+    if [ -n "$pbytes" ] && [ -n "$ptime" ]; then
+      dt=$(( now - ptime ))
+      if [ "$dt" -ge "$CAPTURE_RATE_MIN_DT" ] 2>/dev/null; then
+        CAPTURE_RATE_BPS=$(( (cur - pbytes) / dt ))
+        [ "$CAPTURE_RATE_BPS" -lt 0 ] && CAPTURE_RATE_BPS=""
+      fi
+    fi
+  fi
+  printf '%s %s\n' "$cur" "$now" >"$prev_file" 2>/dev/null || true
+  if [ -f "$best_file" ]; then
+    read -r best <"$best_file" 2>/dev/null || best=""
+  fi
+  if [ -n "$CAPTURE_RATE_BPS" ] && { [ -z "$best" ] || [ "$CAPTURE_RATE_BPS" -gt "$best" ]; }; then
+    best="$CAPTURE_RATE_BPS"
+    printf '%s\n' "$best" >"$best_file" 2>/dev/null || true
+  fi
+  CAPTURE_BASE_BPS="$best"
+  return 0
+}
 classify() {
   local lat fast=0 up=0 hits
   lat="$(cam_latency)"
@@ -474,6 +574,41 @@ classify() {
     if [ "${CAM_STARVED_HITS}" -ge "$STARVE_MIN_HITS" ]; then
       STATE="audio-starved"
       return 0
+    fi
+    # The camera→go2rtc leg, read off go2rtc's own counter. This is the signal
+    # the 15.10.2026 plan wanted and could not take without adding a consumer,
+    # and it is a CAMERA fault, so it routes to the camera ladder and never to
+    # the gateway restart.
+    if [ "$CAPTURE_RATE_ENABLED" = "1" ]; then
+      local rate="" base="" cap_file cap_hits=0
+      if capture_rate; then
+        rate="$CAPTURE_RATE_BPS"
+        base="$CAPTURE_BASE_BPS"
+      fi
+      CAM_CAPTURE_BPS="$rate"; CAM_CAPTURE_BASE="$base"
+      cap_file="${CAPTURE_RATE_STAMPS}_$CUR_STREAM.hits"
+      cap_hits="$(cat "$cap_file" 2>/dev/null || echo 0)"
+      case "$cap_hits" in ''|*[!0-9]*) cap_hits=0 ;; esac
+      if [ -n "$rate" ] && [ -n "$base" ] && [ "$base" -gt 0 ] 2>/dev/null; then
+        if capture_rate_is_slow "$rate" "$base"; then
+          cap_hits=$(( cap_hits + 1 ))
+          echo "$cap_hits" >"$cap_file" 2>/dev/null || true
+        else
+          # Only a measurement that PROVES the rate is healthy clears the counter.
+          rm -f "$cap_file" 2>/dev/null || true
+          cap_hits=0
+        fi
+      fi
+      # The counter is the memory. A pass that could not measure the rate (the
+      # window is 30 s and the confirmation loop re-classifies every 20 s) must
+      # NOT clear a state that has already been established — the first version
+      # raised `slow-capture` and then, in the very same pass, re-classified to
+      # healthy, so the room "recovered on its own" before the ladder was
+      # reached. The state is only cleared by a healthy MEASUREMENT.
+      if [ "$cap_hits" -ge "$CAPTURE_RATE_MIN_HITS" ]; then
+        STATE="slow-capture"
+        return 0
+      fi
     fi
     # Last gate before healthy, and only while the stream is up: with no stream
     # there is no level to read and dead-stream/wedged already route correctly.
@@ -550,13 +685,106 @@ select_camera() {
   return 0
 }
 
+# --- self-test ----------------------------------------------------------------
+# A gate that cannot be shown to fire is not a gate. This exercises the capture
+# rate arithmetic and the threshold in BOTH directions: a healthy rate must not
+# raise the state, a slow one must, and a MISSING measurement must not either.
+run_self_test() {
+  local fails=0 tmp
+  tmp="$(mktemp -d 2>/dev/null)" || { echo "  SELFTEST: cannot create a temp dir"; return 1; }
+  STAMP_DIR="$tmp"; CAPTURE_RATE_STAMPS="$STAMP_DIR/.cap"; CUR_STREAM="selftest"
+  FAKE_NOW=1000
+  date() { printf '%s\n' "$FAKE_NOW"; }
+  CAPTURE_BYTES=0
+  capture_bytes() { printf '%s\n' "$CAPTURE_BYTES"; }
+
+  # --- the threshold, both directions ----------------------------------------
+  if capture_rate_is_slow 6424 6424; then
+    echo "  FAIL: a rate equal to the baseline is not slow"; fails=$((fails+1))
+  fi
+  if capture_rate_is_slow 5138 6424; then
+    : # 79 % of the baseline: slow, and it must be reported as slow
+  else
+    echo "  FAIL: 79 % of the baseline must be slow"; fails=$((fails+1))
+  fi
+  if capture_rate_is_slow 5139 6424; then
+    echo "  FAIL: the 80 % boundary itself is not slow"; fails=$((fails+1))
+  fi
+  if capture_rate_is_slow 5200 6424; then
+    echo "  FAIL: 81 % of the baseline is not slow"; fails=$((fails+1))
+  fi
+  if capture_rate_is_slow "" 6424; then
+    echo "  FAIL: no measurement is not a decision"; fails=$((fails+1))
+  fi
+  if capture_rate_is_slow 100 ""; then
+    echo "  FAIL: no baseline is not a decision"; fails=$((fails+1))
+  fi
+  if capture_rate_is_slow 100 0; then
+    echo "  FAIL: a zero baseline is not a decision"; fails=$((fails+1))
+  fi
+
+  # --- the arithmetic ---------------------------------------------------------
+  CAPTURE_BYTES=0; FAKE_NOW=1000
+  capture_rate >/dev/null
+  if [ -n "$CAPTURE_RATE_BPS" ]; then
+    echo "  FAIL: the first pass has nothing to compare against"; fails=$((fails+1))
+  fi
+  FAKE_NOW=1060; CAPTURE_BYTES=$(( 6424 * 60 ))
+  capture_rate >/dev/null
+  if [ "$CAPTURE_RATE_BPS" != "6424" ]; then
+    echo "  FAIL: 385440 bytes over 60 s is 6424 B/s, got '${CAPTURE_RATE_BPS:-}'"
+    fails=$((fails+1))
+  fi
+  if [ "$CAPTURE_BASE_BPS" != "6424" ]; then
+    echo "  FAIL: the baseline is the rate just measured, got '${CAPTURE_BASE_BPS:-}'"
+    fails=$((fails+1))
+  fi
+  # A slower reading must lower the RATE and must NOT lower the baseline.
+  # The counter is cumulative, so the delta is from the PREVIOUS reading:
+  # 385440 + 1000*60 = 445440 -> 60000 bytes over 60 s -> 1000 B/s.
+  FAKE_NOW=1120; CAPTURE_BYTES=$(( 6424 * 60 + 1000 * 60 ))
+  capture_rate >/dev/null
+  if [ "$CAPTURE_RATE_BPS" != "1000" ]; then
+    echo "  FAIL: the slower pass must report 1000 B/s, got '${CAPTURE_RATE_BPS:-}'"
+    fails=$((fails+1))
+  fi
+  if [ "$CAPTURE_BASE_BPS" != "6424" ]; then
+    echo "  FAIL: the baseline is a rolling maximum, got '${CAPTURE_BASE_BPS:-}'"
+    fails=$((fails+1))
+  fi
+  if ! capture_rate_is_slow "$CAPTURE_RATE_BPS" "$CAPTURE_BASE_BPS"; then
+    echo "  FAIL: 1000 B/s against a 6424 B/s baseline is slow"; fails=$((fails+1))
+  fi
+  # A counter that went backwards means the producer was re-created: ignored.
+  FAKE_NOW=1180; CAPTURE_BYTES=10
+  capture_rate >/dev/null
+  if [ -n "$CAPTURE_RATE_BPS" ]; then
+    echo "  FAIL: a re-created producer must not produce a rate"; fails=$((fails+1))
+  fi
+
+  rm -rf "$tmp" 2>/dev/null || true
+  if [ "$fails" -eq 0 ]; then
+    echo "  SELFTEST OK — threshold fires below 80 % and stays quiet at and above it"
+    return 0
+  fi
+  echo "  SELFTEST FAILED: $fails check(s)"
+  return 1
+}
+
+if [ "${1:-}" = "--self-test" ]; then
+  run_self_test
+  exit $?
+fi
+
 SICK=""
 for entry in $CAMERAS; do
   select_camera "$entry" || continue
   classify
   case "$STATE" in
     healthy)
-      log "$CUR_NAME healthy (http ${CAM_LATENCY}s)"
+      # The capture rate is recorded even here: a value that is only written
+      # when something is wrong is a value that cannot be compared afterwards.
+      log "$CUR_NAME healthy (http ${CAM_LATENCY}s)${CAM_CAPTURE_BPS:+ capture=${CAM_CAPTURE_BPS}/${CAM_CAPTURE_BASE} B/s}"
       ;;
     unreachable)
       # Never rebooted: no answer means the network, and rebooting something you
@@ -572,6 +800,22 @@ for entry in $CAMERAS; do
       # audio is arriving at a fraction of real time while the stream looks fine.
       SICK="$SICK $CUR_STREAM"
       log "$CUR_NAME UNHEALTHY state=$STATE http=$(cam_latency)s stream=$CUR_STREAM${CAM_STARVED_HITS:+ starved=${CAM_STARVED_HITS}/${STARVE_WINDOW_S}s}"
+      ;;
+    slow-capture)
+      # REPORTED, NEVER ACTED ON — and that is a decision, not an oversight.
+      #
+      # The number is measured on both sides of the bar: the healthy side is
+      # 6354-6512 B/s on all four rooms (measured 20.10.2026, a 1.3 % spread),
+      # and the slow side was measured on a stand-in, not on a camera that was
+      # really slow. The threshold therefore rests on ONE measured side, and the
+      # ladder ends in a REBOOT of the physical camera — a destructive step that
+      # must not be armed on an inferred value.
+      #
+      # So this state measures, records and stops. The value is in the log of
+      # every pass, which is what the sick side will be read from the next time a
+      # room is really slow. Arming the action is a one-line change once that
+      # number exists.
+      log "$CUR_NAME SLOW CAPTURE ${CAM_CAPTURE_BPS:-?}/${CAM_CAPTURE_BASE:-?} B/s — the camera is delivering a fraction of real time. Reported, not acting: the threshold's slow side is not yet measured on a real room"
       ;;
     mic-silent)
       # Stream alive, rate fine, level on the floor. Reported, never acted on —

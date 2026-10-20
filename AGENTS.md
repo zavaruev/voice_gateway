@@ -1286,6 +1286,8 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
 
   * **The watchdog is missing exactly one signal — and it is measurable without sound.** `camera_watchdog.sh` measures HTTP latency, stream presence and level, and on all three `×25.7` with `http 0.1 s` passes as `healthy`. **What is needed is capture speed:** `ffmpeg -i rtsp://... -t 15 -f null -` and read `speed=`. The threshold from both sides of the measurement: broken 0.40–0.59x, normal 1.01x, so somewhere at 0.8x. **There is no such measurement in the watchdog today, and that is the next piece of work — not urgent, but without it this class of fault will keep looking "healthy".**
 
+    **DONE, 20.10.2026, and the instrument is not the one planned here.** The `ffmpeg` command above is a SECOND consumer on a single-threaded `majestic` and cannot be used by a watchdog; go2rtc's own producer byte counter measures the same quantity for free, and it is implemented (`slow-capture` in `scripts/camera_watchdog.sh`, report-only until the threshold's slow side is measured on a real room). See the entry at the end of this file.
+
   * **The watchdog cannot see this class and will not learn to:** it measures HTTP latency, stream and level, and `×25.7` with `http 0.1 s` and a live stream is "healthy" by all its criteria. The same lesson as with `majestic restart`: **check the `play_audio` ratio in EVERY room, not in one.**
 
 - **THE HARDWARE WAS TO BLAME, AND IT WAS NOT — THE RECORD STAYS AS AN EXAMPLE OF HOW I WAS WRONG. 15.10.2026.**
@@ -1868,6 +1870,66 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
   * **Я СНАЧАЛА ПОПЫТАЛСЯ ПРИБОРА ИЗ РЕГИСТРАТОРА, И УБРАЛ ЕГО.** Регистратор HA не содержит оптимистичной записи, и сравнение дало бы другой класс. **Полевое НЕ покрывает**: на 2.5 с HA ещё ничего не записала, регистратор и состояние совпадали, проверка решила **ничего**, заплатив сетевым вызовом на каждое чтение. Прибор, который не решает случай, ради которого написан, — ровно та ошибка, которую этот файл документирует.
 
 - **`DRY_RUN` MUST BE SILENT ABOUT NOTHING, OR IT VERIFIES NOTHING.** It logged `would: docker restart` and `would: re-register`, but the two steps that touch the **physical camera** — restart `majestic` and reboot — were called through `[ "$DRY_RUN" = "1" ] ||` and logged nothing. So the single capability worth proving (restarting `majestic` on a room that had just been granted its SSH key) left no evidence in the dry run. Both now go through `act()`. Verified: the full four-step ladder prints, the container's `StartedAt` does not move, and both cameras' uptimes keep climbing (132 and 42 min) instead of resetting — which is the only proof that a reboot did not happen.
+
+- **THE 15.10 "THE LINK DELIVERS 0.3-0.4x" CONCLUSION DID NOT SURVIVE A RE-MEASUREMENT, AND THE WEAK ROOM IS THE CORRIDOR, NOT THE KITCHEN. Measured 20.10.2026 ~10:45-11:15 UTC, three legs in one window.**
+
+  The 15.10.2026 table is what a repeater was bought for:
+
+  ```
+  комната          ip               сигнал/63   capture    play_audio
+  livingroom   192.168.22.241        78        1.02x      x0.3
+  entrance1    192.168.22.198        77        1.02x      x0.4
+  corridor     192.168.22.247        56        0.84x      x1.8
+  kitchen      192.168.22.232        30        0.29x      x25.7
+  ```
+
+  The same command today, on the same four cameras, gives:
+
+  ```
+  livingroom             1.08x
+  entrance1              1.08x
+  kitchen                1.07x
+  camera-corridor1       1.08x
+  ```
+
+  **The kitchen is not slow any more, and the corridor is not slow either — at this moment.** But the two rooms are NOT equivalent, and the difference is the interesting part:
+
+  ```
+  .247 коридор   uptime 325156 s = 90.3 h   link=58   <- НЕ перезагружался
+  .232 кухня     uptime  20542 s =  5.7 h   link=78   <- перезагрузилась сегодня
+  .241 гостиная  uptime  38357 s = 10.7 h   link=79
+  .198 прихожая  uptime  26476 s =  7.4 h   link=77
+  ```
+
+  The kitchen's link quality went **30 → 78** and its capture **0.29x → 1.07x** across its reboot; the corridor's went 56 → 58 and it **starved for 90 minutes this morning** (08:13-09:57, `AUDIO DEGRADED` 54-78 %, three `CAMERA AUDIO DEAD` declarations, one `AUDIO STARVED: 3%`) and **recovered on its own, without a reboot** (uptime is 90 h, so nothing restarted it). So the repeater is aimed at the room that is not broken, and the room that IS fragile is the one without one.
+
+  * **The gateway's own detector caught the corridor's morning fault and was right about it.** `AUDIO DEGRADED: 63%` at 08:13 next to a perfectly normal-looking `feed rms` line is not a contradiction: `feed rms` is printed on a ~3 s TIMER, so its cadence says nothing about the rate, and the byte accounting is the only rate instrument in the process. `ffmpeg` is asked for `pcm_s16le -ar 16000 -ac 1` and the gateway reads exactly 1280 samples (2560 bytes) per read, so the reference is 16000*2 = 32000 B/s and `ratio = bytes / (span * 32000)` is 1.0 at real time. Correct as written.
+  * **THE EXTERNAL PROBE IS NOT THE INSTRUMENT, AND IT IS NOT THE CULPRIT EITHER — it was tested.** The obvious hypothesis was that a second consumer on a single-threaded `majestic` is what made the 15.10 numbers small. Measured, 20.10: the camera's own audio byte rate as seen by go2rtc was **6315 B/s at baseline, 6569 B/s while the external probe was running (104 %), 6431 B/s after it closed**. The probe does not starve the camera's audio leg. The hypothesis was wrong and is withdrawn; the numbers it produced are still not reproducible, so the 15.10 state was a property of that day and not of the link.
+
+  * **THE INSTRUMENT THAT SETTLES IT IS go2rtc's OWN COUNTER, AND IT COSTS NOTHING.** `/api/streams?src=<room>` reports the camera→go2rtc leg as a per-track byte counter on the producer (`98 OPUS/48000/2, bytes=…`) and the go2rtc→gateway leg on the consumer (`send`). Read twice, N seconds apart, it gives the delivery rate of an ALREADY OPEN link — no second consumer, no perturbation, nothing to restart:
+
+    ```
+    30 s окно:  livingroom  OPUS 6424 B/s
+                 kitchen    OPUS 6424 B/s
+                 entrance1  OPUS 6424 B/s
+                 corridor1  OPUS 6428 B/s
+    ```
+
+    **0.06 % spread across four rooms whose microphone levels differ 2.7x** (livingroom rms 380, corridor rms 1032): the OPUS encoder is CBR here, so the byte rate is a usable proxy for "fraction of real time". And the producer's counter and the consumer's counter agree to the RTP header overhead alone (6424 payload → 7228 framed = 1.125x, exactly 20 bytes on a 160-byte packet), so **go2rtc relays what the camera sent and does not re-time it** — the buffering hypothesis is dead too.
+  * **The chain, as measured on 20.10, is real time end to end:** camera 6424 B/s of OPUS → go2rtc relays 1:1 → the decoder's own counter (`vosk diag: chunks=`) shows **12.50 chunk/s in all four rooms** = 100 % of real time (the chunk is 1280 samples = 80 ms, so 12.5/s is the whole story; the 6.25 figure in this file is the 160 ms chunk of an older configuration).
+  * **A consequence for the record: the "the corridor microphone carries nothing above 3 kHz" and "the kitchen camera is wedged" stories are of the same date and the same class** — a state that was real on the day and is not now. Before buying hardware for a room, re-measure the room.
+
+- **`feed rms` IS A TIMER, NOT A RATE, AND `vosk diag: chunks=` IS THE RATE — they are not interchangeable.** The corridor's morning fault (54-78 % of real time) sat in the same log as `feed rms` lines arriving every 3.0 s exactly, which reads as "the audio is fine". It was not: `feed rms` is printed on a ~3 s timer regardless of how fast the audio arrives, so the cadence is identical at 100 % and at 63 %. The quantities that do carry the rate are `vosk diag: chunks=` (divided by the window) and go2rtc's producer byte counter. **A line that appears every N seconds because a timer prints it must never be read as a measure of how much arrived.**
+
+- **THE WATCHDOG'S MISSING SIGNAL EXISTS, AND IT DOES NOT COST A CONSUMER — it is go2rtc's own byte counter.** The open item since 15.10.2026 was "capture speed", and the plan was `ffmpeg -i rtsp://<camera> -t 15 -f null -` read for `speed=`. That command is a SECOND consumer on a single-threaded `majestic`, which is why it was never implemented: a watchdog must not perturb what it watches. go2rtc already holds the camera's RTSP session and counts the bytes of each track it receives, so the same quantity is available for free.
+
+  * `scripts/camera_watchdog.sh` reads `producers[].receivers[]` for the OPUS track and differences it against the previous pass (a stamp file, like the mic-level counter). The bar is **80 % of the room's OWN best observed rate** — the constant is a property of the encoder, and the encoder is not what is being watched. 80 % is the gateway's own `_audio_rate_ok`, measured from both sides (healthy 1.08x, broken ≤ 0.71x).
+  * **Live on all four rooms, in the cron, on the first pass:** `capture=6445/6445 B/s` (livingroom), `6451` (kitchen), `6354` (entrance1), `6461` (corridor). The healthy side is measured.
+  * **The state is REPORT-ONLY, and that is a decision.** The threshold's slow side was measured on a stand-in, not on a camera that was really slow, and the ladder ends in a **reboot of the physical camera** — a destructive step must not be armed on an inferred value. So `slow-capture` measures, records and stops; the value in the log of every pass is what the slow side will be read from the next time a room is really slow. Arming the action is a one-line change once that number exists.
+  * **Proven in BOTH directions, on a stand-in that touches nothing** (a stub go2rtc and a stub camera, `DRY_RUN=1`): a healthy rate leaves the room `healthy`; 1012 B/s against a 6366 B/s baseline raises `SLOW CAPTURE` and produces **no step 1-4, no reboot**; the rate recovering puts the room back to `healthy`. `bash scripts/camera_watchdog.sh --self-test` checks the threshold and the arithmetic in both directions without a network at all.
+  * **Two defects of my own, both caught by the stand before they reached a camera:**
+    * `read -r pbytes ptime <"$prev_file" 2>/dev/null || pbytes=""; ptime=""` does **not** do what it looks like — the `;` ends the `||` list, so the reset runs unconditionally and the values just read are always thrown away. The rate was never computed and the gate was silently inert. The self-test caught it; a live run would not have, because "no rate" and "no problem" look the same in a log.
+    * The state was raised from the current sample and then **cleared inside the same pass**, because the confirmation loop re-classifies every 20 s and the measurement window is 30 s. The room "recovered on its own" before the ladder was reached. The hit counter IS the memory now: only a measurement that PROVES the rate healthy clears it.
 
 ## REST API
 

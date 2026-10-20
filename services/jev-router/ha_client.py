@@ -1091,10 +1091,20 @@ def dedupe_device_facets(targets: list[dict]) -> list[dict]:
     toggling every facet would flip the child lock as well. When one entity
     id is a strict prefix of another they belong to the same device: keep the
     root, drop the facets.
+
+    **A status LED is not a lamp.** `switch.corridor1_light_switch_network_led_switch`
+    is the device's own indicator and it is a switch, so it passed every
+    on/off filter and was called as if it were the light — the corridor command
+    reported "4 target(s)" for ONE lamp. It is not a prefix of the relay
+    (`corridor1_light_switch_relay` vs `corridor1_light_switch_network_led_switch`),
+    so the prefix rule could never see it. The user: «должна включаться только
+    corridor1_light_switch».
     """
     ids = [t.get("entity_id", "").split(".", 1)[1] for t in targets]
     out: list[dict] = []
     for i, base in enumerate(ids):
+        if "network_led" in base or "status_led" in base:
+            continue  # the device's own indicator, not the device
         if any(
             j != i and base.startswith(ids[j]) and base != ids[j]
             for j in range(len(ids))

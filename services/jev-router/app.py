@@ -430,6 +430,34 @@ async def _restore_light_automations() -> None:
             logger.warning("возврат автоматизаций света: %r", exc)
 
 
+def _scope_targets_to_room(targets: list[dict], stream_name: str) -> list[dict]:
+    """Keep only the targets that belong to the ROOM the satellite stands in.
+
+    The HA area is COARSER than the room, and that is not a detail:
+    `switch.corridor1_light_switch_relay` and `switch.corridor2_light_switch_relay`
+    are BOTH in area `Corridor` and are two different rooms with two different
+    motion sensors. The user said so: «включи свет» from the corridor1 camera
+    switches corridor1's lamp and touches corridor1's automation only, and
+    corridor2 is a different room with no relation to it.
+
+    The scope is the DEVICE TOKEN in the entity id — the same token the
+    automation matching uses: `corridor1` in `camera-corridor1`, `living` in
+    `livingroom`, `entrance` in `entrance1`. When the satellite's own room has
+    no device among the candidates (the kitchen has no lamp at all;
+    «включи свет в гостиной» said from the corridor), the area's answer stands:
+    a room the user NAMED is a hard constraint and is never overridden here.
+    """
+    if not stream_name or not targets:
+        return targets
+    stream = (stream_name or "").lower()
+    mine = [
+        t for t in targets
+        if _device_token(t.get("entity_id", "")) and
+        _device_token(t.get("entity_id", "")) in stream
+    ]
+    return mine or targets
+
+
 async def _tie_light_automation(
     areas: dict[str, str], entities: list[str], want_on: bool,
     stream_name: str = "",
@@ -901,6 +929,23 @@ async def _execute_action(
                             f"в {rooms}, нужна комната"
                         ),
                     }
+            # THE SATELLITE'S ROOM NARROWS THE TARGETS — the HA area is coarser
+            # than the room, and the two corridor lamps are two different rooms
+            # with two different motion sensors. Measured 20.10.2026 12:46, the
+            # command «Включи свет» from `camera-corridor1` reached
+            # `on/off HassTurnOn свет: 4 target(s)` — BOTH corridor relays and
+            # both of their network-LED facets — and disarmed the automations of
+            # both rooms. The user: «должна включаться только corridor1_light_switch
+            # и его автоматизация отключаться, а corridor2_light_switch и его
+            # автоматизация — это другое помещение».
+            scoped = _scope_targets_to_room(targets, stream_name)
+            if scoped != targets:
+                logger.info(
+                    "  комната камеры %r оставила: %s",
+                    stream_name,
+                    ", ".join(t.get("entity_id", "") for t in scoped),
+                )
+                targets = scoped
             if not call.args.get("area") and len(targets) > 1:
                 # No room in the utterance and several devices match —
                 # acting would mean guessing which one.
@@ -954,6 +999,7 @@ async def _execute_action(
                         area_map,
                         [t.get("entity_id", "") for t in targets if t.get("entity_id")],
                         want_on,
+                        stream_name,
                     )
                     if touched:
                         logger.info(

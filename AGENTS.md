@@ -1948,6 +1948,36 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
     * **So the repeater is aimed at a link that no measurement has shown to be broken.** The camera→go2rtc leg was the healthiest number in the whole series. Whatever is losing the audio, it is between go2rtc and the gateway, or inside the gateway's own reader — and a repeater on the camera's side of the house would not touch it.
     * **And the `slow-capture` state still has no slow side on a real room**, so it stays report-only. It is not a dead instrument: it is the only passive measure of the camera's own delivery, and it is what turned "the link is slow" from an assertion into a number — 97-99 % where the 15.10 table said 0.29-0.40x.
 
+- **THE HA AREA IS COARSER THAN THE ROOM, AND A COMMAND IN THE CORRIDOR TOUCHED BOTH CORRIDOR LAMPS. Measured 20.10.2026 12:46, fixed 16:21.**
+
+  The report: «по включи свет в коридоре должна включаться только corridor1_light_switch и его автоматизация отключаться, а corridor2_light_switch и его автоматизация — это другое помещение».
+
+  ```
+  12:46:59  on/off HassTurnOn свет: 4 target(s) switch.corridor1_light_switch_relay=off,
+                                    switch.corridor2_light_switch_relay=off, switch…
+            light automation tie: выключена Corridor2 light ON   (комната 2!)
+            light automation tie: выключена Corridor1 light ON   (комната 1!)
+  ```
+
+  **The cause is a namespace mismatch, and it is not fixable in HA.** `switch.corridor1_light_switch_relay` and `switch.corridor2_light_switch_relay` are both in the HA area `Corridor` — two different rooms with two different motion sensors — and the resolver's area filter can only see the area. Everything the command did, it did in BOTH rooms.
+
+  * **THE ROOM IS THE SATELLITE'S, AND IT IS THE DEVICE TOKEN.** The same token the automation matching already used (`corridor1` in `camera-corridor1`, `living` in `livingroom`, `entrance` in `entrance1`) says which room the camera is in, and it is IN the entity id of the lamp. So the targets are narrowed to the ones whose token is in the stream name, and when the satellite's room has no device among the candidates the area's answer stands.
+  * **A room the user NAMED is never overridden by this.** «включи свет в гостиной» from the corridor switches the LIVING ROOM lamp — the area filter decided, the satellite's room has nothing to do with it.
+  * **THE SCOPING EXISTED SINCE v2.49 AND WAS NEVER WIRED.** `_tie_light_automation` grew a `stream_name` parameter that narrowed the entities to the camera's room — and the call site never passed it, so it was dead code. Measured live at 15:44 on 20.10.2026: a command from `camera-corridor1` disarmed the automations of BOTH corridors. **A parameter that is added and not passed is a comment, and the test suite could not see it because every test called the function directly.**
+  * **THE STATUS LED WAS A TARGET, because it is a switch.** `switch.corridor1_light_switch_network_led_switch` is the device's own indicator; it passed every on/off filter and was called as if it were the lamp, which is where the "4 target(s)" for ONE lamp came from. `dedupe_device_facets` could not see it: it drops a facet when its id is a PREFIX of the root's, and `corridor1_light_switch_network_led_switch` is not a prefix of `corridor1_light_switch_relay`. It is dropped now.
+  * **THE ROOM IS IN THE ALIAS, NOT IN THE ENTITY ID, and that is worth knowing before writing a test about it.** corridor1's OFF automation is the entity `automation.corridor2_light_off_2` — aliased «Corridor1 light OFF» and triggered by corridor1's sensor. The name matching of 14.10.2026 gets this right (it matches the friendly name), and the new test asserts on the ALIAS, because asserting on the entity id would have passed on the broken code.
+  * **Verified live, 20.10.2026 16:21, from `camera-corridor1`:**
+
+    ```
+    16:22:16  комната камеры 'camera-corridor1' оставила: switch.corridor1_light_switch_relay
+    16:22:16  light automation tie: выключена Corridor1 light OFF (automation.corridor2_light_off_2)
+    16:22:16  on/off HassTurnOn свет: 1 target(s) switch.corridor1_light_switch_relay=off
+    16:22:16  call switch.corridor1_light_switch_relay -> ok=True
+    16:22:28  on/off HassTurnOff свет: 1 target(s) switch.corridor1_light_switch_relay=on
+    ```
+
+    One target, corridor1's lamp, corridor1's automation — and corridor2's relay and BOTH of its automations untouched. 165 router tests, the new ones covering the narrowing, the named room winning over the satellite's, and the status LED no longer being a lamp.
+
 - **THE MOTION AUTOMATION WAS LEFT HALF DEAD BY EVERY VOICE COMMAND, AND THE FIX IS AN OVERRIDE THAT ENDS WHEN THE ROOM EMPTIES. Measured 20.10.2026 12:46-12:55, fixed 15:44.**
 
   The report: in the corridor, the motion sensor stopped switching the light.

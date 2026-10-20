@@ -188,8 +188,11 @@ def test_dedupe_device_facets():
     assert ids == {
         "switch.coffemaker",
         "switch.living_room_light_swith_relay",
-        "switch.living_room_light_swith_network_led_switch",
-    }
+    }, (
+        "the status LED is the device's own indicator and not the lamp the user "
+        "asked for — it is a switch, so it passed every on/off filter and was "
+        "called as if it were the light"
+    )
 
 
 def test_brightness_with_percent():
@@ -2845,6 +2848,149 @@ async def test_a_re_armed_automation_is_no_longer_overridden():
         assert "automation.corridor1_light_on" not in rec["automations"], (
             "an automation that was just re-armed is not overridden"
         )
+
+
+@pytest.mark.asyncio
+async def test_the_satellite_room_narrows_the_light_targets():
+    """«Включи свет» from the corridor1 camera switches corridor1's lamp ONLY.
+
+    Measured 20.10.2026 12:46: the command reached
+    `on/off HassTurnOn свет: 4 target(s)` — BOTH corridor lamps and both of
+    their status LEDs — and disarmed the automations of BOTH rooms. The two
+    corridor lamps share the HA area `Corridor` and are two different rooms
+    with two different motion sensors, and the user said so: «должна включаться
+    только corridor1_light_switch и его автоматизация отключаться, а
+    corridor2_light_switch и его автоматизация — это другое помещение».
+    """
+    mod = _router_app()
+    ha = _corridor_rooms_ha()
+    mod.ha = ha
+    mod.LIGHT_AUTOMATION_ROOMS = ("corridor",)
+    mod._LIGHT_OVERRIDE.clear()
+
+    async def _reached(ids, target, delay=0.0):
+        return list(ids), None
+
+    mod.confirm_on_off_one_read = _reached
+
+    call = resolve_action("включи свет", "camera-corridor1")
+    assert call.area_source == "default", (
+        "the room came from the satellite — that is what makes it the room"
+    )
+    outcome = await mod._execute_action(call, "включи свет", "camera-corridor1")
+    assert outcome[1] is None, f"unexpected error: {outcome[1]!r}"
+    called = [args.get("name") for _, args in ha.tools]
+    assert called == ["switch.corridor1_light_switch_relay"], (
+        f"only the lamp of the room the camera is in: {ha.tools}"
+    )
+    # And the automation of THAT room is the only one touched. The room is in
+    # the ALIAS, not in the entity id: `automation.corridor2_light_off_2` is
+    # aliased «Corridor1 light OFF» and belongs to corridor1.
+    aliases = {
+        "automation.corridor1_light_on": "Corridor1 light ON",
+        "automation.corridor2_light_on": "Corridor2 light ON",
+        "automation.corridor2_light_off": "Corridor2 light OFF",
+        "automation.corridor2_light_off_2": "Corridor1 light OFF",
+    }
+    automation_calls = [e for _, _, e in ha.services]
+    assert automation_calls, "the motion automation of the room must be disarmed"
+    for eid in automation_calls:
+        assert "Corridor1" in aliases.get(eid, eid), (
+            f"the automation of the OTHER room must not be touched: "
+            f"{eid} ({aliases.get(eid)})"
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_room_the_user_named_is_not_narrowed_by_the_satellite():
+    """«Включи свет в гостиной» said from the corridor switches the LIVING ROOM
+    lamp. The satellite's room narrows an ambiguous name; it never overrides a
+    room the user named."""
+    mod = _router_app()
+    ha = _corridor_rooms_ha()
+    mod.ha = ha
+    mod.LIGHT_AUTOMATION_ROOMS = ("corridor",)
+
+    async def _reached(ids, target, delay=0.0):
+        return list(ids), None
+
+    mod.confirm_on_off_one_read = _reached
+
+    call = resolve_action("включи свет в гостиной", "camera-corridor1")
+    assert call.area_source == "explicit"
+    outcome = await mod._execute_action(call, "включи свет в гостиной", "camera-corridor1")
+    assert outcome[1] is None, f"unexpected error: {outcome[1]!r}"
+    called = [args.get("name") for _, args in ha.tools]
+    assert called == ["switch.living_room_light_swith_relay"], (
+        f"the room the user named wins: {ha.tools}"
+    )
+
+
+def _corridor_rooms_ha():
+    """Two corridor lamps in the SAME HA area, plus a living-room lamp.
+
+    The two corridor lamps share the area `Corridor` and are two different
+    rooms with two different motion sensors — that is the whole point of the
+    20.10.2026 report, so the fixture reproduces that shape exactly.
+    """
+
+    class _HA:
+        def __init__(self):
+            self.tools = []
+            self.services = []
+            self.areas = {
+                "switch.corridor1_light_switch_relay": "Corridor",
+                "switch.corridor2_light_switch_relay": "Corridor",
+                "switch.corridor1_light_switch_network_led_switch": "Corridor",
+                "switch.corridor2_light_switch_network_led_switch": "Corridor",
+                "switch.living_room_light_swith_relay": "Living Room",
+                "automation.corridor1_light_on": "Corridor",
+                "automation.corridor2_light_on": "Corridor",
+                "automation.corridor2_light_off": "Corridor",
+                "automation.corridor2_light_off_2": "Corridor",
+            }
+
+        async def get_entity_areas(self):
+            return dict(self.areas)
+
+        async def get_states(self, force=False):
+            names = {
+                "automation.corridor1_light_on": "Corridor1 light ON",
+                "automation.corridor2_light_on": "Corridor2 light ON",
+                "automation.corridor2_light_off": "Corridor2 light OFF",
+                "automation.corridor2_light_off_2": "Corridor1 light OFF",
+            }
+            out = []
+            for eid in self.areas:
+                if eid.startswith("automation."):
+                    out.append({"entity_id": eid, "state": "on",
+                                "attributes": {"friendly_name": names[eid],
+                                               "id": "cfg-" + eid}})
+                else:
+                    out.append({
+                        "entity_id": eid, "state": "off",
+                        "attributes": {
+                            "friendly_name": eid.split(".", 1)[1].replace("_", " ")}
+                    })
+            return out
+
+        async def get_automation_config(self, config_id):
+            return {"id": config_id,
+                    "triggers": [{"type": "occupied", "device_id": "dev-corridor1"}]}
+
+        async def device_entities(self, device_id):
+            return ["binary_sensor.corridor1_move_sensor_occupancy"]
+
+        async def call_tool(self, name, args, rpc_id=1):
+            self.tools.append((name, args))
+            return {"ok": True,
+                    "claimed": [{"type": "entity", "id": args.get("name", "")}]}
+
+        async def call_service(self, domain, service, data):
+            self.services.append((domain, service, data.get("entity_id", "")))
+            return {"ok": True, "changed": [], "error": ""}
+
+    return _HA()
 
 
 def _automation_ha(relay_state="off", auto_state="on"):

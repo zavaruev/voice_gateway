@@ -2062,6 +2062,28 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
 
     And live, 16:33, from the corridor: «включи кофеварку» -> `1 target(s) switch.coffemaker`, `ok=True`, «Включаю.» — with the corridor's own lamp NOT in the list. **A narrowing that could drop a device the user named by name would be a worse bug than the one it fixes**, so the "keep everything when nothing of my room is there" half is load-bearing, not a convenience.
 
+- **ONE SPOKEN WORD FIRED THE WAKE FIVE TIMES, AND EVERY FIRE WIPED THE COMMAND. Measured 21.10.2026 08:38-08:39, `camera-corridor1`.**
+
+  The report: the corridor camera does not react to «компьютер». The decoder is not the cause — it fired on the word, five times:
+
+  ```
+  08:38:29.844  VOSK WAKE trig='компьютер' peak=1289 window=30846/3000 loud=9/12 triggers=1
+  08:38:33.359  ✅ Whisper OK: 'компьютер'
+  08:38:33.360  🎯 Wake-only utterance, awaiting command
+  08:38:38.212  VOSK WAKE trig='компьютер' peak=1896 window=32767/3000 loud=9/12 triggers=3
+  08:38:47.925  🎯 Wake with no command — sending greeting
+  08:38:57.891  VOSK WAKE trig='компьютер' loud=10/12 triggers=4
+  08:39:01.720  VOSK WAKE trig='компьютер' loud=9/12 triggers=5
+  ```
+
+  **The room woke up correctly and then destroyed what the user said.** Every wake fire clears `_vad_speech_buf` and the pre-roll — the AGENTS.md says so of the re-arm debounce — so the command that was being collected was wiped five times over, and the buffer that finally reached Whisper held only the word.
+
+  * **WHY THE SAME WORD FIRED AGAIN: the decoder was reset right after the fire.** The old code did `self._vosk_wake.reset()` immediately after logging the wake, which gave the recogniser an empty context — and the TAIL of the word was still arriving, because the corridor delivered that word over 2.6 s of wall time (the Whisper input was 2.64 s long). A fresh recogniser decodes that tail as a NEW «компьютер». The reset was there to PREVENT a re-trigger, and it is what caused one.
+  * **THE FIX IS THE OCCURRENCE COUNT IN THE HYPOTHESIS.** The recogniser's partial is a growing transcript of the current segment, so the number of times the wake word appears in it tells the tail from a new word: the tail leaves the count at one, and a word the user says AGAIN raises it to two — and that one must fire, because a wake word exists so that saying it gets attention, always. The recogniser is no longer reset after a fire; it rolls over on its own (`max_secs` of audio).
+  * **AND A CLICK IS NOT A WORD.** The peak cannot tell them apart: a click is a sample-wide transient whose peak is on the rail, so it passes any peak-based bar, and the two false wakes on 20.10.2026 18:48 were exactly that class (window peaks 26210 and 32767 while the room's own level was rms 442-535). Measured on the decoder's own input, 12 chunks of 160 ms: a click is ONE loud chunk, a bang is five, a room noise is six to eight, and the word is nine to ten. The energy gate now counts the loud chunks as well as looking at the peak.
+  * **THE BAR IS 3, AND NOT 6, and the reason is the word's length.** The corridor's word measures 9-10 because that microphone draws it out over 1.5 s, but a NORMAL «компьютер» is ~0.7 s, which is 4-5 chunks of 160 ms — a bar of 6 would refuse the living room's wake. The measured click is one chunk, so 3 rejects it with a 3x margin and keeps a normal word with 1.3x. The bar is low on purpose: the peak guard above it already refuses a dead microphone, and the decoder still has to READ a word before any of this matters.
+  * **The fixtures modelled a word as ONE loud chunk, and that is the click class** — so three tests failed when the count gate arrived, and they were wrong, not the gate. They now use a measured word's window (nine loud chunks of twelve), and the click class has its own test.
+
 - **THE MOTION AUTOMATION WAS LEFT HALF DEAD BY EVERY VOICE COMMAND, AND THE FIX IS AN OVERRIDE THAT ENDS WHEN THE ROOM EMPTIES. Measured 20.10.2026 12:46-12:55, fixed 15:44.**
 
   The report: in the corridor, the motion sensor stopped switching the light.

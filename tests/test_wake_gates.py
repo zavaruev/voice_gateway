@@ -278,6 +278,20 @@ class _StubVosk:
         self.resets += 1
 
 
+def _word_window(peak: int = 12000, loud: int = 9, quiet: int = 3):
+    """The wake window as a REAL word fills it, measured 21.10.2026.
+
+    On the decoder's own input in the corridor: a word is 9-10 loud chunks of
+    12 (the 1.9 s window), a click is ONE, and a slam is five. The old
+    fixtures modelled a word as a single loud chunk, which is the click class
+    — and the energy gate, which now counts the loud chunks, correctly
+    refused them.
+    """
+    vals = [peak] * loud + [200] * quiet
+    return deque(vals[-camera_client._WAKE_PEAK_WINDOW:],
+                 maxlen=camera_client._WAKE_PEAK_WINDOW)
+
+
 async def _feed_quiet(session: CameraSession, peak: int, rounds: int = 1):
     with (
         patch("camera_client._arbiter_submit", new=AsyncMock(return_value=(True, (), "t"))),
@@ -319,13 +333,40 @@ async def test_the_gate_reads_a_window_not_the_trigger_chunk():
     """
     s = _make_session()
     s._vosk_wake = _StubVosk()
-    s._vosk_peak_win = deque([12000, 9000, 6000, 3000], maxlen=camera_client._WAKE_PEAK_WINDOW)
+    s._vosk_peak_win = _word_window()
 
     fire = await _feed_quiet(s, peak=300)
 
     assert fire.await_count == 1, (
         "a real word whose loudest chunk is not the trigger chunk was refused"
     )
+
+
+@pytest.mark.asyncio
+async def test_a_click_does_not_wake_the_room():
+    """A click is a sample-wide transient and its PEAK is on the rail, so no
+    peak-based bar can tell it from a word.
+
+    Measured 21.10.2026 on the decoder's own input, 12 chunks of 160 ms:
+
+        click   loud=1    peak=32768
+        bang    loud=5    peak=10981
+        voice   loud=6-8  peak=3396
+        WORD    loud=9-10 peak=23830-32767
+
+    The two false wakes on 20.10.2026 18:48 were the click class: their window
+    peaks were 26210 and 32767 while the room's own level was rms 442-535, and
+    each one wiped the command the user was speaking.
+    """
+    s = _make_session()
+    s._vosk_wake = _StubVosk()
+    # One loud chunk at the rail: the click.
+    s._vosk_peak_win = deque([32767], maxlen=camera_client._WAKE_PEAK_WINDOW)
+
+    fire = await _feed_quiet(s, peak=32767)
+
+    assert fire.await_count == 0, "a click woke the room"
+    assert s._vosk_wake.resets >= 1, "the decoder must be rolled over, not left armed"
 
 
 @pytest.mark.asyncio
@@ -352,6 +393,10 @@ async def test_the_energy_gate_does_not_swallow_a_real_command():
     would cause, not just the one it prevents."""
     s = _make_session()
     s._vosk_wake = _StubVosk()
+    # A real word fills the window: 9-10 loud chunks of 12, measured
+    # 21.10.2026. A single loud chunk is the CLICK class, and the energy gate
+    # is right to refuse it.
+    s._vosk_peak_win = _word_window()
 
     fire = await _feed_quiet(s, peak=12000)
 
@@ -494,6 +539,9 @@ async def test_a_wake_that_wins_the_cross_camera_contest_does_beep():
     silence the house: winning must still fire."""
     s = _make_session()
     s._vosk_wake = _StubVosk()
+    # A real word fills the window (9-10 loud chunks of 12, measured
+    # 21.10.2026); a single loud chunk is the click class.
+    s._vosk_peak_win = _word_window()
 
     fire = await _feed_with_arbiter(s, won=True)
 

@@ -176,6 +176,28 @@ _ATTENTION_MIN_GAP_S = 3.5
 # «выключи» to a two-tone beep, and the room then spoke about the coffee
 # maker. A wait of 0.8 s is enough for that command to become visible.
 _ATTENTION_SPEECH_GUARD_S = 0.8
+# How many chunks of the 1.9 s wake window must be at least as loud as the
+# energy bar. Measured 21.10.2026 in the corridor, on the decoder's own input
+# (12 chunks of 160 ms):
+#
+#     щелчок   громких=1    пик=32768   <- the false-wake class
+#     шум      громких=5    пик=10981   <- the decoder did NOT read a word here
+#     room    loud=6-8  peak=3396      <- likewise
+#     WORD    loud=9-10 peak=23830-32767   (the log, 08:38)
+#
+# A word is MANY loud chunks and a click is ONE, and the PEAK cannot tell them
+# apart: a click is a sample-wide transient whose peak is on the rail, so it
+# passes any peak-based bar. The two false wakes on 20.10.2026 18:48 were
+# exactly the click class.
+#
+# **3, and not 6.** The corridor's word measures 9-10 because that room's
+# microphone draws it out over 1.5 s, but a NORMAL «компьютер» is ~0.7 s, which
+# is 4-5 chunks of 160 ms — a bar of 6 would refuse the living room's wake. The
+# measured click is ONE chunk, so 3 rejects it with a 3x margin and keeps a
+# normal word with 1.3x. The bar is low on purpose: the peak guard above it
+# already refuses a dead microphone, and the decoder still has to READ a word
+# before any of this matters.
+_WAKE_MIN_LOUD_CHUNKS = 3
 # How long the rate heal may be deferred while the user is talking.
 #
 # The heal restarts the audio pipeline, and a restart in the middle of a
@@ -3151,7 +3173,10 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
                             f"(suppressed={self._vosk_suppressed})"
                         )
                         got_wake = False
-                    elif max(self._vosk_peak_win) < self._wake_min_peak:
+                    elif (
+                        max(self._vosk_peak_win) < self._wake_min_peak
+                        or self._loud_chunks_in_window() < _WAKE_MIN_LOUD_CHUNKS
+                    ):
                         # A decoder run on near-silence returns its most likely
                         # phrase, and «компьютер» is that phrase. Measured
                         # 06.10.2026 08:55 on the kitchen, whose microphone is
@@ -3164,6 +3189,24 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
                         # measure 8000-32767 at the rail in the living room, while
                         # this room's peak never exceeds 388. There is no way to
                         # hear a word in a peak of 135.
+                        #
+                        # **AND THE ENERGY MUST BE SUSTAINED, not a single
+                        # transient.** The peak cannot tell them apart: a CLICK
+                        # is one sample-wide transient whose peak is on the rail,
+                        # so it passes any peak-based bar. Measured 21.10.2026 in
+                        # the corridor, on the decoder's own input (12 chunks of
+                        # 160 ms = 1.9 s):
+                        #
+                        #     click   loud=1    peak=32768
+                        #     bang    loud=5    peak=10981
+                        #     voice   loud=6-8  peak=3396
+                        #     WORD    loud=9-10 peak=23830-32767   (the log, 08:38)
+                        #
+                        # So a word is MANY loud chunks and a click is one, and
+                        # the count is the discriminator. The two false wakes on
+                        # 20.10.2026 18:48 were exactly the click class: their
+                        # window peaks were 26210 and 32767 while the room's own
+                        # level was rms 442-535.
                         #
                         # The decision is `max(self._vosk_peak_win)` — the LOUDEST
                         # chunk of the last 1.9 s — NOT the trigger chunk, because
@@ -3184,6 +3227,8 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
                             f"[{self.stream_name}] VOSK wake heard but not "
                             f"fired: peak={int(np.abs(s16).max())} "
                             f"window={max(self._vosk_peak_win)}/{len(self._vosk_peak_win)} "
+                            f"loud={self._loud_chunks_in_window()}"
+                            f"/{_WAKE_MIN_LOUD_CHUNKS} "
                             f"< {self._wake_min_peak} — that is silence, not a "
                             f"voice (suppressed={self._vosk_suppressed})"
                         )
@@ -3260,7 +3305,21 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
                         f"triggers={self._vosk_wake.triggers} "
                         f"decodes={self._vosk_wake.decodes}"
                     )
-                    self._vosk_wake.reset()
+                    # **THE RECOGNISER IS NOT RESET HERE.** It used to be, and
+                    # that is what made ONE word fire five times: a fresh
+                    # recogniser receives the TAIL of the word that is still
+                    # arriving (the corridor delivered 08:38's word over 2.6 s of
+                    # wall time) and decodes it as a new «компьютер».
+                    # Measured 21.10.2026 08:38-08:39: five fires, and every
+                    # fire clears `_vad_speech_buf` — so the command the user was
+                    # saying was destroyed five times and the room answered
+                    # «Wake with no command — sending greeting».
+                    #
+                    # The matcher now decides with the OCCURRENCE COUNT in the
+                    # hypothesis instead: the tail leaves the count at one, and a
+                    # word the user says AGAIN raises it to two. The recogniser
+                    # rolls over on its own (`max_secs` of audio), so the context
+                    # still refreshes.
                     # **Cross-camera arbitration BEFORE anything audible.**
                     # Measured 11.10.2026 16:19: the user said «компьютер»
                     # between two cameras; both decoded it 0.2 s apart and

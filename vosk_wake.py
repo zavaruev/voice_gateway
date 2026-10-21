@@ -136,6 +136,18 @@ def transcript_has_wake(text: str) -> bool:
     return any(tok.strip(".,!?;:") in WAKE_TOKENS for tok in t.split())
 
 
+def wake_occurrences(text: str) -> int:
+    """How many times the wake word appears in this hypothesis.
+
+    The recogniser's partial is a GROWING transcript of the current segment, so
+    this is what tells the SAME word from a NEW one: the tail of the word we
+    just heard leaves the count at one, and a word the user says again raises
+    it to two.
+    """
+    t = (text or "").lower().replace("ё", "е")
+    return sum(1 for tok in t.split() if tok.strip(".,!?;:") in WAKE_TOKENS)
+
+
 class VoskWakeMatcher:
     # Class-level defaults, because tests and any future caller may build an
     # instance with `__new__` and skip `__init__` — `tests/test_vosk_wake.py`
@@ -144,6 +156,10 @@ class VoskWakeMatcher:
     # which is the worst place to discover a test-only shortcut.
     near_misses = 0
     last_near_miss = ""
+    # How many times the wake word is already in the recogniser's hypothesis.
+    # A class-level default, for the same reason as the rest of them: a matcher
+    # built with `__new__` must not raise inside `feed()`.
+    _wake_hits = 0
 
     """Per-stream wake-word matcher built on a FREE (unconstrained) decoder.
 
@@ -189,6 +205,7 @@ class VoskWakeMatcher:
         """
         self._rec = None
         self._fired = False
+        self._wake_hits = 0
         self._fed = 0
         self._t0 = 0.0
         self.last_text = ""
@@ -207,6 +224,7 @@ class VoskWakeMatcher:
         self._rec = vosk.KaldiRecognizer(self._model, SR)
         self._rec.SetWords(True)
         self._fired = False
+        self._wake_hits = 0
         self._fed = 0
         self._t0 = time.time()
         # A lifetime counter like `triggers`, deliberately NOT cleared by reset().
@@ -226,8 +244,6 @@ class VoskWakeMatcher:
         Returns False while idle or when nothing matched.
         """
         if self._rec is None:
-            return False
-        if self._fired:
             return False
 
         self._fed += len(pcm)
@@ -260,6 +276,9 @@ class VoskWakeMatcher:
         # the only evidence of what it actually hears
         self.last_partial = text
         if not transcript_has_wake(text):
+            # The word left the hypothesis, so the next one is a NEW word and
+            # may fire again.
+            self._wake_hits = 0
             near = wake_near_miss(text)
             if near:
                 self.near_misses += 1
@@ -273,6 +292,31 @@ class VoskWakeMatcher:
                     self.near_misses, near, sorted(WAKE_TOKENS),
                 )
             return False
+
+        # FIRE ONCE PER SPOKEN WORD.
+        #
+        # The recogniser's hypothesis is a growing transcript of the CURRENT
+        # segment, so the number of times the wake word appears in it is what
+        # tells the SAME word from a NEW one:
+        #
+        #   * the tail of the word we just heard arrives late on a slow link
+        #     (the corridor delivered 08:38's word over 2.6 s of wall time),
+        #     and the OLD code reset the recogniser right after the fire — so the
+        #     fresh recogniser decoded that same tail as a NEW «компьютер» and
+        #     fired again. Measured 21.10.2026 08:38-08:39: FIVE fires for one
+        #     word, and every fire clears `_vad_speech_buf`, so the command the
+        #     user was saying was destroyed five times over and the room
+        #     answered «Wake with no command — sending greeting».
+        #   * a word the user says AGAIN grows the hypothesis to two
+        #     occurrences, and that is a new word and must fire — a wake word
+        #     exists so that saying it gets attention, always.
+        #
+        # So the rule is the OCCURRENCE COUNT, and the recogniser is NOT reset
+        # after a fire: resetting it is what made the same word fire again.
+        hits = wake_occurrences(text)
+        if hits <= self._wake_hits:
+            return False
+        self._wake_hits = hits
 
         self.triggers += 1
         self.last_trigger_text = text

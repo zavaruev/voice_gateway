@@ -357,3 +357,80 @@ def test_the_near_miss_counter_survives_until_it_is_read():
     assert m.feed(chunk) is False
     assert m.near_misses >= 1
     assert m.last_near_miss == "компъюта"
+
+
+def test_a_word_fires_once_and_its_tail_does_not(matcher):
+    """The SAME word must not fire twice — and a word said AGAIN must.
+
+    Measured 21.10.2026 08:38-08:39, `camera-corridor1`: one spoken
+    «компьютер» produced FIVE fires, and every fire clears
+    `_vad_speech_buf`, so the command the user was saying was destroyed five
+    times over and the room answered «Wake with no command — sending greeting».
+
+    The old code reset the recogniser right after a fire, so the fresh
+    recogniser received the TAIL of the word that was still arriving (the
+    corridor delivered that word over 2.6 s of wall time) and decoded it as a
+    new «компьютер». The recogniser's hypothesis is a growing transcript, so
+    the OCCURRENCE COUNT is what tells the tail from a new word.
+    """
+    class _Rec:
+        def __init__(self):
+            self.partial = ""
+
+        def AcceptWaveform(self, pcm):
+            return False
+
+        def Result(self):
+            return json.dumps({"text": self.partial})
+
+        def PartialResult(self):
+            return json.dumps({"partial": self.partial})
+
+    rec = _Rec()
+    matcher._rec = rec
+    chunk = np.zeros(2560, dtype=np.int16).tobytes()
+
+    rec.partial = "компьютер"
+    assert matcher.feed(chunk) is True, "the word must fire"
+    # The tail of the same word arrives: the hypothesis still holds ONE
+    # occurrence, and that is the same word, not a new one.
+    assert matcher.feed(chunk) is False, (
+        "the tail of the word just heard fired the room again"
+    )
+    # The user says it AGAIN: the hypothesis grows to two occurrences, and that
+    # is a NEW word — a wake word exists so that saying it gets attention.
+    rec.partial = "компьютер компьютер"
+    assert matcher.feed(chunk) is True, (
+        "a word the user says AGAIN must fire — the rule is one fire per SPOKEN "
+        "word, not one fire per recogniser context"
+    )
+    assert matcher.triggers == 2
+
+
+def test_the_wake_word_leaving_the_hypothesis_re_arms_the_matcher(matcher):
+    """After the word is gone from the hypothesis the next one is a new word."""
+    class _Rec:
+        def __init__(self):
+            self.partial = ""
+
+        def AcceptWaveform(self, pcm):
+            return False
+
+        def Result(self):
+            return json.dumps({"text": self.partial})
+
+        def PartialResult(self):
+            return json.dumps({"partial": self.partial})
+
+    rec = _Rec()
+    matcher._rec = rec
+    chunk = np.zeros(2560, dtype=np.int16).tobytes()
+
+    rec.partial = "компьютер"
+    assert matcher.feed(chunk) is True
+    rec.partial = ""
+    assert matcher.feed(chunk) is False
+    rec.partial = "компьютер"
+    assert matcher.feed(chunk) is True, (
+        "the word left the hypothesis, so this is a new word"
+    )

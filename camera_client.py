@@ -151,6 +151,44 @@ _ECHO_HORIZON_S = 8.0
 # guard has to cover the word, not a fixed short moment.
 _WAKE_REARM_DEBOUNCE_S = 1.5
 
+# Timer regex — Russian voice commands for setting a kitchen timer.
+# Matches: «поставь таймер на 5 минут», «таймер на 10 минут», «таймер на 30 секунд»,
+# «таймер на 1 час 20 минут», «установи таймер на 2 минуты», etc.
+_RE_TIMER = re.compile(
+    r"""(?xi)\b
+        (?:поставь|установи|заведи|включи|запусти)\s+
+        (?:\s*таймер(?:а|у)?\s*)?
+        (?:на\s+)?
+        (?:
+            (?P<hours>\d+)\s*(?:час|часа|часов)\s*
+            (?:\s*(?P<minutes>\d+)\s*(?:минут|минуты|минуты))?\s*
+            (?:\s*(?P<seconds>\d+)\s*(?:секунд|секунды|секунда))?
+          |
+            (?P<minutes2>\d+)\s*(?:минут|минуты|минуту)\s*
+            (?:\s*(?P<seconds2>\d+)\s*(?:секунд|секунды|секунда))?
+          |
+            (?P<seconds3>\d+)\s*(?:секунд|секунды|секунда)
+        )
+        \s*$
+    """,
+)
+
+# How long the camera speaks the timer-done message before going back to standby.
+_TIMER_SPEAK_DELAY_S = 0.5
+
+
+def _parse_timer_seconds(text: str) -> int | None:
+    """Parse a Russian timer phrase into total seconds, or None if not a timer."""
+    m = _RE_TIMER.search(text)
+    if not m:
+        return None
+    hours = int(m.group("hours") or 0)
+    minutes = int(m.group("minutes") or m.group("minutes2") or 0)
+    seconds = int(m.group("seconds") or m.group("seconds2") or m.group("seconds3") or 0)
+    total = hours * 3600 + minutes * 60 + seconds
+    return total if total > 0 else None
+
+
 # Minimum gap between two attention pips. It was 15 s and it produced a measurable
 # cascade, measured 06.10.2026 18:21 UTC on the kitchen:
 #
@@ -4513,6 +4551,38 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
         finally:
             self._processing_utterance = False
 
+    async def _set_timer(self, seconds: int, text: str) -> None:
+        """Set a kitchen timer for `seconds` and speak a confirmation.
+
+        Runs in the background so the camera can keep listening. When the timer
+        expires, speaks a spoken message back to the room.
+        """
+        logger.info(f"[{self.stream_name}] ⏱ setting timer for {seconds}s: {text!r}")
+        try:
+            await asyncio.sleep(seconds)
+        except asyncio.CancelledError:
+            logger.info(f"[{self.stream_name}] ⏱ timer cancelled ({seconds}s)")
+            return
+        # Timer expired — speak the message back through the camera speaker.
+        # Use the TTS pipeline so it goes through the normal playback path
+        # (echo guards, speaker mute, etc.).
+        spoken = f"Таймер на {seconds} секунд истек. {text}"
+        try:
+            pcm = await self._tts_fetch(spoken)
+            if pcm:
+                await self._speak_pcm(pcm, spoken)
+                logger.info(
+                    f"[{self.stream_name}] ⏱ timer finished and spoken: {text!r}"
+                )
+            else:
+                logger.warning(
+                    f"[{self.stream_name}] ⏱ timer TTS failed: {text!r}"
+                )
+        except Exception as e:
+            logger.error(
+                f"[{self.stream_name}] ⏱ timer speak failed: {e!r}"
+            )
+
     async def _handle_wake_or_command(self, txt: str, uid: str = "camera"):
         """Handle an utterance that Whisper transcribed AFTER the acoustic
         wake fired. The oww detector is the ONLY wake path now — this method
@@ -4611,6 +4681,14 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
             self._wake_only_pending = True
             return
         logger.info(f"[{self.stream_name}] 🗣 Post-wake command: '{cmd[:60]}'")
+        # Timer command: «поставь таймер на 5 минут», etc. Handled locally,
+        # not sent to Nanobot.
+        timer_secs = _parse_timer_seconds(cmd)
+        if timer_secs is not None:
+            asyncio.create_task(self._set_timer(timer_secs, cmd))
+            self._wake_only_pending = False
+            self._wake_detected = False
+            return
         # Overlapping wake windows: several cameras hear the same answer —
         # only the closest one talks to Nanobot.
         qual = float(len(cmd)) if is_valid_text(cmd) else 0.0

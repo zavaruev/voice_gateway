@@ -1309,12 +1309,29 @@ class CameraSession:
     _min_audio_rate = 0.5
     _starve_restarts = 3
     # How many utterances the VAD has opened, and how many at the last wake
-    # word. The acknowledgement pip reads them to decide whether the user is
-    # ALREADY speaking (measured 20.10.2026 17:03, the pip destroyed the
-    # command), so they have to be readable off the class — a hand-built
-    # session raised AttributeError from inside the live audio path on the
-    # first version of this.
+    # word. Kept for backwards compat; the pip guard no longer reads it — it
+    # uses `_speech_run` below (the wake itself manufactures an utterance open
+    # ~0.7 s after it fires, so the old counter always tripped).
     _speech_starts = 0
+    # F1: decaying counter of frames whose level is at or above the room's own
+    # noise floor (`self._noise.value * self._noise.mult`). It answers "is the
+    # user speaking RIGHT NOW?" at the pip decision instant — measured against
+    # the same instrument the endpoint uses, per room, with no new constant.
+    # Incremented on an elevated frame, decayed otherwise, so a single noise
+    # spike cannot hold it up.
+    _speech_run = 0
+    # The level (normalised, as fed to _noise) at the last frame — logged with
+    # the pip decision so the threshold is verifiable from the log.
+    _speech_rms = 0.0
+    # Durable flag: set in _fire_wake, cleared when the command is dispatched
+    # or the wake window closes (_back_to_wake). A LATE wake (we are already
+    # awaiting a command) must NOT clear _vad_speech_buf/_preroll and must NOT
+    # reset _vad_has_speech — the command in flight must survive. Measured
+    # 12:27 and 21.10 08:38: a second fire of one spoken word wiped the buffer
+    # and Whisper got 7 s of room noise instead of the command.
+    # Readable off the class so hand-built test sessions do not raise
+    # AttributeError inside the live audio path (same trap as _speech_starts).
+    _awaiting_command = False
     # When the rate heal was first deferred because the user was talking.
     _heal_deferred_since = 0.0
 
@@ -2974,6 +2991,17 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
             # property of the room and not of an utterance. It is what the
             # noise-based endpoint tests against; see _PauseEndpoint.
             self._noise.feed(orig_rms)
+            # F1: track whether the user is speaking RIGHT NOW, against the
+            # room's own floor — the same instrument the endpoint uses. A decaying
+            # counter so one noise spike cannot hold it up (the counter needs a
+            # couple of elevated 160 ms frames). This answers "is the user talking
+            # at the pip decision instant", which is what the pip guard needs.
+            thr = self._noise.value * self._noise.mult
+            self._speech_rms = orig_rms
+            if orig_rms >= thr:
+                self._speech_run = min(self._speech_run + 1, 8)
+            else:
+                self._speech_run = max(self._speech_run - 1, 0)
 
             if now - self._last_rms_log > 2.0:
                 self._last_rms_log = now
@@ -3163,9 +3191,14 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
                     now_w = time.time()
                     if not self._wake_gate_open(now_w):
                         # Our own playback still in the air, or the same
-                        # breath. Roll the decoder over so it cannot re-trigger
-                        # on the same audio, and stay silent.
-                        self._vosk_wake.reset()
+                        # breath. Do NOT reset the decoder here: reset() zeroes
+                        # _wake_hits, so the next chunk of the same word would
+                        # fire again — that is the multi-fire measured at
+                        # 07:38 and 21.10 08:38, where every fire cleared
+                        # _vad_speech_buf and destroyed the command. The
+                        # occurrence count in vosk_wake already prevents
+                        # re-triggering on the same audio, and _wake_hits is
+                        # cleared when the word truly leaves the hypothesis.
                         self._vosk_suppressed += 1
                         logger.info(
                             f"[{self.stream_name}] VOSK wake heard but not "
@@ -3221,7 +3254,11 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
                         # line on 07.10.2026 12:18 and it produced a false alarm for
                         # precisely this reason — the instrument was showing a
                         # different number than the one being judged.
-                        self._vosk_wake.reset()
+                        # Same reasoning as the gate above: never reset the
+                        # decoder on a refusal path — that zeroes _wake_hits and
+                        # makes the tail of the same word fire again. The energy
+                        # gate refuses a near-silence artefact; the next real
+                        # word clears _wake_hits when it leaves the hypothesis.
                         self._vosk_suppressed += 1
                         logger.info(
                             f"[{self.stream_name}] VOSK wake heard but not "
@@ -3772,47 +3809,57 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
         self._followup_chain = 0
         self._ww_consec = 0
         self._ww_recent.clear()
-        # Reset VAD collection: corridor's permanent noise floor keeps
-        # _vad_has_speech=True indefinitely (consec>100 observed), so the
-        # post-wake command would otherwise be drowned inside a noise buffer that
-        # never hits the silence limit. Start the command utterance from a clean
-        # slate.
-        self._vad_has_speech = False
-        self._vad_speech_buf.clear()
-        # How many times the VAD has opened an utterance. The wake word is
-        # remembered here, so the acknowledgement pip can tell "the user is
-        # ALREADY speaking" from "the room is quiet" — the pip must not land on
-        # the command. Measured 20.10.2026 17:03, `camera-corridor1`:
-        #
-        #     17:03:38.358  VOSK WAKE 'компьютер'
-        #     17:03:39.074  🔔 attention pip (vosk)
-        #     17:03:39.082  VAD SPEECH START        <- the command, 8 ms later
-        #     17:03:41.192  Whisper IN: 2.48s raw_rms=11144 peak=32767
-        #     17:03:41.814  Whisper OK: 'выключи'
-        #
-        # The buffer held the PIP (988 Hz then 1319 Hz, at the rail) and no
-        # speech at all: the user's sentence was never recorded, and Whisper
-        # turned a two-tone beep into a one-word command. The bare verb then
-        # borrowed the previous turn's device — the coffee maker — and the room
-        # answered «На кухне уже выключено».
-        self._speech_starts_at_wake = self._speech_starts
-        # Drop the pre-roll too. After a WAKE WORD the utterance starts at the
-        # wake — that is what makes this path immune to the confirmation latency
-        # the pre-roll exists to cover — so audio from BEFORE the wake word is not
-        # part of the command. It is also the noise the pre-roll is made of.
-        #
-        # For a follow-up the pre-roll must survive, because nothing is cleared:
-        # that window has no wake word to cut at, and its whole point is to start
-        # the utterance where the speech did.
-        self._preroll.clear()
-        self._vad_speech_consecutive = 0
-        # How many utterances the VAD has opened SINCE THE WAKE WORD. It is
-        # reset here, so the acknowledgement pip can tell "the user is ALREADY
-        # speaking" from "the room is quiet" — see `_play_attention`.
-        self._speech_starts = 0
-        if getattr(self, "_endpoint", None) is not None:
-            self._endpoint.reset()
-        self._vad_silence_frames = 0
+        # F2: a late wake (we are already awaiting a command) must NOT clear the
+        # command buffer — the user's command is in flight and must survive.
+        # Measured 12:27 and 21.10 08:38: a second fire of one spoken word wiped
+        # _vad_speech_buf, and Whisper got 7 s of room noise instead of the
+        # command. Only the FIRST wake clears the slate.
+        if not self._awaiting_command:
+            # Reset VAD collection: corridor's permanent noise floor keeps
+            # _vad_has_speech=True indefinitely (consec>100 observed), so the
+            # post-wake command would otherwise be drowned inside a noise buffer
+            # that never hits the silence limit. Start the command utterance from a
+            # clean slate.
+            self._vad_has_speech = False
+            self._vad_speech_buf.clear()
+            # How many times the VAD has opened an utterance. The wake word is
+            # remembered here, so the acknowledgement pip can tell "the user is
+            # ALREADY speaking" from "the room is quiet" — the pip must not land on
+            # the command. Measured 20.10.2026 17:03, `camera-corridor1`:
+            #
+            #     17:03:38.358  VOSK WAKE 'компьютер'
+            #     17:03:39.074  🔔 attention pip (vosk)
+            #     17:03:39.082  VAD SPEECH START        <- the command, 8 ms later
+            #     17:03:41.192  Whisper IN: 2.48s raw_rms=11144 peak=32767
+            #     17:03:41.814  Whisper OK: 'выключи'
+            #
+            # The buffer held the PIP (988 Hz then 1319 Hz, at the rail) and no
+            # speech at all: the user's sentence was never recorded, and Whisper
+            # turned a two-tone beep into a one-word command. The bare verb then
+            # borrowed the previous turn's device — the coffee maker — and the room
+            # answered «На кухне уже выключено».
+            self._speech_starts_at_wake = self._speech_starts
+            # Drop the pre-roll too. After a WAKE WORD the utterance starts at the
+            # wake — that is what makes this path immune to the confirmation
+            # latency the pre-roll exists to cover — so audio from BEFORE the
+            # wake word is not part of the command. It is also the noise the
+            # pre-roll is made of.
+            #
+            # For a follow-up the pre-roll must survive, because nothing is
+            # cleared: that window has no wake word to cut at, and its whole
+            # point is to start the utterance where the speech did.
+            self._preroll.clear()
+            self._vad_speech_consecutive = 0
+            # How many utterances the VAD has opened SINCE THE WAKE WORD. It is
+            # reset here, so the acknowledgement pip can tell "the user is ALREADY
+            # speaking" from "the room is quiet" — see `_play_attention`.
+            self._speech_starts = 0
+            if getattr(self, "_endpoint", None) is not None:
+                self._endpoint.reset()
+            self._vad_silence_frames = 0
+        # Whether we cleared or not, we are now awaiting a command. A late wake
+        # must not undo the buffer the command is being collected into.
+        self._awaiting_command = True
         if self._attention_pip:
             asyncio.create_task(self._play_attention(reason, guard_speech=True))
         # Bare 'компьютер' with no follow-up used to end in eternal silence (pip
@@ -4516,7 +4563,6 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
                 self._back_to_wake()
                 return
 
-        self._cancel_wake_greeting()
         # Never forward the wake word itself to nanobot — only the command
         # that follows it. Tolerate Whisper's glued repeats like
         # "компьютеркомпьютер" by matching without word boundaries.
@@ -4545,6 +4591,11 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
             # я не ехать ночью?» — each dispatched as a command and each answered
             # aloud. That is the "strangely reacts to a command" report, and it is
             # caused by closing on the wake word rather than by the wake word.
+            # F3: re-arm the greeting instead of leaving it cancelled — the user
+            # said only the wake word and is waiting to be heard. The greeting
+            # was scheduled in _fire_wake; refresh it so it fires _wake_greeting_delay
+            # after this wake-only transcript, not before it.
+            self._schedule_wake_greeting()
             self._wake_only_pending = True
             return
         if self._is_wake_word_alone():
@@ -4558,6 +4609,9 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
                 f"{self._last_utt_end_ts - self._last_wake_fired_at:.2f}s after the "
                 f"wake) — not a command"
             )
+            # F3: re-arm the greeting — a bare wake deserves an answer so the
+            # user knows they were heard and does not repeat the word.
+            self._schedule_wake_greeting()
             self._wake_only_pending = True
             return
         logger.info(f"[{self.stream_name}] 🗣 Post-wake command: '{cmd[:60]}'")
@@ -4580,6 +4634,10 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
             asyncio.create_task(self._cmd_fallback(cmd, uid, gk, winner))
             return
         _arbiter_mark_sent(gk, self.stream_name)
+        # The command is dispatched: cancel any pending auto-greeting — the user
+        # is being answered, not left waiting. F3.
+        self._cancel_wake_greeting()
+        self._awaiting_command = False
         await self._call_nanobot(cmd, uid)
 
     async def _cmd_fallback(self, cmd: str, uid: str, gk: tuple, winner: str):
@@ -5267,6 +5325,8 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
         # Consecutive turns answered WITHOUT the wake word. Circuit breaker
         # for an echo cascade; see _followup_chain_note for the measurement.
         self._followup_chain = 0
+        # The wake window is closed: we are no longer awaiting a command.
+        self._awaiting_command = False
         _arbiter_clear_owner(self.stream_name)
         # No threshold bump on empty wake windows: the old +0.07 "false-fire
         # penalty" compounded after every missed/empty command (Whisper glitch,
@@ -5437,11 +5497,18 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
         #     thing the user needed anyway.
         if guard_speech:
             await asyncio.sleep(_ATTENTION_SPEECH_GUARD_S)
-            if self._speech_starts > 0:
+            # F1: measure the level against the room's own floor instead of
+            # counting utterance opens — the wake itself opens an utterance on
+            # room noise ~0.7 s after it fires, so the old counter always
+            # tripped and the pip never sounded.
+            thr = self._noise.value * self._noise.mult
+            if self._speech_run > 0:
                 logger.info(
                     f"[{self.stream_name}] 🔇 attention pip skipped ({reason}): "
-                    "пользователь уже говорит — пип лёг бы на команду "
-                    "(20.10.2026 17:03, буфер был пипом, а не речью)"
+                    f"user is speaking — rms={self._speech_rms:.4f} vs "
+                    f"floor={self._noise.value:.4f} x{self._noise.mult:.1f}="
+                    f"{thr:.4f} (run={self._speech_run}). Пип лёг бы на команду "
+                    "(20.10.2026 17:03)."
                 )
                 return
         now = time.time()

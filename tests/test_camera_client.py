@@ -341,8 +341,10 @@ async def test_the_pip_is_dropped_when_the_user_is_already_speaking():
     s.http_session = _SlowHttp(0.01)
     s._out_track = None
     s._last_attention = 0.0
-    # An utterance opened since the wake word: the user is already talking.
-    s._speech_starts = 1
+    # The user is already talking: level above the room's floor (F1). The pip
+    # must not land on the command — measured 20.10.2026 17:03.
+    s._speech_run = 3
+    s._speech_rms = 0.06   # ~60% of full scale, well above any room floor
 
     await s._play_attention("vosk", guard_speech=True)
 
@@ -945,8 +947,49 @@ async def test_recent_wake_mishear_goes_to_greeting():
         s, "_call_nanobot", new_callable=AsyncMock
     ) as mock_nano:
         await s._handle_wake_or_command("шшш шшш", "cam")
-        mock_greet.assert_not_called()
+        # F3: a bare wake re-arms the greeting so the user is not left in
+        # silence (and does not repeat the word).
+        mock_greet.assert_called_once()
         mock_nano.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_a_late_wake_keeps_the_command_that_is_being_collected():
+    """A late wake (we are already awaiting a command) must NOT clear
+    _vad_speech_buf/_preroll or reset _vad_has_speech — the command in flight
+    must survive. Measured 12:27 and 21.10 08:38: a second fire of one spoken
+    word wiped the buffer and Whisper got 7 s of room noise instead of the
+    command. F2.
+    """
+    CMD = bytearray("включи свет".encode("utf-8"))
+    s = _make_session()
+    s._vad_speech_buf = CMD
+    s._preroll = bytearray(b"preroll audio")
+    s._vad_has_speech = True
+    s._speech_starts = 5
+
+    # First wake: clears the slate.
+    s._awaiting_command = False
+    with patch.object(s, "_play_attention"), patch.object(
+        s, "_schedule_wake_greeting"
+    ):
+        await s._fire_wake("test", score=1.0)
+    assert s._vad_speech_buf == bytearray(), "first wake cleared the buffer"
+    assert s._vad_has_speech is False
+    assert s._awaiting_command is True
+
+    # Second (late) wake: must NOT clear the buffer the command is in.
+    s._vad_speech_buf = CMD
+    s._preroll = bytearray(b"preroll audio")
+    s._vad_has_speech = True
+    with patch.object(s, "_play_attention"), patch.object(
+        s, "_schedule_wake_greeting"
+    ):
+        await s._fire_wake("test", score=1.0)
+    assert s._vad_speech_buf == CMD, "late wake cleared the command buffer"
+    assert s._preroll == bytearray(b"preroll audio")
+    assert s._vad_has_speech is True
+    assert s._awaiting_command is True
 
 
 @pytest.mark.asyncio

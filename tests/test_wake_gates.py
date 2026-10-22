@@ -317,7 +317,10 @@ async def test_a_wake_decoded_from_silence_does_not_fire():
     assert fire.await_count == 0, (
         "a wake word decoded out of near-silence fired the room"
     )
-    assert s._vosk_wake.resets >= 1, "the decoder must be rolled over, not left armed"
+    # F4: the decoder is NOT reset on a refusal path — reset() zeroes _wake_hits
+    # and makes the tail of the same word fire again. It stays armed; only the
+    # trigger is suppressed.
+    assert s._vosk_wake.resets == 0, "the decoder must stay armed, not reset"
 
 
 @pytest.mark.asyncio
@@ -366,7 +369,8 @@ async def test_a_click_does_not_wake_the_room():
     fire = await _feed_quiet(s, peak=32767)
 
     assert fire.await_count == 0, "a click woke the room"
-    assert s._vosk_wake.resets >= 1, "the decoder must be rolled over, not left armed"
+    # F4: same reasoning — the decoder stays armed, only the trigger is suppressed.
+    assert s._vosk_wake.resets == 0, "the decoder must stay armed, not reset"
 
 
 @pytest.mark.asyncio

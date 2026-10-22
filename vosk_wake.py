@@ -276,21 +276,26 @@ class VoskWakeMatcher:
         # the only evidence of what it actually hears
         self.last_partial = text
         if not transcript_has_wake(text):
-            # The word left the hypothesis, so the next one is a NEW word and
-            # may fire again.
-            self._wake_hits = 0
             near = wake_near_miss(text)
             if near:
+                # A near miss means the model still heard the wake word but in
+                # another form (an inflection the allowlist does not list, e.g.
+                # «компьютера»). Keep _wake_hits so the same word does not refire
+                # on the tail of the same breath; when the user says it AGAIN
+                # later, the occurrence count grows and it fires — that is what
+                # a wake word is for. Measured 21.10.2026 12:27: seven near-misses
+                # of «компьютера» in a row zeroed the count, and the next
+                # «компьютер» fired again. Do not reset on a near miss.
                 self.near_misses += 1
                 self.last_near_miss = near
-                # Rare by construction and decisive when it happens: a decoded word
-                # that ALMOST matched means the model heard it and the allowlist
-                # threw it away, which is a different fault from a model that did
-                # not hear it, and they need different fixes.
                 _log.warning(
                     "vosk: wake NEAR MISS #%d — decoded %r, not in WAKE_TOKENS %s",
                     self.near_misses, near, sorted(WAKE_TOKENS),
                 )
+                return False
+            # The word truly left the hypothesis: the next one is a NEW word and
+            # may fire again.
+            self._wake_hits = 0
             return False
 
         # FIRE ONCE PER SPOKEN WORD.

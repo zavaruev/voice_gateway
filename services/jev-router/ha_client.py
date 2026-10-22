@@ -182,6 +182,7 @@ class HAClient:
         # (states, fetched_at) and (entity->area, fetched_at) — timestamps are
         # monotonic so a wall-clock jump cannot pin a stale cache forever.
         self._states: list[dict] = []
+        self._states_by_domain: dict[str, list[dict]] = {}
         self._states_at: float = 0.0
         self._entity_areas: dict[str, str] = {}
         self._entity_areas_at: float = 0.0
@@ -304,10 +305,23 @@ class HAClient:
             return self._states
         if isinstance(data, list):
             self._states = data
+            by_domain: dict[str, list[dict]] = {}
+            for e in data:
+                eid = str(e.get("entity_id", ""))
+                dom = eid.split(".", 1)[0]
+                if dom not in by_domain:
+                    by_domain[dom] = []
+                by_domain[dom].append(e)
+            self._states_by_domain = by_domain
             # `now` was taken before the request: the TTL ages from the
             # fetch START, not from whenever the response landed.
             self._states_at = now
         return self._states
+
+    async def get_states_by_domain(self, force: bool = False) -> dict[str, list[dict]]:
+        """Return states grouped by domain for fast O(1) domain lookups."""
+        await self.get_states(force=force)
+        return self._states_by_domain
 
     async def get_automation_config(self, config_id: str) -> dict | None:
         """The automation's own configuration.

@@ -939,18 +939,22 @@ async def test_is_echo_rejects_silence():
 
 
 @pytest.mark.asyncio
-async def test_recent_wake_mishear_goes_to_greeting():
+async def test_bare_wake_pip_not_greeting():
+    """A bare wake ('компьютер' with no command) keeps the utterance open
+    awaiting the command — no spoken 'Да?' greeting. The pip was already
+    played by _fire_wake when the wake fired; the confirmation is the pip,
+    not a voice greeting.
+    """
     s = _make_session()
     s._wake_detected = True
     s._wake_fired_at = time.time() - 1.0  # model fired 1s ago
-    with patch.object(s, "_schedule_wake_greeting") as mock_greet, patch.object(
+    with patch.object(s, "_speak_pcm", new_callable=AsyncMock) as mock_speak, patch.object(
         s, "_call_nanobot", new_callable=AsyncMock
     ) as mock_nano:
         await s._handle_wake_or_command("шшш шшш", "cam")
-        # F3: a bare wake re-arms the greeting so the user is not left in
-        # silence (and does not repeat the word).
-        mock_greet.assert_called_once()
+        # No spoken greeting — just silence while awaiting the command.
         mock_nano.assert_not_called()
+        mock_speak.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -970,9 +974,7 @@ async def test_a_late_wake_keeps_the_command_that_is_being_collected():
 
     # First wake: clears the slate.
     s._awaiting_command = False
-    with patch.object(s, "_play_attention"), patch.object(
-        s, "_schedule_wake_greeting"
-    ):
+    with patch.object(s, "_play_attention"):
         await s._fire_wake("test", score=1.0)
     assert s._vad_speech_buf == bytearray(), "first wake cleared the buffer"
     assert s._vad_has_speech is False
@@ -982,9 +984,7 @@ async def test_a_late_wake_keeps_the_command_that_is_being_collected():
     s._vad_speech_buf = CMD
     s._preroll = bytearray(b"preroll audio")
     s._vad_has_speech = True
-    with patch.object(s, "_play_attention"), patch.object(
-        s, "_schedule_wake_greeting"
-    ):
+    with patch.object(s, "_play_attention"):
         await s._fire_wake("test", score=1.0)
     assert s._vad_speech_buf == CMD, "late wake cleared the command buffer"
     assert s._preroll == bytearray(b"preroll audio")
@@ -997,11 +997,8 @@ async def test_old_wake_command_goes_to_nanobot():
     s = _make_session()
     s._wake_detected = True
     s._wake_fired_at = time.time() - 10.0  # real follow-up, not the wake word
-    with patch.object(s, "_schedule_wake_greeting") as mock_greet, patch.object(
-        s, "_call_nanobot", new_callable=AsyncMock
-    ) as mock_nano:
+    with patch.object(s, "_call_nanobot", new_callable=AsyncMock) as mock_nano:
         await s._handle_wake_or_command("включи свет", "cam")
-        mock_greet.assert_not_called()
         mock_nano.assert_called_once()
 
 def test_filter_sdp_default_ip():
@@ -1501,60 +1498,6 @@ def test_zero_target_means_the_default_not_silence():
 # `not _processing_utterance`, and a previous turn was still in flight), so
 # `_wake_greeting` read the room as silent — while the VAD reported
 # `speech=True consec=54` and the command never reached Whisper at all.
-
-
-async def _raise_cancelled(_delay):
-    """Stand-in for asyncio.sleep that ends the greeting immediately."""
-    raise asyncio.CancelledError
-
-
-async def _no_sleep(_delay):
-    return None
-
-
-def _greet_session():
-    s = CameraSession.__new__(CameraSession)
-    s.stream_name = "cam"
-    s._wake_detected = True
-    s._vad_has_speech = False       # an in-flight utterance blocks the onset
-    s._vad_speech_consecutive = 54  # ...yet speech frames keep arriving
-    s._wake_greeting_delay = 5.0
-    s._wake_greeting_task = None
-    s._auto_greeting = False
-    s._last_auto_greet_ts = 0.0
-    s.spoken = []
-
-    async def _tts_fetch(text):
-        return b"pcm"
-
-    async def _speak(pcm, text):
-        s.spoken.append(text)
-
-    s._tts_fetch = _tts_fetch
-    s._speak_pcm = _speak
-    return s
-
-
-@pytest.mark.asyncio
-async def test_no_greeting_while_speech_frames_are_still_arriving():
-    """`_last_speech_at` is the honest "is the user talking" signal."""
-    s = _greet_session()
-    s._last_speech_at = time.time()      # speech arriving RIGHT NOW
-    with patch("camera_client.asyncio.sleep", new=_raise_cancelled):
-        await s._wake_greeting()
-    assert s.spoken == [], (
-        "greeting interrupted live speech — this is how «включи свет» was lost"
-    )
-
-
-@pytest.mark.asyncio
-async def test_greeting_still_happens_in_a_quiet_room():
-    """A bare «компьютер» with nobody following it must still be answered."""
-    s = _greet_session()
-    s._last_speech_at = time.time() - 600.0
-    with patch("camera_client.asyncio.sleep", new=_no_sleep):
-        await s._wake_greeting()
-    assert s.spoken == ["Да?"]
 
 
 # --- the firing gate, tested by BEHAVIOUR and not by reading the source ---
@@ -3958,7 +3901,6 @@ def test_the_wake_word_resets_the_cascade_breaker():
     s = _followup_session()
     s._followup_chain = _FOLLOWUP_CHAIN_MAX
     s._play_attention = AsyncMock()
-    s._schedule_wake_greeting = lambda *a, **k: None
 
     asyncio.run(s._fire_wake(reason="vosk"))
 

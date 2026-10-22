@@ -3862,12 +3862,12 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
         self._awaiting_command = True
         if self._attention_pip:
             asyncio.create_task(self._play_attention(reason, guard_speech=True))
-        # Bare 'компьютер' with no follow-up used to end in eternal silence (pip
-        # only). After a short pause greet so the user knows they were heard.
-        # Cap ownership: if nobody responds to pip + greeting, release other
-        # rooms quickly.
+        # Bare 'компьютер' with no follow-up ends here — the acknowledgement pip
+        # (fired above via _play_attention) is the confirmation that the room
+        # heard the wake word and is waiting for the command. No spoken greeting:
+        # the user told us on 22.10.2026 that «Да?» after «компьютер» is noise —
+        # the pip is the confirmation.
         self._wake_expires = min(self._wake_expires, time.time() + 14.0)
-        self._schedule_wake_greeting()
 
     async def _confirm_expiry_watch(self):
         """Confirm window closed with ZERO utterances: that pattern is a bare
@@ -3885,7 +3885,6 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
             and not self._wake_detected
         ):
             logger.info(f"[{self.stream_name}] 🔎 confirm window silent — bare wake")
-            self._schedule_wake_greeting()
 
     def _open_stt_confirm(self, sc: float) -> None:
         """Gates held a decent oww score (appliance/quiet-source). Do not pip;
@@ -4280,8 +4279,6 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
                 self._wake_detected = True
                 self._wake_expires = time.time() + self._wake_timeout
                 asyncio.create_task(self._play_attention("oww", guard_speech=True))
-                # Confirmed without an inline command? Greet as well.
-                self._schedule_wake_greeting()
             else:
                 logger.info(
                     f"[{self.stream_name}] ❌ stt-confirm dropped: '{txt[:50]}'"
@@ -4591,11 +4588,6 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
             # я не ехать ночью?» — each dispatched as a command and each answered
             # aloud. That is the "strangely reacts to a command" report, and it is
             # caused by closing on the wake word rather than by the wake word.
-            # F3: re-arm the greeting instead of leaving it cancelled — the user
-            # said only the wake word and is waiting to be heard. The greeting
-            # was scheduled in _fire_wake; refresh it so it fires _wake_greeting_delay
-            # after this wake-only transcript, not before it.
-            self._schedule_wake_greeting()
             self._wake_only_pending = True
             return
         if self._is_wake_word_alone():
@@ -4609,9 +4601,6 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
                 f"{self._last_utt_end_ts - self._last_wake_fired_at:.2f}s after the "
                 f"wake) — not a command"
             )
-            # F3: re-arm the greeting — a bare wake deserves an answer so the
-            # user knows they were heard and does not repeat the word.
-            self._schedule_wake_greeting()
             self._wake_only_pending = True
             return
         logger.info(f"[{self.stream_name}] 🗣 Post-wake command: '{cmd[:60]}'")
@@ -4634,9 +4623,6 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
             asyncio.create_task(self._cmd_fallback(cmd, uid, gk, winner))
             return
         _arbiter_mark_sent(gk, self.stream_name)
-        # The command is dispatched: cancel any pending auto-greeting — the user
-        # is being answered, not left waiting. F3.
-        self._cancel_wake_greeting()
         self._awaiting_command = False
         await self._call_nanobot(cmd, uid)
 
@@ -4662,62 +4648,6 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
             f"[{self.stream_name}] 🥈 winner '{winner}' silent — taking over command"
         )
         await self._call_nanobot(cmd, uid)
-
-    def _cancel_wake_greeting(self):
-        task = self._wake_greeting_task
-        if task is not None and not task.done():
-            task.cancel()
-        self._wake_greeting_task = None
-        # True while the AUTO-greeting (bare wake, no command yet) is being
-        # spoken: shortens the ownership/follow-up window so other rooms do
-        # not stay deaf for half a minute when the user walks away.
-        self._auto_greeting = False
-        self._last_auto_greet_ts = 0.0
-
-    def _schedule_wake_greeting(self):
-        self._cancel_wake_greeting()
-        self._wake_greeting_task = asyncio.create_task(self._wake_greeting())
-
-    async def _wake_greeting(self):
-        try:
-            await asyncio.sleep(self._wake_greeting_delay)
-        except asyncio.CancelledError:
-            return
-        if not self._wake_detected:
-            return
-        # «Is anyone talking?» must mean "has any speech frame arrived lately",
-        # NOT "has an utterance been committed". The two differ exactly when it
-        # hurts: `_vad_has_speech` stays False while `_processing_utterance` is
-        # in flight (the onset requires `not _processing_utterance`), so a
-        # command spoken right after the previous turn is dropped before it
-        # ever reaches Whisper — measured 04.10.2026: VAD reported
-        # `speech=True consec=54` with no SPEECH START at all, and the camera
-        # answered «Да?» to «включи свет» because the room looked silent.
-        if time.time() - self._last_speech_at < self._wake_greeting_delay:
-            try:
-                await asyncio.sleep(4.0)
-            except asyncio.CancelledError:
-                return
-            if not self._wake_detected:
-                return
-        logger.info(f"[{self.stream_name}] 🎯 Wake with no command — sending greeting")
-        # NOTE: keep _wake_detected True so a command the user utters right
-        # after the greeting is still treated as post-wake dialogue and is not
-        # dropped ("No wake word, ignoring"). The 60s _wake_timeout window
-        # governs how long follow-ups are accepted.
-        self._auto_greeting = True
-        self._last_auto_greet_ts = time.time()
-        try:
-            # Fixed local prompt instead of nanobot 'привет': instant, no
-            # chat-history pollution, and it can't be mistaken for a
-            # misheard transcript ('камера считает что я сказал привет').
-            fb = "Да?"
-            pcm = await self._tts_fetch(fb)
-            if pcm:
-                await self._speak_pcm(pcm, fb)
-        finally:
-            self._auto_greeting = False
-        self._last_auto_greet_ts = 0.0
 
     async def _on_user_command(self, text: str):
         """Route a transcript that arrived with the wake word present.

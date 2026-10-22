@@ -93,7 +93,6 @@ def _gates_patched(session: CameraSession):
             new=AsyncMock(return_value=(True, (), "test")),
         ),
         patch.object(session, "_play_attention", new=AsyncMock()),
-        patch.object(session, "_schedule_wake_greeting"),
         patch.object(session, "_confirm_expiry_watch", new=AsyncMock()) as expiry,
     ):
         yield expiry
@@ -296,7 +295,6 @@ async def _feed_quiet(session: CameraSession, peak: int, rounds: int = 1):
     with (
         patch("camera_client._arbiter_submit", new=AsyncMock(return_value=(True, (), "t"))),
         patch.object(session, "_play_attention", new=AsyncMock()),
-        patch.object(session, "_schedule_wake_greeting"),
         patch.object(session, "_fire_wake", new=AsyncMock()) as fire,
     ):
         for _ in range(rounds):
@@ -509,7 +507,6 @@ async def _feed_with_arbiter(session, won: bool, peak: int = 12000):
         patch("camera_client._arbiter_submit",
               new=AsyncMock(return_value=(won, (), "other" if not won else "t"))),
         patch.object(session, "_play_attention", new=AsyncMock()),
-        patch.object(session, "_schedule_wake_greeting"),
         patch.object(session, "_fire_wake", new=AsyncMock()) as fire,
     ):
         await session._vad_process(_chunk(peak))

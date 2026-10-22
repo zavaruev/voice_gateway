@@ -48,6 +48,8 @@ from collections import deque
 from dataclasses import dataclass
 from math import gcd
 
+from vosk_wake import transcript_has_wake
+
 import aiohttp
 import av
 import numpy as np
@@ -4345,6 +4347,11 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
         assembled over seconds and arriving after the audio it contains.
         """
         if not norm:
+            return None
+        # Wake word is never an echo of itself — the user may say «компьютер»
+        # repeatedly and each instance must be treated as a new wake attempt,
+        # not dropped as «Echo repeat».
+        if transcript_has_wake(norm):
             return None
         now = time.time()
         horizon = self._echo_repeat_horizon

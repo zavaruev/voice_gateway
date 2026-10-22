@@ -1,6 +1,6 @@
 # Voice Gateway
 
-![version](https://img.shields.io/badge/version-v2.61-blue)
+![version](https://img.shields.io/badge/version-v2.62-blue)
 [![tests](https://github.com/zavaruev/voice_gateway/actions/workflows/tests.yml/badge.svg)](https://github.com/zavaruev/voice_gateway/actions/workflows/tests.yml)
 ![python](https://img.shields.io/badge/python-3.12%2B-3776AB?logo=python&logoColor=white)
 ![backend](https://img.shields.io/badge/AI%20backend-Cascade-orange)

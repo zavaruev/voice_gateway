@@ -1464,17 +1464,16 @@ class CameraSession:
         # one unanswered question, not a recorder. See the dump in _vad_process.
         self._vosk_dump_fh = None
         self._vosk_dump_written = 0
+        self._vosk_dump_path = ""
         if config.vosk_dump_dir:
             try:
                 os.makedirs(config.vosk_dump_dir, exist_ok=True)
-                self._vosk_dump_fh = open(
-                    os.path.join(config.vosk_dump_dir, f"{self.stream_name}.raw"),
-                    "wb",
-                )
+                self._vosk_dump_path = os.path.join(config.vosk_dump_dir, f"{self.stream_name}.raw")
+                self._vosk_dump_fh = open(self._vosk_dump_path, "wb")
                 logger.info(
                     f"[{self.stream_name}] vosk dump ON -> "
-                    f"{config.vosk_dump_dir}/{self.stream_name}.raw "
-                    f"(cap {_VOSK_DUMP_CAP_MB} MB)"
+                    f"{self._vosk_dump_path} "
+                    f"(cap {_VOSK_DUMP_CAP_MB} MB, rotating)"
                 )
             except Exception as e:  # a diagnostic must never break the audio path
                 logger.warning(
@@ -3150,31 +3149,32 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
                 # 7448-11201 over the same seconds — so no offline reproduction
                 # can settle a question about the live feed. These bytes can.
                 if self._vosk_dump_fh is not None:
-                    if self._vosk_dump_written < _VOSK_DUMP_CAP_BYTES:
-                        try:
-                            self._vosk_dump_fh.write(wake_pcm)
-                            # Flush every chunk, deliberately. The point of this
-                            # file is to be `docker cp`'d OUT of a live room, and
-                            # Python's buffer would leave it empty on disk for
-                            # exactly as long as the question is being asked —
-                            # and lose everything on a restart.
-                            self._vosk_dump_fh.flush()
-                            self._vosk_dump_written += len(wake_pcm)
-                        except Exception as e:  # never break audio for a dump
-                            logger.warning(
-                                f"[{self.stream_name}] vosk dump write failed, "
-                                f"stopping: {e!r}"
-                            )
-                            self._vosk_dump_fh = None
-                    else:
-                        logger.info(
-                            f"[{self.stream_name}] vosk dump cap reached "
-                            f"({_VOSK_DUMP_CAP_MB} MB), closing"
-                        )
-                        try:
+                    try:
+                        self._vosk_dump_fh.write(wake_pcm)
+                        # Flush every chunk, deliberately. The point of this
+                        # file is to be `docker cp`'d OUT of a live room, and
+                        # Python's buffer would leave it empty on disk for
+                        # exactly as long as the question is being asked —
+                        # and lose everything on a restart.
+                        self._vosk_dump_fh.flush()
+                        self._vosk_dump_written += len(wake_pcm)
+
+                        if self._vosk_dump_written >= _VOSK_DUMP_CAP_BYTES:
                             self._vosk_dump_fh.close()
-                        except Exception:
-                            pass
+                            backup = self._vosk_dump_path + ".1"
+                            try:
+                                if os.path.exists(backup):
+                                    os.remove(backup)
+                                os.rename(self._vosk_dump_path, backup)
+                            except Exception:
+                                pass
+                            self._vosk_dump_fh = open(self._vosk_dump_path, "wb")
+                            self._vosk_dump_written = 0
+                    except Exception as e:  # never break audio for a dump
+                        logger.warning(
+                            f"[{self.stream_name}] vosk dump write failed, "
+                            f"stopping: {e!r}"
+                        )
                         self._vosk_dump_fh = None
                 got_wake = await asyncio.to_thread(
                     self._vosk_wake.feed, wake_pcm

@@ -149,7 +149,7 @@ _ECHO_HORIZON_S = 8.0
 # `_fire_wake` again and cleared the command being collected, which is the exact
 # failure this guard exists to prevent. The word's tail is up to ~2.7 s, so the
 # guard has to cover the word, not a fixed short moment.
-_WAKE_REARM_DEBOUNCE_S = 3.0
+_WAKE_REARM_DEBOUNCE_S = 1.5
 
 # Minimum gap between two attention pips. It was 15 s and it produced a measurable
 # cascade, measured 06.10.2026 18:21 UTC on the kitchen:

@@ -1986,17 +1986,22 @@ async def _handle(req: RouteRequest):
                     # authoritative second source — same shape as the ha_read
                     # fix on the worker side.
                     area_map = await ha.get_entity_areas()
+                    states_by_domain = await ha.get_states_by_domain()
                     wanted = {d.lower() for d in q.args["domain"]}
-                    for e in states:
-                        eid = str(e.get("entity_id", ""))
-                        if eid.split(".", 1)[0] not in wanted:
+
+                    for d in wanted:
+                        if d not in states_by_domain:
                             continue
-                        if str(e.get("state", "")).lower() in (
-                                "unavailable", "unknown"):
-                            continue
-                        if area_map.get(eid) == area or (
-                                area in str(area_map.get(eid, "")).lower()):
-                            ent = e
+                        for e in states_by_domain[d]:
+                            eid = str(e.get("entity_id", ""))
+                            if str(e.get("state", "")).lower() in (
+                                    "unavailable", "unknown"):
+                                continue
+                            if area_map.get(eid) == area or (
+                                    area in str(area_map.get(eid, "")).lower()):
+                                ent = e
+                                break
+                        if ent:
                             break
                 if ent is not None:
                     sentence = describe_entity(

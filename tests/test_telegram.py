@@ -366,6 +366,49 @@ def test_long_reply_overflows_into_extra_messages():
 # ------------------------------------------------------------- voice turns
 
 
+def test_is_valid_voice_text():
+    # 1. Empty, None, whitespace, or punctuation-only
+    assert is_valid_voice_text("") is False
+    assert is_valid_voice_text(None) is False
+    assert is_valid_voice_text("   ") is False
+    assert is_valid_voice_text(".,?!-") is False
+
+    # 2. Known single-word hallucinations
+    assert is_valid_voice_text("о") is False
+    assert is_valid_voice_text("а") is False
+    assert is_valid_voice_text("как") is False
+    assert is_valid_voice_text("жизнь") is False
+
+    # 3. Long runs of one character (>=5 chars, >40% repetition)
+    assert is_valid_voice_text("кккккк") is False
+    assert is_valid_voice_text("шшшшшшшшшшшш") is False
+    assert is_valid_voice_text("ооооо") is False
+    assert is_valid_voice_text("приветкккккк") is False
+
+    # 4. Whole text being one repeated short substring
+    assert is_valid_voice_text("каккак") is False
+    assert is_valid_voice_text("ататат") is False
+    assert is_valid_voice_text("бамбамбам") is False
+    assert is_valid_voice_text("окок") is False
+
+    # 5. Model looping, not a human.
+    assert is_valid_voice_text("да да да да") is False
+    assert is_valid_voice_text("нет нет нет") is False
+    assert is_valid_voice_text("свет свет свет") is False
+
+    # 6. WHISPER_HALLUCINATIONS_PATTERN matches
+    assert is_valid_voice_text("спасибо за просмотр") is False
+    assert is_valid_voice_text("подписывайтесь на канал") is False
+
+    # 7. Normal valid sentences
+    assert is_valid_voice_text("включи свет") is True
+    assert is_valid_voice_text("какая сегодня погода?") is True
+    # Unlike audio_utils.is_valid_text, short valid words are kept.
+    assert is_valid_voice_text("да") is True
+    assert is_valid_voice_text("нет, спасибо") is True
+    assert is_valid_voice_text("расскажи сказку") is True
+
+
 def test_voice_turn_happy_path(tmp_path, monkeypatch):
     monkeypatch.setattr(
         tg, "prepare_stt_audio", lambda data, ext, dur: (b"OGG", dur or 1.0)

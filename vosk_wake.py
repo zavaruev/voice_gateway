@@ -46,8 +46,6 @@ import os
 import threading
 import time
 
-import numpy as np
-
 SR = 16000
 
 # Token forms vosk actually produced for «компьютер» on this room's audio, plus

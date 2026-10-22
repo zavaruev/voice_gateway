@@ -20,6 +20,7 @@ import fractions
 import camera_client
 from camera_client import (
     AIVoiceOutputTrack,
+    _echo_of_reply,
     _FOLLOWUP_MIN_PEAK,
     _PREROLL_FRAMES,
     _WEBRTC_GIVEUP_ATTEMPTS,
@@ -4027,3 +4028,58 @@ def test_a_cue_still_waits_for_its_own_upload():
     src = inspect.getsource(CameraSession._play_attention)
     assert "_arm_tts_inflight" in src, "the pip must still arm the endpoint guard"
     assert "wait=False" not in src, "the pip must not be sent to the background"
+
+def test_arbiter_set_owner():
+    """Test that _arbiter_set_owner updates the _ARB_STATE correctly."""
+    from unittest.mock import patch
+    import camera_client
+
+    with patch("camera_client.time.time", return_value=12345.0):
+        with patch.dict(camera_client._ARB_STATE, {"owner": None, "cmd_sent": "some_command"}, clear=True):
+            camera_client._arbiter_set_owner("kitchen_camera", 0.95)
+
+            assert camera_client._ARB_STATE["owner"] == {
+                "stream": "kitchen_camera",
+                "ts": 12345.0,
+                "level": 0.95
+            }
+            assert camera_client._ARB_STATE["cmd_sent"] is None
+
+
+def test_filter_sdp_default_ip():
+    sdp = (
+        "v=0\n"
+        "o=- 0 0 IN IP4 127.0.0.1\n"
+        "a=candidate:1 1 UDP 2013266431 192.168.22.250 50000 typ host\n"
+        "a=candidate:2 1 UDP 2013266431 192.168.22.102 50000 typ host\n"
+        "c=IN IP4 192.168.22.250\n"
+    )
+    expected = (
+        "v=0\n"
+        "o=- 0 0 IN IP4 127.0.0.1\n"
+        "a=candidate:2 1 UDP 2013266431 192.168.22.102 50000 typ host\n"
+        "c=IN IP4 192.168.22.250\n"
+    )
+    assert CameraSession._filter_sdp(sdp) == expected
+
+
+def test_filter_sdp_custom_ip():
+    sdp = (
+        "v=0\n"
+        "a=candidate:1 1 UDP 2013266431 10.0.0.5 50000 typ host\n"
+        "a=candidate:2 1 UDP 2013266431 192.168.22.250 50000 typ host\n"
+    )
+    expected = (
+        "v=0\n"
+        "a=candidate:2 1 UDP 2013266431 192.168.22.250 50000 typ host\n"
+    )
+    assert CameraSession._filter_sdp(sdp, drop_ip="10.0.0.5") == expected
+
+
+def test_filter_sdp_empty():
+    assert CameraSession._filter_sdp("") == ""
+
+
+def test_echo_of_reply():
+    # Exact match
+    assert _echo_of_reply("hello world", "hello world") is True

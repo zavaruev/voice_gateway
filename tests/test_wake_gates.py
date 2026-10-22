@@ -838,8 +838,9 @@ async def test_dump_follows_the_filter_not_the_raw_chunk(tmp_path):
 
 @pytest.mark.asyncio
 async def test_dump_stops_at_the_cap(tmp_path):
-    """A diagnostic must not fill the disk. The cap is reached and the handle
-    closed rather than the write path growing without bound."""
+    """A diagnostic must not fill the disk. At the cap the dump rotates:
+    the current file is renamed to .1 and a new one opened, so the handle
+    is never None while the cap is being enforced."""
     s = _session_with_dump(tmp_path)
     s._vosk_wake = _RecordingVosk()
     s._vosk_dump_written = camera_client._VOSK_DUMP_CAP_BYTES
@@ -849,7 +850,10 @@ async def test_dump_stops_at_the_cap(tmp_path):
     ):
         await s._vad_process(_chunk(1000))
         await asyncio.sleep(0)
-    assert s._vosk_dump_fh is None, "the dump must close itself at the cap"
+    assert s._vosk_dump_fh is not None, "rotation opens a new handle, does not close"
+    import os
+    backup = str(s._vosk_dump_path) + ".1"
+    assert os.path.exists(backup), "rotation leaves a .1 backup"
 
 
 # ---------------------------------------------------------------------------

@@ -153,28 +153,65 @@ _WAKE_REARM_DEBOUNCE_S = 1.5
 
 # Timer regex — Russian voice commands for setting a kitchen timer.
 # Matches: «поставь таймер на 5 минут», «таймер на 10 минут», «таймер на 30 секунд»,
-# «таймер на 1 час 20 минут», «установи таймер на 2 минуты», etc.
+# «таймер на 1 час 20 минут», «установи таймер на 2 минуты», «таймер на тридцать
+# секунд», «таймер на полчаса», «таймер на час», etc. Both digits and Russian
+# number words are accepted. The leading verb is optional: «таймер на 5 минут»
+# works without «поставь».
+_NUMBER_WORDS = {
+    # Units
+    "ноль": 0, "один": 1, "одна": 1, "два": 2, "две": 2, "три": 3, "четыре": 4,
+    "пять": 5, "шесть": 6, "семь": 7, "восемь": 8, "девять": 9,
+    # Teens
+    "десять": 10, "одиннадцать": 11, "двенадцать": 12, "тринадцать": 13,
+    "четырнадцать": 14, "пятнадцать": 15, "шестнадцать": 16, "семнадцать": 17,
+    "восемнадцать": 18, "девятнадцать": 19,
+    # Tens
+    "двадцать": 20, "тридцать": 30, "сорок": 40, "пятьдесят": 50,
+    "шестьдесят": 60, "семьдесят": 70, "восемьдесят": 80, "девяносто": 90,
+    # Hundreds
+    "сто": 100, "двести": 200, "триста": 300, "четыреста": 400, "пятьсот": 500,
+    "шестьсот": 600, "семьсот": 700, "восемьсот": 800, "девятьсот": 900,
+}
+
+_WORD_NUM_RE = r"(?:\d+|" + "|".join(sorted(_NUMBER_WORDS.keys(), key=len, reverse=True)) + r")"
+
 _RE_TIMER = re.compile(
     r"""(?xi)\b
-        (?:поставь|установи|заведи|включи|запусти)\s+
-        (?:\s*таймер(?:а|у)?\s*)?
+        (?:поставь|установи|заведи|включи|запусти)?\s*
+        (?:таймер(?:а|у)?\s*)?
         (?:на\s+)?
         (?:
-            (?P<hours>\d+)\s*(?:час|часа|часов)\s*
-            (?:\s*(?P<minutes>\d+)\s*(?:минут|минуты|минуты))?\s*
-            (?:\s*(?P<seconds>\d+)\s*(?:секунд|секунды|секунда))?
+            (?P<hours>{word})\s*(?:час|часа|часов)\s*
+            (?:\s*(?P<minutes>{word})\s*(?:минут|минуты|минуту))?\s*
+            (?:\s*(?P<seconds>{word})\s*(?:секунд|секунды|секунда))?
           |
-            (?P<minutes2>\d+)\s*(?:минут|минуты|минуту)\s*
-            (?:\s*(?P<seconds2>\d+)\s*(?:секунд|секунды|секунда))?
+            (?P<minutes2>{word})\s*(?:минут|минуты|минуту)\s*
+            (?:\s*(?P<seconds2>{word})\s*(?:секунд|секунды|секунда))?
           |
-            (?P<seconds3>\d+)\s*(?:секунд|секунды|секунда)
+            (?P<seconds3>{word})\s*(?:секунд|секунды|секунда)
+          |
+            \s*час
+          |
+            \s*полчаса
         )
         \s*$
-    """,
+    """.format(word=_WORD_NUM_RE),
 )
 
 # How long the camera speaks the timer-done message before going back to standby.
 _TIMER_SPEAK_DELAY_S = 0.5
+
+
+def _word_to_int(word: str) -> int:
+    """Convert a Russian number word (or digit string) to an integer. Handles
+    single words and simple compounds like «тридцать пять»."""
+    word = word.strip()
+    if word.isdigit():
+        return int(word)
+    total = 0
+    for part in word.split():
+        total += _NUMBER_WORDS.get(part, 0)
+    return total
 
 
 def _parse_timer_seconds(text: str) -> int | None:
@@ -182,9 +219,19 @@ def _parse_timer_seconds(text: str) -> int | None:
     m = _RE_TIMER.search(text)
     if not m:
         return None
-    hours = int(m.group("hours") or 0)
-    minutes = int(m.group("minutes") or m.group("minutes2") or 0)
-    seconds = int(m.group("seconds") or m.group("seconds2") or m.group("seconds3") or 0)
+    text_norm = text.strip().lower()
+    # "час" without a number = 1 hour; "полчаса" = 30 minutes.
+    # These match as alternatives without named groups, so all groups are None.
+    if m.group("hours") is None and m.group("minutes") is None and m.group("seconds") is None:
+        if "полчаса" in text_norm:
+            return 1800
+        if "час" in text_norm:
+            return 3600
+    hours = _word_to_int(m.group("hours") or "0")
+    minutes = _word_to_int(m.group("minutes") or m.group("minutes2") or "0")
+    seconds = _word_to_int(
+        m.group("seconds") or m.group("seconds2") or m.group("seconds3") or "0"
+    )
     total = hours * 3600 + minutes * 60 + seconds
     return total if total > 0 else None
 

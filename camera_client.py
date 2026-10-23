@@ -4602,33 +4602,38 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
         """Set a kitchen timer for `seconds` and speak a confirmation.
 
         Runs in the background so the camera can keep listening. When the timer
-        expires, speaks a spoken message back to the room.
+        expires, speaks "Таймер истек" back to the room with an attention pip.
         """
         logger.info(f"[{self.stream_name}] ⏱ setting timer for {seconds}s: {text!r}")
+        # Speak confirmation immediately so the user knows the timer was set.
+        spoken = f"Таймер на {seconds} секунд"
+        try:
+            pcm = await self._tts_fetch(spoken)
+            if pcm:
+                await self._speak_pcm(pcm, spoken)
+                logger.info(f"[{self.stream_name}] ⏱ timer set: {seconds}s")
+            else:
+                logger.warning(f"[{self.stream_name}] ⏱ timer TTS failed (confirm): {text!r}")
+        except Exception as e:
+            logger.error(f"[{self.stream_name}] ⏱ timer confirm TTS failed: {e!r}")
         try:
             await asyncio.sleep(seconds)
         except asyncio.CancelledError:
             logger.info(f"[{self.stream_name}] ⏱ timer cancelled ({seconds}s)")
             return
-        # Timer expired — speak the message back through the camera speaker.
+        # Timer expired — speak "Таймер истек" with an attention pip first.
         # Use the TTS pipeline so it goes through the normal playback path
         # (echo guards, speaker mute, etc.).
-        spoken = f"Таймер на {seconds} секунд истек. {text}"
         try:
-            pcm = await self._tts_fetch(spoken)
+            pcm = await self._tts_fetch("Таймер истек")
             if pcm:
-                await self._speak_pcm(pcm, spoken)
-                logger.info(
-                    f"[{self.stream_name}] ⏱ timer finished and spoken: {text!r}"
-                )
+                await self._play_attention("timer", guard_speech=False)
+                await self._speak_pcm(pcm, "Таймер истек")
+                logger.info(f"[{self.stream_name}] ⏱ timer finished and spoken")
             else:
-                logger.warning(
-                    f"[{self.stream_name}] ⏱ timer TTS failed: {text!r}"
-                )
+                logger.warning(f"[{self.stream_name}] ⏱ timer TTS failed: {text!r}")
         except Exception as e:
-            logger.error(
-                f"[{self.stream_name}] ⏱ timer speak failed: {e!r}"
-            )
+            logger.error(f"[{self.stream_name}] ⏱ timer speak failed: {e!r}")
 
     async def _handle_wake_or_command(self, txt: str, uid: str = "camera"):
         """Handle an utterance that Whisper transcribed AFTER the acoustic

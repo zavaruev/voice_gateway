@@ -145,11 +145,10 @@ _ECHO_HORIZON_S = 8.0
 # Measured 06.10.2026 14:36: the wake fired at 14:36:48.964 and the decoder
 # decoded «компьютер» AGAIN from the same word's tail at 14:36:51.582 — 2.62 s
 # later — because the trigger lands in the middle of the word and the tail is fed
-# to the fresh recogniser. 1.5 s did not cover it; the second fire would have run
-# `_fire_wake` again and cleared the command being collected, which is the exact
-# failure this guard exists to prevent. The word's tail is up to ~2.7 s, so the
-# guard has to cover the word, not a fixed short moment.
-_WAKE_REARM_DEBOUNCE_S = 1.5
+# to the fresh recogniser. The guard has to cover the whole word's tail (~2.7 s),
+# not a fixed short moment, or the second fire runs `_fire_wake` again and clears
+# the command being collected — the exact failure this guard exists to prevent.
+_WAKE_REARM_DEBOUNCE_S = 3.0
 
 # Timer regex — Russian voice commands for setting a kitchen timer.
 # Matches: «поставь таймер на 5 минут», «таймер на 10 минут», «таймер на 30 секунд»,

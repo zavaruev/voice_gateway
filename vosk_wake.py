@@ -129,17 +129,14 @@ def transcript_has_wake(text: str) -> bool:
     activation per occurrence.
     """
     t = (text or "").lower().replace("ё", "е")
-    # Wake word must be the FIRST word in the phrase — addressing the
-    # assistant. «Включи компьютер» (turn on the computer) or «Выключи свой
-    # компьютер» (turn off your computer) are NOT wake-word invocations — the
-    # word «компьютер» is the object of the sentence, not the addressee.
-    # Measured 22.10.2026 in livingroom: «от её типа включи компьютер» and
-    # «выключи свой компьютер» both falsely fired as wake words.
+    # Check every token: vosk may emit filler words («ну», «это») before the
+    # wake word on short/noisy audio, so the addressee can land anywhere in the
+    # phrase. The match is exact against observed spellings — «компот» and
+    # «компания» are NOT in WAKE_TOKENS and stay rejected.
     tokens = t.split()
     if not tokens:
         return False
-    first_tok = tokens[0].strip(".,!?;:")
-    return first_tok in WAKE_TOKENS
+    return any(tok.strip(".,!?;:") in WAKE_TOKENS for tok in tokens)
 
 
 def wake_occurrences(text: str) -> int:

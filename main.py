@@ -135,9 +135,6 @@
 #   telegram_client, never the other way round — that would be a cycle).
 #
 # KNOWN GOTCHAS / TODOs
-#   * The import block that follows the first config section is duplicated
-#     (historical copy-paste). It is harmless — Python caches imported modules —
-#     but the redundant block should be merged some day.
 #   * During a gateway restart a single `ERROR ... Error in device websocket loop`
 #     line (old process logged it as voice_ws:1961) is a benign artifact of the
 #     satellite connection dropping mid-shutdown, not a regression.
@@ -203,50 +200,6 @@ ROUTER_URL = os.getenv("ROUTER_URL", "http://localhost:8091")
 # slow L1/L2 turn — cancelled as soon as the first real sentence arrives, so
 # fast paths never hear it (see backends.CascadeBackend).
 ROUTER_ACK_DELAY = float(os.getenv("ROUTER_ACK_DELAY", "3"))
-# ==========================================
-
-# NOTE: the import block below is a historical duplicate of the one above.
-# Modules are cached by Python, so re-importing is a no-op; kept as-is to avoid
-# touching executable lines (TODO: merge the two blocks).
-import asyncio
-import json
-import os
-import time
-import uuid
-import re
-import io
-import hashlib
-import aiohttp
-import secrets
-import numpy as np
-import onnxruntime as ort
-import opuslib
-from pydub import AudioSegment
-from loguru import logger
-from dataclasses import dataclass
-from fastapi import (
-    FastAPI,
-    Request,
-    Form,
-    WebSocket,
-    HTTPException,
-    UploadFile,
-    File,
-    Depends,
-)
-from fastapi.responses import HTMLResponse
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
-import limits
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.util import get_remote_address
-from slowapi.errors import RateLimitExceeded
-import camera_client
-from camera_client import CameraSession, CameraConfig
-
-# ==========================================
-# CONFIGURATION & ENVIRONMENT VARIABLES (continued)
 # Nanobot WebSocket (legacy default backend) — also used as the auth token for
 # the satellite WebSocket in voice_ws() and as the OTA access_token.
 NANOBOT_WS_URL = os.getenv("NANOBOT_WS_URL", "ws://nanobot:8765/").rstrip("/")

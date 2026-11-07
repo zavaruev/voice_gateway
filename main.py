@@ -149,10 +149,12 @@
 import asyncio
 import json
 import os
+import sys
 import time
 import uuid
 import re
 import io
+import faulthandler
 import hashlib
 import aiohttp
 import secrets
@@ -3858,7 +3860,98 @@ async def stop_camera_sessions():
 # a blocked loop shows exactly this shape). The monitor is the only witness:
 # it measures how late its own 1 s deadline was rescheduled.
 _LOOP_STALL_THRESHOLD = 2.0
+
+
+def _env_seconds(name: str, default: float) -> float:
+    """Read a non-negative number of seconds from the environment."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return default
+
+
+# A stall longer than this dumps every thread's stack from faulthandler's own
+# C thread, so it fires while the loop itself cannot. 20 s is the number the
+# two unanswered stalls asked for: 124.3 s on 05.11.2026 and 44.9 s on
+# 07.11.2026, both with nothing in the log saying WHAT blocked — the loop
+# cannot report on itself, and the blocked call leaves no line at all.
+# `0` disables it, which is what `0` means everywhere else in this file.
+_LOOP_DUMP_AFTER_S = _env_seconds("LOOP_STALL_DUMP_S", 20.0)
+_stall_dump_file = None
+_stall_dump_armed_at = 0.0
 _loop_monitor_task: asyncio.Task | None = None
+
+
+def _open_stall_dump_file():
+    """Where a stall dump goes: the durable log directory, else stderr.
+
+    `faulthandler` writes to a FILE DESCRIPTOR, so a StringIO is useless and
+    the handle has to stay open for the life of the process. The durable
+    directory wins because the whole point is to read the dump AFTER a
+    restart — `docker logs` is exactly what the 05.11 investigation lost.
+    """
+    log_dir = os.environ.get("GATEWAY_LOG_DIR", "").strip()
+    if not log_dir:
+        return sys.stderr
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        return open(os.path.join(log_dir, "loop_stalls.log"), "a",
+                    buffering=1, encoding="utf-8")
+    except Exception as e:
+        logger.warning(f"loop stall dump file unavailable ({e!r}) — using stderr")
+        return sys.stderr
+
+
+def _arm_stall_dump() -> None:
+    """Arm faulthandler's watchdog thread for the NEXT stall.
+
+    `dump_traceback_later` counts wall clock and fires from its own C thread,
+    which is the only property that matters here: the code that blocks the
+    loop cannot log, and the loop cannot run a timeout. It cannot be reset,
+    only cancelled and re-armed, so a healthy loop keeps pushing the fuse
+    forward — otherwise it would dump a healthy stack every 20 s forever.
+    """
+    global _stall_dump_armed_at
+    if _LOOP_DUMP_AFTER_S <= 0:
+        return
+    try:
+        if _stall_dump_armed_at:
+            faulthandler.cancel_dump_traceback_later()
+        faulthandler.dump_traceback_later(
+            _LOOP_DUMP_AFTER_S,
+            repeat=False,
+            file=_stall_dump_file if _stall_dump_file is not None else sys.stderr,
+        )
+        _stall_dump_armed_at = time.monotonic()
+    except Exception as e:
+        # A missing diagnostic must never take the gateway down, but it must
+        # not be silent either: an unarmed dump is indistinguishable from a
+        # stall that left no stack.
+        _stall_dump_armed_at = 0.0
+        logger.warning(f"loop stall dump NOT armed: {e!r}")
+
+
+def _maybe_rearm_stall_dump(now: float) -> bool:
+    """Re-arm the fuse once half of it is spent. True when it was re-armed.
+
+    Half, not every tick: this keeps at most one full `_LOOP_DUMP_AFTER_S`
+    ahead of the loop, so a stall LONGER than the fuse is guaranteed to be
+    dumped whichever moment it starts in — while re-arming on every 1 s tick
+    would create a thread a second for no added coverage. A stall that lands
+    in the half..full band can also be dumped, depending on where the fuse
+    was; that is extra evidence, not noise, because the fuse only survives
+    while the loop is healthy.
+    """
+    if _LOOP_DUMP_AFTER_S <= 0:
+        return False
+    if not _stall_dump_armed_at or now - _stall_dump_armed_at >= _LOOP_DUMP_AFTER_S / 2.0:
+        _arm_stall_dump()
+        return True
+    return False
+
 
 # Telegram source (optional): the bot and its long-poll task, created in
 # on_startup() only when TELEGRAM_BOT_TOKEN is set, cancelled there in
@@ -3868,7 +3961,7 @@ _telegram_task: asyncio.Task | None = None
 
 
 async def loop_stall_monitor() -> None:
-    """Log when the event loop stops scheduling tasks for more than 2 s.
+    """Log when the event loop stops scheduling tasks, and dump stacks on a long one.
 
     A stall freezes everything at once — SSE reads, queue puts, TTS
     synthesis, WS sends — which is what the 12 s of dead air in that turn
@@ -3878,9 +3971,11 @@ async def loop_stall_monitor() -> None:
     while True:
         t0 = time.monotonic()
         await asyncio.sleep(1.0)
-        lag = time.monotonic() - t0 - 1.0
+        now = time.monotonic()
+        lag = now - t0 - 1.0
         if lag >= _LOOP_STALL_THRESHOLD:
             logger.warning(f"🐌 [Loop] event loop stalled for {lag:.1f}s")
+        _maybe_rearm_stall_dump(now)
 
 
 @app.on_event("startup")
@@ -3889,7 +3984,13 @@ async def on_startup():
     await start_camera_sessions()
     # Diagnostics stay on in every mode (prod, CI image, local): a stalled
     # loop is invisible to the code running inside it.
-    global _loop_monitor_task
+    global _loop_monitor_task, _stall_dump_file
+    _stall_dump_file = _open_stall_dump_file()
+    _arm_stall_dump()
+    if _LOOP_DUMP_AFTER_S > 0:
+        where = getattr(_stall_dump_file, "name", "<stderr>")
+        logger.info(f"loop stall dump -> {where} if the loop stops for "
+                    f">{_LOOP_DUMP_AFTER_S:.0f}s")
     _loop_monitor_task = asyncio.create_task(loop_stall_monitor())
     # Telegram as a third source: one long-poll task in the SAME loop (no
     # webhook, no extra port). Disabled entirely without a token; the

@@ -352,13 +352,23 @@ async def _occupancy_sensor_of(automation_entity_id: str) -> str:
     cfg = await ha.get_automation_config(cfg_id)
     if not cfg:
         return ""
+
+    tasks = []
     for trig in cfg.get("triggers") or []:
         if str(trig.get("type") or "") not in ("occupied", "not_occupied"):
             continue
         dev = str(trig.get("device_id") or "")
         if not dev:
             continue
-        for eid in await ha.device_entities(dev):
+        tasks.append(ha.device_entities(dev))
+
+    if not tasks:
+        return ""
+
+    results = await asyncio.gather(*tasks)
+
+    for entities in results:
+        for eid in entities:
             if (
                 eid.startswith("binary_sensor.")
                 and "occupancy" in eid

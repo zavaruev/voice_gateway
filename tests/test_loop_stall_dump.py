@@ -217,7 +217,7 @@ def test_zero_fatal_threshold_means_never_exit(monkeypatch):
             except asyncio.CancelledError:
                 pass
 
-    asyncio.get_event_loop().run_until_complete(run_one_tick())
+    asyncio.run(run_one_tick())
     assert exited == [], "fatal threshold of 0 must never call os._exit"
 
 
@@ -231,8 +231,12 @@ async def test_a_fatal_stall_exits_the_process(monkeypatch):
     monkeypatch.setattr(main, "_LOOP_STALL_FATAL_S", 1.0)
     monkeypatch.setattr(main, "_LOOP_DUMP_AFTER_S", 0.0)
 
+    real_sleep = main.asyncio.sleep
+
     async def no_sleep(_t, *a, **k):
-        return
+        # Yield control so the loop_stall_monitor task can run between ticks.
+        await real_sleep(0)
+
     monkeypatch.setattr(main.asyncio, "sleep", no_sleep)
 
     t = [1000.0]
@@ -243,7 +247,12 @@ async def test_a_fatal_stall_exits_the_process(monkeypatch):
 
     task = asyncio.create_task(main.loop_stall_monitor())
     try:
-        await asyncio.sleep(0.05)
+        # First yield: monitor starts, calls t0=monotonic(), then yields on its
+        # own sleep. Second yield: monitor's sleep completes, it checks lag and
+        # calls os._exit(1). The test's own sleep was scheduled before the
+        # monitor's, so we need two ticks for the monitor to catch up.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
     finally:
         task.cancel()
         try:

@@ -32,3 +32,6 @@ config/vosk-model-ru-0.42
 config/vosk-model-small-ru-0.22
 config/*.onnx.bak*
 config/firmware/
+
+# Silero VAD model is now tracked in git
+!silero_vad.onnx

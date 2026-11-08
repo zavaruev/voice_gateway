@@ -7,7 +7,7 @@ __pycache__/
 .pytest_cache/
 
 # Project-specific
-silero_vad.onnx
+# silero_vad.onnx is tracked in git (needed by Dockerfile COPY)
 config/chat_id_cache.json
 config/telegram_chats.json
 config/speaker_names.json

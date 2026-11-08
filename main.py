@@ -3873,6 +3873,16 @@ def _env_seconds(name: str, default: float) -> float:
         return default
 
 
+# A stall longer than this is fatal: the process exits with code 1 and Docker
+# (RestartPolicy=unless-stopped) restarts the gateway instead of leaving it
+# hung for hours. Measured 08.11.2026: the loop froze at ~10:24 and stayed
+# frozen for ~3 hours while every room went silent. 60 s is long enough that
+# a brief hitch (GC, a slow DNS, a momentary btrfs stall) does not kill us,
+# and short enough that a real wedge costs at most a minute of silence.
+# `0` disables it — dump-only mode, as everywhere else in this file.
+_LOOP_STALL_FATAL_S = _env_seconds("LOOP_STALL_FATAL_S", 60.0)
+
+
 # A stall longer than this dumps every thread's stack from faulthandler's own
 # C thread, so it fires while the loop itself cannot. 20 s is the number the
 # two unanswered stalls asked for: 124.3 s on 05.11.2026 and 44.9 s on
@@ -3975,6 +3985,16 @@ async def loop_stall_monitor() -> None:
         lag = now - t0 - 1.0
         if lag >= _LOOP_STALL_THRESHOLD:
             logger.warning(f"🐌 [Loop] event loop stalled for {lag:.1f}s")
+        # A stall longer than the fatal threshold cannot be logged out of — the
+        # loop itself is frozen. The only sane recovery is to die and let
+        # Docker's unless-stopped restart policy bring the gateway back.
+        if _LOOP_STALL_FATAL_S > 0 and lag >= _LOOP_STALL_FATAL_S:
+            logger.critical(
+                f"💀 [Loop] event loop stalled for {lag:.1f}s >= "
+                f"{_LOOP_STALL_FATAL_S:.0f}s fatal threshold — exiting so "
+                f"Docker restarts the gateway"
+            )
+            os._exit(1)
         _maybe_rearm_stall_dump(now)
 
 
@@ -3998,6 +4018,8 @@ async def on_startup():
     # main (main imports it).
     global _telegram_bot, _telegram_task
     if TELEGRAM_BOT_TOKEN:
+        raw_streams = os.getenv("CAMERA_STREAMS", "")
+        camera_streams = tuple(s.strip() for s in raw_streams.split(",") if s.strip())
         _telegram_bot = telegram_client.build_telegram_bot(
             token=TELEGRAM_BOT_TOKEN,
             allowed_chat_ids=TELEGRAM_ALLOWED_CHAT_IDS,
@@ -4013,6 +4035,9 @@ async def on_startup():
             transcribe=fetch_transcription,
             tts_mp3=_telegram_tts,
             make_session_id=lambda chat: make_chat_id(f"tg:{chat}"),
+            go2rtc_host=os.getenv("GO2RTC_HOST", "192.168.22.102"),
+            go2rtc_port=int(os.getenv("GO2RTC_PORT", "1984")),
+            camera_streams=camera_streams,
         )
         _telegram_task = asyncio.create_task(
             _telegram_bot.run(), name="telegram-poll"
@@ -4079,7 +4104,7 @@ def _install_durable_log() -> None:
             rotation=rotation,
             retention=retention,
             encoding="utf-8",
-            enqueue=False,
+            enqueue=True,
         )
         # loguru uses `{}` braces, NOT printf `%s`: the printf form reaches the
         # log verbatim, which is how a confirmation line can look like it proved

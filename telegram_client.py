@@ -99,9 +99,42 @@ MAX_TEXT_CHARS = 1000
 # is already in the message above it.
 VOICE_MAX_CHARS = 900
 
+# TTS (edge-tts) intermittently refuses the WebSocket handshake (HTTP 403 ->
+# surfaced as HTTP 500 by the wrapper). One retry ~0.5 s later is enough —
+# measured: the very next request returns 200. More attempts just mean more
+# silence in front of the apology when TTS is genuinely dead.
+_TTS_ATTEMPTS = 2
+_TTS_RETRY_S = 0.5
+
 # Voice notes are Ogg/Opus by Telegram spec; other audio attachments (mp3,
 # m4a sent as a file) are re-containered to match the Whisper contract.
 OGG_EXTS = ("ogg", "oga", "opus")
+
+# go2rtc serves a single JPEG snapshot at /api/frame.jpeg?name=<stream>.
+# No auth is needed on most hosts (see AGENTS.md). The frame is fetched as
+# raw bytes and re-uploaded to Telegram because Telegram's servers cannot
+# reach the internal go2rtc address.
+GO2RTC_FRAME_TIMEOUT = 10.0
+
+
+async def fetch_go2rtc_frame(session, host: str, port: int, stream_name: str) -> bytes | None:
+    """Pull one JPEG snapshot from go2rtc. Returns raw bytes or None.
+
+    go2rtc 1.9.2 exposes the snapshot as /api/frame.jpeg?src=<stream> (the
+    `name` parameter returns 404 — verified against the live instance).
+    """
+    url = f"http://{host}:{port}/api/frame.jpeg?src={stream_name}"
+    try:
+        async with session.get(url, timeout=GO2RTC_FRAME_TIMEOUT) as r:
+            if r.status != 200:
+                logger.warning(
+                    f"[Telegram] go2rtc frame for {stream_name}: HTTP {r.status}"
+                )
+                return None
+            return await r.read()
+    except Exception as e:
+        logger.warning(f"[Telegram] go2rtc frame fetch failed for {stream_name}: {e}")
+        return None
 
 ACK_PHRASES = frozenset(
     {
@@ -132,7 +165,9 @@ GREETING = (
     "\n"
     "Команды:\n"
     "/room кухня — комната по умолчанию для включений;\n"
-    "/voice on | /voice off — отвечать ли голосом."
+    "/voice on | /voice off — отвечать ли голосом;\n"
+    "/camera [имя] — снимок с камеры (например: /camera kitchen, /camera livingroom);\n"
+    "просто скажите «покажи камеру на кухне» или «фото с гостиной»."
 )
 
 # Rooms the router can actually default to (STREAM_DEFAULT_AREA keys in
@@ -471,11 +506,11 @@ class TelegramAPI:
                 return False
             raise
 
-    async def send_chat_action(self, chat_id: str) -> bool:
+    async def send_chat_action(self, chat_id: str, action: str = "typing") -> bool:
         return bool(
             await self._post(
                 "sendChatAction",
-                json_body={"chat_id": chat_id, "action": "typing"},
+                json_body={"chat_id": chat_id, "action": action},
                 timeout=10,
             )
         )
@@ -503,6 +538,24 @@ class TelegramAPI:
         if reply_to is not None:
             params["reply_to_message_id"] = str(reply_to)
         result = await self._post("sendVoice", form=form, params=params, timeout=60)
+        return int(result.get("message_id", 0)) if isinstance(result, dict) else 0
+
+    async def send_photo(
+        self,
+        chat_id: str,
+        photo: bytes,
+        caption: str = "",
+        reply_to: int | None = None,
+    ) -> int:
+        """Upload a JPEG snapshot and send it as a photo message."""
+        form = aiohttp.FormData()
+        form.add_field("photo", photo, filename="snapshot.jpg", content_type="image/jpeg")
+        params: dict = {"chat_id": str(chat_id)}
+        if caption:
+            params["caption"] = caption[:1024]
+        if reply_to is not None:
+            params["reply_to_message_id"] = str(reply_to)
+        result = await self._post("sendPhoto", form=form, params=params, timeout=60)
         return int(result.get("message_id", 0)) if isinstance(result, dict) else 0
 
 
@@ -598,6 +651,9 @@ class TelegramBot:
         log_transcripts: bool = False,
         max_pending: int = MAX_PENDING_PER_CHAT,
         max_text_chars: int = MAX_TEXT_CHARS,
+        go2rtc_host: str = "192.168.22.102",
+        go2rtc_port: int = 1984,
+        camera_streams: tuple[str, ...] = (),
     ):
         self.api = api
         # Empty allowlist denies everyone (a token in a public repo must
@@ -616,6 +672,10 @@ class TelegramBot:
         self.log_transcripts = log_transcripts
         self.max_pending = max_pending
         self.max_text_chars = max_text_chars
+        self.go2rtc_host = go2rtc_host
+        self.go2rtc_port = go2rtc_port
+        self.camera_streams = tuple(camera_streams)
+        self._last_camera_stream: str | None = None
 
         self._session: aiohttp.ClientSession | None = None
         self._queues: dict[str, asyncio.Queue] = {}
@@ -852,16 +912,53 @@ class TelegramBot:
         chat_id = str(chat_id)
         text = (msg.get("text") or msg.get("caption") or "").strip()
         if text.startswith("/"):
+            logger.info(
+                f"[Telegram:{chat_id}] command: {text}"
+            )
             await self._command(chat_id, msg, text)
             return ""
         if msg.get("voice") or msg.get("audio"):
             return await self._voice_turn(chat_id, msg)
         if text:
+            logger.info(
+                f"[Telegram:{chat_id}] text: {text[:200]}"
+            )
             return await self._text_turn(chat_id, msg, text)
         await self._send(chat_id, HINT_UNSUPPORTED, reply_to=msg.get("message_id"))
         return ""
 
     async def _text_turn(self, chat_id: str, msg: dict, text: str) -> str:
+        # Если пользователь просит показать камеру — фото вместо LLM.
+        # «покажи» всегда про изображение (по условию пользователя).
+        # Также принимаем продолжения разговора: «Теперь гостиную», «А теперь коридор»,
+        # «И прихожую» — когда в сообщении только название комнаты без гласов действия.
+        low = text.lower()
+        cam_keywords = ("камер", "фото", "снимок", "кадр", "покажи")
+        stream = self._match_camera_stream(low)
+        is_cam_keyword = any(k in low for k in cam_keywords)
+        is_bare_room = (
+            stream is not None
+            and not is_cam_keyword
+            and len(text) <= 40
+            and not any(v in low for v in ("включи", "выключи", "погаси", "зажги", "сделай", "включить", "выключить"))
+        )
+        if (is_cam_keyword or is_bare_room) and self.camera_streams and stream is not None:
+            logger.info(
+                f"[Telegram:{chat_id}] camera request from text '{text}' -> stream '{stream}'"
+            )
+            await self._cmd_camera(chat_id, msg.get("message_id"), [stream])
+            return ""
+        # Есть слова о камере, но комната не распознана («другая камера»,
+        # «следующая», «ещё одну»). Не отказываем — показываем следующую
+        # камеру из списка по порядку.
+        if is_cam_keyword and self.camera_streams:
+            nxt = self._next_camera_stream()
+            logger.info(
+                f"[Telegram:{chat_id}] camera request from text '{text}' -> "
+                f"next stream '{nxt}' (room not recognised)"
+            )
+            await self._cmd_camera(chat_id, msg.get("message_id"), [nxt])
+            return ""
         if len(text) > self.max_text_chars:
             await self._send(
                 chat_id,
@@ -925,10 +1022,43 @@ class TelegramBot:
         if not transcript or not is_valid_voice_text(transcript):
             await self._send(chat_id, HINT_NOT_HEARD, reply_to=reply_to)
             return ""
+        # Если в голосовом просьба показать камеру — фото вместо LLM.
+        # «покажи» всегда про изображение (по условию пользователя).
+        # Также принимаем продолжения: «Теперь гостиную», «И прихожую» и т.п.
+        low = transcript.lower()
+        cam_keywords = ("камер", "фото", "снимок", "кадр", "покажи")
+        stream = self._match_camera_stream(low)
+        is_cam_keyword = any(k in low for k in cam_keywords)
+        is_bare_room = (
+            stream is not None
+            and not is_cam_keyword
+            and len(transcript) <= 40
+            and not any(v in low for v in ("включи", "выключи", "погаси", "зажги", "сделай", "включить", "выключить"))
+        )
+        if (is_cam_keyword or is_bare_room) and self.camera_streams and stream is not None:
+            logger.info(
+                f"[Telegram:{chat_id}] voice camera request '{transcript}' -> stream '{stream}'"
+            )
+            await self._cmd_camera(chat_id, reply_to, [stream])
+            return ""
+        # Есть слова о камере, но комната не распознана («другая камера»,
+        # «следующая», «ещё одну»). Не отказываем — показываем следующую
+        # камеру из списка по порядку.
+        if is_cam_keyword and self.camera_streams:
+            nxt = self._next_camera_stream()
+            logger.info(
+                f"[Telegram:{chat_id}] voice camera request '{transcript}' -> "
+                f"next stream '{nxt}' (room not recognised)"
+            )
+            await self._cmd_camera(chat_id, reply_to, [nxt])
+            return ""
         return await self._run_turn(chat_id, transcript, reply_to)
 
     async def _run_turn(self, chat_id: str, text: str, reply_to: int | None) -> str:
         """One LLM turn under the concurrency cap, with a typing indicator."""
+        logger.info(
+            f"[Telegram:{chat_id}] _run_turn start: '{text[:100]}'"
+        )
         async with self._turn_sem:
             self._next_start[chat_id] = time.monotonic() + self.cooldown
             typing = asyncio.create_task(self._typing_loop(chat_id))
@@ -938,6 +1068,9 @@ class TelegramBot:
             finally:
                 typing.cancel()
                 await _await_cancelled(typing)
+        logger.info(
+            f"[Telegram:{chat_id}] _run_turn done: final_text={len(final_text or '')} chars"
+        )
         if final_text and self.chat_voice(chat_id):
             await self._voice_reply(chat_id, final_text, reply_to)
         return final_text
@@ -1023,11 +1156,16 @@ class TelegramBot:
             return final_text
         # Nothing to say: close the turn unless the backend already did.
         if sender.last_status in CLOSING_PHRASES:
+            logger.info(f"[Telegram:{chat_id}] _stream_reply: closing phrase, no text")
             return ""
         if timed_out:
+            logger.warning(f"[Telegram:{chat_id}] _stream_reply: timed out, no text")
             await sender.status(FALLBACK_TIMEOUT)
+        elif errored:
+            logger.warning(f"[Telegram:{chat_id}] _stream_reply: errored, no text")
+            await sender.status(FALLBACK_ERROR)
         else:
-            # Covers both a silent backend and `errored`.
+            logger.warning(f"[Telegram:{chat_id}] _stream_reply: silent backend, no text")
             await sender.status(FALLBACK_ERROR)
         return ""
 
@@ -1037,9 +1175,23 @@ class TelegramBot:
             excerpt = self._voice_excerpt(text)
             if not excerpt:
                 return
-            mp3 = await self._tts_mp3(excerpt, self._session)
+            mp3 = None
+            for attempt in range(_TTS_ATTEMPTS):
+                mp3 = await self._tts_mp3(excerpt, self._session)
+                if mp3:
+                    break
+                if attempt < _TTS_ATTEMPTS - 1:
+                    await asyncio.sleep(_TTS_RETRY_S)
             if not mp3:
-                logger.warning("[Telegram] TTS returned nothing; voice reply skipped")
+                logger.warning(
+                    f"[Telegram:{chat_id}] TTS failed after {_TTS_ATTEMPTS} attempts; "
+                    f"sending text fallback instead of voice"
+                )
+                await self._send(
+                    chat_id,
+                    "(Голосовой ответ временно недоступен — текст выше.)",
+                    reply_to=reply_to,
+                )
                 return
             ogg = await asyncio.to_thread(mp3_to_voice_ogg, mp3)
             if not ogg:
@@ -1080,6 +1232,8 @@ class TelegramBot:
             await self._cmd_room(chat_id, reply_to, args)
         elif cmd == "/voice":
             await self._cmd_voice(chat_id, reply_to, args)
+        elif cmd == "/camera":
+            await self._cmd_camera(chat_id, reply_to, args)
         else:
             await self._send(
                 chat_id, "Не знаю такой команды. Вот что понимаю:", reply_to=reply_to
@@ -1148,6 +1302,88 @@ class TelegramBot:
             reply_to=reply_to,
         )
 
+    # ---------------------------------------------------------- camera photo
+
+    async def _cmd_camera(self, chat_id: str, reply_to, args: list[str]) -> None:
+        """Отправить снимок с камеры через go2rtc /api/frame.jpeg."""
+        if not self.camera_streams:
+            await self._send(chat_id, "Камеры не настроены.", reply_to=reply_to)
+            return
+        # `/camera кухня` — аргумент может быть русским названием комнаты,
+        # а не именем потока. Сопоставляем.
+        stream = None
+        if args:
+            stream = self._match_camera_stream(args[0].lower())
+        if stream is None:
+            stream = self.camera_streams[0]
+            await self._send(
+                chat_id,
+                f"Показываю камеру «{stream}» (первая из настроенных).",
+                reply_to=reply_to,
+            )
+        session = self.api.session
+        if session is None:
+            await self._send(chat_id, "Бот ещё не готов, попробуйте позже.", reply_to=reply_to)
+            return
+        await self.api.send_chat_action(chat_id, action="upload_photo")
+        frame = await fetch_go2rtc_frame(session, self.go2rtc_host, self.go2rtc_port, stream)
+        if not frame:
+            await self._send(
+                chat_id,
+                f"Не удалось получить кадр с камеры «{stream}».",
+                reply_to=reply_to,
+            )
+            return
+        await self.api.send_photo(
+            chat_id,
+            frame,
+            caption=f"📷 {stream}",
+            reply_to=reply_to,
+        )
+        logger.info(
+            f"[Telegram:{chat_id}] camera photo sent: stream='{stream}'"
+        )
+        self._last_camera_stream = stream
+
+    def _match_camera_stream(self, low: str) -> str | None:
+        """Сопоставить речь пользователя с названием камеры из camera_streams.
+
+        Учитывает русские названия комнат: кухня, гостиная, прихожая, коридор,
+        а также сокращения и словоформы.
+        """
+        # Прямое совпадение с именем потока
+        for s in self.camera_streams:
+            if s.lower() in low:
+                return s
+        # Русские названия комнат -> stream name
+        room_map = {
+            "кухн": "kitchen",
+            "гостин": "livingroom",
+            "зал": "livingroom",
+            "прихож": "entrance1",
+            "коридор": "camera-corridor1",
+        }
+        for stem, stream in room_map.items():
+            if stem in low and stream in self.camera_streams:
+                return stream
+        return None
+
+    def _next_camera_stream(self) -> str:
+        """Вернуть следующую камеру после последней показанной (циклически).
+
+        Используется когда пользователь говорит «другая камера», «следующая»,
+        «ещё одну» — без названия конкретной комнаты.
+        """
+        if not self.camera_streams:
+            return ""
+        if self._last_camera_stream is None:
+            return self.camera_streams[0]
+        try:
+            idx = self.camera_streams.index(self._last_camera_stream)
+        except ValueError:
+            return self.camera_streams[0]
+        return self.camera_streams[(idx + 1) % len(self.camera_streams)]
+
 
 def build_telegram_bot(
     *,
@@ -1165,6 +1401,9 @@ def build_telegram_bot(
     api_base: str = API_BASE,
     state_file: str = "",
     log_transcripts: bool = False,
+    go2rtc_host: str = "192.168.22.102",
+    go2rtc_port: int = 1984,
+    camera_streams: tuple[str, ...] = (),
 ) -> TelegramBot:
     """Wire the bot to main.py's helpers (the anti-cycle seam).
 
@@ -1187,4 +1426,7 @@ def build_telegram_bot(
         cooldown=cooldown,
         state_file=state_file,
         log_transcripts=log_transcripts,
+        go2rtc_host=go2rtc_host,
+        go2rtc_port=go2rtc_port,
+        camera_streams=camera_streams,
     )

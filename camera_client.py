@@ -1701,6 +1701,7 @@ class CameraSession:
         self._last_feed_log = 0.0
         self._last_rms_log = 0.0
 
+        self._speaker_id_in_flight = False
         self._wake_cmd_sent = False
         self._last_uid = None
         self._last_uid_ts = 0.0
@@ -3122,6 +3123,20 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
                             self._endpoint.reset()
                         # Seed with the audio that arrived BEFORE the VAD
                         # confirmed anything.
+                        # Speaker ID on speech onset — log "от кого обращение"
+                        # for every utterance, even if VAD never reports silence
+                        # and _process_utterance never runs.
+                        # Guard against piling up too many ffmpeg tasks.
+                        if not self._speaker_id_in_flight:
+                            self._speaker_id_in_flight = True
+                            asyncio.create_task(
+                                self._log_speaker_id_on_onset()
+                            )
+                            # Auto-clear the flag after 5 s in case the task
+                            # hangs (ffmpeg or the SpeakerID service stalled).
+                            asyncio.create_task(
+                                self._reset_speaker_id_flag_after(5.0)
+                            )
                         #
                         # `win_speech >= 3` over a 6-frame window means the
                         # utterance opens up to 0.96 s after the user actually
@@ -4122,7 +4137,7 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
 
     async def _process_stt(
         self, buf_processed: bytes, buf_raw: bytes, duration_s: float, stats: dict
-    ) -> tuple[str | None, str | None]:
+    ) -> str | None:
         wav = await asyncio.to_thread(self._encode_wav, buf_processed)
 
         # Best-effort dump. Two destinations, and the reason is 15.10.2026:
@@ -4177,32 +4192,9 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
             f"dB={stats['rms_dB']:.1f} gain={stats['gain_applied']:.1f}x "
             f"ns={int(stats['ns_applied'])} wav={len(wav)}B"
         )
-        # Speaker ID runs in PARALLEL but never gates the reply — the service
-        # can take 5+s while Whisper needs <1s, and uid is only used for logs.
-        stt_task = asyncio.create_task(
-            self._fetch_transcription(wav, rms_raw=float(stats.get("rms_raw") or 0.0))
-        )
-        uid_task = asyncio.create_task(self._fetch_speaker_id(wav))
-
-        def _uid_done(t: "asyncio.Task") -> None:
-            """done-callback: log the recognised speaker, never raise.
-
-            Must be exception-safe (a raise inside a callback is only
-            logged by asyncio and would look like a SpeakerID bug); the
-            result is read defensively because the task may have been
-            cancelled along with the session.
-            """
-            try:
-                u = t.result()
-            except BaseException:
-                return
-                self._last_uid = u
-                self._last_uid_ts = time.time()
-            if u and u != "unknown":
-                logger.info(f"[{self.stream_name}] 👤 [SpeakerID] {u}")
-
-        uid_task.add_done_callback(_uid_done)
-        txt = await stt_task
+        # Speaker ID now runs in _process_utterance for ALL utterances,
+        # not just post-wake ones. Here we only do Whisper transcription.
+        txt = await self._fetch_transcription(wav, rms_raw=float(stats.get("rms_raw") or 0.0))
 
         def _manifest(verdict: str) -> None:
             """Append one self-describing line per utterance.
@@ -4552,15 +4544,6 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
         if self._processing_utterance:
             return
 
-        # Whisper listens ONLY after the acoustic wake fired (oww pip / active
-        # wake window) or while a gray-zone STT-confirmation window is open
-        # (gates held a decent oww score; Whisper arbitrates). Everything else
-        # is ambient noise — feeding it to STT just spams Whisper with TV/
-        # radio garbage and burns CPU. The oww detector runs continuously on
-        # the live feed instead (cheap).
-        if not self._wake_detected and time.time() >= self._stt_confirm_until:
-            return
-
         # Trim trailing silence: the corridor noise floor keeps VAD "speech"
         # alive, so buffers routinely run to the max-duration cap with ~1s of
         # dead tail — that tail inflates Whisper time and adds nothing.
@@ -4576,14 +4559,19 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
             if not buf_processed or not buf_raw:
                 return
 
-            txt, uid = await self._process_stt(
+            # Whisper только после wake или в окне подтверждения STT.
+            # Все остальное — фоновый шум, не кормим Whisper.
+            if not self._wake_detected and time.time() >= self._stt_confirm_until:
+                return
+
+            txt = await self._process_stt(
                 buf_processed, buf_raw, duration_s, stats
             )
             if not txt:
                 return
 
             self._last_utt_rms_raw = float((stats or {}).get("rms_raw", 0.0))
-            await self._handle_stt_result(txt, uid)
+            await self._handle_stt_result(txt, self._last_uid or "camera")
             if self._wake_only_pending:
                 # Keep the utterance open across the gap between «компьютер» and
                 # the command, so the next pause commits them together and the
@@ -5345,6 +5333,7 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
         "unknown" on any failure or when confidence <= 0.1 — speaker ID
         only annotates logs and must never gate or fail the reply.
         """
+        uid, conf = "unknown", 0.0
         try:
             proc = await asyncio.create_subprocess_exec(
                 "ffmpeg",
@@ -5373,16 +5362,43 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
                     j = await r.json()
                     uid, conf = j.get("user_id", "unknown"), j.get("confidence", 0.0)
                     if uid != "unknown" and conf > 0.1:
-                        logger.info(
-                            f"[{self.stream_name}] 👤 [SpeakerID] Recognized: {uid} ({conf:.2f})"
-                        )
                         return uid
-                    logger.debug(
-                        f"[{self.stream_name}] 👤 [SpeakerID] Rejected: {uid} ({conf:.2f})"
-                    )
         except Exception as e:
             logger.warning(f"[{self.stream_name}] ⚠️ [SpeakerID] Request failed: {e}")
+        logger.info(
+            f"[{self.stream_name}] 👤 [SpeakerID] result='{uid}' conf={conf:.2f}"
+        )
         return "unknown"
+
+    async def _log_speaker_id_on_onset(self) -> None:
+        """Run SpeakerID on speech onset and log "от кого обращение".
+
+        Called from _vad_process when VAD detects speech onset (_vad_has_speech
+        flips False -> True). Runs independently of _process_utterance so it
+        works even when VAD never reports silence and utterance never closes.
+
+        Sends the ACCUMULATED speech buffer (not a single 160 ms chunk) so the
+        CAMPPlus embedding has enough audio to compare against enrolled speakers.
+        """
+        try:
+            buf = bytes(self._vad_speech_buf)
+            if len(buf) < 3200:  # <100 ms, too short
+                buf = buf or b""  # fallback to empty, fetch_speaker_id handles it
+            wav = await asyncio.to_thread(self._encode_wav, buf)
+            uid = await self._fetch_speaker_id(wav)
+            self._last_uid = uid
+            self._last_uid_ts = time.time()
+        except Exception as e:
+            logger.warning(
+                f"[{self.stream_name}] 👤 [SpeakerID] onset failed: {e!r}"
+            )
+        finally:
+            self._speaker_id_in_flight = False
+
+    async def _reset_speaker_id_flag_after(self, seconds: float) -> None:
+        """Safety net: clear `_speaker_id_in_flight` if a SpeakerID task hangs."""
+        await asyncio.sleep(seconds)
+        self._speaker_id_in_flight = False
 
     def _back_to_wake(self):
         self._wake_detected = False

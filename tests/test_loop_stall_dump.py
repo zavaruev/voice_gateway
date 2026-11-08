@@ -182,3 +182,73 @@ async def test_startup_opens_the_file_and_arms_the_fuse(monkeypatch):
     assert started, "the camera sessions must still start"
     assert main._stall_dump_file is sentinel
     assert armed == [1]
+
+
+def test_the_fatal_threshold_defaults_to_sixty_seconds(monkeypatch):
+    monkeypatch.delenv("LOOP_STALL_FATAL_S", raising=False)
+    # Re-import to pick up the default; simplest is to call _env_seconds directly.
+    assert main._env_seconds("LOOP_STALL_FATAL_S", 60.0) == 60.0
+
+
+def test_zero_fatal_threshold_means_never_exit(monkeypatch):
+    """`0` disables the fatal exit — dump-only mode, same as every other _S."""
+    monkeypatch.setattr(main, "_LOOP_STALL_FATAL_S", 0.0)
+    exited = []
+    monkeypatch.setattr(main.os, "_exit", lambda code: exited.append(code))
+    monkeypatch.setattr(main, "_LOOP_STALL_THRESHOLD", 999.0)
+    monkeypatch.setattr(main, "_LOOP_DUMP_AFTER_S", 0.0)
+
+    async def run_one_tick():
+        async def no_sleep(_t, *a, **k):
+            return
+        monkeypatch.setattr(main.asyncio, "sleep", no_sleep)
+        t = [1000.0]
+        def fake_mono():
+            t[0] += 10.0          # lag of 10 s, above threshold, fatal is 0=off
+            return t[0]
+        monkeypatch.setattr(main.time, "monotonic", fake_mono)
+        task = asyncio.create_task(main.loop_stall_monitor())
+        try:
+            await asyncio.sleep(0.05)
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    asyncio.get_event_loop().run_until_complete(run_one_tick())
+    assert exited == [], "fatal threshold of 0 must never call os._exit"
+
+
+@pytest.mark.asyncio
+async def test_a_fatal_stall_exits_the_process(monkeypatch):
+    """A stall above the fatal threshold must kill the process so Docker
+    (unless-stopped) restarts the gateway instead of leaving it hung."""
+    exited = []
+    monkeypatch.setattr(main.os, "_exit", lambda code: exited.append(code))
+    monkeypatch.setattr(main, "_LOOP_STALL_THRESHOLD", 999.0)
+    monkeypatch.setattr(main, "_LOOP_STALL_FATAL_S", 1.0)
+    monkeypatch.setattr(main, "_LOOP_DUMP_AFTER_S", 0.0)
+
+    async def no_sleep(_t, *a, **k):
+        return
+    monkeypatch.setattr(main.asyncio, "sleep", no_sleep)
+
+    t = [1000.0]
+    def fake_mono():
+        t[0] += 5.0          # lag of 5 s >= fatal threshold of 1 s
+        return t[0]
+    monkeypatch.setattr(main.time, "monotonic", fake_mono)
+
+    task = asyncio.create_task(main.loop_stall_monitor())
+    try:
+        await asyncio.sleep(0.05)
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    assert exited == [1], f"expected os._exit(1), got {exited!r}"

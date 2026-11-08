@@ -26,7 +26,6 @@ AGENTS.md
 DESIGN.md
 setup_gateway.sh
 opencode.json
-silero_vad.onnx
 
 # Downloaded at build time by the Dockerfile itself
 config/vosk-model-ru-0.42

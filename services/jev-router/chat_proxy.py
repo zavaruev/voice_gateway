@@ -69,6 +69,19 @@ def _speakable(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 
+def _head_emotion(head: str) -> str:
+    """The emotion tag carried by one sentence head, '' when untagged.
+
+    The chat brain is prompted to tag its answers ([happy]..[angry]); the
+    tag must never be spoken — _speakable strips it — but the gateway
+    needs it to pick the playback speed (emotion -> speed map in
+    backends.py). The LAST tag in the head wins: a model that re-tags
+    mid-answer means the newest tag for the sentence it precedes.
+    """
+    tags = _EMOTION_TAG.findall(head)
+    return tags[-1] if tags else ""
+
+
 def _has_letters(s: str) -> bool:
     """Drop punctuation/emoji-only fragments: TTS would either skip them or
     read them as noise, and a sentence without a single letter is never a
@@ -87,8 +100,12 @@ async def stream_sentences(
 ):
     """Yield speakable sentences from an OpenAI-compatible SSE endpoint.
 
-    Raises on transport/status errors so the caller can try a failover target.
-    Yields nothing (not an error) if the model returned an empty completion.
+    Yields (sentence, emotion) tuples — `emotion` is the tag the model
+    placed on that sentence ('' when untagged); the caller forwards it as
+    a structured field on the SSE sentence event so the gateway can map
+    it to a playback speed. Raises on transport/status errors so the
+    caller can try a failover target. Yields nothing (not an error) if
+    the model returned an empty completion.
     """
     headers = {"Accept": "text/event-stream"}
     if api_key:
@@ -152,26 +169,29 @@ async def stream_sentences(
                     bi = _sentence_boundary(buf)
                     while bi != -1:
                         head, buf = buf[:bi], buf[bi:]
+                        emo = _head_emotion(head)
                         s = _speakable(head)
                         if s and _has_letters(s):
-                            yield s
+                            yield s, emo
                             sent += 1
                             if sent >= MAX_SENTENCES:
                                 return
                         bi = _sentence_boundary(buf)
                 # Hard cap: never let the unsplittable tail grow unbounded.
                 if len(buf) > 600:
+                    emo = _head_emotion(buf)
                     s = _speakable(buf)
                     buf = ""
                     if s and _has_letters(s):
-                        yield s
+                        yield s, emo
                         sent += 1
                         if sent >= MAX_SENTENCES:
                             return
             # Final flush
+            emo = _head_emotion(buf)
             tail = _speakable(buf)
             if tail and _has_letters(tail):
-                yield tail
+                yield tail, emo
     logger.debug("chat stream done in %.2fs", asyncio.get_event_loop().time() - t_start)
 
 
@@ -179,8 +199,15 @@ async def stream_sentences(
 # upstream models. The "no markdown" rules exist because a leaked «### 1.»
 # would be read aloud by TTS; sentence splitting still sanitizes whatever
 # slips through (see _speakable). Edit wording only with an E2E voice check.
+#
+# The emotion-tag sentence mirrors HermesBackend's proven prompt (same list,
+# same "ровно с одного" wording): the tag is stripped before speech and
+# forwarded as a structured field on the sentence event, where the gateway
+# maps sad/angry -> speed 0.9 (emotion -> speed, decided 10.11.2026).
 CHAT_SYSTEM = (
-    "Ты голосовой ассистент умной колонки. Отвечай ГОЛОСОМ: по-русски, "
+    "Ты голосовой ассистент умной колонки. Начинай КАЖДЫЙ ответ ровно с "
+    "одного тега эмоции из списка [happy] [neutral] [surprised] [sad] "
+    "[angry] — без преамбул. Отвечай ГОЛОСОМ: по-русски, "
     "живо, сразу по существу, 1-3 предложения. Тебе недоступны инструменты — "
     "никогда не озвучивай их вызовы. СТРОГО без markdown: никаких #, *, "
     "списков, нумерации, кода, формул и спецсимволов — только обычные "
@@ -189,7 +216,9 @@ CHAT_SYSTEM = (
 
 EXPERT_SYSTEM = (
     "Ты — эксперт по диагностике умного дома и домашней инфраструктуры "
-    "(сеть, серверы, Home Assistant, устройства). Отвечай ГОЛОСОМ колонки: "
+    "(сеть, серверы, Home Assistant, устройства). Начинай КАЖДЫЙ ответ "
+    "ровно с одного тега эмоции из списка [happy] [neutral] [surprised] "
+    "[sad] [angry] — без преамбул. Отвечай ГОЛОСОМ колонки: "
     "по-русски, живо, максимум 5 коротких предложений, сразу по существу: "
     "2-3 самых вероятные причины и один первый шаг проверки. СТРОГО без "
     "markdown: никаких #, *, списков, нумерации, кода, формул, LaTeX и "
@@ -218,9 +247,9 @@ async def stream_chat(text: str, expert: bool = False):
     for url, model, api_key in targets:
         try:
             got = False
-            async for s in stream_sentences(url, model, messages, api_key=api_key):
+            async for s, emo in stream_sentences(url, model, messages, api_key=api_key):
                 got = True
-                yield s
+                yield s, emo
             if got:
                 return
             logger.warning("%s returned empty, trying next target", model)
@@ -239,7 +268,7 @@ async def stream_hermes(text: str, system: str = CHAT_SYSTEM):
         {"role": "user", "content": text},
     ]
     logger.info("stream_hermes: direct L3 call (weather fallback)")
-    async for s in stream_sentences(
+    async for s, emo in stream_sentences(
         config.HERMES_URL, "hermes-agent", messages, api_key=config.HERMES_API_KEY
     ):
-        yield s
+        yield s, emo

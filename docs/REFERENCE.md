@@ -14,8 +14,8 @@ WebSocket gateway bridging [Xiaozhi ESP32](https://github.com/78/xiaozhi-esp32) 
 ESP32 (Opus WS)  ──┐
                    ├──▶ Voice Gateway ──STT text──▶ AI backend (Cascade | Nanobot | Hermes)
 Camera (RTSP/L16) ─┘          │                        │
-                        Silero VAD               Edge TTS
-                        Wake word (openWakeWord)  emotions
+                        Silero VAD               Coqui XTTS v2 / Edge TTS
+                        Wake word (openWakeWord)  emotions -> speed
                         Speaker ID                MCP commands
                         noise gate + SpeexDSP     OTA firmware
                         echo guards
@@ -31,7 +31,7 @@ Camera (RTSP/L16) ─┘          │                        │
 4. **Whisper STT** transcribes audio to text (Russian; the camera path retries at temperature 0.0 → 0.5, the ESP32 path sends a single 0.0 attempt)
 5. **Speaker ID** identifies the speaker (parallel with STT)
 6. **LLM backend** (Cascade *or* Nanobot *or* Hermes) processes text, returns response with optional emotions `[emotion_name]`
-7. **Edge TTS** synthesizes speech; Opus streamed to ESP32, PCM queued to camera speakers
+7. **TTS** synthesizes speech (Coqui XTTS v2 in production, Edge TTS fallback; `speed` for sad/angry sentences); Opus streamed to ESP32, PCM queued to camera speakers
 
 ## Features
 
@@ -130,8 +130,8 @@ Do **not** start the container manually with `docker run` on the default bridge 
 | `ROUTER_URL` | `http://localhost:8091` | jev-router SSE endpoint (used when `LLM_BACKEND=cascade`) |
 | `ROUTER_ACK_DELAY` | `3` | Seconds before the fallback ack «Секунду…» when the first sentence is slow (chat/easy routes; complex/expert ack immediately) |
 | `WHISPER_URL` | `http://192.168.22.111:8000/v1/audio/transcriptions` | OpenAI-compatible STT endpoint |
-| `TTS_URL` | `http://edge_tts:5050/v1/audio/speech` | OpenAI-compatible TTS endpoint |
-| `TTS_VOICE` | `ru-RU-SvetlanaNeural` | TTS voice identifier |
+| `TTS_URL` | `http://edge_tts:5050/v1/audio/speech` | OpenAI-compatible TTS endpoint. Production runs **Coqui XTTS v2** (`:5051`/`:5052`), with `edge_tts:5050` as the fallback |
+| `TTS_VOICE` | `ru-RU-SvetlanaNeural` | TTS voice identifier. Production: `Zofija Kendrick` (XTTS zero-shot voice) |
 | `TTS_MODEL` | `tts-1` | `model` field posted to the TTS endpoint |
 | `TTS_API_KEY` | `""` | Sends `Authorization: Bearer` if set |
 | `SPEAKER_ID_URL` | `http://192.168.22.102:8001/identify` | Speaker recognition ([speaker-id](https://github.com/zavaruev/speaker-id) container) |
@@ -206,7 +206,15 @@ openWakeWord on the live 16 kHz feed of every camera — library head `computer_
 After a fire: attention pip, VAD state reset, Whisper listens until the command is dispatched (or the **15 s** wake window expires — a bare wake with no command within 5 s speaks a local «Да?» instead of polling the LLM).
 
 ### TTS Pipeline
-Backend text → sentence splitter → **prefetch pipeline** (sentence N+1 is synthesised while N plays, hiding Edge-TTS latency) → Edge TTS (MP3) → decode → resample (16/24 kHz) → Opus for ESP32 / PCM for cameras → paced 60 ms chunks. Every played clip is registered in the echo-reference ring and extends wake suppression past the delayed-echo window.
+
+Backend text → sentence splitter → **prefetch pipeline** (sentence N+1 is synthesised while N plays, hiding synthesis latency) → TTS (MP3/WAV) → decode → resample (16/24 kHz) → Opus for ESP32 / PCM for cameras → paced 60 ms chunks. Every played clip is registered in the echo-reference ring and extends wake suppression past the delayed-echo window.
+
+**The production voice is Coqui XTTS v2** (self-hosted `coqui/server.py`, OpenAI-compatible `POST /v1/audio/speech` on `:5051`/`:5052`, one GPU each), selected by `TTS_URL`/`TTS_VOICE=Zofija Kendrick` (zero-shot voice cloned from a ~12 s sample). `edge_tts:5050` stays deployed as the instant-fallback endpoint; its payloads are kept byte-identical (see the `speed` rule below). Two XTTS-specifics live server-side, at the single TTS choke point all three sources (cameras, ESP32, Telegram) share:
+
+- **ё-restore** (`coqui/yo_restore.py`) — XTTS reads «ё» as stressed [о] and plain «е» in без-ё spellings often comes out as [е]; every utterance is restored through a **whitelist-only** е→ё dictionary (adjectives expanded from stems × endings; `все→всё` only before singular/neuter agreement words — «все готовы» about people is left alone), and the combining acute U+0301 is stripped (XTTS ignores it). Every replacement is logged (`yo-restore: Еще->Ещё`).
+- **`speed`** (optional request field, clamped 0.5–2.0) — applied by bypassing `api.TTS.tts()` (TTS 0.22 validates it and then DROPS it) and calling `Synthesizer.tts(..., speed=)` directly, which forwards kwargs to `Xtts.inference(speed=)`. Logged as `(speed 0.90)` only when non-neutral.
+
+**Emotion → speed.** The L1 chat/expert system prompts require every reply to start with an emotion tag (`[happy] [neutral] [surprised] [sad] [angry]`). The router's chat proxy captures the tag (last one wins), strips it from the text, and forwards it as a **structured `emotion` field on the SSE sentence event** — it never reaches a TTS. The gateway maps it through `EMOTION_SPEED` in `backends.py` (`sad`/`angry` → **0.9**, everything else → 1.0) and pushes a `TTSentence(str)` — a str subclass, so every existing consumer (players, follow-up detection, history) keeps working — carrying `.speed`. `_tts_fetch`/`synthesize_tts_mp3` add `"speed"` to the payload **only when it differs from 1.0** (a `0` counts as unset), which is what keeps the edge_tts fallback payloads unchanged. XTTS synthesises ~11% longer audio at 0.9; at RTF ≈ 0.9 the prefetch player hides the extra latency.
 
 ### LLM Backend (Nanobot / Hermes / Cascade)
 
@@ -214,7 +222,7 @@ The AI brain is selected by `LLM_BACKEND` and implemented as a `BaseLLMBackend` 
 
 - **`NanobotBackend`** (default) — opens a WebSocket to `NANOBOT_WS_URL?token=…&chat_id=…`, streams `text` deltas, handles `[thinking]` blocks, and pushes sentence-split replies into the response queue.
 - **`HermesBackend`** — streams the user message to `${HERMES_API_URL}/v1/chat/completions` (OpenAI-compatible SSE, `stream: true`); each `choices[].delta.content` chunk is accumulated and flushed sentence-by-sentence on `. ! ? …` into the response queue. `[thinking]` reasoning blocks and `[emotion_name]` tags are stripped before TTS, identical to `NanobotBackend`. Streaming keeps first-token latency low so the prefetch TTS player starts before the full reply arrives (avoiding the 90 s watchdog fallback).
-- **`CascadeBackend`** — POSTs the text to `${ROUTER_URL}/route` (SSE) and replays router events into the same queue: `sentence`/`progress` are spoken (emotion tags stripped, no monologue gate — the router output is already curated), `route` events drive the ack timer (immediate «Секунду, занимаюсь…» for `complex_logic`/`expert`, `ROUTER_ACK_DELAY`-second fallback for chat/easy), `error`/empty streams produce an immediate apology so the user is never left in silence. The first played audio (usually the ack) cancels the watchdog downstream, which is what makes 48–120 s L2 turns possible.
+- **`CascadeBackend`** — POSTs the text to `${ROUTER_URL}/route` (SSE) and replays router events into the same queue: `sentence`/`progress` are spoken (emotion tags stripped, no monologue gate — the router output is already curated; a sentence event may carry a structured `emotion` field, which becomes playback speed — see *Emotion → speed* under TTS Pipeline), `route` events drive the ack timer (immediate «Секунду, занимаюсь…» for `complex_logic`/`expert`, `ROUTER_ACK_DELAY`-second fallback for chat/easy), `error`/empty streams produce an immediate apology so the user is never left in silence. The first played audio (usually the ack) cancels the watchdog downstream, which is what makes 48–120 s L2 turns possible.
 
 Both backends expose the same `generate_response(text, session_id, stream_name, response_queue, room="")` contract. The ESP32 path dispatches via `_dispatch_hermes`/`_hermes_player_task`; camera sessions receive the backend instance at construction and call `_call_backend` → `_nanobot_player_task` (the player is backend-agnostic). Either way replies reach the prefetch TTS player, so sentence-level latency hiding works identically for both brains. `room` is a default-area hint only (Telegram `/room` binding) — only `CascadeBackend` forwards it, as `RouteRequest.room`; it is deliberately NOT folded into `stream_name`, which keys the dialogue history.
 
@@ -309,7 +317,7 @@ docker exec voice_gateway rm -rf /tmp/vg_src
 
 Tests must run against a copy of the sources, not the live `/app` mounts: the three router tests import `honesty`/`classifier`/`weather` from `services/jev-router`, which is not part of the image (it runs as its own container), so the sources, `services/` and `tests/` have to travel together.
 
-Covers **615 tests across 19 files (11,885 lines)**: router slot resolution and the escalation hint, the ESP32 `main.py` protocol, honesty vetoes (action / data / weather) + the retry note built from them, the HA REST fallback and its "carries data?" detector, the wake-gate cascade's STT-confirm bands, engine wake scoring, the camera audio track plus its echo and SDP guards, cascade backend streaming (including the `room` payload), the Telegram source (`test_telegram.py`: allowlist and group gates, ack phrases kept out of the final text, turn timeout with partial/fallback, the voice turn end to end, `/room` binding persisted to disk), the short-term dialogue ring, weather, TTS gate, OTA auth, RMS utils the RU→latin hint-table sync (`test_hint_sync.py`, which reads both copies out of the source with `ast` — importing the two services in one pytest process collides on the `config` module name) the HA on/off intent target resolver plus the room-first registry ranking (`test_ha_match.py`, `resolve_onoff_targets`/`match_states`) and the ordinal table that selects corridor1/corridor2 (the same file plus `test_hint_sync.py`, which also holds `ORDINAL_STEMS`/`ORDINAL_ENDINGS` together).
+Covers **719 tests across 22 files (14,719 lines)**: router slot resolution and the escalation hint, the ESP32 `main.py` protocol, honesty vetoes (action / data / weather) + the retry note built from them, the HA REST fallback and its "carries data?" detector, the wake-gate cascade's STT-confirm bands, engine wake scoring, the camera audio track plus its echo and SDP guards, cascade backend streaming (including the `room` payload), the Telegram source (`test_telegram.py`: allowlist and group gates, ack phrases kept out of the final text, turn timeout with partial/fallback, the voice turn end to end, `/room` binding persisted to disk), the short-term dialogue ring, weather, TTS gate, OTA auth, RMS utils the RU→latin hint-table sync (`test_hint_sync.py`, which reads both copies out of the source with `ast` — importing the two services in one pytest process collides on the `config` module name) the HA on/off intent target resolver plus the room-first registry ranking (`test_ha_match.py`, `resolve_onoff_targets`/`match_states`) and the ordinal table that selects corridor1/corridor2 (the same file plus `test_hint_sync.py`, which also holds `ORDINAL_STEMS`/`ORDINAL_ENDINGS` together). `test_emotion_speed.py` pins the emotion→speed chain: `TTSentence` is-a str, the sad/angry → 0.9 map, the router's tag capture, the SSE `emotion` field → `TTSentence`, and the payload rule that keeps edge_tts payloads byte-identical.
 
 **Not covered:** the arbiter's internal state transitions. `test_wake_gates.py` drives `_arbiter_submit` through stubs for the gate cascade, but no test exercises `_arbiter_set_owner` / `_arbiter_sent_recently` against the real implementation — the level normalisation added in 2.39 is covered at the call sites with the measured field values (7303/9577 against floors of 495/1981), not inside the arbiter.
 
@@ -322,7 +330,7 @@ CI (`.github/workflows/tests.yml`) runs this exact recipe inside the built image
 - Silero VAD ONNX model (downloaded at build time)
 - openWakeWord + the library head `computer_20260706_130638.onnx` and the custom `computer.onnx` / `embedding_model.onnx` (baked into the image)
 - SpeexDSP noise suppression (`speexdsp-ns`)
-- External services: Whisper STT, Edge TTS, Speaker ID, go2rtc (for cameras), plus one of the backends — Nanobot; Hermes; or (cascade) Ollama embeddings + Qdrant + OmniRoute + Home Assistant MCP
+- External services: Whisper STT, TTS (Coqui XTTS v2 in production, Edge TTS fallback), Speaker ID, go2rtc (for cameras), plus one of the backends — Nanobot; Hermes; or (cascade) Ollama embeddings + Qdrant + OmniRoute + Home Assistant MCP
 
 ## Changelog
 

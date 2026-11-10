@@ -1721,8 +1721,14 @@ async def _hermes_player_task(q: asyncio.Queue, device_ws, state):
     """
 
     def start_synth(text):
-        """Start (do not await) MP3 synthesis for one sentence, returning the task."""
-        return asyncio.create_task(synthesize_tts_mp3(text, state))
+        """Start (do not await) MP3 synthesis for one sentence, returning the task.
+
+        The queue item may be a TTSentence carrying .speed (emotion -> speed
+        map in backends.py); a plain str — ack, apology — reads as neutral.
+        """
+        return asyncio.create_task(
+            synthesize_tts_mp3(text, state, getattr(text, "speed", 1.0))
+        )
 
     async def play(mp3_data, text: str):
         """Stream one sentence to the device and disarm the watchdog.
@@ -1948,12 +1954,16 @@ async def process_audio_and_send(
 # ==========================================
 # TTS & EMOTION
 # ==========================================
-async def synthesize_tts_mp3(text: str, state: dict) -> bytes | None:
+async def synthesize_tts_mp3(text: str, state: dict, speed: float = 1.0) -> bytes | None:
     """Synthesize text to MP3 via the TTS API (network-bound, no streaming).
 
     Args:
         text: sentence to speak (already stripped of emotion tags).
         state: session state — only state["http_session"] is used.
+        speed: playback speed (emotion -> speed map in backends.py, carried
+            on TTSentence). The `speed` key is added to the payload ONLY
+            when it differs from 1.0, so the edge_tts fallback keeps the
+            exact payload it always got.
     Returns:
         bytes | None: MP3 payload, or None on non-200 responses/errors.
 
@@ -1971,6 +1981,8 @@ async def synthesize_tts_mp3(text: str, state: dict) -> bytes | None:
             "voice": TTS_VOICE,
             "response_format": "mp3",
         }
+        if speed and speed != 1.0:
+            payload["speed"] = speed
         headers = {"Content-Type": "application/json"}
         if TTS_API_KEY:
             headers["Authorization"] = f"Bearer {TTS_API_KEY}"

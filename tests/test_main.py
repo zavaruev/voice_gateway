@@ -727,7 +727,7 @@ async def test_player_speaks_the_ack_without_the_next_sentence():
     q: asyncio.Queue = asyncio.Queue()
     played, synth = [], []
 
-    async def fake_synth(text, state):
+    async def fake_synth(text, state, speed=1.0):
         synth.append(text)
         await asyncio.sleep(0.01)
         return text.encode()
@@ -765,7 +765,7 @@ async def test_player_watchdog_fired_drains_the_queue_silently():
     q: asyncio.Queue = asyncio.Queue()
     played = []
 
-    async def fake_synth(text, state):  # pragma: no cover - must not run
+    async def fake_synth(text, state, speed=1.0):  # pragma: no cover - must not run
         raise AssertionError("no synthesis after the watchdog fired")
 
     async def fake_stream(mp3, ws, sid, state, send_stop=True):  # pragma: no cover

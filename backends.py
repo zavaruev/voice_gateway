@@ -237,6 +237,48 @@ _TAG_WAIT_S = 12.0
 # than a leaked fragment.
 _HELD_MAX_CHARS = 500
 
+# Emotion -> playback speed. XTTS v2 synthesises slower speech for a
+# dejected/angry delivery; 0.9 is the only pairing the user approved
+# (10.11.2026). Everything else stays at 1.0 — a value with no user
+# verdict behind it must not change how the house sounds.
+EMOTION_SPEED = {"sad": 0.9, "angry": 0.9}
+
+
+class TTSentence(str):
+    """A speakable sentence carrying its playback speed.
+
+    Is-a str on purpose: every consumer downstream (players, follow-up
+    question detection, history) already handles plain strings, and a
+    subclass keeps them working unchanged. `.speed` is read by the TTS
+    callers via getattr(sent, "speed", 1.0), so plain str queue items
+    (acks, apologies) stay neutral without any branch.
+    """
+
+    speed: float = 1.0
+
+    def __new__(cls, text: str, speed: float = 1.0):
+        obj = super().__new__(cls, text)
+        obj.speed = float(speed)
+        return obj
+
+
+def _speed_for(emotion: str | None) -> float:
+    """Playback speed for an emotion tag (''/None/unknown -> 1.0)."""
+    if not emotion:
+        return 1.0
+    return EMOTION_SPEED.get(str(emotion).lower(), 1.0)
+
+
+def _with_speed(text: str, speed: float) -> str:
+    """TTSentence when the speed is non-neutral, the plain str otherwise.
+
+    The common case stays bit-identical (a bare str in the queue); only
+    sad/angry sentences carry the subclass — and the TTS payload gains
+    its `speed` key only from those, keeping the edge_tts fallback
+    payloads unchanged.
+    """
+    return TTSentence(text, speed) if speed != 1.0 else text
+
 
 def _sentence_boundary(text: str) -> int:
     """End offset just past the last real sentence boundary, or -1.
@@ -333,6 +375,7 @@ class HermesBackend(BaseLLMBackend):
                     holder = ""
                     seen_tag = False
                     held = []  # pre-tag sentences: discarded on tag, spoken on release
+                    emotion = ""  # tag the gate opened on; speeds the whole reply
                     t_start = time.monotonic()
 
                     def flush(final: bool) -> None:
@@ -341,7 +384,7 @@ class HermesBackend(BaseLLMBackend):
                         # see the branches below), (2) then stream whole
                         # sentences. Unterminated [thinking]/[tag] tails
                         # stay in `holder` so a half tag is never spoken.
-                        nonlocal buf, holder, seen_tag, held
+                        nonlocal buf, holder, seen_tag, held, emotion
                         m = re.search(r"\[thinking\]", buf)
                         if m and not re.search(r"\[/thinking\]", buf[m.start():]):
                             part, holder = (buf[:m.start()], buf[m.start():]) if not final else (buf, "")
@@ -360,6 +403,7 @@ class HermesBackend(BaseLLMBackend):
                         if not seen_tag:
                             if mtag:
                                 seen_tag = True
+                                emotion = mtag.group(1)
                                 held = []
                                 part = part[mtag.start():]
                                 # re-strip thinking blocks after cut
@@ -401,7 +445,9 @@ class HermesBackend(BaseLLMBackend):
                         for s in done:
                             s2 = HermesBackend._speakable(s)
                             if s2:
-                                response_queue.put_nowait(s2)
+                                response_queue.put_nowait(
+                                    _with_speed(s2, _speed_for(emotion))
+                                )
                         buf = (tail + " " + holder).strip()
 
                     # OpenAI SSE framing: `data: <json>` frames until
@@ -489,14 +535,17 @@ class CascadeBackend(BaseLLMBackend):
         ack_sent = False
         ack_task: asyncio.Task | None = None
 
-        def put(s: str) -> None:
+        def put(s: str, emotion: str = "") -> None:
             # Reuses HermesBackend._speakable: router output is already
             # curated, so tags/markdown are simply stripped (no emotion
-            # gate here, unlike HermesBackend).
+            # gate here, unlike HermesBackend). The router forwards the
+            # tag it stripped as a structured `emotion` field on the
+            # sentence event; sad/angry -> slower playback (speed travels
+            # on the sentence itself, see TTSentence).
             nonlocal spoken
             s2 = HermesBackend._speakable(s)
             if s2:
-                response_queue.put_nowait(s2)
+                response_queue.put_nowait(_with_speed(s2, _speed_for(emotion)))
                 spoken = True
 
         def put_ack(phrase: str) -> None:
@@ -574,7 +623,7 @@ class CascadeBackend(BaseLLMBackend):
                                 ack_task.cancel()
                                 ack_task = None
                             if ev.get("text"):
-                                put(ev["text"])
+                                put(ev["text"], ev.get("emotion") or "")
                         elif etype == "progress":
                             if ev.get("text"):
                                 put(ev["text"])

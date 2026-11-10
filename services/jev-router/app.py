@@ -1964,7 +1964,11 @@ async def _handle(req: RouteRequest):
                 parts = await weather.weather_sentences(text)
                 if not parts:
                     try:
-                        async for s in chat_proxy.stream_hermes(text):
+                        # (s, _emo): the weather fallback's own text is
+                        # deterministic/factual — the Hermes failover's
+                        # emotion tag is not needed here, and `parts` is a
+                        # plain-string list consumed without emotion below.
+                        async for s, _emo in chat_proxy.stream_hermes(text):
                             parts.append(s)
                     except Exception as e:
                         logger.warning("weather hermes fallback failed: %s", e)
@@ -2055,9 +2059,15 @@ async def _handle(req: RouteRequest):
         elif route in ("general_qa", "expert"):
             # expert=True flips the failover order inside stream_chat
             # (Hermes-first). No HA side-effects are possible on this path.
-            async for s in chat_proxy.stream_chat(text, expert=(route == "expert")):
+            # The emotion tag travels as a STRUCTURED FIELD on the event —
+            # the gateway maps sad/angry -> slower playback (emotion ->
+            # speed in backends.py); the tag itself never reaches the text.
+            async for s, emo in chat_proxy.stream_chat(text, expert=(route == "expert")):
                 reply_parts.append(s)
-                yield _sse({"type": "sentence", "text": s})
+                ev = {"type": "sentence", "text": s}
+                if emo:
+                    ev["emotion"] = emo
+                yield _sse(ev)
 
         # --- complex_logic: L2 CodeAgent ----------------------------------
         else:

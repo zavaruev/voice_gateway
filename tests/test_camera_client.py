@@ -1845,7 +1845,7 @@ def _player_session():
     s.played = []
     s.back_to_wake = 0
 
-    async def _tts(text):
+    async def _tts(text, speed=1.0):
         return b"pcm"
 
     async def _speak(pcm, reply):
@@ -3589,7 +3589,7 @@ async def test_a_turn_that_produced_no_audio_at_least_leaves_a_trace(monkeypatch
         def __getattr__(self, _name):
             return self.info
 
-    async def _fetch(text):
+    async def _fetch(text, speed=1.0):
         return None
 
     async def _speak_pcm(pcm, reply=""):
@@ -3622,7 +3622,7 @@ async def test_a_turn_with_no_audible_output_speaks_one_apology(monkeypatch):
     s = _make_http_session()
     spoken: list[str] = []
 
-    async def _fetch(text):
+    async def _fetch(text, speed=1.0):
         # Reply sentences fail; the apology's own synthesis succeeds.
         return b"\x00\x01" * 48000 if "Простите" in text else None
 
@@ -3657,7 +3657,7 @@ async def test_a_silent_second_sentence_does_not_add_an_apology(monkeypatch):
     s = _make_http_session()
     spoken: list[str] = []
 
-    async def _fetch(text):
+    async def _fetch(text, speed=1.0):
         return b"\x00\x01" * 48000 if "Первое" in text else None
 
     async def _speak_pcm(pcm, reply=""):

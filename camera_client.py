@@ -5030,7 +5030,9 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
         nxt = await q.get()
         if nxt is None:
             return None
-        return nxt, await self._tts_fetch(nxt)
+        # Speed travels on the sentence itself (TTSentence.speed); plain str
+        # queue items (acks, apologies) default to neutral via getattr.
+        return nxt, await self._tts_fetch(nxt, getattr(nxt, "speed", 1.0))
 
     async def _nanobot_player_task(self, q: asyncio.Queue) -> None:
         last_q = False
@@ -5069,7 +5071,7 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
                         break
                     sent, pcm = got
                 elif pcm is None:
-                    pcm = await self._tts_fetch(sent)
+                    pcm = await self._tts_fetch(sent, getattr(sent, "speed", 1.0))
 
                 # OUTSIDE the branch above, on purpose. This was an `elif` on
                 # `if pending is not None`, so it only ran when there was NO
@@ -5755,12 +5757,18 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
                 return
             await asyncio.sleep(0.2)
 
-    async def _tts_fetch(self, text: str) -> bytes | None:
+    async def _tts_fetch(self, text: str, speed: float = 1.0) -> bytes | None:
         """Synthesize one sentence to PCM (48kHz mono s16le, the camera
         speaker's native rate — see TTS_PLAY_RATE). Split out of _speak so the
         player can prefetch the NEXT sentence while the current one is still
         playing — without that overlap the playback queue runs dry between
         sentences and the speaker stutters with silence gaps.
+
+        `speed` comes from the sentence itself (TTSentence.speed, the
+        emotion -> speed map in backends.py); 1.0 is the neutral default.
+        The key is added to the payload ONLY when it differs from 1.0 —
+        edge_tts, the fallback endpoint, must keep the exact payload it
+        always got, and Coqui synthesises bit-identically at 1.0 either way.
 
         **RETRIED ONCE, because the upstream fails ~3% of the time and every
         failure costs a whole sentence.** Measured 11.10.2026 across the TTS
@@ -5780,6 +5788,14 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
         headers = {}
         if self.tts_api_key:
             headers["Authorization"] = f"Bearer {self.tts_api_key}"
+        payload = {
+            "model": "tts-1",
+            "input": text,
+            "voice": self.tts_voice,
+            "response_format": "mp3",
+        }
+        if speed and speed != 1.0:
+            payload["speed"] = speed
         mp3 = None
         for attempt in range(1, _TTS_ATTEMPTS + 1):
             if attempt > 1:
@@ -5787,12 +5803,7 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
             try:
                 async with self.http_session.post(
                     self.tts_url,
-                    json={
-                        "model": "tts-1",
-                        "input": text,
-                        "voice": self.tts_voice,
-                        "response_format": "mp3",
-                    },
+                    json=payload,
                     headers=headers,
                     timeout=aiohttp.ClientTimeout(total=60),
                 ) as r:
@@ -5859,8 +5870,9 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
             # is a handful per voice command.
             logger.info(
                 f"[{self.stream_name}] tts pcm peak={peak:.0f} target={target} "
-                f"gain={gain:.2f} applied={applied} "
-                f"out_peak={int(np.max(np.abs(np.frombuffer(pcm, dtype=np.int16)))) if len(pcm) else 0}"
+                f"gain={gain:.2f} applied={applied}"
+                + (f" speed={speed}" if speed and speed != 1.0 else "")
+                + f" out_peak={int(np.max(np.abs(np.frombuffer(pcm, dtype=np.int16)))) if len(pcm) else 0}"
             )
             return pcm
         except Exception as e:

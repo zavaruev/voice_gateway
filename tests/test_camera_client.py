@@ -2539,6 +2539,66 @@ def test_both_rooms_read_identical_thresholds():
         )
 
 
+@pytest.mark.asyncio
+async def test_camera_config_carries_the_env_voice(monkeypatch):
+    """main.start_camera_sessions() must pass TTS_VOICE into CameraConfig.
+
+    It passed tts_url/tts_api_key but not tts_voice, so every camera posted the
+    dataclass default 'ru-RU-SvetlanaNeural' while TTS_VOICE='Zofija Kendrick'
+    was set; coqui has no such voice, fell back to its default (male) speaker
+    and the rooms answered in a man's voice (coqui log 10.11.2026 12:25). The
+    ESP32 path always read the env; only the camera fill was missing — and a
+    missing fill is invisible to any test of CameraConfig alone, so this goes
+    through start_camera_sessions itself and asserts on what it BUILDS.
+    """
+    import main as main_mod
+
+    created = []
+
+    class _FakeSession:
+        def __init__(self, config=None, backend=None):
+            self.config = config
+            created.append(self)
+
+        async def start(self):
+            return None
+
+    class _StubBackend:
+        pass
+
+    class _FakeClientSession:
+        def __init__(self, timeout=None):
+            pass
+
+    monkeypatch.delenv("DISABLE_CAMERAS", raising=False)
+    monkeypatch.setenv("CAMERA_STREAMS", "livingroom")
+    monkeypatch.setattr(main_mod, "CameraSession", _FakeSession)
+    monkeypatch.setattr(main_mod, "_camera_sessions", [])
+    # VadEngine loads silero_vad.onnx from the working directory, which the
+    # CI/source copy does not carry — the test is about the CONFIG wiring, not
+    # about the VAD, so it never reaches a real one.
+    monkeypatch.setattr(main_mod, "VadEngine", lambda **kwargs: None)
+    monkeypatch.setattr(main_mod, "LLM_BACKEND", "cascade")
+    monkeypatch.setattr(main_mod.backends, "CascadeBackend",
+                        lambda *a, **k: _StubBackend())
+    monkeypatch.setattr(main_mod.aiohttp, "ClientSession", _FakeClientSession)
+    monkeypatch.setattr(main_mod, "TTS_VOICE", "Zofija Kendrick")
+    monkeypatch.setattr(main_mod, "TTS_URL", "http://tts.test:5051/v1/audio/speech")
+
+    await main_mod.start_camera_sessions()
+
+    assert len(created) == 1
+    cfg = created[0].config
+    assert cfg.stream_name == "livingroom"
+    # The wiring itself: the function must hand the module value over, not let
+    # the dataclass default stand in for it.
+    assert cfg.tts_voice == "Zofija Kendrick"
+    assert cfg.tts_voice != CameraConfig(stream_name="x").tts_voice, (
+        "the dataclass default leaked through — the fill is missing again"
+    )
+    assert cfg.tts_url == "http://tts.test:5051/v1/audio/speech"
+
+
 # --- the utterance must not close on the wake word alone (06.10.2026 13:25) ---
 #
 # Measured on the living room: the pause endpoint committed a 2.56 s utterance

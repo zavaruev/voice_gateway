@@ -3751,6 +3751,15 @@ async def start_camera_sessions():
                 nanobot_token=NANOBOT_TOKEN,
                 tts_url=TTS_URL,
                 tts_api_key=TTS_API_KEY,
+                # The voice name travels with the request. This line was missing
+                # until 10.11.2026: every camera then sent the dataclass default
+                # 'ru-RU-SvetlanaNeural' while TTS_VOICE='Zofija Kendrick' was
+                # set — coqui has no such voice, fell back to its default (male)
+                # speaker, and the rooms answered in a man's voice (measured in
+                # the coqui log: WARNING Голос 'ru-RU-SvetlanaNeural' не найден).
+                # The ESP32 path always read the env; only the camera path
+                # silently reverted to the constant.
+                tts_voice=TTS_VOICE,
                 speaker_id_url=SPEAKER_ID_URL,
                 vad=VadEngine(
                     energy_fallback=True,

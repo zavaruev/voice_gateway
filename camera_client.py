@@ -44,6 +44,11 @@ import os
 import re
 import struct
 import time
+# stdlib in 3.12 (deprecated, removed in 3.13 — the image pins 3.12): the
+# stateful 22050->48000 resampler for the streamed TTS relay. A single call
+# per chunk, verified in-container; scipy.resample_poly per chunk would be
+# slower and the stateful form keeps chunk boundaries continuous.
+import audioop
 from collections import deque
 from dataclasses import dataclass
 from math import gcd
@@ -618,6 +623,27 @@ logger.propagate = False
 _TTS_ATTEMPTS = 2
 _TTS_RETRY_S = 0.5
 
+# --- streamed long sentences (10.11.2026, coqui /v1/audio/speech/stream) ---
+#
+# XTTS whole-file synthesis on these GPUs is RTF ~1.14 with NO first sound
+# until the whole sentence is done (measured 46 chars -> 8.63 s audio ->
+# 9.8 s wall). `inference_stream(stream_chunk_size=60)` emits a ~2.74 s chunk
+# every ~3.65 s (RTF 1.33) — chunky, NOT continuous, which is why a 1-chunk
+# lead would gap at 2.74 s. The lead below is TWO chunks of audio: it drains
+# at ~0.9 s per produced chunk, so it stays positive for ~22 s of audio at
+# RTF 1.33. Longer sentences may tail-gap; the relay logs it, it does not
+# hide it.
+_TTS_STREAM_LEAD_S = 5.5
+# A stream that delivers nothing for this long is dead: what was already
+# relayed keeps playing, the turn completes as truncated.
+_TTS_STREAM_STALL_S = 20.0
+# Crossover between the whole-file and the streamed path, in characters.
+# Derived from the measured 46-char sentence (whole-file RTF 1.14 x 0.19
+# s/char vs ~7.3 s to first streamed sound): below this the whole-file path
+# through the prefetch overlap is cheaper AND it hits the server-side PCM
+# cache, above it the streamed first sound wins.
+_TTS_STREAM_MIN_CHARS = 32
+
 
 class AIVoiceOutputTrack(MediaStreamTrack):
     """aiortc sendonly track that plays TTS PCM to the camera speaker.
@@ -1181,6 +1207,11 @@ class CameraConfig:
     tts_url: str = "http://edge_tts:5050/v1/audio/speech"
     tts_voice: str = "ru-RU-SvetlanaNeural"
     tts_api_key: str = ""
+    # Streaming endpoint for LONG sentences (coqui /v1/audio/speech/stream).
+    # Empty => every sentence goes through the whole-file path, exactly as
+    # before; the player consults it per turn, so a typo in the env var
+    # degrades to the old behaviour rather than to silence.
+    tts_stream_url: str = ""
     nanobot_url: str = "ws://nanobot:8765/"
     nanobot_token: str = "token"
     speaker_id_url: str = "http://192.168.22.102:8001/identify"
@@ -1394,6 +1425,14 @@ class CameraSession:
     _audio_rate_ok = 0.8
     _min_audio_rate = 0.5
     _starve_restarts = 3
+    # Streaming TTS endpoint (from the config) and the per-turn bail flag.
+    # `_stream_fallback_needed` is set BEFORE the camera POST when the stream
+    # could not even start (non-200, missing X-Sample-Rate, connect failure) —
+    # in that case NOTHING was relayed and the player may fall back to the
+    # whole-file path. A stream that dies MID-AUDIO does not set it: the audio
+    # already played, and a fallback would speak the reply twice.
+    tts_stream_url = ""
+    _stream_fallback_needed = False
     # How many utterances the VAD has opened, and how many at the last wake
     # word. Kept for backwards compat; the pip guard no longer reads it — it
     # uses `_speech_run` below (the wake itself manufactures an utterance open
@@ -1444,6 +1483,7 @@ class CameraSession:
         self.tts_url = config.tts_url
         self.tts_voice = config.tts_voice
         self.tts_api_key = config.tts_api_key
+        self.tts_stream_url = config.tts_stream_url
         self._nanobot_url = config.nanobot_url.rstrip("/")
         self._nanobot_token = config.nanobot_token
         self._speaker_id_url = config.speaker_id_url
@@ -5030,6 +5070,13 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
         nxt = await q.get()
         if nxt is None:
             return None
+        # A long sentence under streaming is deliberately NOT synthesised
+        # here: `_speak_streamed` will pull it from the streaming endpoint
+        # when its turn comes. Paying whole-file synthesis (RTF 1.14, no
+        # first sound until done) for a sentence that will never use it
+        # would be the very latency this path exists to remove.
+        if getattr(self, "tts_stream_url", "") and self._sentence_is_long(nxt):
+            return nxt, None
         # Speed travels on the sentence itself (TTSentence.speed); plain str
         # queue items (acks, apologies) default to neutral via getattr.
         return nxt, await self._tts_fetch(nxt, getattr(nxt, "speed", 1.0))
@@ -5048,6 +5095,13 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
         turn_is_q = False
         sent: str | None = None
         pcm: bytes | None = None
+        # Streaming is a per-session capability: a session without the stream
+        # URL behaves exactly as before, sentence by sentence.
+        streaming = bool(getattr(self, "tts_stream_url", ""))
+        # Whether the CURRENT sentence goes through the streamed path. Reset
+        # per iteration after `sent` is known; the pre-loop value only covers
+        # the defensive `elif pcm is None` branch.
+        stream_this = False
         try:
             while True:
                 if sent is None:
@@ -5070,8 +5124,15 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
                         # appears at all.
                         break
                     sent, pcm = got
-                elif pcm is None:
+                elif pcm is None and not stream_this:
                     pcm = await self._tts_fetch(sent, getattr(sent, "speed", 1.0))
+
+                # A long sentence under streaming is NOT a synthesis failure:
+                # `_prefetch_next` deliberately returned it with pcm=None for
+                # the streamed path. Short sentences keep the whole-file path.
+                stream_this = (
+                    streaming and pcm is None and self._sentence_is_long(sent)
+                )
 
                 # OUTSIDE the branch above, on purpose. This was an `elif` on
                 # `if pending is not None`, so it only ran when there was NO
@@ -5080,7 +5141,7 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
                 # therefore never fired on the path it was written for: measured
                 # 10.10.2026 13:29:53, the kitchen queued two sentences, both
                 # prefetched, both unplayable, and the room said nothing at all.
-                if sent is not None and pcm is None:
+                if sent is not None and pcm is None and not stream_this:
                     # A sentence that cannot be synthesised must not become
                     # SILENCE. The backend guarantees `SORRY` when a stream ends
                     # empty, and that guarantee is worthless if the very next stage
@@ -5095,15 +5156,11 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
                     if not spoke_anything:
                         # One per turn: a three-sentence reply whose synthesis all
                         # failed must not become three identical apologies.
-                        apol = "Простите, голос сейчас не получился."
-                        fb_pcm = await self._tts_fetch(apol)
-                        if fb_pcm:
-                            # TTS being down will usually fail here too, but the
-                            # attempt is one line and free when it succeeds — and the
-                            # case it covers is real: a single bad sentence, a rate
-                            # limit, a transient 5xx.
-                            await self._speak_pcm(fb_pcm, apol)
-                            spoke_anything = True
+                        # TTS being down will usually fail inside too, but the
+                        # attempt is one line and free when it succeeds — and the
+                        # case it covers is real: a single bad sentence, a rate
+                        # limit, a transient 5xx.
+                        spoke_anything = await self._speak_apology_once()
 
                 # Ask the queue for the following sentence BEFORE speaking this
                 # one, so its synthesis overlaps this one's playback.
@@ -5112,13 +5169,30 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
 
                 try:
                     self._wake_expires = time.time() + self._wake_timeout
-                    is_q = (
-                        await asyncio.wait_for(
+                    if pcm:
+                        is_q = await asyncio.wait_for(
                             self._speak_pcm(pcm, sent), timeout=90.0
                         )
-                        if pcm
-                        else False
-                    )
+                    elif stream_this:
+                        # Long sentence: stream it, first sound ~7.3 s instead
+                        # of ~9.8 s (measured 10.11.2026). Nothing reaching the
+                        # speaker (stream never started) falls back to the
+                        # whole-file path; a mid-stream death does NOT — the
+                        # audio already played and a fallback would speak the
+                        # reply twice.
+                        is_q, streamed_ok = await asyncio.wait_for(
+                            self._speak_streamed(sent), timeout=600.0
+                        )
+                        if not streamed_ok and not spoke_anything:
+                            pcm = await self._tts_fetch(
+                                sent, getattr(sent, "speed", 1.0)
+                            )
+                            if pcm:
+                                is_q = await self._speak_pcm(pcm, sent)
+                            else:
+                                await self._speak_apology_once()
+                    else:
+                        is_q = False
                     last_q = bool(is_q)
                     # The POST is in the background now, so `_last_play_ok` is
                     # only real once it comes back. Settling here — after this
@@ -6230,3 +6304,328 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
 
         self._speaking = False
         return is_question
+
+    # ------------------------------------------------------------------
+    # Streamed long sentences (10.11.2026, coqui /v1/audio/speech/stream).
+    #
+    # Whole-file XTTS synthesis is RTF ~1.14 and produces NO sound until the
+    # whole sentence is done (measured 46 chars -> 8.63 s audio -> 9.8 s
+    # wall). The streaming endpoint emits ~2.74 s chunks every ~3.65 s (RTF
+    # 1.33) — chunky, not continuous — so the relay buffers
+    # `_TTS_STREAM_LEAD_S` of audio BEFORE the camera POST starts and keeps
+    # roughly a second ahead afterwards: the speaker never drains between
+    # chunks. First sound ~7.3 s instead of ~9.8 s, gap-free for ~22 s of
+    # audio; longer sentences may tail-gap and the log says so instead of
+    # hiding it.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _sentence_is_long(text) -> bool:
+        """The streamed path only pays off past the measured crossover.
+
+        Below `_TTS_STREAM_MIN_CHARS` the whole-file path through the prefetch
+        overlap is cheaper AND it hits the server-side PCM cache.
+        """
+        return len(str(text or "").strip()) >= _TTS_STREAM_MIN_CHARS
+
+    def _extend_stream_timing(self, sent_at: float, cum_dur: float) -> None:
+        """Extend every playback guard to cover streamed audio, per chunk.
+
+        The whole-file path arms all guards once from a known duration; a
+        stream does not know its duration up front, so each relayed chunk
+        applies the SAME arithmetic (`sent_at` + audio) incrementally.
+        Max-extension is what makes that safe — `_arm_playback_timing` already
+        max-extends `_tts_play_end`/`_speaking_until`, and the two inline
+        guards here are written the same way, so a later chunk can never
+        SHORTEN a window an earlier, longer one opened.
+
+        `sent_at` is the moment the camera POST started (the first byte handed
+        to it), because that is when our audio can first sound — function entry
+        only knows when coqui was ASKED, and the mute must describe the sound.
+        """
+        # `_speaking_until` is the hard mic mute in `_feed_audio`;
+        # `_tts_play_end` is the `_is_echo` horizon. Both cover the audio END.
+        self._arm_playback_timing(sent_at, cum_dur)
+        # The pause endpoint must not decide on our own audio either — same
+        # shape as `_arm_tts_inflight`, but with the cumulative duration, since
+        # the stream keeps sounding well past `sent_at + _TTS_START_GUARD_S`.
+        self._tts_playing_until = max(
+            getattr(self, "_tts_playing_until", 0.0),
+            sent_at + _TTS_START_GUARD_S + cum_dur,
+        )
+        # Cross-camera echo guard: covers the relayed audio plus the settle.
+        global GLOBAL_TTS_UNTIL, _GLOBAL_TTS_BY, _GLOBAL_TTS_DUR
+        g = sent_at + cum_dur + _SPEAKER_SETTLE_S
+        if g > GLOBAL_TTS_UNTIL:
+            GLOBAL_TTS_UNTIL = g
+        _GLOBAL_TTS_DUR = cum_dur
+        # The wake decoder gets the playback plus the SHORT `_ECHO_TAIL_S`: a
+        # «компьютер» decoded out of our own speaker is a false wake, exactly
+        # as on the whole-file path.
+        self._wake_suppress_until = max(
+            getattr(self, "_wake_suppress_until", 0.0),
+            sent_at + cum_dur + _ECHO_TAIL_S,
+        )
+
+    async def _speak_stream(
+        self, text: str, reply: str = "", speed: float = 1.0
+    ) -> bool:
+        """Stream ONE sentence from the TTS stream endpoint and relay the PCM
+        to /play_audio as it is synthesised. Returns is_question, like
+        `_speak_pcm`.
+
+        **The contract with coqui**: the answer must be HTTP 200 and carry
+        `X-Sample-Rate` BEFORE the first audio byte (the relay reads the rate
+        from it). Non-200, a missing header, or a camera that refuses the POST
+        before anything was relayed leaves `_stream_fallback_needed` set — the
+        player then speaks the sentence through the whole-file path, and
+        NOTHING was heard in the room, so the fallback cannot double-speak.
+        A stream that dies MID-AUDIO does NOT set it: what was relayed already
+        played, a fallback WOULD speak the reply twice, so the honest outcome
+        is a truncated reply — logged, not retried.
+
+        The `speed` key travels only when it differs from 1.0, exactly as in
+        `_tts_fetch`: the edge_tts fallback payload stays byte-identical and
+        coqui synthesises bit-identically at 1.0 either way.
+        """
+        is_question = bool(_HAS_QUESTION_RE.search((reply or "").strip()))
+        payload = {
+            "model": "tts-1",
+            "input": text,
+            "voice": self.tts_voice,
+            "response_format": "pcm",
+        }
+        if speed and float(speed) != 1.0:
+            payload["speed"] = float(speed)
+        headers = {}
+        if self.tts_api_key:
+            headers["Authorization"] = f"Bearer {self.tts_api_key}"
+
+        self._speaking = True
+        # Same fields `_speak_pcm` fills: `_echo_of_reply` recognises our own
+        # sentence coming back, and it needs to know what we are saying.
+        self._last_tts_reply = reply.lower().strip().strip(".,!? -") if reply else ""
+        self._last_tts_reply_at = time.time()
+
+        t0 = time.time()
+        sent_at: float | None = None
+        cum_dur = 0.0
+        n_chunks = 0
+        posted_any = False
+        try:
+            async with self.http_session.post(
+                self.tts_stream_url,
+                json=payload,
+                headers=headers,
+                # total=None: the stream legitimately lasts as long as the
+                # sentence (RTF 1.33). A DEAD stream is caught by sock_read —
+                # nothing arriving for `_TTS_STREAM_STALL_S` is a stall, and
+                # what was already relayed keeps playing.
+                timeout=aiohttp.ClientTimeout(
+                    total=None, sock_connect=10, sock_read=_TTS_STREAM_STALL_S
+                ),
+            ) as r:
+                if r.status != 200:
+                    logger.warning(
+                        f"[{self.stream_name}] TTS stream HTTP {r.status} for "
+                        f"{len(text)} chars — falling back to the whole-file path"
+                    )
+                    return is_question
+                src_rate = int(r.headers.get("X-Sample-Rate") or 0)
+                if src_rate <= 0:
+                    # The rate is not decorable after the fact: the relay has
+                    # to resample to TTS_PLAY_RATE, and guessing it would
+                    # pitch-shift the reply. Refuse, whole-file, no sound lost.
+                    logger.warning(
+                        f"[{self.stream_name}] TTS stream answered without "
+                        f"X-Sample-Rate — falling back to the whole-file path"
+                    )
+                    return is_question
+
+                dst_rate = TTS_PLAY_RATE
+                lead_bytes = int(_TTS_STREAM_LEAD_S * dst_rate) * 2
+                state = None  # audioop.ratecv state: chunk boundaries continuous
+                buf = bytearray()
+                # A TCP read ends at an arbitrary byte; audioop needs a whole
+                # number of frames (width*nchannels = 2 bytes here) and dies
+                # with `not a whole number of frames` on an odd fragment —
+                # measured on the first live probe 11.11.2026, where the whole
+                # relay bailed to the whole-file path. The tail is carried to
+                # the next read instead of being fed.
+                src_buf = bytearray()
+                src_done = False
+                stalled = False
+
+                async def relay():
+                    """Pull PCM from coqui, convert 22.05k -> 48k, hand it to
+                    the camera POST. The lead is buffered before the first
+                    yield, so `sent_at` — captured at that first yield — is
+                    when the speaker can first sound, not when coqui was
+                    asked."""
+                    nonlocal sent_at, cum_dur, n_chunks, posted_any
+                    nonlocal state, src_done, stalled
+                    while True:
+                        want = lead_bytes if sent_at is None else dst_rate * 2
+                        while len(buf) < want and not src_done:
+                            try:
+                                raw = await r.content.read(src_rate * 2)
+                            except asyncio.TimeoutError:
+                                src_done = True
+                                stalled = True
+                                logger.warning(
+                                    f"[{self.stream_name}] TTS stream stalled "
+                                    f"(no bytes for {_TTS_STREAM_STALL_S:.0f}s) "
+                                    f"after {cum_dur:.2f}s relayed — truncated"
+                                )
+                                break
+                            if not raw:
+                                src_done = True
+                                break
+                            src_buf.extend(raw)
+                            whole = len(src_buf) - (len(src_buf) % 2)
+                            if whole == 0:
+                                continue
+                            out, state = audioop.ratecv(
+                                bytes(src_buf[:whole]), 2, 1, src_rate, dst_rate,
+                                state,
+                            )
+                            del src_buf[:whole]
+                            buf.extend(out)
+                        if not buf:
+                            return
+                        if sent_at is None:
+                            # Lead full (or the stream ended short): the camera
+                            # POST starts NOW. From the first handoff there is
+                            # no fallback — what plays is already on the camera.
+                            sent_at = time.time()
+                            posted_any = True
+                            self._stream_fallback_needed = False
+                            self._arm_tts_inflight(sent_at, 0.0)
+                            global _GLOBAL_TTS_BY
+                            _GLOBAL_TTS_BY = (
+                                f"{self.stream_name} 'stream:{(reply or '')[:40]}' "
+                                f"lead={_TTS_STREAM_LEAD_S:.1f}s"
+                            )
+                        chunk = bytes(buf[: dst_rate * 2])
+                        del buf[: dst_rate * 2]
+                        cum_dur += len(chunk) / (dst_rate * 2)
+                        n_chunks += 1
+                        self._extend_stream_timing(sent_at, cum_dur)
+                        self._store_tts_echo(chunk)
+                        yield chunk
+
+                post_headers = dict(getattr(self, "_play_audio_headers", {}))
+                post_headers["Content-Type"] = (
+                    f"application/octet-stream;rate={TTS_PLAY_RATE}"
+                )
+                try:
+                    async with self.http_session.post(
+                        getattr(self, "_play_audio_url", ""),
+                        data=relay(),
+                        headers=post_headers,
+                        # A slow camera is not a dead one (3-21x measured on
+                        # whole-file POSTs), but a streaming POST reads from
+                        # our generator, so a hang shows as a stalled body.
+                        # sock_read bounds that; total stays None for the same
+                        # reason as above.
+                        timeout=aiohttp.ClientTimeout(
+                            total=None, sock_connect=10, sock_read=90
+                        ),
+                    ) as pr:
+                        pass
+                except asyncio.TimeoutError as e:
+                    if not posted_any:
+                        self._stream_fallback_needed = True
+                    logger.warning(
+                        f"[{self.stream_name}] play_audio stream POST timed out "
+                        f"after {cum_dur:.2f}s relayed: {e!r}"
+                    )
+                except Exception as e:
+                    if not posted_any:
+                        # Connect refused / 4xx / camera gone BEFORE the first
+                        # byte: nothing sounded, whole-file fallback is honest.
+                        self._stream_fallback_needed = True
+                        logger.warning(
+                            f"[{self.stream_name}] play_audio stream POST failed "
+                            f"before anything was relayed: {e!r}"
+                        )
+                    else:
+                        logger.warning(
+                            f"[{self.stream_name}] play_audio stream POST died "
+                            f"mid-stream after {cum_dur:.2f}s relayed (truncated): "
+                            f"{e!r}"
+                        )
+
+                if sent_at is not None:
+                    took = time.time() - sent_at
+                    # Something really reached the speaker (truncated or not):
+                    # the player reads `_last_play_ok` after this sentence to
+                    # decide whether a LATER failed sentence may apologise, and
+                    # a stale previous-turn value here is exactly the shape the
+                    # 10.10.2026 fix guards against.
+                    self._last_play_ok = True
+                    # Sound lower bound: the camera cannot have finished before
+                    # the last byte was delivered. Max-extends, so it can only
+                    # push the guards out, never shorten them.
+                    self._arm_playback_timing(sent_at, took)
+                    self._close_tts_inflight(0)
+                    logger.info(
+                        f"[{self.stream_name}] play_audio stream {cum_dur:.2f}s in "
+                        f"{took:.2f}s (rtf {(took / cum_dur) if cum_dur else 0:.2f}, "
+                        f"first +{sent_at - t0:.2f}s, {n_chunks} chunks, "
+                        f"{len(text)} chars{', truncated' if stalled else ''})"
+                    )
+                else:
+                    logger.warning(
+                        f"[{self.stream_name}] TTS stream produced no audio for "
+                        f"{len(text)} chars — falling back to the whole-file path"
+                    )
+                    self._stream_fallback_needed = True
+            return is_question
+        except Exception as e:
+            # Anything outside the two POSTs (session closed mid-flight, bug in
+            # the relay): pre-first-chunk means nothing played, mid-stream means
+            # truncated. The flag decides which the player sees.
+            if not posted_any:
+                self._stream_fallback_needed = True
+            logger.warning(
+                f"[{self.stream_name}] TTS stream failed after {cum_dur:.2f}s "
+                f"relayed: {e!r}"
+            )
+            return is_question
+        finally:
+            self._speaking = False
+
+    async def _speak_streamed(self, sent) -> tuple[bool, bool]:
+        """Stream one sentence; returns (is_question, streamed_without_bail).
+
+        `streamed_without_bail` is False ONLY when nothing reached the speaker
+        (the stream never started) — the player may then fall back to the
+        whole-file path without risking a double-speak. A truncated stream
+        returns True: the audio already played.
+        """
+        # Pessimistic until `_speak_stream` proves the camera is playing: an
+        # exception before the first handoff must read as "nothing played",
+        # not as "carried on".
+        self._stream_fallback_needed = True
+        speed = getattr(sent, "speed", 1.0) or 1.0
+        try:
+            is_q = await self._speak_stream(str(sent), reply=str(sent), speed=speed)
+        except Exception as e:
+            logger.warning(f"[{self.stream_name}] TTS stream crashed: {e!r}")
+            is_q = False
+        return bool(is_q), not self._stream_fallback_needed
+
+    async def _speak_apology_once(self) -> bool:
+        """Speak the apology, if TTS can synthesise it at all.
+
+        Returns whether something was spoken; the caller owns the once-per-turn
+        guard. A fully dead TTS cannot speak the apology either — what must
+        always survive is the trace, and `_tts_fetch` logs that.
+        """
+        apol = "Простите, голос сейчас не получился."
+        fb_pcm = await self._tts_fetch(apol)
+        if fb_pcm:
+            await self._speak_pcm(fb_pcm, apol)
+            return True
+        return False

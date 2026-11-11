@@ -239,6 +239,11 @@ TTS_URL = os.getenv("TTS_URL", "http://edge_tts:5050/v1/audio/speech")
 TTS_MODEL = os.getenv("TTS_MODEL", "tts-1")
 TTS_VOICE = os.getenv("TTS_VOICE", "ru-RU-SvetlanaNeural")
 TTS_API_KEY = os.getenv("TTS_API_KEY", "")
+# Streaming endpoint for LONG sentences (coqui /v1/audio/speech/stream).
+# Empty => every sentence takes the whole-file path; the camera session
+# falls back to it per sentence when the stream cannot start, so a typo
+# here degrades to the old latency, never to silence.
+TTS_STREAM_URL = os.getenv("TTS_STREAM_URL", "")
 
 # Web UI / REST API credentials. Both must be set or verify_auth() rejects every
 # request with 401 "Authentication disabled".
@@ -3760,6 +3765,10 @@ async def start_camera_sessions():
                 # The ESP32 path always read the env; only the camera path
                 # silently reverted to the constant.
                 tts_voice=TTS_VOICE,
+                # Filled like tts_voice: a missing fill here silently reverts
+                # the camera path to the dataclass default — the exact shape
+                # that put a man's voice in every room on 10.11.2026.
+                tts_stream_url=TTS_STREAM_URL,
                 speaker_id_url=SPEAKER_ID_URL,
                 vad=VadEngine(
                     energy_fallback=True,

@@ -245,6 +245,87 @@ TTS_API_KEY = os.getenv("TTS_API_KEY", "")
 # here degrades to the old latency, never to silence.
 TTS_STREAM_URL = os.getenv("TTS_STREAM_URL", "")
 
+# --- Three switchable TTS backends (edge / coqui / silero) ------------------
+# A preset rebinds the legacy TTS_* globals above, so every existing consumer
+# keeps working unchanged: synthesize_tts_mp3 (ESP32 + Telegram) reads them at
+# call time and start_camera_sessions() fills new CameraConfigs from them.
+# Only coqui carries a stream_url — edge and silero are whole-file endpoints,
+# and whole-file is also the stutter-free path (chunked bodies are consumed
+# slower by the cameras' majestic: bytes x2.1, chunked x2.7..x5.2, 11.11.2026).
+TTS_BACKENDS: dict[str, dict[str, str]] = {
+    "edge": {
+        "url": "http://edge_tts:5050/v1/audio/speech",
+        "stream_url": "",
+        "voice": "ru-RU-SvetlanaNeural",
+        "model": "tts-1",
+    },
+    "coqui": {
+        "url": "http://192.168.22.102:5051/v1/audio/speech",
+        "stream_url": "http://192.168.22.102:5051/v1/audio/speech/stream",
+        "voice": "Zofija Kendrick",
+        "model": "tts_models/multilingual/multi-dataset/xtts_v2",
+    },
+    "silero": {
+        "url": "http://192.168.22.102:5053/v1/audio/speech",
+        "stream_url": "",
+        "voice": "baya",
+        "model": "v5_6_ru",
+    },
+}
+# Boot preset name. Empty/unset => the legacy env vars above win EXACTLY as
+# before (zero regression when nobody switches); a name => the preset wins.
+TTS_BACKEND = os.getenv("TTS_BACKEND", "")
+TTS_BACKEND_ACTIVE = ""
+
+
+def apply_tts_backend(name: str, voice: str | None = None) -> str:
+    """Switch the TTS engine at runtime by rebinding the legacy globals.
+
+    Rebinding is enough because both consumption paths read the globals at
+    call time: synthesize_tts_mp3() for ESP32/Telegram, and the CameraConfig
+    fill in start_camera_sessions() for every NEW session. LIVE camera
+    sessions are updated in place below (tts_model is deliberately absent —
+    the camera path hardcodes "tts-1", which every backend accepts or
+    ignores; tts_api_key stays per-session too, all three backends tolerate
+    a Bearer header).
+
+    `voice` overrides the preset's speaker without losing which preset is
+    active (e.g. silero + kseniya). An unknown `name` raises KeyError and
+    changes NOTHING — callers turn that into a 404.
+
+    Returns the applied preset name.
+    """
+    global TTS_URL, TTS_MODEL, TTS_VOICE, TTS_STREAM_URL, TTS_BACKEND_ACTIVE
+    preset = TTS_BACKENDS[name]  # KeyError on an unknown name: nothing changed
+    TTS_URL = preset["url"]
+    TTS_MODEL = preset["model"]
+    TTS_STREAM_URL = preset["stream_url"]
+    TTS_VOICE = voice or preset["voice"]
+    TTS_BACKEND_ACTIVE = name
+    # globals().get: boot application can run before _camera_sessions exists
+    # (it is defined further down); at boot the list is empty anyway and new
+    # sessions pick the preset up from the globals.
+    for s in globals().get("_camera_sessions", []):
+        s.tts_url = TTS_URL
+        s.tts_voice = TTS_VOICE
+        s.tts_stream_url = TTS_STREAM_URL
+    logger.info(
+        f"🔊 TTS backend -> {name} voice={TTS_VOICE!r} url={TTS_URL} "
+        f"stream={'on' if TTS_STREAM_URL else 'off'} "
+        f"({len(globals().get('_camera_sessions', []))} live session(s) updated)"
+    )
+    return name
+
+
+def _boot_tts_backend() -> str:
+    """Apply TTS_BACKEND once at boot. Empty => legacy envs win, no change."""
+    if TTS_BACKEND:
+        return apply_tts_backend(TTS_BACKEND)
+    return ""
+
+
+_boot_tts_backend()
+
 # Web UI / REST API credentials. Both must be set or verify_auth() rejects every
 # request with 401 "Authentication disabled".
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "")
@@ -3821,6 +3902,69 @@ async def api_camera_tts(req: Request, username: str = Depends(verify_auth)):
         except Exception as e:
             logger.error(f"TTS create_task failed: {e}", exc_info=True)
     return {"status": "sent", "cameras": [s.stream_name for s in target]}
+
+
+@app.get("/api/tts/backends")
+async def api_tts_backends_list(username: str = Depends(verify_auth)):
+    """List the switchable TTS backends and which one is active."""
+    return {
+        "active": TTS_BACKEND_ACTIVE,
+        "voice": TTS_VOICE,
+        "url": TTS_URL,
+        "stream_url": TTS_STREAM_URL,
+        "backends": {
+            n: {
+                "url": p["url"],
+                "stream_url": p["stream_url"],
+                "voice": p["voice"],
+                "model": p["model"],
+            }
+            for n, p in TTS_BACKENDS.items()
+        },
+    }
+
+
+@app.post("/api/tts/backends/{name}")
+async def api_tts_backends_select(
+    name: str, req: Request, username: str = Depends(verify_auth)
+):
+    """Switch the TTS backend at runtime.
+
+    Body is optional (a bare POST switches to the preset's own voice);
+    `{"voice": "kseniya"}` overrides the preset's speaker (silero speakers:
+    aidar/baya/kseniya/xenia/eugene). An unknown backend is a 404 that names
+    the valid ones, and NOTHING is changed on that path.
+    """
+    voice = None
+    raw = await req.body()
+    if raw:
+        # An empty body is a VALID request (bare POST); req.json() would
+        # raise JSONDecodeError on it — found live 11.11.2026, the tests
+        # passed because json={} still sends a body.
+        try:
+            body = json.loads(raw)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="body must be JSON")
+        if isinstance(body, dict):
+            voice = body.get("voice") or None
+    try:
+        applied = apply_tts_backend(name, voice)
+    except KeyError:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"unknown TTS backend {name!r}; "
+                f"available: {', '.join(sorted(TTS_BACKENDS))}"
+            ),
+        )
+    return {
+        "status": "ok",
+        "active": applied,
+        "voice": TTS_VOICE,
+        "url": TTS_URL,
+        "stream_url": TTS_STREAM_URL,
+        "sessions_updated": len(globals().get("_camera_sessions", [])),
+    }
 
 
 async def stop_camera_sessions():

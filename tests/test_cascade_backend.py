@@ -212,3 +212,51 @@ def test_room_omitted_when_empty():
     # Devices/cameras send no room -> the payload is byte-identical to the
     # pre-Telegram contract.
     assert "room" not in payload
+
+
+# --- progress heartbeats are NOT content (12.11.2026) -------------------------
+#
+# Measured on the 08:51 kitchen turn: the worker burned 120 s, the gateway
+# spoke eight «Анализирую запрос…» heartbeats (one per 15 s), and the error
+# event's apology was suppressed because the heartbeats had flipped the SAME
+# `spoken` flag the apology checks. The user heard eight progress phrases
+# and then nothing — and the camera watchdog stayed silent because the
+# heartbeats kept the turn "alive". The ack already got this right («ack
+# alone is not content»); progress gets the same treatment.
+
+def test_progress_before_an_error_still_apologizes():
+    events = [
+        {"type": "route", "route": "complex_logic", "confidence": 0.9},
+        {"type": "progress", "text": "Анализирую запрос…"},
+        {"type": "error", "message": "timeout>120s"},
+    ]
+    out = _drain(asyncio.run(_run(events)))
+    assert out == [CascadeBackend.ACK_COMPLEX, "Анализирую запрос…",
+                   CascadeBackend.SORRY]
+
+
+def test_a_progress_only_stream_that_ends_still_apologizes():
+    # done with heartbeats and not one sentence: the turn produced nothing
+    # speakable, so the promise the heartbeats made must be answered.
+    events = [
+        {"type": "route", "route": "complex_logic", "confidence": 0.9},
+        {"type": "progress", "text": "Анализирую запрос…"},
+        {"type": "done", "route": "complex_logic", "elapsed": 120.12},
+    ]
+    out = _drain(asyncio.run(_run(events)))
+    assert out == [CascadeBackend.ACK_COMPLEX, "Анализирую запрос…",
+                   CascadeBackend.SORRY]
+
+
+def test_real_content_still_suppresses_the_apology():
+    """Unchanged behaviour, guarded against over-correcting: once a real
+    answer has been heard, a late error must NOT append an apology."""
+    events = [
+        {"type": "route", "route": "complex_logic", "confidence": 0.9},
+        {"type": "progress", "text": "Анализирую запрос…"},
+        {"type": "sentence", "text": "Готово: свет выключен."},
+        {"type": "error", "message": "late failure"},
+    ]
+    out = _drain(asyncio.run(_run(events)))
+    assert out == [CascadeBackend.ACK_COMPLEX, "Анализирую запрос…",
+                   "Готово: свет выключен."]

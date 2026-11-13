@@ -225,14 +225,40 @@ EXPERT_SYSTEM = (
     "спецсимволов (→, $, кавычки-звёздочки) — только обычные предложения."
 )
 
+# General knowledge / small math («что такое корень из трех», «сколько будет
+# 17 умножить на 4»), routed here from the resolver fallback on 12.11.2026.
+# NOT the diagnostics persona: an answer to √3 framed as «2-3 вероятные
+# причины и шаг проверки» is nonsense, and the EXPERT_SYSTEM wording would
+# push Hermes to produce exactly that. Same voice/tag/markdown contract as
+# the other two — the tag is stripped before speech and forwarded as the
+# structured `emotion` field (backends.py maps sad/angry -> speed 0.9).
+KNOWLEDGE_SYSTEM = (
+    "Ты голосовой ассистент умной колонки, отвечаешь на общие вопросы и "
+    "небольшие расчёты (математика, факты, переводы). Начинай КАЖДЫЙ ответ "
+    "ровно с одного тега эмоции из списка [happy] [neutral] [surprised] "
+    "[sad] [angry] — без преамбул. Отвечай ГОЛОСОМ: по-русски, живо, "
+    "сразу по существу, 1-3 предложения; числа говори словами, без формул "
+    "и знаков. СТРОГО без markdown: никаких #, *, списков, кода, формул "
+    "и спецсимволов — только обычные предложения, пригодные для озвучки."
+)
 
-async def stream_chat(text: str, expert: bool = False):
+
+async def stream_chat(
+    text: str, expert: bool = False, knowledge: bool = False
+):
     """general_qa: OmniRoute combo → Hermes failover (fast chat brain).
     expert: Hermes L3 FIRST, OmniRoute failover — the expert route is the
     «вопрос не решается ниже → Гермес» path (README promised it; before
     2.28 the free combo answered expert questions too, and its polite
-    refusals are exactly what hid the missing escalation)."""
-    system = EXPERT_SYSTEM if expert else CHAT_SYSTEM
+    refusals are exactly what hid the missing escalation).
+    knowledge: same Hermes-first order, but the general-knowledge persona —
+    the resolver escalates UNANSWERABLE easy_query questions here (measured
+    12.11.2026: the L2 tool agent burned 161 s on «корень из трех»), and an
+    answer framed as smart-home diagnostics is not an answer."""
+    if knowledge:
+        system = KNOWLEDGE_SYSTEM
+    else:
+        system = EXPERT_SYSTEM if expert else CHAT_SYSTEM
     messages = [
         {"role": "system", "content": system},
         {"role": "user", "content": text},
@@ -241,8 +267,8 @@ async def stream_chat(text: str, expert: bool = False):
     hermes = (config.HERMES_URL, "hermes-agent", config.HERMES_API_KEY)
     targets = (hermes, omni) if expert else (omni, hermes)
     logger.info(
-        "stream_chat expert=%s primary=%s",
-        expert, "hermes" if expert else "omniroute",
+        "stream_chat expert=%s knowledge=%s primary=%s",
+        expert, knowledge, "hermes" if expert else "omniroute",
     )
     for url, model, api_key in targets:
         try:

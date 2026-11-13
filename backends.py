@@ -493,8 +493,14 @@ class CascadeBackend(BaseLLMBackend):
         the first real sentence arrives (fast paths never hear the ack);
       * progress events from L2    -> spoken as short sentences (worker
         emits them at most every 20 s), replacing watchdog-driven apologies;
-      * error with nothing spoken  -> immediate apology sentence instead of
-        dead air.
+      * error with no CONTENT yet -> immediate apology sentence instead of
+        dead air. Progress heartbeats do NOT count as content: measured
+        12.11.2026, a 120 s worker timeout after eight «Анализирую запрос…»
+        heartbeats left the room silent, because the heartbeats had flipped
+        the same `spoken` flag that suppresses the apology (`if not spoken`)
+        — the user heard eight progress phrases and then nothing. The ack
+        already got this right («ack alone is not content»); progress gets
+        the same treatment now.
 
     The first played audio cancels the gateway watchdog downstream
     (_hermes_player_task.play), so one ack keeps the whole turn alive.
@@ -527,26 +533,30 @@ class CascadeBackend(BaseLLMBackend):
         Event handling: `route` picks/immediately cancels the ack phrase
         (complex/expert = instant ack, easy = 3 s delayed ack), `sentence`
         cancels the pending ack and speaks, `progress` speaks L2 heartbeat
-        phrases, `error`/`exception`/empty stream produce SORRY when
-        nothing was said yet, `done` breaks the loop. Returns normally in
-        all cases (never raises) after pushing the None sentinel.
+        phrases (progress is NOT content: it must not suppress the apology),
+        `error`/`exception`/empty stream produce SORRY when nothing
+        CONTENT-wise was said yet, `done` breaks the loop. Returns normally
+        in all cases (never raises) after pushing the None sentinel.
         """
-        spoken = False   # any real sentence reached the queue
+        spoken = False   # any queue item, content OR progress: gates the ack
+        content = False  # a real answer sentence: gates the apology
         ack_sent = False
         ack_task: asyncio.Task | None = None
 
-        def put(s: str, emotion: str = "") -> None:
+        def put(s: str, emotion: str = "", progress: bool = False) -> None:
             # Reuses HermesBackend._speakable: router output is already
             # curated, so tags/markdown are simply stripped (no emotion
             # gate here, unlike HermesBackend). The router forwards the
             # tag it stripped as a structured `emotion` field on the
             # sentence event; sad/angry -> slower playback (speed travels
             # on the sentence itself, see TTSentence).
-            nonlocal spoken
+            nonlocal spoken, content
             s2 = HermesBackend._speakable(s)
             if s2:
                 response_queue.put_nowait(_with_speed(s2, _speed_for(emotion)))
                 spoken = True
+                if not progress:
+                    content = True
 
         def put_ack(phrase: str) -> None:
             # At most one ack, and never once real content is flowing —
@@ -626,14 +636,17 @@ class CascadeBackend(BaseLLMBackend):
                                 put(ev["text"], ev.get("emotion") or "")
                         elif etype == "progress":
                             if ev.get("text"):
-                                put(ev["text"])
+                                # progress=True: heartbeats never count as
+                                # content, so a timeout after them still
+                                # speaks the apology (12.11.2026 silence).
+                                put(ev["text"], progress=True)
                         elif etype == "error":
                             logger.error(
                                 f"❌ [Cascade] router error: {ev.get('message')}"
                             )
                             # ack alone is not content: after it the watchdog is
                             # already cancelled, so silence here would be final.
-                            if not spoken:
+                            if not content:
                                 put(self.SORRY)
                         elif etype == "done":
                             logger.info(
@@ -643,13 +656,15 @@ class CascadeBackend(BaseLLMBackend):
                             break
         except Exception as e:
             logger.error(f"Cascade error: {e}")
-            if not spoken:
+            if not content:
                 put(self.SORRY)
         finally:
             if ack_task is not None:
                 ack_task.cancel()
-            if not spoken:
-                # Stream ended empty without an error event: never leave the
-                # caller in silence (watchdog would apologize 90 s later).
+            if not content:
+                # Stream ended without CONTENT (progress heartbeats do not
+                # count): never leave the caller in silence (watchdog would
+                # apologize 90 s later; and after 8 heartbeats the user has
+                # already been promised an answer — the apology must come).
                 response_queue.put_nowait(self.SORRY)
             response_queue.put_nowait(None)

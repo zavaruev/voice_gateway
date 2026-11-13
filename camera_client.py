@@ -4421,6 +4421,10 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
         self._last_transcript_at = time.time()
         if uid and uid != "unknown":
             logger.info(f"[{self.stream_name}] 👤 Speaker: {uid} | '{txt[:60]}'")
+        logger.info(
+            f"[{self.stream_name}] 🔍 _handle_stt_result -> _handle_wake_or_command: "
+            f"wake_detected={self._wake_detected}, txt={txt[:60]!r}"
+        )
         await self._handle_wake_or_command(txt, uid or "camera")
 
     def _transcript_is_echo(self, norm: str) -> str | None:
@@ -4657,6 +4661,13 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
         wake fired. The oww detector is the ONLY wake path now — this method
         never wakes on transcript content, it only extracts and dispatches
         the command that followed a live oww detection."""
+        logger.info(
+            f"[{self.stream_name}] 🔍 _handle_wake_or_command called: "
+            f"wake_detected={self._wake_detected}, "
+            f"followup_only={self._followup_only}, "
+            f"txt={txt[:60]!r}, "
+            f"since_wake={time.time() - self._last_wake_fired_at:.1f}s"
+        )
         if not self._wake_detected:
             # No active wake window: nothing to do. (Reached only via stale
             # queued utterances — live utterances are gated earlier.)
@@ -4705,6 +4716,10 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
                 )
                 self._back_to_wake()
                 return
+        logger.info(
+            f"[{self.stream_name}] 🔍 after followup check: wake_detected={self._wake_detected}, "
+            f"followup_only={self._followup_only}, txt={txt[:60]!r}"
+        )
 
         # Never forward the wake word itself to nanobot — only the command
         # that follows it. Tolerate Whisper's glued repeats like
@@ -5953,8 +5968,15 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
             logger.warning(f"[{self.stream_name}] TTS decode failed: {e}")
             return None
 
+    _TIME_RE = re.compile(r"Сейчас\s+\d{1,2}:\d{2}(:\d{2})?")
+
     async def _speak(self, text: str, reply: str = "") -> bool:
         """Synthesise `text` and play it; False when TTS produced nothing."""
+        if _TIME_RE.search(text):
+            logger.info(
+                f"[{self.stream_name}] [TIME] TTS: {text!r} "
+                f"(reply={reply!r})"
+            )
         pcm = await self._tts_fetch(text)
         if not pcm:
             return False

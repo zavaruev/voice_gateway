@@ -24,6 +24,8 @@ from resolver import (  # noqa: E402
     resolve_action,
     resolve_query,
     unresolved_hint,
+    knowledge_question,
+    _datetime_phrase,
 )
 from ha_client import (  # noqa: E402
     MEDIA_PREFER,
@@ -276,6 +278,127 @@ def test_query_text_is_not_an_action():
 def test_time_query():
     q = resolve_query("который час", "device")
     assert q is not None and q.kind == "datetime"
+
+
+# --- _datetime_phrase: every numeral agrees with its noun --------------------
+# Measured 13.11.2026 on the kitchen turn of 07:30 UTC (silero log): the
+# phrase used to travel as DIGITS and num2ru read every one cardinally with
+# NO noun — «Сейчас 10:30.» became «Сейчас десять тридцать», «13 ноября
+# 2026» became «тринадцать… две тысячи двадцать шесть». The user asked for
+# all numerals in the time answer to agree with their nouns, so the words
+# are built in resolver and these tests pin the agreement.
+
+
+def _dt_payload(day, month, year, h, m, weekday="Friday"):
+    return {
+        "date": f"{year:04d}-{month:02d}-{day:02d}",
+        "time": f"{h:02d}:{m:02d}:46",
+        "timezone": "MSK",
+        "weekday": weekday,
+    }
+
+
+def test_datetime_phrase_spelled_in_words():
+    # The exact live payload of the 07:30 kitchen turn (silero num2ru lines
+    # measured against it): the phrase must contain no digit at all.
+    s = _datetime_phrase(_dt_payload(13, 11, 2026, 10, 30))
+    assert s == (
+        "Сегодня пятница, тринадцатое ноября две тысячи двадцать шестого "
+        "года. Сейчас десять часов тридцать минут."
+    )
+    assert not any(ch.isdigit() for ch in s)
+
+
+def test_datetime_phrase_day_ordinals():
+    # The day is read as a neuter ordinal agreeing with the implied «число».
+    assert "первое ноября" in _datetime_phrase(_dt_payload(1, 11, 2026, 10, 0))
+    assert "второе ноября" in _datetime_phrase(_dt_payload(2, 11, 2026, 10, 0))
+    assert "третье ноября" in _datetime_phrase(_dt_payload(3, 11, 2026, 10, 0))
+    assert "тринадцатое ноября" in _datetime_phrase(_dt_payload(13, 11, 2026, 10, 0))
+    assert "двадцатое ноября" in _datetime_phrase(_dt_payload(20, 11, 2026, 10, 0))
+    assert "двадцать первое ноября" in _datetime_phrase(_dt_payload(21, 11, 2026, 10, 0))
+    assert "тридцать первое декабря" in _datetime_phrase(_dt_payload(31, 12, 2026, 10, 0))
+
+
+def test_datetime_phrase_years():
+    # A year is an ordinal with «года»: genitive masculine.
+    assert "две тысячи двадцать шестого года" in _datetime_phrase(
+        _dt_payload(13, 11, 2026, 10, 0)
+    )
+    assert "две тысячи двадцатого года" in _datetime_phrase(
+        _dt_payload(13, 11, 2020, 10, 0)
+    )
+    assert "две тысячи первого года" in _datetime_phrase(
+        _dt_payload(13, 11, 2001, 10, 0)
+    )
+    # 2000 has no remainder — its own compound word, not «двухтысячного…»
+    assert "двухтысячного года" in _datetime_phrase(_dt_payload(13, 11, 2000, 10, 0))
+
+
+def test_datetime_phrase_hour_noun_agreement():
+    # один час / два-четыре часа / пять..двадцать часов, with the 11-14
+    # exception (одиннадцать ЧАСОВ, not «часа»).
+    assert "Сейчас один час." in _datetime_phrase(_dt_payload(13, 11, 2026, 1, 0))
+    assert "Сейчас два часа." in _datetime_phrase(_dt_payload(13, 11, 2026, 2, 0))
+    assert "Сейчас четыре часа." in _datetime_phrase(_dt_payload(13, 11, 2026, 4, 0))
+    assert "Сейчас пять часов." in _datetime_phrase(_dt_payload(13, 11, 2026, 5, 0))
+    assert "Сейчас двенадцать часов." in _datetime_phrase(_dt_payload(13, 11, 2026, 12, 0))
+    assert "Сейчас одиннадцать часов." in _datetime_phrase(_dt_payload(13, 11, 2026, 11, 0))
+    assert "Сейчас двадцать один час." in _datetime_phrase(_dt_payload(13, 11, 2026, 21, 0))
+    assert "Сейчас двадцать два часа." in _datetime_phrase(_dt_payload(13, 11, 2026, 22, 0))
+    # h=0 keeps the 24h reading — every numeral still has its noun.
+    assert "Сейчас ноль часов." in _datetime_phrase(_dt_payload(13, 11, 2026, 0, 0))
+
+
+def test_datetime_phrase_minute_noun_agreement():
+    # минута/минуты/минут with the feminine cardinals «одна»/«две» and the
+    # 11-14 exception (двенадцать МИНУТ).
+    assert "десять часов одна минута." in _datetime_phrase(_dt_payload(13, 11, 2026, 10, 1))
+    assert "десять часов две минуты." in _datetime_phrase(_dt_payload(13, 11, 2026, 10, 2))
+    assert "десять часов четыре минуты." in _datetime_phrase(_dt_payload(13, 11, 2026, 10, 4))
+    assert "десять часов двенадцать минут." in _datetime_phrase(_dt_payload(13, 11, 2026, 10, 12))
+    assert "десять часов одиннадцать минут." in _datetime_phrase(_dt_payload(13, 11, 2026, 10, 11))
+    assert "десять часов двадцать одна минута." in _datetime_phrase(_dt_payload(13, 11, 2026, 10, 21))
+    assert "десять часов двадцать две минуты." in _datetime_phrase(_dt_payload(13, 11, 2026, 10, 22))
+    assert "десять часов тридцать минут." in _datetime_phrase(_dt_payload(13, 11, 2026, 10, 30))
+    # m=0 is dropped, not spoken as «ноль минут».
+    s = _datetime_phrase(_dt_payload(13, 11, 2026, 10, 0))
+    assert s.endswith("Сейчас десять часов.") and "минут" not in s
+
+
+def test_datetime_phrase_without_weekday():
+    s = _datetime_phrase(_dt_payload(13, 11, 2026, 10, 0, weekday=""))
+    assert s.startswith("Сегодня тринадцатое ноября")
+    assert "," not in s.split(".")[0]  # no dangling comma before the date
+
+
+def test_datetime_phrase_plain_string_passthrough():
+    assert _datetime_phrase("все хорошо") == "все хорошо"
+    assert _datetime_phrase("   ") is None
+
+
+def test_datetime_phrase_malformed_payloads():
+    assert _datetime_phrase(None) is None
+    assert _datetime_phrase(42) is None
+    assert _datetime_phrase({}) is None
+    # A bad date alone still leaves the time.
+    s = _datetime_phrase({"date": "not-a-date", "time": "10:30:00"})
+    assert s == "Сейчас десять часов тридцать минут."
+
+
+def test_datetime_phrase_malformed_time_keeps_digit_form():
+    # A working clock must still answer — the malformed branch falls back to
+    # the digit form rather than escalating a working turn. (An out-of-range
+    # but numeric time still parses and is spoken in words; HA's own clock
+    # never produces either, so no range guard is added.)
+    s2 = _datetime_phrase({"date": "2026-11-13", "time": "ab:cd", "weekday": "Friday"})
+    assert s2 == (
+        "Сегодня пятница, тринадцатое ноября две тысячи двадцать шестого "
+        "года. Сейчас ab:cd."
+    )
+    # and the empty-time case stays silent about the clock entirely
+    s3 = _datetime_phrase({"date": "2026-11-13", "weekday": "Friday"})
+    assert s3 == "Сегодня пятница, тринадцатое ноября две тысячи двадцать шестого года."
 
 
 def test_temperature_query_carries_area_and_hint():
@@ -3323,3 +3446,96 @@ def test_the_historical_corridor_stream_names_still_map():
         assert STREAM_DEFAULT_AREA.get(name) == "Corridor", (
             f"{name} — историческое имя потока должно работать наравне с текущим"
         )
+
+
+# --- knowledge questions: the missing ladder step (12.11.2026) ---------------
+#
+# Measured on the 08:51 kitchen turn: «Сколько будет город из трех» (STT
+# mangle of «корень из трех») went easy_query -> complex_logic -> the tool
+# agent burned 161.5 s / 6 steps / 69k tokens on a phantom media title, and
+# WORKER_TIMEOUT killed the turn; the corridor mangle «только будет корень
+# трех» (18:54) went low_confidence(0.19) -> complex_logic -> 343 s / 16
+# steps -> NOTHING. Hermes answers the question in one sentence. The
+# whitelist recognises exactly the observed question shapes; everything the
+# house owns stays on the ladder.
+
+def test_the_observed_knowledge_questions_are_recognised():
+    assert knowledge_question("Сколько будет корень из трех")
+    assert knowledge_question("что такое корень из трех")
+    # «сколько» -> «только» is the second observed mangle of the same phrase
+    assert knowledge_question("только будет корень трех")
+    assert knowledge_question("Сколько будет 17 умножить на 4")
+
+
+def test_home_questions_stay_on_the_ladder():
+    """The chat brain cannot see the house: these are the turns L2 and the
+    resolvers own today, and they must not move to Hermes."""
+    assert not knowledge_question("Сколько выключателей в нашей гостиной")
+    assert not knowledge_question("сколько времени")
+    assert not knowledge_question("сколько будет времени")
+    assert not knowledge_question("какая погода на завтра")
+    assert not knowledge_question("сколько градусов на улице")
+
+
+def test_device_sentences_never_reach_the_chat_brain():
+    """The device-noun guard lives INSIDE knowledge_question, so a caller
+    cannot forget it: «процент» is a home word too («сколько процентов
+    заряда», «включи свет на 50 процентов»)."""
+    assert not knowledge_question("включи свет на 50 процентов")
+    assert not knowledge_question("сколько процентов заряда пылесоса")
+    assert not knowledge_question("включи кофеварку")
+    assert not knowledge_question("")
+
+
+def test_the_knowledge_redirects_are_wired_into_handle():
+    import app as jev_router_app
+    import inspect
+
+    src = inspect.getsource(jev_router_app._handle)
+    # Both escalation sites (the easy_query fallback and the classifier's
+    # low_confidence path) must route to expert — a gate that is only read
+    # in one of the two places reproduces the 11.11 corridor turn.
+    assert '"expert", "general_knowledge"' in src
+    assert '"expert", "knowledge_low_confidence"' in src
+    # And the dispatch must PASS the persona flag: a parameter that is added
+    # and not passed shipped once already (the 20.10.2026 stream_name), and
+    # the knowledge persona never reaching the model looks exactly like the
+    # diagnostics persona answering everything.
+    assert "knowledge=knowledge" in src
+
+
+def test_the_low_confidence_redirect_sits_before_the_verb_note():
+    """The verb-missing note is written for L2 («НЕ угадывай направление»),
+    so a turn that is about to leave for Hermes must not be annotated with
+    it — and the note gates on route == complex_logic, which the redirect
+    changes. The redirect has to come first."""
+    import app as jev_router_app
+    import inspect
+
+    src = inspect.getsource(jev_router_app._handle)
+    redirect_at = src.index("knowledge_low_confidence")
+    verb_at = src.index("action_verb_missing(text)")
+    assert redirect_at < verb_at
+
+
+def test_the_knowledge_persona_is_not_the_diagnostics_one():
+    """EXPERT_SYSTEM is a smart-home DIAGNOSTICS persona («2-3 вероятные
+    причины и один первый шаг проверки»); an answer to «что такое корень из
+    трех» framed as a network outage diagnosis is nonsense. The knowledge
+    escalation carries its own persona, and stream_chat accepts the switch.
+    Read as text, not imported: the host has no aiohttp."""
+    import os
+
+    path = os.path.join(_ROUTER, "chat_proxy.py")
+    src = open(path, encoding="utf-8").read()
+    assert "KNOWLEDGE_SYSTEM" in src
+    assert "knowledge: bool = False" in src
+    diag_at = src.index("EXPERT_SYSTEM = (")
+    know_at = src.index("KNOWLEDGE_SYSTEM = (")
+    assert "диагностике" in src[diag_at:know_at], (
+        "EXPERT_SYSTEM lost its diagnostics identity — which persona does "
+        "the classifier's own expert verdict get now?"
+    )
+    assert "диагностике" not in src[know_at:], (
+        "KNOWLEDGE_SYSTEM must not reuse the diagnostics framing"
+    )

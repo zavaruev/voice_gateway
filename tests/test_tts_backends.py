@@ -135,6 +135,11 @@ def test_boot_backend_empty_keeps_legacy_envs(restore_tts, monkeypatch):
     """TTS_BACKEND unset => the legacy envs win EXACTLY as before. This is
     the zero-regression guarantee for every deployment that never switches."""
     monkeypatch.setattr(main_mod, "TTS_BACKEND", "")
+    # The import-time boot (line ~327) applied the CONTAINER'S env: on the live
+    # deployment TTS_BACKEND=silero (compose, 11.11.2026), so the pre-state here
+    # is not "" but whatever the boot did. The test measures the BOOT, not the
+    # environment — pin the pre-state like test_apply_rebinds does.
+    main_mod.TTS_BACKEND_ACTIVE = ""
     main_mod.TTS_URL = "http://legacy:1/v1/audio/speech"
     main_mod.TTS_VOICE = "legacy-voice"
 

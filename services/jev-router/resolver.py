@@ -1014,6 +1014,64 @@ def unresolved_hint(text: str) -> str:
     )
 
 
+# --- General knowledge questions --------------------------------------------
+#
+# Measured 12.11.2026, the 08:51 kitchen turn «Сколько будет город из трех»
+# (STT mangle of «корень из трех»): resolve_query has no answer for it, the
+# fallback escalated to complex_logic, and the tool agent burned 161.5 s / 6
+# steps / 69k tokens hunting a phantom media title «Три города» in the Kodi
+# library before WORKER_TIMEOUT killed the turn — the honest «не поняла»
+# arrived 41 s AFTER the turn was closed, and the progress heartbeats had
+# suppressed the apology, so the room said nothing at all. The same question
+# mangled differently («только будет корень трех», 11.11 18:54 corridor) went
+# low_confidence(0.19) -> complex_logic -> 343 s / 16 steps / three parse
+# failures -> NOTHING. Hermes answers «что такое корень из трех» in one
+# sentence; the ladder simply had no step that led there.
+#
+# This is a WHITELIST, not a classifier: only the question classes OBSERVED
+# falling into the L2 trap are routed to the chat brain (same rule as
+# normalize_stt_verbs — no measured spelling, no repair). Everything else
+# keeps the current escalation, so a state query the resolver has not grown
+# yet still reaches L2 and its tools.
+#
+# Guards, both because the chat brain cannot see the house:
+#  * time/date/weather words — «сколько будет времени» is a CLOCK question
+#    and get_datetime answers it correctly today; handing it to Hermes would
+#    be a regression (an LLM does not know the time);
+#  * device/state nouns — «Сколько выключателей в нашей гостиной» (11.11
+#    12:44) is an L2/ha_read turn: only the registry can count the switches.
+#    «процент» is deliberately NOT in the positive list: «сколько процентов
+#    заряда», «прибавь яркость на 20 процентов» are home questions/actions.
+RE_KNOWLEDGE = re.compile(
+    r"\b(?:что|кто)\s+так[ао][йе]\b"          # «что такое корень из трех»
+    r"|\bсколько\s+(?:будет|составит)\b"       # «сколько будет корень из трех»
+    r"|\b(?:корень|квадрат|степен|синус|косинус|тангенс|логарифм)\w*\b",
+    re.IGNORECASE,
+)
+RE_HOME_QUESTION = re.compile(
+    r"\b(?:времени?|час[аов]|дат\w*|числ\w*|месяц\w*|год[ау]?|дн\w*|день|"
+    r"сегодня|завтра|погод\w*|градус\w*|температур\w*|"
+    r"выключател\w*|розетк\w*|датчик\w*|сенсор\w*|реле)\b",
+    re.IGNORECASE,
+)
+
+
+def knowledge_question(text: str) -> bool:
+    """True when the utterance is general knowledge / math the HA ladder
+    (resolve_query -> complex_logic) can never answer and the chat brain
+    (Hermes) should own. Pure and offline. The device-noun guard is inside
+    so a caller cannot forget it: a sentence about a device is a HOME
+    question even when it wears a knowledge shape."""
+    t = (text or "")
+    if not t:
+        return False
+    if _DEVICE_NOUN.search(t):
+        return False  # a home question («сколько процентов заряда пылесоса»)
+    if RE_HOME_QUESTION.search(t):
+        return False  # time/date/weather/state: the ladder owns these today
+    return bool(RE_KNOWLEDGE.search(t))
+
+
 # --- Queries ----------------------------------------------------------------
 
 # Query regexes: they pick the ANSWER SOURCE, not a tool. The captured kind
@@ -1193,3 +1251,160 @@ def resolve_query(text: str, stream_name: str) -> ResolvedQuery | None:
         return ResolvedQuery("state", args, entity_hint=hint)
 
     return None
+
+
+# ---------------------------------------------------------------------------
+# datetime_phrase: the «Сколько времени?» answer, spelled in WORDS.
+# ---------------------------------------------------------------------------
+# Measured 13.11.2026 on the kitchen turn of 07:30 UTC (silero log): the
+# phrase used to travel as DIGITS — «Сегодня пятница, 13 ноября 2026.
+# Сейчас 10:30.» — and num2ru read every one cardinally with NO noun:
+# `num2ru: 13->тринадцать`, `num2ru: 2026->две тысячи двадцать шесть`,
+# `num2ru: 10->десять`, `num2ru: 30->тридцать`. Spoken result: «…две тысячи
+# двадцать шесть. Сейчас десять тридцать.» The user asked for every numeral
+# to agree with its noun, so the words are built HERE — the one place that
+# knows what noun each number belongs to. TTS now receives no digits at all.
+# Lives in resolver.py (pure string logic, importable by the offline tests);
+# app.py only forwards the HA payload.
+
+_WEEKDAYS_RU = {
+    "Monday": "понедельник", "Tuesday": "вторник", "Wednesday": "среда",
+    "Thursday": "четверг", "Friday": "пятница", "Saturday": "суббота",
+    "Sunday": "воскресенье",
+}
+# Keyed by the "MM" slice of the ISO date returned by HA (date[5:7]).
+_MONTHS_RU = {
+    "01": "января", "02": "февраля", "03": "марта", "04": "апреля",
+    "05": "мая", "06": "июня", "07": "июля", "08": "августа",
+    "09": "сентября", "10": "октября", "11": "ноября", "12": "декабря",
+}
+
+# Cardinal 0..19; the feminine list differs only where gender does (1/2):
+# «одна минута», «две минуты» — but «один час», «два часа».
+_UNITS_M = ("ноль", "один", "два", "три", "четыре", "пять", "шесть", "семь",
+            "восемь", "девять", "десять", "одиннадцать", "двенадцать",
+            "тринадцать", "четырнадцать", "пятнадцать", "шестнадцать",
+            "семнадцать", "восемнадцать", "девятнадцать")
+_UNITS_F = _UNITS_M[:1] + ("одна", "две") + _UNITS_M[3:]
+_TENS = ("", "", "двадцать", "тридцать", "сорок", "пятьдесят",
+         "шестьдесят", "семьдесят", "восемьдесят", "девяносто")
+
+# Ordinal in the masculine nominative; the other needed forms are derived
+# mechanically from the ending («первый» -> «первое»/«первого», «шестой» ->
+# «шестое»/«шестого», «третий» -> «третье»/«третьего»). The day is read as a
+# neuter ordinal («тринадцатое ноября» — agrees with the implied «число»),
+# the year as a masculine GENITIVE ordinal followed by «года».
+_ORD_M = ("нулевой", "первый", "второй", "третий", "четвёртый", "пятый",
+          "шестой", "седьмой", "восьмой", "девятый", "десятый",
+          "одиннадцатый", "двенадцатый", "тринадцатый", "четырнадцатый",
+          "пятнадцатый", "шестнадцатый", "семнадцатый", "восемнадцатый",
+          "девятнадцатый")
+_ORD_TENS = ("", "", "двадцатый", "тридцатый", "сороковой", "пятидесятый",
+             "шестидесятый", "семидесятый", "восьмидесятый", "девяностый")
+
+
+def _cardinal(n: int, fem: bool = False) -> str:
+    """0..99 in words; fem=True gives «одна»/«две» (the minutes are feminine)."""
+    units = _UNITS_F if fem else _UNITS_M
+    if n < 20:
+        return units[n]
+    t, u = divmod(n, 10)
+    if u == 0:  # round tens: «тридцать», never «тридцать ноль»
+        return _TENS[t]
+    return f"{_TENS[t]} {units[u]}"
+
+
+def _ordinal(n: int, form: str) -> str:
+    """0..99 ordinal in words. form 'm' = nom masc, 'n' = nom neut, 'g' = gen."""
+    if n < 20:
+        base = _ORD_M[n]
+    else:
+        t, u = divmod(n, 10)
+        base = _ORD_TENS[t] if not u else f"{_TENS[t]} {_ORD_M[u]}"
+    if form == "m":
+        return base
+    if base.endswith("ий"):  # «третий» -> «третье» / «третьего»
+        return base[:-2] + ("ье" if form == "n" else "ьего")
+    return base[:-2] + ("ое" if form == "n" else "ого")
+
+
+def _hour_word(h: int) -> str:
+    """The noun form of «час» after h: один час / два часа / пять часов."""
+    if h % 10 == 1 and h % 100 != 11:
+        return "час"
+    if h % 10 in (2, 3, 4) and h % 100 not in (12, 13, 14):
+        return "часа"
+    return "часов"
+
+
+def _minute_word(m: int) -> str:
+    """The noun form of «минута» after m: одна минута / две минуты / пять минут."""
+    if m % 10 == 1 and m % 100 != 11:
+        return "минута"
+    if m % 10 in (2, 3, 4) and m % 100 not in (12, 13, 14):
+        return "минуты"
+    return "минут"
+
+
+def _year_words(year: int) -> str:
+    """A year is read as an ordinal with «года»: 2026 -> «две тысячи двадцать
+    шестого». Scoped to 2000-2099 — the century this deployment lives in;
+    anything outside keeps the digit form (num2ru reads it; that branch is
+    unreachable in practice and produces no agreement — documented, not
+    hidden)."""
+    rest = year - 2000
+    if 1 <= rest <= 99:
+        return f"две тысячи {_ordinal(rest, 'g')}"
+    if rest == 0:
+        return "двухтысячного"
+    return str(year)
+
+
+def _datetime_phrase(result) -> str | None:
+    """llm__GetDateTime payload -> speakable Russian phrase.
+
+    Shape verified live: {"date": "2026-09-24", "time": "17:52:46",
+    "timezone": "MSK", "weekday": "Thursday"} — a plain string is also
+    accepted for forward compatibility.
+    Every numeral is spelled out and agrees with its noun:
+      «Сегодня пятница, тринадцатое ноября две тысячи двадцать шестого года.
+       Сейчас десять часов тридцать минут.»
+    Returns None when nothing speakable could be built; the caller then
+    escalates instead of staying silent (a voice turn must always answer).
+    """
+    if isinstance(result, str):
+        return result.strip() or None
+    if not isinstance(result, dict):
+        return None
+    parts: list[str] = []
+    date = str(result.get("date", ""))
+    # len/date[4] guards distinguish a real "YYYY-MM-DD" from a short or
+    # differently formatted value before slicing it apart.
+    if len(date) >= 10 and date[4] == "-":
+        month = _MONTHS_RU.get(date[5:7], "")
+        if month:
+            day = int(date[8:10])
+            year = int(date[:4])
+            wd = _WEEKDAYS_RU.get(str(result.get("weekday", "")), "")
+            date_ru = (
+                f"{_ordinal(day, 'n')} {month} {_year_words(year)} года"
+            )
+            parts.append(f"Сегодня {wd}, {date_ru}." if wd else f"Сегодня {date_ru}.")
+    # "17:52:46" -> "17:52": seconds are noise for speech.
+    t = str(result.get("time", ""))[:5]
+    try:
+        h, m = (int(x) for x in t.split(":"))
+        # m=0 is dropped: «Сейчас десять часов», not «…десять часов ноль минут».
+        # h=0 keeps the 24h reading «ноль часов» — every numeral still has
+        # its noun (the traditional «пять минут первого» is a different
+        # system and was not asked for).
+        time_ru = f"{_cardinal(h)} {_hour_word(h)}"
+        if m:
+            time_ru += f" {_cardinal(m, fem=True)} {_minute_word(m)}"
+        parts.append(f"Сейчас {time_ru}.")
+    except ValueError:
+        # Malformed time: the old digit form, so the turn still answers
+        # rather than escalating a working clock.
+        if t:
+            parts.append(f"Сейчас {t}.")
+    return " ".join(parts) or None

@@ -95,6 +95,8 @@ from resolver import (
     unresolved_hint,
     action_verb_missing,
     normalize_stt_verbs,
+    knowledge_question,
+    _datetime_phrase,
 )
 
 # stdout logging: uvicorn does not configure root logging by default, and the
@@ -198,50 +200,6 @@ def _sse(obj: dict) -> str:
     main.py.
     """
     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
-
-
-# RU names for the English fields HA returns from llm__GetDateTime — the
-# phrase is spoken aloud, so the translation happens here, not in TTS.
-_WEEKDAYS_RU = {
-    "Monday": "понедельник", "Tuesday": "вторник", "Wednesday": "среда",
-    "Thursday": "четверг", "Friday": "пятница", "Saturday": "суббота",
-    "Sunday": "воскресенье",
-}
-# Keyed by the "MM" slice of the ISO date returned by HA (date[5:7]).
-_MONTHS_RU = {
-    "01": "января", "02": "февраля", "03": "марта", "04": "апреля",
-    "05": "мая", "06": "июня", "07": "июля", "08": "августа",
-    "09": "сентября", "10": "октября", "11": "ноября", "12": "декабря",
-}
-
-
-def _datetime_phrase(result) -> str | None:
-    """llm__GetDateTime payload -> speakable Russian phrase.
-
-    Shape verified live: {"date": "2026-09-24", "time": "17:52:46",
-    "timezone": "MSK", "weekday": "Thursday"} — a plain string is also
-    accepted for forward compatibility.
-    Returns None when nothing speakable could be built; the caller then
-    escalates instead of staying silent (a voice turn must always answer).
-    """
-    if isinstance(result, str):
-        return result.strip() or None
-    if not isinstance(result, dict):
-        return None
-    parts: list[str] = []
-    date = str(result.get("date", ""))
-    # len/date[4] guards distinguish a real "YYYY-MM-DD" from a short or
-    # differently formatted value before slicing it apart.
-    if len(date) >= 10 and date[4] == "-":
-        month = _MONTHS_RU.get(date[5:7], "")
-        date_ru = f"{int(date[8:10])} {month} {date[:4]}".strip()
-        wd = _WEEKDAYS_RU.get(str(result.get("weekday", "")), "")
-        parts.append(f"Сегодня {wd}, {date_ru}." if wd else f"Сегодня {date_ru}.")
-    # "17:52:46" -> "17:52": seconds are noise for speech.
-    t = str(result.get("time", ""))[:5]
-    if t:
-        parts.append(f"Сейчас {t}.")
-    return " ".join(parts) or None
 
 
 # --- easy_action execution --------------------------------------------------
@@ -1714,6 +1672,22 @@ async def _handle(req: RouteRequest):
         route, confidence, reason or "-", req.stream_name, text[:80],
     )
 
+    # A knowledge question the classifier could not commit to must NOT land
+    # on the tool agent. Measured 11.11.2026 18:54, corridor: «только будет
+    # корень трех» (STT mangle of «сколько будет корень из трех») scored
+    # low_confidence(0.19) -> complex_logic -> the worker burned 343.1 s /
+    # 16 steps / 153k tokens and produced NOTHING. A low-confidence text that
+    # is nevertheless clearly a knowledge/math question belongs to Hermes
+    # (the 08:51 kitchen turn of 12.11: the same question went through the
+    # easy_query fallback and L2 spent 161.5 s / 69k tokens on it).
+    # `knowledge_question` is a narrow whitelist with home/time guards, so a
+    # mangled ACTION text never reaches it (its own device-noun guard).
+    if (route == "complex_logic" and reason.startswith("low_confidence")
+            and knowledge_question(text)):
+        route, reason = "expert", "knowledge_low_confidence"
+        knowledge = True
+        logger.info("knowledge question -> expert (Hermes): %r", text[:80])
+
     # --- Escalation hooks before emitting the route event ----------------
     # The resolvers are pure and cheap (regex only), so they run HERE as a
     # pre-flight: a downgrade is visible in the very first route event and
@@ -1723,6 +1697,7 @@ async def _handle(req: RouteRequest):
     # both, because a bare utterance made the model guess a device name and a
     # pronoun a whole room (field case 28.09.2026).
     ctx = ""
+    knowledge = False  # expert persona + Hermes-first, set by the knowledge redirects
     hist = history.block(req.stream_name or req.session_id)
     # Default-room hint for the resolvers: an explicit /room binding (a
     # source whose stream_name is not a room) beats the stream name. Passed
@@ -1806,7 +1781,23 @@ async def _handle(req: RouteRequest):
             ctx = unresolved_hint(text)  # «кашеварку» -> «кофеварка», or ""
     elif route == "easy_query":
         q = resolve_query(text, area_hint)
-        if q is None:
+        if q is None and knowledge_question(text):
+            # The ladder has no owner for general knowledge / math: the
+            # resolver knows only datetime/weather/state, and the fallback
+            # used to hand the question to the TOOL agent — measured
+            # 12.11.2026 08:51, kitchen: «Сколько будет город из трех» (STT
+            # mangle of «корень из трех») cost L2 161.5 s / 6 steps / 69k
+            # tokens hunting a phantom media title, and WORKER_TIMEOUT then
+            # killed the turn with the apology suppressed by the progress
+            # heartbeats. Hermes answers in one sentence; route it there
+            # (Hermes-first, knowledge persona — see chat_proxy.KNOWLEDGE_
+            # SYSTEM). Home/time guards live inside knowledge_question, so
+            # «Сколько выключателей в нашей гостиной» (11.11 12:44) keeps
+            # going to L2 and its tools.
+            route, reason = "expert", "general_knowledge"
+            knowledge = True
+            logger.info("knowledge question -> expert (Hermes): %r", text[:80])
+        elif q is None:
             logger.info("query resolver ambiguous -> complex_logic: %r", text[:80])
             route, reason = "complex_logic", "query_resolver_ambiguous"
     # Every escalation carries the canonical room name: the RU word is NOT an
@@ -2058,11 +2049,17 @@ async def _handle(req: RouteRequest):
         # --- general_qa / expert: chat proxy ------------------------------
         elif route in ("general_qa", "expert"):
             # expert=True flips the failover order inside stream_chat
-            # (Hermes-first). No HA side-effects are possible on this path.
+            # (Hermes-first). `knowledge` swaps the diagnostics persona for
+            # the general-knowledge one — set ONLY by the two resolver-side
+            # knowledge redirects above, never by the classifier's own
+            # expert verdict (that one stays diagnostics). No HA
+            # side-effects are possible on this path.
             # The emotion tag travels as a STRUCTURED FIELD on the event —
             # the gateway maps sad/angry -> slower playback (emotion ->
             # speed in backends.py); the tag itself never reaches the text.
-            async for s, emo in chat_proxy.stream_chat(text, expert=(route == "expert")):
+            async for s, emo in chat_proxy.stream_chat(
+                text, expert=(route == "expert"), knowledge=knowledge
+            ):
                 reply_parts.append(s)
                 ev = {"type": "sentence", "text": s}
                 if emo:

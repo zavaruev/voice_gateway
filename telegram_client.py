@@ -928,10 +928,10 @@ class TelegramBot:
         return ""
 
     async def _text_turn(self, chat_id: str, msg: dict, text: str) -> str:
-        # Если пользователь просит показать камеру — фото вместо LLM.
-        # «покажи» всегда про изображение (по условию пользователя).
-        # Также принимаем продолжения разговора: «Теперь гостиную», «А теперь коридор»,
-        # «И прихожую» — когда в сообщении только название комнаты без гласов действия.
+        # A request to show a camera sends a photo instead of going to the LLM.
+        # «покажи» always means an image (per the user's requirement).
+        # Conversation continuations are accepted too: «Теперь гостиную», «А теперь коридор»,
+        # «И прихожую» — when the message is only a room name with no action verb.
         low = text.lower()
         cam_keywords = ("камер", "фото", "снимок", "кадр", "покажи")
         stream = self._match_camera_stream(low)
@@ -948,9 +948,9 @@ class TelegramBot:
             )
             await self._cmd_camera(chat_id, msg.get("message_id"), [stream])
             return ""
-        # Есть слова о камере, но комната не распознана («другая камера»,
-        # «следующая», «ещё одну»). Не отказываем — показываем следующую
-        # камеру из списка по порядку.
+        # Camera words but no room recognised («другая камера»,
+        # «следующая», «ещё одну»). Do not refuse — show the next
+        # camera from the list, in order.
         if is_cam_keyword and self.camera_streams:
             nxt = self._next_camera_stream()
             logger.info(
@@ -1022,9 +1022,9 @@ class TelegramBot:
         if not transcript or not is_valid_voice_text(transcript):
             await self._send(chat_id, HINT_NOT_HEARD, reply_to=reply_to)
             return ""
-        # Если в голосовом просьба показать камеру — фото вместо LLM.
-        # «покажи» всегда про изображение (по условию пользователя).
-        # Также принимаем продолжения: «Теперь гостиную», «И прихожую» и т.п.
+        # A voice request to show a camera sends a photo instead of the LLM.
+        # «покажи» always means an image (per the user's requirement).
+        # Continuations are accepted too: «Теперь гостиную», «И прихожую» and so on.
         low = transcript.lower()
         cam_keywords = ("камер", "фото", "снимок", "кадр", "покажи")
         stream = self._match_camera_stream(low)
@@ -1041,9 +1041,9 @@ class TelegramBot:
             )
             await self._cmd_camera(chat_id, reply_to, [stream])
             return ""
-        # Есть слова о камере, но комната не распознана («другая камера»,
-        # «следующая», «ещё одну»). Не отказываем — показываем следующую
-        # камеру из списка по порядку.
+        # Camera words but no room recognised («другая камера»,
+        # «следующая», «ещё одну»). Do not refuse — show the next
+        # camera from the list, in order.
         if is_cam_keyword and self.camera_streams:
             nxt = self._next_camera_stream()
             logger.info(
@@ -1305,12 +1305,12 @@ class TelegramBot:
     # ---------------------------------------------------------- camera photo
 
     async def _cmd_camera(self, chat_id: str, reply_to, args: list[str]) -> None:
-        """Отправить снимок с камеры через go2rtc /api/frame.jpeg."""
+        """Send a camera snapshot via go2rtc /api/frame.jpeg."""
         if not self.camera_streams:
             await self._send(chat_id, "Камеры не настроены.", reply_to=reply_to)
             return
-        # `/camera кухня` — аргумент может быть русским названием комнаты,
-        # а не именем потока. Сопоставляем.
+        # `/camera кухня` — the argument may be a Russian room name,
+        # not a stream name. Match it.
         stream = None
         if args:
             stream = self._match_camera_stream(args[0].lower())
@@ -1346,16 +1346,16 @@ class TelegramBot:
         self._last_camera_stream = stream
 
     def _match_camera_stream(self, low: str) -> str | None:
-        """Сопоставить речь пользователя с названием камеры из camera_streams.
+        """Match the user's speech to a camera name from camera_streams.
 
-        Учитывает русские названия комнат: кухня, гостиная, прихожая, коридор,
-        а также сокращения и словоформы.
+        Understands the Russian room names: «кухня», «гостиная», «прихожая», «коридор»,
+        plus abbreviations and inflected forms.
         """
-        # Прямое совпадение с именем потока
+        # Direct match against the stream name
         for s in self.camera_streams:
             if s.lower() in low:
                 return s
-        # Русские названия комнат -> stream name
+        # Russian room names -> stream name
         room_map = {
             "кухн": "kitchen",
             "гостин": "livingroom",
@@ -1369,10 +1369,10 @@ class TelegramBot:
         return None
 
     def _next_camera_stream(self) -> str:
-        """Вернуть следующую камеру после последней показанной (циклически).
+        """Return the next camera after the last one shown (cyclically).
 
-        Используется когда пользователь говорит «другая камера», «следующая»,
-        «ещё одну» — без названия конкретной комнаты.
+        Used when the user says «другая камера», «следующая»,
+        «ещё одну» — without naming a specific room.
         """
         if not self.camera_streams:
             return ""

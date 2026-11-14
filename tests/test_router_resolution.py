@@ -336,8 +336,8 @@ def test_datetime_phrase_years():
 
 
 def test_datetime_phrase_hour_noun_agreement():
-    # один час / два-четыре часа / пять..двадцать часов, with the 11-14
-    # exception (одиннадцать ЧАСОВ, not «часа»).
+    # one hour / two-four hours / five..twenty hours, with the 11-14
+    # exception («одиннадцать часов», not «часа»).
     assert "Сейчас один час." in _datetime_phrase(_dt_payload(13, 11, 2026, 1, 0))
     assert "Сейчас два часа." in _datetime_phrase(_dt_payload(13, 11, 2026, 2, 0))
     assert "Сейчас четыре часа." in _datetime_phrase(_dt_payload(13, 11, 2026, 4, 0))
@@ -351,8 +351,8 @@ def test_datetime_phrase_hour_noun_agreement():
 
 
 def test_datetime_phrase_minute_noun_agreement():
-    # минута/минуты/минут with the feminine cardinals «одна»/«две» and the
-    # 11-14 exception (двенадцать МИНУТ).
+    # «минута»/«минуты»/«минут» with the feminine cardinals «одна»/«две» and the
+    # 11-14 exception («двенадцать минут»).
     assert "десять часов одна минута." in _datetime_phrase(_dt_payload(13, 11, 2026, 10, 1))
     assert "десять часов две минуты." in _datetime_phrase(_dt_payload(13, 11, 2026, 10, 2))
     assert "десять часов четыре минуты." in _datetime_phrase(_dt_payload(13, 11, 2026, 10, 4))

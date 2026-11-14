@@ -4593,8 +4593,8 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
             if not buf_processed or not buf_raw:
                 return
 
-            # Whisper только после wake или в окне подтверждения STT.
-            # Все остальное — фоновый шум, не кормим Whisper.
+            # Whisper only after a wake or inside an STT-confirm window.
+            # Everything else is background noise — do not feed Whisper.
             if not self._wake_detected and time.time() >= self._stt_confirm_until:
                 return
 
@@ -5452,7 +5452,7 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
         return "unknown"
 
     async def _log_speaker_id_full_utterance(self, buf: bytes) -> None:
-        """Run SpeakerID on the full utterance buffer and log "от кого обращение".
+        """Run SpeakerID on the full utterance buffer and log «от кого обращение» (who spoke).
 
         Same as the ESP32 path: pack_ogg of the whole phrase, not 160 ms.
         Called from _end_utterance with the complete buffer so CAMPPlus has

@@ -48,7 +48,7 @@ See [`docs/REFERENCE.md`](docs/REFERENCE.md) → *Known Issues & Current Problem
 | L2 turn with a verified side effect | **3.2–4.0 s** |
 | Wake debounce | ~240 ms (2 of 3 chunks); a single chunk ≥ 0.68 fires immediately |
 | Wake window / watchdog | 15 s / 90 s |
-| Test suite | 719 tests, 22 files, ~14,719 lines |
+| Test suite | 766 tests, 24 files, ~15,900 lines |
 
 ---
 
@@ -71,6 +71,11 @@ docker run --network host -e NANOBOT_TOKEN=token voice_gateway
 docker compose up -d --no-deps --build jev-router smolagents-worker voice_gateway
 ```
 
+- **`TTS_BACKEND`** names the voice preset to boot with (`edge` / `coqui` /
+  `silero`; empty = the legacy `TTS_URL` envs win unchanged), and
+  `POST /api/tts/backends/{name}` switches engines on every live session without
+  a restart — see *Speech* below.
+
 Full environment table, backend variants, REST API and OTA: [`docs/REFERENCE.md`](docs/REFERENCE.md).
 
 ---
@@ -87,16 +92,16 @@ Full environment table, backend variants, REST API and OTA: [`docs/REFERENCE.md`
 
 | File | Responsibility | Why it is separate |
 |---|---|---|
-| **`main.py`** (~4,000 lines) | Core: ESP32 WebSocket protocol, REST API, OTA, web UI, camera session startup | Single entry point for everything |
-| **`camera_client.py`** (~6,090 lines) | One `CameraSession` per stream: RTSP mic feed, wake word, cross-camera arbitration, replies over the camera's `/play_audio` | Cameras have their own transport and their own hard problem — the mic hears its own speaker |
+| **`main.py`** (~4,300 lines) | Core: ESP32 WebSocket protocol, REST API, OTA, web UI, camera session startup | Single entry point for everything |
+| **`camera_client.py`** (~6,650 lines) | One `CameraSession` per stream: RTSP mic feed, wake word, cross-camera arbitration, replies over the camera's `/play_audio` | Cameras have their own transport and their own hard problem — the mic hears its own speaker |
 | **`engine.py`** (~570 lines) | Silero VAD + openWakeWord scoring — the "science" part, pure ONNX calls | Testable without a network, without a camera |
-| **`backends.py`** (~610 lines) | Who answers: `NanobotBackend` / `HermesBackend` / `CascadeBackend` | One interface — the brain is swappable with a single env var |
-| **`telegram_client.py`** (~1,190 lines) | Third request source: Telegram long-polling, chat allowlist, voice note → Whisper → the same backend → text reply (+ optional voice note) | No bot framework — three Bot API calls over the `aiohttp` the process already has; all main.py helpers injected (no import cycle) |
+| **`backends.py`** (~670 lines) | Who answers: `NanobotBackend` / `HermesBackend` / `CascadeBackend` | One interface — the brain is swappable with a single env var |
+| **`telegram_client.py`** (~1,430 lines) | Third request source: Telegram long-polling, chat allowlist, voice note → Whisper → the same backend → text reply (+ optional voice note) | No bot framework — three Bot API calls over the `aiohttp` the process already has; all main.py helpers injected (no import cycle) |
 | **`audio_utils.py`** (~220 lines) | `pack_ogg()` (Opus → Ogg for Whisper) and `is_valid_text()` (drops hallucinations and mic echoes of our own TTS) | Shared by both device paths |
-| **`vosk_wake.py`** (~340 lines) | Wake word by **decoding** it (per-room model, free decoder, no grammar) | Decoding has no ceiling where scoring has one — see *Three instruments* above |
+| **`vosk_wake.py`** (~350 lines) | Wake word by **decoding** it (per-room model, free decoder, no grammar) | Decoding has no ceiling where scoring has one — see *Three instruments* above |
 | **`services/jev-router/`** | **L1** — intent classifier, offline slot resolver, direct Home Assistant calls, weather, chat/expert proxy | ~0.1 s for a simple command, no LLM in the loop |
 | **`services/smolagents-worker/`** | **L2** — smolagents `CodeAgent` with HA / Qdrant / Hermes / weather tools, plus honesty vetoes | Multi-step tasks that must not lie about side effects |
-| **`tests/`** | 645 tests across 19 files | Pins the wake-gate bands, the protocol, the cascade contract, the Telegram source, the utterance endpointing and the side-effect verification |
+| **`tests/`** | 766 tests across 24 files | Pins the wake-gate bands, the protocol, the cascade contract, the Telegram source, the utterance endpointing and the side-effect verification |
 
 > Production (`docker-compose.yml`) runs `LLM_BACKEND=cascade` with **four cameras enabled** (`CAMERA_STREAMS=livingroom,kitchen,entrance1,camera-corridor1`, `DISABLE_CAMERAS=false`), all four decoding the wake word with vosk and playing replies over `/play_audio`; the ESP32 path remains the main one.
 
@@ -115,7 +120,7 @@ long commands.
     CAMERA_PAUSE_MIN_SPEECH_FRAMES[_<NAME>]  # speech before a pause may end, default 5
 
 Every end logs `via <reason>` with the `rms/ref/floor/run/speech` numbers behind
-it and tallies per boot — `since boot: {'pause': N, 'cap': M}` answers whether the
+it and tallies per boot — `awake ends: {'pause': N, 'cap': M}` answers whether the
 endpoint is doing anything without an argument. `0` means "unset, use the default",
 so a half-filled override cannot silently disable a threshold. Enable it per room
 only after reading that room's `UTTERANCE END` lines on real audio;
@@ -200,28 +205,45 @@ room and it will support any conclusion you put it to.
 
     */3 * * * * voice_gateway/scripts/camera_watchdog.sh
 
-Five states, because three independent signals are measured: HTTP latency, whether
-go2rtc holds a producer with a consumer, and **how fast the audio arrives**.
-`audio-starved` is the one that matters in practice — a stream that is alive and
-carrying audio at a fraction of real time is invisible to latency and to
-`producers/consumers`, and it is not fixable by restarting the gateway, so those
-rooms skip that step and go straight to restarting `majestic` on the camera (the
-cheapest lever; a power cycle is the fallback, because ONVIF `Reboot` is not
-implemented on OpenIPC).
+Seven states, because four independent signals are measured: HTTP latency, whether
+go2rtc holds a producer with a consumer, **how fast the audio arrives**, and the
+microphone level. `audio-starved` is the one that matters in practice — a stream
+that is alive and carrying audio at a fraction of real time is invisible to
+latency and to `producers/consumers`, and it is not fixable by restarting the
+gateway, so those rooms skip that step and go straight to restarting `majestic`
+on the camera (the cheapest lever; a power cycle is the fallback, because ONVIF
+`Reboot` is not implemented on OpenIPC). `mic-silent` and `slow-capture` are
+deliberately report-only, and both were earned — `config_drift` never writes
+either.
 
 The rate is read from the gateway's own log rather than measured by a second
 consumer: a watchdog must not perturb the single-threaded `majestic` it watches.
 `DRY_RUN=1` decides and logs what it would do and touches nothing — the ladder's
 first step restarts the gateway, so testing it the hard way is what once made it
-restart a healthy container seventeen times in a day.
+restart a healthy container seventeen times in a day. An `flock` keeps overlapping
+cron firings from running recovery ladders over each other, and the reboot rung
+has its own cooldown, because a ladder able to reboot a camera every thirteen
+minutes was measured doing exactly that.
 
-**Known gap — capture speed.** A camera can be healthy on every signal the watchdog
-measures and still be ×4.45 on `/play_audio`: HTTP latency, stream presence and
-level are normal while the speaker takes four times the audio length. **Capture
-speed separates the two classes on the capture side** (measured 17.10.2026, three
-12 s captures per room: 1.08 / 1.08 / 1.08 fast, 0.96 / 0.74 / 0.79 degraded) but
-it says nothing about playback, which has its own cause. It is **not implemented
-yet**, and it would not have caught the corridor.
+Three checks report and never act, because acting would be the wrong answer:
+
+- **`mic-silent`** — the stream runs at real time and the level lies on the floor
+  (threshold 150, set between a broken p90 of 25 and a healthy minimum of 304):
+  `audio.volume` has most likely been dropped from `/etc/majestic.yaml` — a
+  firmware update did that to four cameras at once. Nothing is restarted: the
+  setting is absent from the file, so a restart would re-read the same file, and
+  the log names the room and the fix instead.
+- **`slow-capture`** — the camera→go2rtc leg, read from go2rtc's own producer
+  byte counter (no second consumer is created): healthy rooms deliver ~6,400 B/s
+  of OPUS and the bar is 80 % of the room's own best observed rate. Reported, not
+  acted on, until the slow side of the threshold is measured on a room that is
+  really slow — the ladder ends in a camera reboot, and a destructive step is not
+  armed on an inferred value.
+- **`config_drift`** — reads twelve keys of `/etc/majestic.yaml` over SSH
+  (`audio.volume`, `rtsp.backchannel`, the video keys the 14.10.2026 firmware
+  update removed) and reports every missing or wrong value; it never writes the
+  file. A key read as missing means *a build default is now in force*, which is
+  the shape that outage took.
 
 ### Repository gates
 
@@ -342,6 +364,44 @@ Production runs **Cascade**:
 
 Two valves keep L2 honest: the **honesty veto** (a reply claiming success after failed tool calls is replaced by the recorded truth, plus exactly one bounded retry carrying the raw errors) and the **near-miss hint** (`«кашеварку» → «кофеварка»`, difflib over the device dictionary) so escalation arrives with context instead of guessing. The satellite's last 4 finished turns ride along as well, so a pronoun has an antecedent.
 
+Two shapes of question used to fall off this ladder entirely. A **knowledge
+question** («что такое корень из трех») has no tool to call, and it used to cost
+L2 161–343 s and end in silence; it is now routed to a Hermes chat persona before
+escalation (`resolver.knowledge_question()`, a narrow whitelist guarded so a
+device sentence never becomes a chat question), and progress heartbeats no longer
+suppress the apology when a turn produced no content. And «сколько времени» is
+answered offline from the resolver with numerals that agree with their nouns
+(«десять часов тридцать минут»), so TTS never receives a digit to mangle.
+
+---
+
+## Speech: three TTS engines, switchable at runtime
+
+    GET  /api/tts/backends            # active backend + the presets
+    POST /api/tts/backends/silero     # switch every live session, no restart
+
+| Backend | Voice | Endpoint | Notes |
+|---|---|---|---|
+| **edge** | `ru-RU-SvetlanaNeural` | :5050 | the original OpenAI-compatible relay; reads digits itself |
+| **coqui** | XTTS v2 · `Zofija Kendrick` | :5051–5052 | the only one with a **streaming** endpoint (`/v1/audio/speech/stream`, s16le @ 22.05 kHz, the rate in `X-Sample-Rate`); the relay leads playback by 5.5 s so the speaker never drains between sentences |
+| **silero** | v5_6_ru · `baya` | :5053–5054 | one per GPU, auto-stress, homographs and question intonation; synthesised once *before* the port opens, RTF 0.03 |
+
+`TTS_BACKEND=<name>` in compose picks the boot preset; **empty means the legacy
+`TTS_URL`/`TTS_VOICE` envs win exactly as before** — the zero-regression default.
+`POST /api/tts/backends/{name}` (optionally with `{"voice": …}`) rebinds the
+URL/voice/stream globals and updates the **live sessions** in place, so every
+room follows the switch without a restart; an unknown name is refused with the
+valid ones listed. Whatever the backend, three things ride along:
+
+- **ё-restore lives server-side** (`yo_restore.py`), at the single TTS choke
+  point shared by cameras, ESP32 and Telegram — no backend can drop it.
+- **`num2ru.py` converts digits to words before synthesis** — silero is silent
+  on bare digits («1» produced nothing), and edge-tts, which reads digits
+  itself, is unharmed by already-spelled words.
+- **`[emotion]` tags travel as data** — the router captures the leading
+  `[happy]…[angry]` tag, strips it from the text and forwards it as a structured
+  field; sad/angry drop the speech rate to 0.9, the only pairing asked for.
+
 ---
 
 ## Design rules worth remembering
@@ -374,13 +434,14 @@ voice_gateway/
 ├── services/
 │   ├── jev-router/         # cascade L1
 │   └── smolagents-worker/  # cascade L2
-├── tests/                  # 645 tests / 19 files
+├── scripts/                # verify_endpoint, camera watchdog, doc gates
+├── tests/                  # 766 tests / 24 files
 └── docs/
     └── REFERENCE.md        # full config tables, REST API, known issues, changelog
 ```
 
 - **Configuration, REST API, environment variables, known issues and the full changelog:** [`docs/REFERENCE.md`](docs/REFERENCE.md)
-- **Tests:** 645 tests across 19 files covering engine scoring and wake gates, the camera audio track and its echo guards, the ESP32 protocol, cascade streaming, honesty vetoes, HA entity matching, router resolution, dialogue memory and the Telegram source (allowlist, ack vs final text, turn timeout, voice turns, `/room`). Run them inside the container — see [`docs/REFERENCE.md`](docs/REFERENCE.md#tests), the host Python usually lacks `opuslib` / `onnxruntime`. CI (`.github/workflows/tests.yml`) runs the same recipe on every push and PR.
+- **Tests:** 766 tests across 24 files covering engine scoring and wake gates, the camera audio track and its echo guards, the ESP32 protocol, cascade streaming, honesty vetoes, HA entity matching, router resolution, dialogue memory, the streaming speech relay, the TTS engine switching and the Telegram source (allowlist, ack vs final text, turn timeout, voice turns, `/room`). Run them inside the container — see [`docs/REFERENCE.md`](docs/REFERENCE.md#tests), the host Python usually lacks `opuslib` / `onnxruntime`. CI (`.github/workflows/tests.yml`) runs the same recipe on every push and PR.
 
 ---
 

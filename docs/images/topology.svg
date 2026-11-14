@@ -35,9 +35,9 @@
     <text x="46" y="353" fill="#8b949e" font-size="12">two mics, one arbitration owner</text>
 
     <rect x="30" y="384" width="250" height="70" rx="7" fill="#161b22" stroke="#30363d"/>
-    <text x="46" y="410" fill="#e6edf3" font-size="13.5" font-weight="700">Anywhere else</text>
-    <text x="46" y="431" fill="#8b949e" font-size="12">any WS client speaking the v1/v2/v3</text>
-    <text x="46" y="447" fill="#8b949e" font-size="12">Opus frame protocol</text>
+    <text x="46" y="410" fill="#e6edf3" font-size="13.5" font-weight="700">Entrance + any other room</text>
+    <text x="46" y="431" fill="#8b949e" font-size="12">OpenIPC camera + any WS client</text>
+    <text x="46" y="447" fill="#8b949e" font-size="12">speaking the v1/v2/v3 Opus protocol</text>
   </g>
 
   <!-- LAN -->
@@ -71,8 +71,8 @@
     <text x="552" y="259" fill="#8b949e" font-size="11">OpenAI-compatible</text>
 
     <rect x="693" y="216" width="145" height="64" rx="6" fill="#0d1117" stroke="#30363d"/>
-    <text x="707" y="239" fill="#e6edf3" font-size="12.5" font-weight="700">Edge TTS</text>
-    <text x="707" y="259" fill="#8b949e" font-size="11">:5050 · prefetch</text>
+    <text x="707" y="239" fill="#e6edf3" font-size="12.5" font-weight="700">TTS engines</text>
+    <text x="707" y="259" fill="#8b949e" font-size="11">:5050–5054 · 3 presets</text>
 
     <rect x="848" y="216" width="126" height="64" rx="6" fill="#0d1117" stroke="#30363d"/>
     <text x="862" y="239" fill="#e6edf3" font-size="12.5" font-weight="700">speaker-id</text>

@@ -16,3 +16,4 @@ scipy
 openwakeword
 slowapi
 limits  # direct `import limits` in main.py; slowapi dep but kept explicit
+mcp>=1.2,<2  # 2.x renamed FastMCP -> MCPServer; voice_mcp.py uses the v1 API

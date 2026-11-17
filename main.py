@@ -396,6 +396,11 @@ from audio_utils import pack_ogg, is_valid_text
 # from telegram_client, that would close the cycle.
 import telegram_client
 
+# Hermes MCP server (proactive speech): same rule — voice_mcp must never
+# import main. The live session list is handed over with set_sessions() in
+# on_startup() instead.
+import voice_mcp
+
 # Fillers the user may say while deciding what to ask ("wait a second").
 # _handle_successful_transcription() detects them in the transcript and only
 # extends the listening window, so an utterance starting with a filler is not
@@ -4096,6 +4101,10 @@ def _maybe_rearm_stall_dump(now: float) -> bool:
 _telegram_bot: "telegram_client.TelegramBot | None" = None
 _telegram_task: asyncio.Task | None = None
 
+# Hermes MCP server (proactive speech, voice_mcp.py): started in
+# on_startup() after the camera sessions exist, cancelled in on_shutdown().
+_mcp_task: asyncio.Task | None = None
+
 
 async def loop_stall_monitor() -> None:
     """Log when the event loop stops scheduling tasks, and dump stacks on a long one.
@@ -4129,6 +4138,12 @@ async def loop_stall_monitor() -> None:
 async def on_startup():
     """Lifespan hook: bring up the go2rtc camera sessions with the app."""
     await start_camera_sessions()
+    # Hermes MCP: proactive speech on its own port. The session list is the
+    # LIVE list object (voice_mcp holds it by reference), and the server
+    # only exists when MCP_TOKEN is set — empty means fail-closed.
+    voice_mcp.set_sessions(_camera_sessions)
+    global _mcp_task
+    _mcp_task = asyncio.create_task(voice_mcp.run_mcp_server(), name="voice-mcp")
     # Diagnostics stay on in every mode (prod, CI image, local): a stalled
     # loop is invisible to the code running inside it.
     global _loop_monitor_task, _stall_dump_file
@@ -4179,6 +4194,22 @@ async def on_shutdown():
     """Lifespan hook: tear the camera sessions down before exit."""
     if _loop_monitor_task is not None:
         _loop_monitor_task.cancel()
+    # Hermes MCP: cancel the server task and any proactive playback it left
+    # outstanding — a phrase must not outlive the gateway stop.
+    global _mcp_task
+    if _mcp_task is not None:
+        _mcp_task.cancel()
+        try:
+            await _mcp_task
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.warning(f"[MCP] task ended with: {e}")
+        _mcp_task = None
+    try:
+        await voice_mcp.stop_speak_tasks()
+    except Exception as e:
+        logger.warning(f"[MCP] speak tasks stop failed: {e}")
     # Telegram: cancel the poll (its finally cancels every per-chat worker
     # and closes the aiohttp session) and wait for it, so shutdown never
     # leaves a stray getUpdates against a dead loop.

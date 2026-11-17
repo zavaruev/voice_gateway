@@ -61,7 +61,7 @@ set -u
 # so every camera-side step is skipped with a log line and only the gateway-side
 # step and the classification run. That is fine for mic-silent, which reads the
 # gateway's own log and needs no SSH at all.
-CAMERAS="${CAMERAS:-livingroom:192.168.22.241 kitchen:192.168.22.232 entrance1:192.168.22.198 camera-corridor1:192.168.22.247}"
+CAMERAS="${CAMERAS:-livingroom:192.168.22.241 kitchen:192.168.22.232 entrance1:192.168.22.198 camera-corridor1:192.168.22.247 balcony:192.168.22.246}"
 GO2RTC="${GO2RTC:-http://192.168.22.102:1984}"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/voice_watchdog_ed25519}"
 LOG="${LOG:-/tmp/camera_watchdog.log}"

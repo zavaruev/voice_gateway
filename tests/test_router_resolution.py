@@ -1820,6 +1820,99 @@ def test_a_device_command_with_no_verb_is_flagged_for_the_escalation():
     )
 
 
+def test_a_first_person_future_off_verb_is_repaired():
+    """Measured 16.11.2026 05:36:50 UTC, living room. The user said «выключи
+    свет» and Whisper wrote the 1st-person future: 'Выключу свет в гостиной.'
+    RE_ON/RE_OFF match neither spelling, the route escalated (`verb_missing`),
+    L2 burned its whole 120 s budget on two steps of a slow model and the turn
+    ended in an apology with the lamp untouched. A future verb is this house's
+    phrasing for the same order, so it is repaired where the transcript enters.
+    """
+    from resolver import normalize_stt_verbs, resolve_action
+
+    measured = "Выключу свет в гостиной."
+    assert normalize_stt_verbs(measured) == "выключи свет в гостиной."
+
+    call = resolve_action(measured, "livingroom")
+    assert call is not None, "the measured turn-1 transcript still escalates"
+    assert "TurnOff" in call.tool, f"{measured!r} -> {call.tool}"
+    assert call.args.get("area") == "Living Room", call.args
+
+
+def test_the_parallel_future_on_verb_is_repaired_too():
+    """The ON future was NOT observed (like the ON participle above) and is here
+    because a one-sided repair looks finished and is not: «включу свет» would
+    fail for exactly the same reason. Unmeasured, and labelled as such."""
+    from resolver import normalize_stt_verbs, resolve_action
+
+    assert normalize_stt_verbs("включу свет") == "включи свет"
+    call = resolve_action("включу свет в гостиной", "livingroom")
+    assert call is not None and "TurnOn" in call.tool, call and call.tool
+
+
+def test_a_future_verb_without_a_device_noun_is_left_alone():
+    """Same gate as every STT variant table: «выключу» is an ordinary Russian
+    word about the speaker, and only a device sentence may be rewritten."""
+    from resolver import normalize_stt_verbs
+
+    for text in ("я выключу", "я включу завтра", "выключу когда вернусь"):
+        assert normalize_stt_verbs(text) == text, f"{text!r} was rewritten"
+
+
+def test_the_wake_tail_turn_2_transcript_resolves_to_the_last_verb():
+    """Measured 16.11.2026 05:41:38 UTC, living room. The utterance buffer
+    carries the wake word's tail in the pre-roll (vosk decodes that dump as
+    'свет | выключи свет' — ONE spoken phrase «компьютер, выключи свет»), and
+    Whisper rendered the tail as an extra «включи свет» ahead of the command.
+    The old tie-break (`bool(RE_ON.search(t))`, "when both families appear, ON
+    wins") read the FIRST verb and answered «В гостиной уже включено.» to an
+    OFF command; the light went out 24 s later, by other hands."""
+    from resolver import resolve_action
+
+    measured = "включи свет выключи свет"
+    call = resolve_action(measured, "livingroom")
+    assert call is not None, f"{measured!r} escalates"
+    assert "TurnOff" in call.tool, f"{measured!r} -> {call.tool}"
+    assert call.args.get("area") == "Living Room", call.args
+
+
+def test_the_reverse_order_resolves_to_the_last_verb_on():
+    """Mirror guard: with the tail flipped the other way the command wins the
+    same way. On the pre-fix tree this passed by accident (ON-wins happened to
+    agree); it is here so no future tie-break can invert the rule."""
+    from resolver import resolve_action
+
+    call = resolve_action("выключи свет включи свет", "livingroom")
+    assert call is not None and "TurnOn" in call.tool, call and call.tool
+
+
+def test_a_single_verb_sentence_is_unaffected_by_the_last_verb_rule():
+    from resolver import resolve_action
+
+    for text, family in (("включи свет", "TurnOn"), ("выключи свет", "TurnOff")):
+        call = resolve_action(text, "livingroom")
+        assert call is not None and family in call.tool, (
+            f"{text!r} -> {call and call.tool}"
+        )
+
+
+def test_the_media_power_direction_also_follows_the_last_verb():
+    """Same tie-break at the media-power branch: the wake tail can manufacture
+    the ON verb inside «включи коди выключи коди», and the command part is the
+    OFF one. The old `RE_ON.search` read the first verb and would START
+    playback on a stop command."""
+    from resolver import MEDIA_POWER_OFF, MEDIA_POWER_ON, resolve_action
+
+    call = resolve_action("включи коди выключи коди", "livingroom")
+    assert call is not None, "the both-verb media phrase escalates"
+    assert call.tool == f"media__{MEDIA_POWER_OFF}", call.tool
+
+    mirror = resolve_action("выключи коди включи коди", "livingroom")
+    assert mirror is not None and mirror.tool == f"media__{MEDIA_POWER_ON}", (
+        mirror and mirror.tool
+    )
+
+
 def test_the_stt_repair_happens_before_the_classifier_decides():
     """Normalising inside the resolver was not enough, and the failure is
     instructive: «куча свет» scored 0.75 (below the 0.85 gate, straight to L2, the

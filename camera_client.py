@@ -739,6 +739,15 @@ class AIVoiceOutputTrack(MediaStreamTrack):
 
 _HAS_QUESTION_RE = re.compile(r"[?？]")
 
+# Module level, not a class attribute: `_speak` reads it as a BARE name, and
+# a class-body assignment is invisible to that lookup (bare names in a method
+# go local → global → builtin, never class attrs). Shipped 13.11.2026 as a
+# class attribute, so every /api/camera/tts call died with
+# `name '_TIME_RE' is not defined` inside the fire-and-forget task — logged
+# by the done-callback only, the HTTP answer still said "sent". Found
+# 15.11.2026 by the balcony room's first probe.
+_TIME_RE = re.compile(r"Сейчас\s+\d{1,2}:\d{2}(:\d{2})?")
+
 # ---------------------------------------------------------------------------
 # Cross-camera arbitration.
 #
@@ -5967,8 +5976,6 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
         except Exception as e:
             logger.warning(f"[{self.stream_name}] TTS decode failed: {e}")
             return None
-
-    _TIME_RE = re.compile(r"Сейчас\s+\d{1,2}:\d{2}(:\d{2})?")
 
     async def _speak(self, text: str, reply: str = "") -> bool:
         """Synthesise `text` and play it; False when TTS produced nothing."""

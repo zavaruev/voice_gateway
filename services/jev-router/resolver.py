@@ -218,6 +218,31 @@ _STT_OFF_VARIANTS: tuple[tuple[re.Pattern[str], str], ...] = (
 )
 
 
+# Measured 16.11.2026 05:36 UTC in the living room. The user said «выключи
+# свет» and Whisper produced a 1ST-PERSON FUTURE, not an imperative:
+# 'Выключу свет в гостиной.' Neither RE_ON nor RE_OFF matches «выключу», so the
+# resolver escalated (`verb_missing`), L2 burned its whole 120 s budget on two
+# steps of a slow model and the turn ended in an apology with the lamp
+# untouched. In this house's voice grammar a future verb is the same order, so
+# it is repaired where the transcript enters.
+#
+# The ON entry («включу» -> «включи») is the same mechanism one verb over. It
+# was NOT observed in the log and is here for the reason the ON participle
+# above is: a one-sided repair looks finished and is not.
+#
+# No question-mark gate, unlike the participle table: «свет выключен» can be
+# read as a statement about the world, «выключу свет» cannot — a future with a
+# device noun is an order.
+#
+# OFF substitution first, matching _STT_OFF_VARIANTS; the two words do not
+# collide («выключу» has «ы» where «включу» needs «в»), so order is a
+# convention rather than a load-bearing choice.
+_STT_FUTURE_VARIANTS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"\bвыключу\b", re.IGNORECASE), "выключи"),
+    (re.compile(r"\bвключу\b", re.IGNORECASE), "включи"),
+)
+
+
 # Measured 13.10.2026 09:49 in the living room. The user said «выключи свет» and
 # Whisper produced a STATEMENT, not an order: 'Цвет выключен', which the router
 # sent to L2 at conf 0.60 and nothing spoke. Two independent distortions in one
@@ -276,6 +301,8 @@ def normalize_stt_verbs(text: str) -> str:
         for pattern, canonical in _STT_PARTICIPLE_VARIANTS:
             t = pattern.sub(canonical, t, count=1)
     for pattern, canonical in _STT_OFF_VARIANTS:
+        t = pattern.sub(canonical, t, count=1)
+    for pattern, canonical in _STT_FUTURE_VARIANTS:
         t = pattern.sub(canonical, t, count=1)
     if t.strip() != (text or "").strip():
         logger.info("STT off-verb normalised: %r -> %r", text[:80], t[:80])
@@ -596,6 +623,31 @@ def area_of(text: str, stream_name: str) -> tuple[str | None, str]:
     return _find_area(text or "", stream_name)
 
 
+def _turn_on_by_last_verb(t: str) -> bool:
+    """Which on/off family a sentence carrying BOTH verbs asks for: the LAST one.
+
+    Measured 16.11.2026 05:41 UTC in the living room. The utterance buffer keeps
+    the wake word's tail in the pre-roll, so Whisper heard «компьютер» as an
+    extra «включи свет» in front of the real command and wrote
+    'включи свет выключи свет'. The old tie-break — `bool(RE_ON.search(t))`,
+    "when both verb families appear, ON wins" — read the FIRST verb and
+    answered «В гостиной уже включено.» to a command to switch the lamp OFF.
+
+    Structure, not tuning: the buffer is [pre-roll] + [command], so the command
+    is always the verb closest to the end of the transcript. A single-verb
+    sentence is unaffected (the other family never matched), and measured STT
+    mangles have already been repaired by `normalize_stt_verbs` before this
+    runs.
+    """
+    on = [m.start() for m in RE_ON.finditer(t)]
+    off = [m.start() for m in RE_OFF.finditer(t)]
+    if not off:
+        return True
+    if not on:
+        return False
+    return on[-1] > off[-1]
+
+
 def resolve_action(text: str, stream_name: str) -> ResolvedCall | None:
     """Map an imperative device command to an MCP intent tool. None = escalate.
 
@@ -738,7 +790,9 @@ def resolve_action(text: str, stream_name: str) -> ResolvedCall | None:
         and thing_domain == ["media_player"]
         and (RE_ON.search(t) or RE_OFF.search(t))
     ):
-        media_service = MEDIA_POWER_ON if RE_ON.search(t) else MEDIA_POWER_OFF
+        # Direction follows the LAST verb (see _turn_on_by_last_verb): the wake
+        # tail can put an «включи …» in front of the real «выключи …» command.
+        media_service = MEDIA_POWER_ON if _turn_on_by_last_verb(t) else MEDIA_POWER_OFF
     # A device word from another family wins over any media reading:
     # «включи свет и поставь музыку» is not a media-only command, and half a
     # command is an escalation, never a partial side effect.
@@ -805,8 +859,10 @@ def resolve_action(text: str, stream_name: str) -> ResolvedCall | None:
         return None
 
     # --- Plain on/off ---
-    # Tie-break: when both verb families appear in one sentence, ON wins.
-    turn_on = bool(RE_ON.search(t))
+    # Tie-break: the LAST verb wins — see _turn_on_by_last_verb(). The old
+    # "ON wins" read the wake word's tail that Whisper renders as an extra
+    # «включи …» in front of the real command (measured 16.11.2026 05:41 UTC).
+    turn_on = _turn_on_by_last_verb(t)
     if thing_domain is None and not _DEVICE_NOUN.search(t):
         # No recognizable device noun ("включи" alone) -> ambiguous -> escalate
         return None

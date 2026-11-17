@@ -2321,6 +2321,7 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
   * **A second `asyncio.run` in a test harness CANCELS the pending task at its first await** — the chorus gather died there while the await-less single-room stub sailed through, i.e. the test was green on the broken harness for the single-room path and red for the chorus. The tool and its fire-and-forget dispatches must run on ONE loop (`_drive()` helper).
   * **`pip install pytest` alone clobbers `pytest-asyncio`** in this image (shared namespace, uninstall not implied) — install them TOGETHER, or every `pytest` run silently loses the async plugins.
   * **The first chorus probe measured the livingroom link again**: kitchen/corridor/balcony/entrance played within 160 ms of each other (x0.6–0.7), livingroom's POST hit the 38 s budget (`play_audio failed: TimeoutError()`, the x7-class measured twice on .241). The tool answered fire-and-forget `spoken: true` and the log named the failure — that is the designed honesty, not a bug. A room whose link is flaky will drop out of choruses; the verdict line is the instrument.
+  * **The user's ear verdict, 17.11.2026: «да, хором одновременно» — the chorus is confirmed.** The only instrument that can judge playback here is the ear (the microphone is saturated, 05.10.2026), so this line closes the feature.
 
 ## REST API
 

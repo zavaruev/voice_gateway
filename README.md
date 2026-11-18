@@ -28,7 +28,7 @@ Home Assistant's own voice stack (Wyoming + ESPHome satellites) is the right ans
 | Who is speaking | — | CAMP++ speaker embeddings, cross-device speaker lock |
 | False-wake protection | per-device threshold | an 8-gate cascade (echo ring, appliance noise, distance, clipping, crest factor, …) with a Whisper confirm-rescue band instead of silence |
 
-The camera subsystem runs **four rooms** — `livingroom`, `kitchen`, `entrance1` and `camera-corridor1`. The wake word there is detected by **decoding** it with a local vosk model (`vosk_wake.py`, 88 MB, CPU-only, one per process shared by all rooms) rather than by scoring it acoustically: a head trained on 27 recordings of the word learned the envelope instead of the word and fired 114–229 times per hour on the television. Measured on the living room: 5/5 live detections, 0 false accepts over 7 minutes of TV. Set `WAKE_VOSK_MODEL_<NAME>` to enable per room; without it a room keeps the acoustic path.
+The camera subsystem runs **five rooms** — `livingroom`, `kitchen`, `entrance1`, `camera-corridor1` and `balcony`. The wake word there is detected by **decoding** it with a local vosk model (`vosk_wake.py`, 88 MB, CPU-only, one per process shared by all rooms) rather than by scoring it acoustically: a head trained on 27 recordings of the word learned the envelope instead of the word and fired 114–229 times per hour on the television. Measured on the living room: 5/5 live detections, 0 false accepts over 7 minutes of TV. Set `WAKE_VOSK_MODEL_<NAME>` to enable per room; without it a room keeps the acoustic path.
 
 Two lessons from bringing the rooms up are worth stating here, because both cost a day each and neither is visible in the code:
 
@@ -48,7 +48,7 @@ See [`docs/REFERENCE.md`](docs/REFERENCE.md) → *Known Issues & Current Problem
 | L2 turn with a verified side effect | **3.2–4.0 s** |
 | Wake debounce | ~240 ms (2 of 3 chunks); a single chunk ≥ 0.68 fires immediately |
 | Wake window / watchdog | 15 s / 90 s |
-| Test suite | 766 tests, 24 files, ~15,900 lines |
+| Test suite | 859 tests, 27 files, ~17,100 lines |
 
 ---
 
@@ -76,6 +76,9 @@ docker compose up -d --no-deps --build jev-router smolagents-worker voice_gatewa
   `POST /api/tts/backends/{name}` switches engines on every live session without
   a restart — see *Speech* below.
 
+- **`FACE_GREETINGS_ENABLED=1`** turns on the arrival watcher. It needs the face-captures `captures/` and `pending/` directories mounted at their **host paths** (meta.json carries absolute frame paths), `FACE_API_URL` (InsightFace, :8090), its own `FACE_TG_BOT_TOKEN`/`FACE_TG_CHAT_ID` (a different bot from the assistant's Telegram source) and `MCP_TOKEN`. Leave it unset for a plain voice gateway.
+- **`MCP_TOKEN`** is the Bearer token of the proactive-speech MCP server on :18793; empty means the server does not start (fail closed).
+
 Full environment table, backend variants, REST API and OTA: [`docs/REFERENCE.md`](docs/REFERENCE.md).
 
 ---
@@ -92,18 +95,21 @@ Full environment table, backend variants, REST API and OTA: [`docs/REFERENCE.md`
 
 | File | Responsibility | Why it is separate |
 |---|---|---|
-| **`main.py`** (~4,300 lines) | Core: ESP32 WebSocket protocol, REST API, OTA, web UI, camera session startup | Single entry point for everything |
-| **`camera_client.py`** (~6,650 lines) | One `CameraSession` per stream: RTSP mic feed, wake word, cross-camera arbitration, replies over the camera's `/play_audio` | Cameras have their own transport and their own hard problem — the mic hears its own speaker |
+| **`main.py`** (~4,390 lines) | Core: ESP32 WebSocket protocol, REST API, OTA, web UI, camera session startup | Single entry point for everything |
+| **`camera_client.py`** (~6,670 lines) | One `CameraSession` per stream: RTSP mic feed, wake word, cross-camera arbitration, replies over the camera's `/play_audio` | Cameras have their own transport and their own hard problem — the mic hears its own speaker |
 | **`engine.py`** (~570 lines) | Silero VAD + openWakeWord scoring — the "science" part, pure ONNX calls | Testable without a network, without a camera |
 | **`backends.py`** (~670 lines) | Who answers: `NanobotBackend` / `HermesBackend` / `CascadeBackend` | One interface — the brain is swappable with a single env var |
 | **`telegram_client.py`** (~1,430 lines) | Third request source: Telegram long-polling, chat allowlist, voice note → Whisper → the same backend → text reply (+ optional voice note) | No bot framework — three Bot API calls over the `aiohttp` the process already has; all main.py helpers injected (no import cycle) |
 | **`audio_utils.py`** (~220 lines) | `pack_ogg()` (Opus → Ogg for Whisper) and `is_valid_text()` (drops hallucinations and mic echoes of our own TTS) | Shared by both device paths |
 | **`vosk_wake.py`** (~350 lines) | Wake word by **decoding** it (per-room model, free decoder, no grammar) | Decoding has no ceiling where scoring has one — see *Three instruments* above |
+| **`voice_mcp.py`** (~560 lines) | MCP (SSE) server on :18793: `speak(text, room)` / `rooms()` for Hermes, quiet hours, per-room gap, strict `room=all` chorus | Guards live in SERVER CODE, not in the skill prompt; one synthesis and the same bytes for every room |
+| **`face_greeting.py`** (~250 lines) | LLM-written arrival phrases, generated in the background and cached by `(name, time-of-day bucket)`; no «Доброе утро» at 03:00 | A live generation takes 17 s — far too slow for a doorway; the cache makes the choice instant |
+| **`face_events.py`** (~490 lines) | Watches face-captures events: streaming recognition, 2-frame vote, ambiguity margin, Telegram, `pending/`; speaks through `voice_mcp` | The whole arrival path in one process: one log, one auth model, one voice |
 | **`services/jev-router/`** | **L1** — intent classifier, offline slot resolver, direct Home Assistant calls, weather, chat/expert proxy | ~0.1 s for a simple command, no LLM in the loop |
 | **`services/smolagents-worker/`** | **L2** — smolagents `CodeAgent` with HA / Qdrant / Hermes / weather tools, plus honesty vetoes | Multi-step tasks that must not lie about side effects |
-| **`tests/`** | 766 tests across 24 files | Pins the wake-gate bands, the protocol, the cascade contract, the Telegram source, the utterance endpointing and the side-effect verification |
+| **`tests/`** | 859 tests across 27 files | Pins the wake-gate bands, the protocol, the cascade contract, the Telegram source, the utterance endpointing, the side-effect verification, the chorus verdict, the time-of-day greeting cache and the one-voice rule |
 
-> Production (`docker-compose.yml`) runs `LLM_BACKEND=cascade` with **four cameras enabled** (`CAMERA_STREAMS=livingroom,kitchen,entrance1,camera-corridor1`, `DISABLE_CAMERAS=false`), all four decoding the wake word with vosk and playing replies over `/play_audio`; the ESP32 path remains the main one.
+> Production (`docker-compose.yml`) runs `LLM_BACKEND=cascade` with **five cameras enabled** (`CAMERA_STREAMS=livingroom,kitchen,entrance1,camera-corridor1,balcony`, `DISABLE_CAMERAS=false`), all five decoding the wake word with vosk and playing replies over `/play_audio`; the ESP32 path remains the main one. The face-arrival watcher (`FACE_GREETINGS_ENABLED=1`) speaks greetings in `entrance1`; the old `face-greeting-handler` from the face-captures project is retired behind a `legacy` compose profile.
 
 ### Utterance endpointing (off by default, on in three rooms)
 
@@ -404,6 +410,45 @@ valid ones listed. Whatever the backend, three things ride along:
 
 ---
 
+## Proactive speech and arrivals (v2.77)
+
+Two ways to speak without somebody saying the wake word. Both go through the
+same playback code, so the echo ring, the arbiter and the honest per-room
+verdict apply to both.
+
+**Hermes → MCP.** `voice_mcp.py` serves `speak(text, room)` and `rooms()` over
+SSE on **:18793**, authenticated with `MCP_TOKEN` (separate from admin Basic and
+from the face-greeting token). Guards are in the server, not in the skill
+prompt: quiet hours **23:00–08:00 MSK**, 120 s per room, 240 chars truncated at
+a word boundary. `room=all` is a **strict chorus** — one synthesis, the very
+same PCM bytes handed to every session under `asyncio.gather`, so all rooms
+start together; if any room is inside its gap the whole call is refused rather
+than producing a partial chorus. The verdict is read from `_last_play_ok` and
+names who actually played: `_speak_pcm` returns `is_question`, a property of
+the text, which is not an outcome.
+
+**A person at the door → `face_events.py`.** The gateway watches the
+face-captures `captures/` directory itself; the InsightFace API, capture daemon
+and retrainer still live in that project. Each frame is judged only after the
+daemon publishes its quality verdict, a greeting fires as soon as **2 frames**
+agree (with an ambiguity margin of 0.08 against family members who cross-score
+at 0.365), Telegram gets the photo, and high-confidence frames go to `pending/`.
+The greeting is spoken only in `entrance1` and **a real arrival is not
+proactive speech** — it bypasses quiet hours with `bypass_quiet=True`, while
+the 120 s room gap stays. The old `face-greeting-handler` is stopped and behind
+a `legacy` compose profile; starting it alongside the gateway would produce two
+Telegram messages and two voices for one arrival.
+
+**Phrases come from an LLM, but never at the doorway.** Measured: a live Hermes
+generation takes 17.2 s against 6–20 s from door to spoken greeting. Phrases are
+therefore generated in the background and cached by `(name, time-of-day bucket)`;
+selection uses only the **current** bucket, and a phrase carrying another
+bucket's time marker («Доброе утро» at night) is rejected on both write and
+read. Fallbacks are time-neutral. The HTTP entry point `POST /api/face/greeting`
+uses its own narrow Bearer token, so a leak cannot speak as admin.
+
+---
+
 ## Design rules worth remembering
 
 1. **Queue of sentences, not tokens** — TTS is sentence-granular; token-by-token synthesis produces audible gaps.
@@ -416,6 +461,7 @@ valid ones listed. Whatever the backend, three things ride along:
 8. **Bound a cascade instead of trying to detect it perfectly** — after `_FOLLOWUP_CHAIN_MAX = 2` consecutive turns answered from a window opened by our own reply, the next reply opens no window and the wake word is required again. It is one-directional on purpose: it can only cost a wake word, never a wrong action. (Shipped 13.10.2026.)
 9. **A verdict needs an instrument behind it, and "I don't know" is a third outcome** — an on/off device is proven by its own power sensor; where none exists the turn is `unproven`, spoken as silence after «Включаю», never as a claim in either direction. (Shipped 16.10.2026.)
 10. **Confirm the stimulus reached the sensor before calling the sensor broken** — a "dead microphone" conclusion is invalid until the stimulus is visible in the log at the same timestamp. Four separate false diagnoses of a mute room came from recordings made in an empty one.
+11. **A cached greeting belongs to the time of day it was written for** — generation is too slow for a doorway, so phrases are pre-made; a morning phrase must never be selected at 03:00. The cache is keyed by bucket and validated on both write and read, because the alternative is a sentence nobody asked for. (Shipped 18.11.2026.)
 
 ---
 
@@ -430,18 +476,21 @@ voice_gateway/
 ├── telegram_client.py      # Telegram source: long polling, allowlist, /room
 ├── audio_utils.py          # pack_ogg(), is_valid_text()
 ├── vosk_wake.py            # wake word by DECODING (per-room model, free decoder)
+├── voice_mcp.py             # MCP :18793: speak/rooms, guards, strict chorus
+├── face_greeting.py         # LLM phrases cached by (name, time-of-day bucket)
+├── face_events.py           # arrival watcher: vote, Telegram, pending, one voice
 ├── config/                 # devices.json, wake-word ONNX heads
 ├── services/
 │   ├── jev-router/         # cascade L1
 │   └── smolagents-worker/  # cascade L2
 ├── scripts/                # verify_endpoint, camera watchdog, doc gates
-├── tests/                  # 766 tests / 24 files
+├── tests/                  # 859 tests / 27 files
 └── docs/
     └── REFERENCE.md        # full config tables, REST API, known issues, changelog
 ```
 
 - **Configuration, REST API, environment variables, known issues and the full changelog:** [`docs/REFERENCE.md`](docs/REFERENCE.md)
-- **Tests:** 766 tests across 24 files covering engine scoring and wake gates, the camera audio track and its echo guards, the ESP32 protocol, cascade streaming, honesty vetoes, HA entity matching, router resolution, dialogue memory, the streaming speech relay, the TTS engine switching and the Telegram source (allowlist, ack vs final text, turn timeout, voice turns, `/room`). Run them inside the container — see [`docs/REFERENCE.md`](docs/REFERENCE.md#tests), the host Python usually lacks `opuslib` / `onnxruntime`. CI (`.github/workflows/tests.yml`) runs the same recipe on every push and PR.
+- **Tests:** 859 tests across 27 files covering engine scoring and wake gates, the camera audio track and its echo guards, the ESP32 protocol, cascade streaming, honesty vetoes, HA entity matching, router resolution, dialogue memory, the streaming speech relay, the TTS engine switching, the Telegram source (allowlist, ack vs final text, turn timeout, voice turns, `/room`), the chorus verdict, the time-of-day greeting cache and the one-voice arrival watcher. Run them inside the container — see [`docs/REFERENCE.md`](docs/REFERENCE.md#tests), the host Python usually lacks `opuslib` / `onnxruntime`. CI (`.github/workflows/tests.yml`) runs the same recipe on every push and PR.
 
 ---
 

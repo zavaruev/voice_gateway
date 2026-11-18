@@ -3847,6 +3847,29 @@ async def start_camera_sessions():
                     or os.getenv("CAMERA_DIALOGUE_STATEMENT_S")
                     or 0
                 ),
+                # Streaming STT (LocalAgreement-2). Off by default. `0` means
+                # "unset" for the numeric knobs so a half-filled override
+                # cannot accidentally make the window shorter than two steps.
+                streaming_stt=(
+                    os.getenv(f"CAMERA_STREAMING_STT_{name.upper()}")
+                    or os.getenv("CAMERA_STREAMING_STT") or ""
+                ).lower() in ("1", "true", "yes"),
+                streaming_window_s=float(
+                    os.getenv(f"CAMERA_STREAMING_WINDOW_S_{name.upper()}")
+                    or os.getenv("CAMERA_STREAMING_WINDOW_S") or 0
+                ),
+                streaming_step_s=float(
+                    os.getenv(f"CAMERA_STREAMING_STEP_S_{name.upper()}")
+                    or os.getenv("CAMERA_STREAMING_STEP_S") or 0
+                ),
+                streaming_stable_s=float(
+                    os.getenv(f"CAMERA_STREAMING_STABLE_S_{name.upper()}")
+                    or os.getenv("CAMERA_STREAMING_STABLE_S") or 0
+                ),
+                streaming_min_words=int(
+                    os.getenv(f"CAMERA_STREAMING_MIN_WORDS_{name.upper()}")
+                    or os.getenv("CAMERA_STREAMING_MIN_WORDS") or 0
+                ),
                 http_session=http,
                 nanobot_url=NANOBOT_WS_URL,
                 nanobot_token=NANOBOT_TOKEN,

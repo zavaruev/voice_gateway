@@ -64,6 +64,7 @@ from pydub import AudioSegment
 
 from audio_utils import is_valid_text
 from engine import LocalAudioEngine, CameraProcessor, AgentState
+from streaming_stt import StreamingTranscriber, words as stt_words
 
 logger = logging.getLogger("camera")
 
@@ -1413,6 +1414,15 @@ class CameraConfig:
     # so a camera and an ESP32 answer a follow-up on the same terms.
     dialogue_question_s: float = 0.0
     dialogue_statement_s: float = 0.0
+    # Streaming STT (LocalAgreement-2). Off by default: it changes WHEN an
+    # utterance is dispatched, which is the most dangerous class of change in
+    # this file. Enable per room only after replaying that room's own utterance
+    # dumps through the policy — see streaming_stt.py and AGENTS.md.
+    streaming_stt: bool = False
+    streaming_window_s: float = 2.0
+    streaming_step_s: float = 0.5
+    streaming_stable_s: float = 0.7
+    streaming_min_words: int = 3
 
 
 class CameraSession:
@@ -1434,6 +1444,14 @@ class CameraSession:
     _audio_rate_ok = 0.8
     _min_audio_rate = 0.5
     _starve_restarts = 3
+    # Streaming STT state (LocalAgreement-2). Class defaults so hand-built
+    # sessions in tests can read them; __init__ replaces _stream_st with a real
+    # transcriber only when the room opts in.
+    _stream_st = None
+    _stream_task = None
+    _stream_forced_text = ""
+    _stream_stable_since = 0.0
+    _stream_calls = 0
     # Streaming TTS endpoint (from the config) and the per-turn bail flag.
     # `_stream_fallback_needed` is set BEFORE the camera POST when the stream
     # could not even start (non-200, missing X-Sample-Rate, connect failure) —
@@ -1548,6 +1566,23 @@ class CameraSession:
         self._pause_run_frames = config.pause_run_frames
         self._pause_min_speech_frames = config.pause_min_speech_frames
         self._pause_noise_mult = config.pause_noise_mult
+        # Streaming STT: opt-in per room. The transcriber is fed a COPY of the
+        # raw PCM in a background task so a Whisper round trip never blocks
+        # _vad_process (which holds the VAD lock — blocking there costs audio).
+        self._stream_st: StreamingTranscriber | None = None
+        if getattr(config, "streaming_stt", False):
+            self._stream_st = StreamingTranscriber(
+                self._stream_transcribe,
+                window_s=config.streaming_window_s or 2.0,
+                step_s=config.streaming_step_s or 0.5,
+            )
+            self._stream_stable_s = config.streaming_stable_s or 0.7
+            self._stream_min_words = config.streaming_min_words or 3
+            logger.info(
+                f"[{self.stream_name}] streaming STT enabled "
+                f"(window={self._stream_st.window_bytes / 32000:.1f}s "
+                f"step={self._stream_st.step_bytes / 32000:.1f}s)"
+            )
         # `bool` kept as a derived value so existing callers and tests that set it
         # directly still mean "any window at all".
         self._followup_mode = str(config.followup_window or "question").strip().lower()
@@ -3091,6 +3126,62 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
         self._hp_zi = zi
         return np.clip(y, -32768, 32767).astype(np.int16).tobytes()
 
+    async def _stream_transcribe(self, pcm: bytes, rms_raw: float) -> str:
+        """One overlapping window through the SAME Whisper endpoint as the
+        full-buffer path; a failure is an empty hypothesis, never an exception
+        out of the background task."""
+        try:
+            wav = await asyncio.to_thread(self._encode_wav, pcm)
+            return (await self._fetch_transcription(
+                wav, temperature="0.0", rms_raw=rms_raw)) or ""
+        except Exception as exc:                                   # noqa: BLE001
+            logger.warning(f"[{self.stream_name}] streaming STT window failed: {exc!r}")
+            return ""
+
+    def _stream_cancel(self) -> None:
+        """Drop the in-flight window and the hypothesis history. The forced
+        text is deliberately NOT cleared here: if a commit already happened,
+        the utterance that was just ended must still carry it to STT."""
+        task = getattr(self, "_stream_task", None)
+        if task is not None and not task.done():
+            task.cancel()
+        self._stream_task = None
+        if self._stream_st is not None:
+            self._stream_st.reset()
+        self._stream_stable_since = 0.0
+
+    async def _stream_maybe_feed(self, pcm: bytes, rms_raw: float,
+                                 loud: bool) -> None:
+        """Background task: one window per call. Ends the utterance EARLY only
+        on a committed (2-window stable) prefix AND real voice energy AND a
+        quiet-enough commit age. A single loud frame or a fresh hypothesis can
+        never end it — that is the failure mode of the level-only endpoints."""
+        st = self._stream_st
+        if st is None:
+            return
+        now = time.time()
+        changed = await st.feed(pcm, rms_raw, now)
+        if changed:
+            self._stream_stable_since = now
+        text = st.committed
+        if (not text or not self._wake_detected or self._processing_utterance
+                or time.time() < self._tts_playing_until):
+            return
+        if len(stt_words(text)) < getattr(self, "_stream_min_words", 3):
+            return
+        if now - self._stream_stable_since < getattr(self, "_stream_stable_s", 0.7):
+            return
+        if not loud:
+            return
+        self._stream_forced_text = text
+        logger.info(
+            f"[{self.stream_name}] streaming STT commit "
+            f"({len(stt_words(text))}w, {st.windows} windows, "
+            f"{st.last_latency_s:.2f}s/window): {text[:60]!r}"
+        )
+        self._stream_cancel()
+        self._end_utterance(f"streaming ({len(stt_words(text))}w)")
+
     async def _vad_process(self, chunk: bytes):
         async with self._vad_lock:
             s16 = np.frombuffer(chunk, dtype=np.int16)
@@ -3252,6 +3343,28 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
                 verdict, detail = self._endpoint.feed(orig_rms)
                 if verdict == "end":
                     self._end_utterance(f"pause ({detail})")
+
+            # Streaming STT: feed ONLY while a wake window is open, like the
+            # pause endpoint. The Whisper call runs in a task — awaiting it
+            # here would stall _vad_process while it holds the VAD lock, i.e.
+            # drop the very words we are trying to recognise.
+            if (
+                self._stream_st is not None
+                and self._vad_has_speech
+                and self._wake_detected
+                and getattr(self, "_stream_task", None) is None
+            ):
+                task = asyncio.create_task(self._stream_maybe_feed(
+                    bytes(chunk), orig_rms, self._speech_run >= 3))
+                self._stream_task = task
+
+                def _stream_done(t, _self=self):
+                    if _self._stream_task is t:
+                        _self._stream_task = None
+                    if not t.cancelled() and t.exception():
+                        logger.warning(f"[{_self.stream_name}] streaming STT task: {t.exception()!r}")
+
+                task.add_done_callback(_stream_done)
 
             # vosk wake word (rooms configured with WAKE_VOSK_MODEL_<NAME>).
             # Fed EVERY chunk, with NO VAD gate: the Silero VAD rejects 95 % of
@@ -3943,6 +4056,10 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
         # The wake word is the only unambiguous reset of the cascade breaker:
         # it is what proves a person is present, not our own voice.
         self._followup_chain = 0
+        # A NEW wake starts a NEW command: any prefix committed from the old
+        # utterance must not be dispatched as the answer to this one.
+        self._stream_cancel()
+        self._stream_forced_text = ""
         self._ww_consec = 0
         self._ww_recent.clear()
         # F2: a late wake (we are already awaiting a command) must NOT clear the
@@ -4171,7 +4288,8 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
         return buf_processed, buf_raw, duration_s, stats
 
     async def _process_stt(
-        self, buf_processed: bytes, buf_raw: bytes, duration_s: float, stats: dict
+        self, buf_processed: bytes, buf_raw: bytes, duration_s: float,
+        stats: dict, forced_text: str = "",
     ) -> str | None:
         wav = await asyncio.to_thread(self._encode_wav, buf_processed)
 
@@ -4229,7 +4347,11 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
         )
         # Speaker ID now runs in _process_utterance for ALL utterances,
         # not just post-wake ones. Here we only do Whisper transcription.
-        txt = await self._fetch_transcription(wav, rms_raw=float(stats.get("rms_raw") or 0.0))
+        txt = (forced_text.strip() if forced_text else await self._fetch_transcription(
+            wav, rms_raw=float(stats.get("rms_raw") or 0.0)))
+        if forced_text:
+            logger.info(f"[{self.stream_name}] ⚡ using confirmed streaming prefix "
+                        f"(no full-buffer Whisper call): {txt[:60]!r}")
 
         def _manifest(verdict: str) -> None:
             """Append one self-describing line per utterance.
@@ -4607,8 +4729,10 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
             if not self._wake_detected and time.time() >= self._stt_confirm_until:
                 return
 
+            forced = getattr(self, "_stream_forced_text", "") or ""
+            self._stream_forced_text = ""
             txt = await self._process_stt(
-                buf_processed, buf_raw, duration_s, stats
+                buf_processed, buf_raw, duration_s, stats, forced_text=forced
             )
             if not txt:
                 return
@@ -5487,6 +5611,8 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
         self._wake_detected = False
         self._followup_only = False
         self._followup_is_question = False
+        self._stream_cancel()
+        self._stream_forced_text = ""
         # Consecutive turns answered WITHOUT the wake word. Circuit breaker
         # for an echo cascade; see _followup_chain_note for the measurement.
         self._followup_chain = 0

@@ -2561,6 +2561,107 @@ def test_both_rooms_read_identical_thresholds():
 
 
 @pytest.mark.asyncio
+async def test_camera_config_carries_the_streaming_stt_env(monkeypatch):
+    """The same wiring trap as TTS_VOICE: a new config field must be filled in
+    start_camera_sessions(), not merely declared on CameraConfig."""
+    import main as main_mod
+
+    created = []
+
+    class _FakeSession:
+        def __init__(self, config=None, backend=None):
+            self.config = config
+            created.append(self)
+
+        async def start(self):
+            return None
+
+    class _StubBackend:
+        pass
+
+    class _FakeClientSession:
+        def __init__(self, timeout=None):
+            pass
+
+    monkeypatch.delenv("DISABLE_CAMERAS", raising=False)
+    monkeypatch.setenv("CAMERA_STREAMS", "livingroom")
+    monkeypatch.setenv("CAMERA_STREAMING_STT_LIVINGROOM", "true")
+    monkeypatch.setenv("CAMERA_STREAMING_STABLE_S", "1.5")
+    monkeypatch.setattr(main_mod, "CameraSession", _FakeSession)
+    monkeypatch.setattr(main_mod, "_camera_sessions", [])
+    monkeypatch.setattr(main_mod, "VadEngine", lambda **kwargs: None)
+    monkeypatch.setattr(main_mod, "LLM_BACKEND", "cascade")
+    monkeypatch.setattr(main_mod.backends, "CascadeBackend",
+                        lambda *a, **k: _StubBackend())
+    monkeypatch.setattr(main_mod.aiohttp, "ClientSession", _FakeClientSession)
+
+    await main_mod.start_camera_sessions()
+    cfg = created[0].config
+    assert cfg.streaming_stt is True
+    assert cfg.streaming_stable_s == 1.5
+    assert CameraConfig(stream_name="x").streaming_stt is False
+
+
+@pytest.mark.asyncio
+async def test_streaming_commit_ends_only_on_a_stable_loud_prefix(monkeypatch):
+    s = _make_http_session()
+
+    class _FakeST:
+        windows = 4
+        last_latency_s = 0.4
+        committed = "включи свет в гостиной"
+
+        def __init__(self):
+            self.calls = 0
+
+        async def feed(self, pcm, rms, now):
+            self.calls += 1
+            return False            # prefix is already stable before the test
+
+        def reset(self):
+            pass
+
+    s._stream_st = _FakeST()
+    s._stream_task = None
+    s._stream_min_words = 3
+    s._stream_stable_s = 0.7
+    s._stream_stable_since = time.time() - 2.0   # already stable, loud is the only gate
+    s._wake_detected = True
+    s._processing_utterance = False
+    s._tts_playing_until = 0.0
+    ended = []
+    monkeypatch.setattr(s, "_end_utterance", lambda reason: ended.append(reason))
+
+    await s._stream_maybe_feed(b"\x01\x02" * 100, 4000.0, loud=False)
+    assert ended == []                      # loud frame alone is not evidence
+    await s._stream_maybe_feed(b"\x01\x02" * 100, 4000.0, loud=True)
+    assert len(ended) == 1 and "streaming" in ended[0]
+    assert s._stream_forced_text == "включи свет в гостиной"
+
+
+@pytest.mark.asyncio
+async def test_forced_streaming_prefix_skips_the_full_buffer_whisper_call(monkeypatch):
+    """The whole latency win depends on this: a committed prefix must be used
+    instead of re-transcribing the full buffer. If the field is added but not
+    read, the feature silently becomes slower, not broken — the worst kind."""
+    s = _make_http_session()
+    s.http_session = _FakeHttp(200)
+    calls = []
+
+    async def fake_fetch(*a, **kw):
+        calls.append(kw)
+        return "полный буфер"
+
+    monkeypatch.setattr(s, "_fetch_transcription", fake_fetch)
+    pcm = b"\x03\x04" * 24000
+    buf_proc, buf_raw, dur, stats = s._preprocess_audio(pcm)
+    txt = await s._process_stt(buf_proc, buf_raw, dur, stats,
+                               forced_text="включи свет в гостиной")
+    assert txt == "включи свет в гостиной"
+    assert calls == []
+
+
+@pytest.mark.asyncio
 async def test_camera_config_carries_the_env_voice(monkeypatch):
     """main.start_camera_sessions() must pass TTS_VOICE into CameraConfig.
 

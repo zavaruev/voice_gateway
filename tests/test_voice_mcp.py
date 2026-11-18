@@ -344,6 +344,35 @@ def test_quiet_hours_refuse_the_tool_and_dispatch_nothing():
     assert "livingroom" not in voice_mcp._LAST_SPEAK_AT
 
 
+def test_a_real_arrival_bypasses_quiet_hours_but_not_the_gap():
+    """A person at the door at 00:00 MSK is not proactive speech: the face
+    greeting path passes bypass_quiet=True. The MCP tool itself never does.
+    """
+    s = _StubSession("livingroom")
+    voice_mcp._SESSIONS.append(s)
+    night = _epoch_utc(21)                 # 00:00 MSK
+    res = asyncio.run(voice_mcp._speak_tool(
+        "Добро пожаловать домой", "livingroom", now=night, bypass_quiet=True))
+    assert "error" not in res
+    asyncio.run(_drain_speak_tasks())
+    assert s.spoken == ["Добро пожаловать домой"]
+    # The min-gap guard is NOT bypassed: two arrivals in one minute still
+    # produce one greeting, not a pile of voices on the camera.
+    res = asyncio.run(voice_mcp._speak_tool(
+        "Ещё раз", "livingroom", now=night + 30, bypass_quiet=True))
+    assert "min gap" in res
+    assert s.spoken == ["Добро пожаловать домой"]
+
+
+def test_the_tool_keeps_quiet_hours_without_the_bypass_flag():
+    s = _StubSession("livingroom")
+    voice_mcp._SESSIONS.append(s)
+    res = asyncio.run(voice_mcp._speak_tool(
+        "Тест", "livingroom", now=_epoch_utc(21)))
+    assert "quiet hours" in res
+    assert s.spoken == []
+
+
 def test_the_gap_refuses_the_tool_before_dispatch():
     s = _StubSession("livingroom")
     voice_mcp._SESSIONS.append(s)

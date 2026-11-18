@@ -178,17 +178,22 @@ def check_speak_allowed(
     room: str,
     now: float,
     last_at: dict | None = None,
+    bypass_quiet: bool = False,
 ) -> str:
     """Empty string when the guards allow the speech; otherwise the reason.
 
     Room existence is a data question handled by the tool (it answers with
     the live rooms list); this function is about the time guards only.
+
+    `bypass_quiet` is ONLY for a real person arriving at the door: the face
+    greeting must speak at 03:00 too, when it is not proactive speech and the
+    person is standing there. The min-gap guard is never bypassed.
     """
     if last_at is None:
         last_at = _LAST_SPEAK_AT
     if not text:
         return "empty text"
-    if in_quiet_hours(now):
+    if not bypass_quiet and in_quiet_hours(now):
         return (
             f"quiet hours ({PROACTIVE_QUIET_HOURS} UTC+"
             f"{PROACTIVE_QUIET_TZ_OFFSET_H}); the rooms stay silent at night"
@@ -293,8 +298,16 @@ def _dispatch_speak_all(sessions: list, text: str) -> None:
     )
 
 
-async def _speak_tool(text: str, room: str = "", now: float | None = None) -> str:
-    """Body of the `speak` tool. Returns a JSON string for the MCP result."""
+async def _speak_tool(
+    text: str, room: str = "", now: float | None = None,
+    bypass_quiet: bool = False,
+) -> str:
+    """Body of the `speak` tool. Returns a JSON string for the MCP result.
+
+    `bypass_quiet=True` is reserved for the face-arrival greeting path in
+    main.py — a person who just walked in at night is not "proactive speech".
+    The MCP tool itself never sets it, so Hermes is still silent at night.
+    """
     if now is None:
         now = time.time()
     text = (text or "").strip()
@@ -317,7 +330,8 @@ async def _speak_tool(text: str, room: str = "", now: float | None = None) -> st
         # all-or-nothing rule exists to prevent.
         blocked: dict = {}
         for s in _SESSIONS:
-            r = check_speak_allowed(clipped, s.stream_name, now)
+            r = check_speak_allowed(clipped, s.stream_name, now,
+                                    bypass_quiet=bypass_quiet)
             if r:
                 blocked[s.stream_name] = r
         if not _SESSIONS:
@@ -338,7 +352,7 @@ async def _speak_tool(text: str, room: str = "", now: float | None = None) -> st
         if was_clipped:
             res["note"] = f"text was truncated to {len(clipped)} chars"
         return _json(res)
-    reason = check_speak_allowed(clipped, room, now)
+    reason = check_speak_allowed(clipped, room, now, bypass_quiet=bypass_quiet)
     if reason:
         return _json({"error": reason, "rooms": rooms_list})
     session = target[0]

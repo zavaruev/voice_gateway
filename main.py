@@ -182,6 +182,8 @@ from slowapi.errors import RateLimitExceeded
 import camera_client
 from camera_client import CameraSession, CameraConfig
 import backends
+import face_greeting
+import voice_mcp
 
 # ==========================================
 # CONFIGURATION & ENVIRONMENT VARIABLES
@@ -197,6 +199,13 @@ HERMES_API_KEY = os.getenv("HERMES_API_KEY", "")
 # Cascade mode (LLM_BACKEND=cascade): jev-router SSE endpoint
 # (jev-router = L1 of the cascade; it classifies the utterance and forwards to
 # the L2 smolagents worker or the L3 Hermes expert.)
+# Separate Bearer token for the face-greeting source. Deliberately NOT the
+# admin Basic credentials (voiceadmin) and NOT MCP_TOKEN/Hermes' key: a leak of
+# this one can only make the hallway say a greeting. Empty = fail closed.
+FACE_GREETING_TOKEN = os.getenv("FACE_GREETING_TOKEN", "")
+# The one room a real arrival is greeted in (the front door).
+FACE_GREETING_ROOM = os.getenv("FACE_GREETING_ROOM", "entrance1")
+
 ROUTER_URL = os.getenv("ROUTER_URL", "http://localhost:8091")
 # Seconds to wait before speaking the filler ack «Секунду, занимаюсь…» on a
 # slow L1/L2 turn — cancelled as soon as the first real sentence arrives, so
@@ -3909,6 +3918,73 @@ async def api_camera_tts(req: Request, username: str = Depends(verify_auth)):
     return {"status": "sent", "cameras": [s.stream_name for s in target]}
 
 
+_face_greeting_warm_task = None
+
+
+async def _warm_face_greetings() -> None:
+    """Best-effort cache warm-up from the face API's own /health roster."""
+    if not FACE_GREETING_TOKEN:
+        return                      # source off (also keeps CI tests offline)
+    url = os.getenv("FACE_API_URL", "http://192.168.22.102:8090").rstrip("/")
+    try:
+        timeout = aiohttp.ClientTimeout(total=6)
+        async with aiohttp.ClientSession(timeout=timeout) as sess:
+            async with sess.get(f"{url}/health") as resp:
+                if resp.status != 200:
+                    logger.info(f"face greeting warm-up: API HTTP {resp.status}")
+                    return
+                data = await resp.json()
+        names = data.get("known_faces") or []
+        logger.info(f"face greeting warm-up: {names}")
+        await face_greeting.warm(names)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.info(f"face greeting warm-up skipped: {exc!r}")
+
+
+@app.post("/api/face/greeting")
+async def api_face_greeting(req: Request):
+    """Speak an LLM-written greeting to a person arriving at the front door.
+
+    The face-captures handler owns recognition, voting, Telegram and
+    enrollment; this endpoint owns the voice. One phrase is chosen INSTANTLY
+    from the time-of-day cache (generation of future phrases runs in the
+    background — a live Hermes call takes ~17 s, far too slow for a doorway).
+    Playback is fire-and-forget like /api/camera/tts; the honest per-room
+    outcome is logged. `bypass_quiet=True`: a person walking in at 03:00 is
+    not proactive speech, but the 120 s room gap guard still applies.
+    """
+    if (not FACE_GREETING_TOKEN or
+            req.headers.get("authorization") != f"Bearer {FACE_GREETING_TOKEN}"):
+        raise HTTPException(status_code=401, detail="invalid face greeting token")
+    try:
+        data = await req.json()
+    except Exception:
+        data = {}
+    names = data.get("names") or []
+    if isinstance(names, str):
+        names = [names]
+    names = [str(n)[:64] for n in names if str(n).strip()][:4]
+    text, source, bucket = face_greeting.prepare(names)
+
+    async def _speak():
+        try:
+            result = await voice_mcp._speak_tool(
+                text, FACE_GREETING_ROOM, bypass_quiet=True)
+            logger.info(f"face greeting playback [{bucket}/{source}]: {result}")
+        except Exception as exc:
+            logger.error(f"face greeting playback failed: {exc!r}")
+
+    task = asyncio.create_task(_speak())
+    task.add_done_callback(
+        lambda fut: logger.debug(f"face greeting task done: {fut.exception()!r}")
+        if not fut.cancelled() and fut.exception() else None
+    )
+    return {"status": "sent", "text": text, "source": source,
+            "bucket": bucket, "room": FACE_GREETING_ROOM}
+
+
 @app.get("/api/tts/backends")
 async def api_tts_backends_list(username: str = Depends(verify_auth)):
     """List the switchable TTS backends and which one is active."""
@@ -4142,8 +4218,14 @@ async def on_startup():
     # LIVE list object (voice_mcp holds it by reference), and the server
     # only exists when MCP_TOKEN is set — empty means fail-closed.
     voice_mcp.set_sessions(_camera_sessions)
-    global _mcp_task
+    global _mcp_task, _face_greeting_warm_task
     _mcp_task = asyncio.create_task(voice_mcp.run_mcp_server(), name="voice-mcp")
+    # Pre-generate one LLM phrase per known person for the CURRENT part of the
+    # day, in the BACKGROUND: a live Hermes call is ~17 s (measured), so the
+    # port must open without waiting for it. The first arrival falls back to
+    # the time-neutral phrase if the cache is not ready yet.
+    _face_greeting_warm_task = asyncio.create_task(
+        _warm_face_greetings(), name="face-greeting-warm")
     # Diagnostics stay on in every mode (prod, CI image, local): a stalled
     # loop is invisible to the code running inside it.
     global _loop_monitor_task, _stall_dump_file
@@ -4196,7 +4278,10 @@ async def on_shutdown():
         _loop_monitor_task.cancel()
     # Hermes MCP: cancel the server task and any proactive playback it left
     # outstanding — a phrase must not outlive the gateway stop.
-    global _mcp_task
+    global _mcp_task, _face_greeting_warm_task
+    if _face_greeting_warm_task is not None:
+        _face_greeting_warm_task.cancel()
+        _face_greeting_warm_task = None
     if _mcp_task is not None:
         _mcp_task.cancel()
         try:

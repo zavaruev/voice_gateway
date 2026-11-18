@@ -183,6 +183,7 @@ import camera_client
 from camera_client import CameraSession, CameraConfig
 import backends
 import face_greeting
+import face_events
 import voice_mcp
 
 # ==========================================
@@ -3919,6 +3920,7 @@ async def api_camera_tts(req: Request, username: str = Depends(verify_auth)):
 
 
 _face_greeting_warm_task = None
+_face_watcher = None     # face_events.FaceGreetingWatcher, started only when enabled
 
 
 async def _warm_face_greetings() -> None:
@@ -4218,7 +4220,7 @@ async def on_startup():
     # LIVE list object (voice_mcp holds it by reference), and the server
     # only exists when MCP_TOKEN is set — empty means fail-closed.
     voice_mcp.set_sessions(_camera_sessions)
-    global _mcp_task, _face_greeting_warm_task
+    global _mcp_task, _face_greeting_warm_task, _face_watcher
     _mcp_task = asyncio.create_task(voice_mcp.run_mcp_server(), name="voice-mcp")
     # Pre-generate one LLM phrase per known person for the CURRENT part of the
     # day, in the BACKGROUND: a live Hermes call is ~17 s (measured), so the
@@ -4226,6 +4228,13 @@ async def on_startup():
     # the time-neutral phrase if the cache is not ready yet.
     _face_greeting_warm_task = asyncio.create_task(
         _warm_face_greetings(), name="face-greeting-warm")
+    # Stage 2: the gateway itself watches the face-captures events. Disabled by
+    # default (CI/local); FACE_GREETINGS_ENABLED=1 in production only, and the
+    # old face-greeting-handler must be STOPPED before this is turned on or
+    # both would send Telegram and speak at once.
+    if os.getenv("FACE_GREETINGS_ENABLED", "") == "1":
+        _face_watcher = face_events.FaceGreetingWatcher()
+        _face_watcher.start()
     # Diagnostics stay on in every mode (prod, CI image, local): a stalled
     # loop is invisible to the code running inside it.
     global _loop_monitor_task, _stall_dump_file
@@ -4278,7 +4287,10 @@ async def on_shutdown():
         _loop_monitor_task.cancel()
     # Hermes MCP: cancel the server task and any proactive playback it left
     # outstanding — a phrase must not outlive the gateway stop.
-    global _mcp_task, _face_greeting_warm_task
+    global _mcp_task, _face_greeting_warm_task, _face_watcher
+    if _face_watcher is not None:
+        await _face_watcher.stop()
+        _face_watcher = None
     if _face_greeting_warm_task is not None:
         _face_greeting_warm_task.cancel()
         _face_greeting_warm_task = None

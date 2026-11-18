@@ -54,7 +54,7 @@ ROOT = Path(__file__).resolve().parent.parent
 STACK = ROOT.parent
 DEFAULT_COMPOSE = STACK / "docker-compose.yml"
 
-SOURCES = ("main.py", "camera_client.py", "voice_mcp.py", "face_greeting.py", "face_events.py")
+SOURCES = ("main.py", "camera_client.py", "voice_mcp.py", "face_greeting.py", "face_events.py", "face_review.py", "frigate_events.py")
 
 SERVICE = re.compile(r"^  ([a-z0-9_-]+):")
 ENV_LINE = re.compile(r"^\s+-\s+([A-Z][A-Z0-9_]*)=")

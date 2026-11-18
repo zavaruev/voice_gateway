@@ -35,6 +35,8 @@ import time
 import aiohttp
 
 import face_greeting
+import face_review
+import frigate_events
 import voice_mcp
 
 logger = logging.getLogger("face_events")
@@ -66,6 +68,7 @@ TTS_SUPPRESS_WHEN_ALONE = {
     n.strip().lower() for n in
     os.getenv("FACE_TTS_SUPPRESS_WHEN_ALONE", "marina").split(",") if n.strip()
 }
+FACE_WEIGHTED_VOTE = os.getenv("FACE_WEIGHTED_VOTE", "").lower() in ("1", "true", "yes")
 CAMERA_IDS = ("camera_entrance1", "camera_entrance2")
 
 EVENT_PATTERN = re.compile(r"^(\d{2}-\d{2}-\d{2})_")
@@ -73,6 +76,12 @@ UNKNOWN_META_PATTERN = re.compile(r"^(\d{2}-\d{2}-\d{2})_unknown_meta\.json$")
 DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 TG_RETRIES = 3
 TG_RETRY_DELAY = 2
+# Review loop (Frigate "Train tab" via Telegram inline buttons). Off by
+# default: it changes what a door photo looks like in the chat.
+FACE_REVIEW_ENABLED = os.getenv("FACE_REVIEW_ENABLED", "").lower() in ("1", "true", "yes")
+FRIGATE_EVENTS_ENABLED = os.getenv("FRIGATE_EVENTS_ENABLED", "").lower() in ("1", "true", "yes")
+REVIEW_DIR = os.getenv("FACE_REVIEW_DIR", os.path.join(PENDING_DIR, "_review_records"))
+KNOWN_NAMES = {n.strip() for n in os.getenv("FACE_KNOWN_NAMES", "").split(",") if n.strip()}
 
 
 # --- pure helpers (unit-tested without a network or a camera) -------------
@@ -181,8 +190,30 @@ def frame_verdicts(day_dir: str, event_prefix: str) -> dict:
     return out
 
 
-def votes_to_recognized(votes: dict, event_prefix: str) -> list:
-    """Exact port of the handler's rule (including its log lines)."""
+def face_areas_from_meta(day_dir: str, event_prefix: str) -> dict:
+    """The daemon already publishes face_size per frame in meta.json. Frigate's
+    rule — bigger, closer faces count more — needs no new measurement here."""
+    out: dict = {}
+    for d in load_meta(day_dir, event_prefix).get("frame_details") or []:
+        path = d.get("path")
+        if path and d.get("quality_ok"):
+            try:
+                out[path] = int(d.get("face_size") or 0)
+            except (TypeError, ValueError):
+                out[path] = 0
+    return out
+
+
+def votes_to_recognized(votes: dict, event_prefix: str,
+                        face_areas: dict | None = None) -> list:
+    """Port of the handler's vote rule, plus Frigate-style area weighting.
+
+    `face_areas` maps frame path -> face size in px. When present the
+    per-person confidence is the area-weighted mean over that person's voting
+    frames (weight 1..3, a 60 px face still counts), so a large clear face
+    outweighs a distant one without ever increasing the FRAME COUNT needed to
+    greet. Without it the original max-confidence rule is unchanged.
+    """
     recognized = []
     for name, entries in votes.items():
         entries.sort(key=lambda x: x[0], reverse=True)
@@ -198,7 +229,14 @@ def votes_to_recognized(votes: dict, event_prefix: str) -> list:
                         f"{len(entries)} frames (best {best[0]:.3f}, "
                         f"{over} at/above {RECOGNITION_THRESHOLD}, "
                         f"slack {FRAME_VOTER_SLACK})")
-        recognized.append((name, best[0], best[1], best[2]))
+        conf = best[0]
+        if face_areas:
+            weights = [max(1.0, min(3.0, int(face_areas.get(e[1], 0) or 0) / 200.0))
+                       for e in entries]
+            conf = sum(e[0] * w for e, w in zip(entries, weights)) / sum(weights)
+            logger.info(f"[VOTE] {event_prefix}: {name} area-weighted "
+                        f"{conf:.3f} (raw best {best[0]:.3f})")
+        recognized.append((name, conf, best[1], best[2]))
 
     best_by_name = {}
     for name, conf, frame_path, cam_id in recognized:
@@ -237,6 +275,8 @@ class FaceGreetingWatcher:
         self.processed_events: set = existing_events()
         self.last_trigger = 0.0
         self._task: asyncio.Task | None = None
+        self._review_task: asyncio.Task | None = None
+        self._frigate = frigate_events.FrigateEventInjector() if FRIGATE_EVENTS_ENABLED else None
         logger.info(f"[INIT] pre-loaded {len(self.processed_events)} existing "
                     f"face events (face_events)")
 
@@ -245,15 +285,25 @@ class FaceGreetingWatcher:
             self._task = asyncio.create_task(self.run(), name="face-events")
             logger.info(f"face events: watching {CAPTURES_DIR} -> "
                         f"{FACE_ROOM} via face_greeting")
+        if (FACE_REVIEW_ENABLED and TG_TOKEN and self._review_task is None):
+            self._review_task = asyncio.create_task(
+                face_review.review_loop(TG_TOKEN, REVIEW_DIR, PENDING_DIR,
+                                        KNOWN_NAMES), name="face-review")
+        if self._frigate is not None:
+            self._frigate.start()
 
     async def stop(self) -> None:
-        if self._task is not None:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
-            self._task = None
+        if self._frigate is not None:
+            await self._frigate.stop()
+        for task in (self._task, self._review_task):
+            if task is not None:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        self._task = None
+        self._review_task = None
 
     # --- recognition -------------------------------------------------------
     async def _recognize_frame(self, session, frame_path: str,
@@ -285,6 +335,7 @@ class FaceGreetingWatcher:
         judged: set = set()
         votes: dict = {}
         greeted = False
+        areas = face_areas_from_meta(day_dir, event_prefix) if FACE_WEIGHTED_VOTE else None
         async with aiohttp.ClientSession() as session:
             while time.monotonic() < deadline:
                 verdicts = frame_verdicts(day_dir, event_prefix)
@@ -311,7 +362,7 @@ class FaceGreetingWatcher:
                         votes.setdefault(name, []).append((conf, frame_path, cam_id))
                     if greeted:
                         continue
-                    candidate = votes_to_recognized(votes, event_prefix)
+                    candidate = votes_to_recognized(votes, event_prefix, areas)
                     if not candidate:
                         continue
                     greeted = True
@@ -322,7 +373,11 @@ class FaceGreetingWatcher:
                     if len(glob.glob(frame_glob)) <= len(judged):
                         break
                 await asyncio.sleep(STREAM_POLL_INTERVAL)
-        return votes_to_recognized(votes, event_prefix)
+        # meta.json exists by now (or the wait expired) — re-read the areas so
+        # the FINAL vote uses every frame's size, even during a live burst.
+        if FACE_WEIGHTED_VOTE:
+            areas = face_areas_from_meta(day_dir, event_prefix)
+        return votes_to_recognized(votes, event_prefix, areas)
 
     # --- outputs -----------------------------------------------------------
     async def _greet_and_notify(self, recognized: list, event_prefix: str) -> None:
@@ -345,9 +400,19 @@ class FaceGreetingWatcher:
             logger.info(f"[TTS] suppressed: {', '.join(sorted(set(r[0] for r in recognized) & TTS_SUPPRESS_WHEN_ALONE))} alone — Telegram still sent")
         await self._telegram_notification(recognized, event_prefix, text)
 
-    async def _send_photo(self, frame_path: str, caption: str, tag: str) -> None:
+    async def _send_photo(self, frame_path: str, caption: str, tag: str,
+                          choices: list[str] | None = None) -> None:
         if not TG_TOKEN:
             return
+        markup = None
+        if FACE_REVIEW_ENABLED and choices:
+            import secrets
+            rid = secrets.token_hex(6)
+            face_review.save_record(REVIEW_DIR, rid, frame_path, choices, tag)
+            row = [{"text": c[:30], "callback_data": face_review.make_callback(rid, c)}
+                   for c in dict.fromkeys(choices)]
+            markup = {"inline_keyboard": [row[i:i + 3]
+                                          for i in range(0, len(row), 3)]}
         url = f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto"
         for attempt in range(1, TG_RETRIES + 1):
             try:
@@ -360,6 +425,8 @@ class FaceGreetingWatcher:
                                content_type="image/jpeg")
                 data.add_field("caption", caption)
                 data.add_field("parse_mode", "HTML")
+                if markup:
+                    data.add_field("reply_markup", json.dumps(markup))
                 async with aiohttp.ClientSession() as session:
                     async with session.post(
                             url, data=data,
@@ -392,7 +459,9 @@ class FaceGreetingWatcher:
             else:
                 caption = (f"👤 Тоже вошёл: {html.escape(name)} ({conf:.2f}) "
                            f"[{cam_id}]")
-            await self._send_photo(frame_path, caption, name)
+            await self._send_photo(frame_path, caption, name,
+                                   choices=[r[0] for r in recognized] + ["unknown"]
+                                   if i == 0 else None)
 
     async def _unknown_visitor(self, day_dir: str, event_prefix: str) -> None:
         frames = event_frames(day_dir, event_prefix)
@@ -405,7 +474,8 @@ class FaceGreetingWatcher:
                    f"👤 Распознано: неизвестный посетитель "
                    f"(лицо обнаружено, но не опознано)\n"
                    f"📷 Камера: {cam_id}\n💬 Приветствие: —")
-        await self._send_photo(frame, caption, "unknown-visitor")
+        await self._send_photo(frame, caption, "unknown-visitor",
+                               choices=sorted(KNOWN_NAMES) + ["unknown"] if KNOWN_NAMES else None)
 
     async def _unknown_entry(self, day_dir: str, event_prefix: str) -> None:
         frame = None
@@ -420,7 +490,8 @@ class FaceGreetingWatcher:
                    f"👤 Распознано: неизвестно "
                    f"(лицо не обнаружено ни на одной камере)\n"
                    f"💬 Приветствие: —")
-        await self._send_photo(frame, caption, "unknown-entry")
+        await self._send_photo(frame, caption, "unknown-entry",
+                               choices=sorted(KNOWN_NAMES) + ["unknown"] if KNOWN_NAMES else None)
 
     async def _save_pending(self, day_dir: str, event_prefix: str,
                             recognized: list) -> None:

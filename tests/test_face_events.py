@@ -58,6 +58,34 @@ def test_a_clearly_separated_second_person_is_kept():
     assert {r[0] for r in out} == {"alexander", "marina"}
 
 
+def test_area_weighting_can_override_a_single_distant_high_score():
+    votes = {
+        "alexander": [(0.50, "small.jpg", "c1"), (0.50, "big.jpg", "c2")],
+        "vladislava": [(0.60, "far1.jpg", "c1"), (0.40, "far2.jpg", "c2")],
+    }
+    areas = {"small.jpg": 60, "big.jpg": 600,
+             "far1.jpg": 60, "far2.jpg": 60}
+    raw = fe.votes_to_recognized(votes, "12-00-00")
+    assert raw[0][0] == "vladislava"          # the old max-confidence rule
+    weighted = fe.votes_to_recognized(votes, "12-00-00", areas)
+    assert weighted[0][0] == "alexander"      # a large clear face wins
+    assert len(weighted) == 1                 # the close second is still dropped
+
+
+def test_area_weighting_needs_no_measurement_when_disabled():
+    votes = {"alexander": [(0.42, "a.jpg", "c1"), (0.41, "b.jpg", "c2")]}
+    assert fe.votes_to_recognized(votes, "x")[0][1] == 0.42
+
+
+def test_face_areas_come_from_the_daemons_meta(tmp_path):
+    (tmp_path / "12-00-00_meta.json").write_text(__import__("json").dumps({
+        "frame_details": [
+            {"path": "/a.jpg", "face_size": 300, "quality_ok": True},
+            {"path": "/b.jpg", "face_size": 80, "quality_ok": False},
+        ]}))
+    assert fe.face_areas_from_meta(str(tmp_path), "12-00-00") == {"/a.jpg": 300}
+
+
 def test_marina_alone_is_not_greeted_but_with_company_she_is():
     assert fe.who_to_greet([_recognized("marina", 0.4)]) == set()
     assert fe.who_to_greet([_recognized("marina", 0.4),

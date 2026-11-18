@@ -6307,7 +6307,20 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
                 # `_feed_audio` (and extends suppression by up to 20 s when, and
                 # only when, a correlation actually matches).
                 self._wake_suppress_until = sent_at + audio_dur + _ECHO_TAIL_S
-                return True
+                # The return is the REAL outcome, not a constant True. It used
+                # to return True unconditionally, so on the `wait=True` path
+                # `_last_play_ok = bool(played)` OVERWROTE the honest flag with
+                # True for every room: the chorus verdict then named a room
+                # whose POST had TIMED OUT ("the reply was NOT spoken") as
+                # played — the third verdict lie in a row (17-18.11.2026,
+                # probes #1-#3: first the is_question return value, then the
+                # exception check, and under both of them THIS unconditional
+                # True was what made the flag read True no matter what).
+                # "The audio went out somewhere real" = `/play_audio` said
+                # played, or the WebRTC backchannel queued it (the same
+                # condition that sets `_last_play_ok` at the backchannel
+                # branch above); with neither, nothing sounded.
+                return bool(played or self._out_track)
 
             # Wait, or hand it to the background. The cues and every single-clip
             # caller keep the old behaviour; the player opts into overlapping so

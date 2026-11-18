@@ -865,6 +865,27 @@ async def test_speak_pcm_falls_back_to_the_track_when_http_fails():
 
 
 @pytest.mark.asyncio
+async def test_speak_pcm_wait_true_records_the_real_outcome():
+    """On the blocking path `_last_play_ok` must be the REAL outcome, not a
+    constant. `_post_and_close` used to return True unconditionally, so the
+    `wait=True` overwrite (`_last_play_ok = bool(played)`) reset a room whose
+    POST had failed to True — the chorus verdict then named a room that had
+    logged "the reply was NOT spoken" as played (entrance1, 18.11.2026,
+    chorus probe #3: five rooms named, one of them a TimeoutError)."""
+    s = _make_http_session()
+    s.http_session = _FakeHttp(500)          # the POST fails, no backchannel
+    assert s._out_track is None
+
+    await s._speak_pcm(b"\x03\x04" * 24000, "сказано", wait=True)
+    assert s._last_play_ok is False          # nothing sounded
+
+    s2 = _make_http_session()
+    s2.http_session = _FakeHttp(200)
+    await s2._speak_pcm(b"\x03\x04" * 24000, "сказано", wait=True)
+    assert s2._last_play_ok is True          # /play_audio accepted the body
+
+
+@pytest.mark.asyncio
 async def test_is_echo_detects_own_tts():
     s = _make_session()
     rng = np.random.default_rng(0)

@@ -2334,6 +2334,10 @@ listing is lossy (it reports the bare `rtsp://<ip>/stream=0`).
     - **Probe #4 (05:37 UTC, after redeploy) — the first verdict that matches the log:** `PROACTIVE chorus: spoken in ['kitchen', 'camera-corridor1', 'balcony']; failed: [('livingroom', 'False'), ('entrance1', 'False')]`, against `play_audio` x0.7/x1.1/x0.7 and two `TimeoutError()`s. livingroom/entrance1 keep alternating their x5.4–x7-class timeouts between probes (probe #3 hit entrance1, #4 hit both) — the known WiFi flakiness, report-only.
     - **Reading the container's test directory:** the image bakes only a stub `/app/tests`, so a full-suite run needs `tests/` + `services/` tar-PUT copies (`honesty`/`kodi`/`ha_match` imports); they are LOST on container RECREATE and survive restart — re-PUT after any recreate, and `pip install -q pytest pytest-asyncio httpx` together when the sandbox has been reset.
 
+- **CI WAS RED FOR FOUR RUNS BECAUSE A HAND-KEPT FILE LIST DRIFTED — `voice_mcp.py` missing from the workflow's staging copy. 18.11.2026.** Every push since the MCP commit (`96e935a`) failed on COLLECTION: `.github/workflows/tests.yml` docker-cp'd a fixed list of top-level modules into `/tmp/vg_src`, `main.py:402` does `import voice_mcp`, and all 8 test files importing `main` died with `ModuleNotFoundError` before a single test ran. The image itself was fine — the Dockerfile's COPY list HAS `voice_mcp.py` (line 11); only the second, hand-copied list in the workflow was forgotten.
+  * **The list was the trap, and it is removed rather than updated.** The staging loop is now `for f in ./*.py`, a superset that cannot drift when the next module is added. Updating the list would have fixed this occurrence only; the Dockerfile's own COPY list is a hand-kept list too, and it had already been bitten once (05.10.2026, `vosk_wake.py` missing from it).
+  * **Verified by reproducing the staging, both directions:** with the glob — `813 tests collected, 0 errors`; without `voice_mcp.py` — the same 7 collection errors the CI log showed. The broken side needs no rerun after the next commit: a green run on main is itself the confirmation.
+
 ## REST API
 
 | Path | Method | Purpose |

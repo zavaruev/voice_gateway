@@ -182,6 +182,7 @@ from slowapi.errors import RateLimitExceeded
 import camera_client
 from camera_client import CameraSession, CameraConfig
 import backends
+import providers
 import face_greeting
 import face_events
 import voice_mcp
@@ -2055,8 +2056,10 @@ async def process_audio_and_send(
 # ==========================================
 # TTS & EMOTION
 # ==========================================
-async def synthesize_tts_mp3(text: str, state: dict, speed: float = 1.0) -> bytes | None:
-    """Synthesize text to MP3 via the TTS API (network-bound, no streaming).
+async def _synthesize_tts_mp3_url(
+    text: str, state: dict, speed: float = 1.0, url: str = "",
+) -> bytes | None:
+    """Synthesize text to MP3 via one TTS endpoint (`url=""` => TTS_URL).
 
     Args:
         text: sentence to speak (already stripped of emotion tags).
@@ -2087,7 +2090,7 @@ async def synthesize_tts_mp3(text: str, state: dict, speed: float = 1.0) -> byte
         headers = {"Content-Type": "application/json"}
         if TTS_API_KEY:
             headers["Authorization"] = f"Bearer {TTS_API_KEY}"
-        async with sess.post(TTS_URL, json=payload, headers=headers, timeout=30) as r:
+        async with sess.post(url or TTS_URL, json=payload, headers=headers, timeout=30) as r:
             if r.status == 200:
                 return await r.read()
             logger.error(f"❌ [TTS] API Error: {await r.text()}")
@@ -2095,6 +2098,41 @@ async def synthesize_tts_mp3(text: str, state: dict, speed: float = 1.0) -> byte
         if "Cannot call" not in str(e):
             logger.error(f"❌ [TTS] Error: {e}")
     return None
+
+
+async def synthesize_tts_mp3(text: str, state: dict, speed: float = 1.0) -> bytes | None:
+    """Public entry point: the TTS chain when a backup endpoint is configured.
+
+    Without TTS_FALLBACK_URL this is exactly the old single-call path, so the
+    ESP32 and Telegram sources are unchanged. With one, a failed or empty
+    primary serves from the backup and the downgrade is logged by name — no
+    more 'the room said nothing' with no line saying which engine died.
+    """
+    fallback = os.getenv("TTS_FALLBACK_URL", "").strip()
+    if not fallback:
+        return await _synthesize_tts_mp3_url(text, state, speed, TTS_URL)
+
+    async def primary(t, s, sp):
+        got = await _synthesize_tts_mp3_url(t, s, sp, TTS_URL)
+        if got is None:
+            raise RuntimeError("primary TTS returned no audio")
+        return got
+
+    async def backup(t, s, sp):
+        got = await _synthesize_tts_mp3_url(t, s, sp, fallback)
+        if got is None:
+            raise RuntimeError("fallback TTS returned no audio")
+        return got
+
+    try:
+        res = await providers.ProviderChain("tts", [
+            providers.Provider("primary", primary),
+            providers.Provider("fallback", backup),
+        ]).call(text, state, speed)
+        return res.value
+    except Exception as exc:                                       # noqa: BLE001
+        logger.error(f"❌ [TTS] all providers failed: {exc!r}")
+        return None
 
 
 async def _telegram_tts(text: str, sess: aiohttp.ClientSession | None) -> bytes | None:
@@ -3850,9 +3888,10 @@ async def start_camera_sessions():
                 # Streaming STT (LocalAgreement-2). Off by default. `0` means
                 # "unset" for the numeric knobs so a half-filled override
                 # cannot accidentally make the window shorter than two steps.
+                # Second Whisper endpoint; empty = sole primary (old behaviour).
+                whisper_fallback_url=os.getenv("WHISPER_FALLBACK_URL", ""),
                 streaming_stt=(
-                    os.getenv(f"CAMERA_STREAMING_STT_{name.upper()}")
-                    or os.getenv("CAMERA_STREAMING_STT") or ""
+                    os.getenv(f"CAMERA_STREAMING_STT_{name.upper()}")                    or os.getenv("CAMERA_STREAMING_STT") or ""
                 ).lower() in ("1", "true", "yes"),
                 streaming_window_s=float(
                     os.getenv(f"CAMERA_STREAMING_WINDOW_S_{name.upper()}")

@@ -3512,7 +3512,8 @@ def test_the_two_http_budgets_belong_to_their_own_functions():
 
     import camera_client as cc
 
-    whisper = inspect.getsource(cc.CameraSession._fetch_transcription)
+    whisper = (inspect.getsource(cc.CameraSession._fetch_transcription)
+               + inspect.getsource(cc.CameraSession._fetch_transcription_one))
     play = inspect.getsource(cc.CameraSession._play_audio_http)
 
     assert "len(pcm)" not in whisper, (

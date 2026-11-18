@@ -48,7 +48,7 @@ See [`docs/REFERENCE.md`](docs/REFERENCE.md) → *Known Issues & Current Problem
 | L2 turn with a verified side effect | **3.2–4.0 s** |
 | Wake debounce | ~240 ms (2 of 3 chunks); a single chunk ≥ 0.68 fires immediately |
 | Wake window / watchdog | 15 s / 90 s |
-| Test suite | 859 tests, 27 files, ~17,100 lines |
+| Test suite | 890 tests, 32 files, ~17,600 lines |
 
 ---
 
@@ -95,8 +95,8 @@ Full environment table, backend variants, REST API and OTA: [`docs/REFERENCE.md`
 
 | File | Responsibility | Why it is separate |
 |---|---|---|
-| **`main.py`** (~4,390 lines) | Core: ESP32 WebSocket protocol, REST API, OTA, web UI, camera session startup | Single entry point for everything |
-| **`camera_client.py`** (~6,670 lines) | One `CameraSession` per stream: RTSP mic feed, wake word, cross-camera arbitration, replies over the camera's `/play_audio` | Cameras have their own transport and their own hard problem — the mic hears its own speaker |
+| **`main.py`** (~4,450 lines) | Core: ESP32 WebSocket protocol, REST API, OTA, web UI, camera session startup | Single entry point for everything |
+| **`camera_client.py`** (~6,830 lines) | One `CameraSession` per stream: RTSP mic feed, wake word, cross-camera arbitration, replies over the camera's `/play_audio` | Cameras have their own transport and their own hard problem — the mic hears its own speaker |
 | **`engine.py`** (~570 lines) | Silero VAD + openWakeWord scoring — the "science" part, pure ONNX calls | Testable without a network, without a camera |
 | **`backends.py`** (~670 lines) | Who answers: `NanobotBackend` / `HermesBackend` / `CascadeBackend` | One interface — the brain is swappable with a single env var |
 | **`telegram_client.py`** (~1,430 lines) | Third request source: Telegram long-polling, chat allowlist, voice note → Whisper → the same backend → text reply (+ optional voice note) | No bot framework — three Bot API calls over the `aiohttp` the process already has; all main.py helpers injected (no import cycle) |
@@ -104,7 +104,11 @@ Full environment table, backend variants, REST API and OTA: [`docs/REFERENCE.md`
 | **`vosk_wake.py`** (~350 lines) | Wake word by **decoding** it (per-room model, free decoder, no grammar) | Decoding has no ceiling where scoring has one — see *Three instruments* above |
 | **`voice_mcp.py`** (~560 lines) | MCP (SSE) server on :18793: `speak(text, room)` / `rooms()` for Hermes, quiet hours, per-room gap, strict `room=all` chorus | Guards live in SERVER CODE, not in the skill prompt; one synthesis and the same bytes for every room |
 | **`face_greeting.py`** (~250 lines) | LLM-written arrival phrases, generated in the background and cached by `(name, time-of-day bucket)`; no «Доброе утро» at 03:00 | A live generation takes 17 s — far too slow for a doorway; the cache makes the choice instant |
-| **`face_events.py`** (~490 lines) | Watches face-captures events: streaming recognition, 2-frame vote, ambiguity margin, Telegram, `pending/`; speaks through `voice_mcp` | The whole arrival path in one process: one log, one auth model, one voice |
+| **`face_events.py`** (~560 lines) | Watches face-captures events: streaming recognition, 2-frame vote, ambiguity margin, Telegram, `pending/`; speaks through `voice_mcp` | The whole arrival path in one process: one log, one auth model, one voice |
+| **`streaming_stt.py`** (~155 lines) | LocalAgreement-2 stable-prefix STT; only committed text leaves the module | A live generation/transcription cannot happen at the doorway — see *Proactive speech* below |
+| **`face_review.py`** (~134 lines) | Telegram inline review of door photos -> `pending/_review/<name>/` | Frigate's Train tab, but with the bot this house already has; callback names are validated against the stored record |
+| **`frigate_events.py`** (~175 lines) | Injects Frigate `person` snapshots into an active capture burst | The HA trigger fires before anyone is in frame; Frigate already saw the person |
+| **`providers.py`** (~125 lines) | Provider chain with circuit breaker for TTS/Whisper failures | A fallback must be LOGGED by name, or a dead service looks like a quiet room |
 | **`services/jev-router/`** | **L1** — intent classifier, offline slot resolver, direct Home Assistant calls, weather, chat/expert proxy | ~0.1 s for a simple command, no LLM in the loop |
 | **`services/smolagents-worker/`** | **L2** — smolagents `CodeAgent` with HA / Qdrant / Hermes / weather tools, plus honesty vetoes | Multi-step tasks that must not lie about side effects |
 | **`tests/`** | 859 tests across 27 files | Pins the wake-gate bands, the protocol, the cascade contract, the Telegram source, the utterance endpointing, the side-effect verification, the chorus verdict, the time-of-day greeting cache and the one-voice rule |
@@ -447,6 +451,19 @@ bucket's time marker («Доброе утро» at night) is rejected on both wr
 read. Fallbacks are time-neutral. The HTTP entry point `POST /api/face/greeting`
 uses its own narrow Bearer token, so a leak cannot speak as admin.
 
+**Accuracy and resilience work from similar projects (all opt-in):** Frigate's
+face-recognition rules (a decision over many attempts, weighted by face area, a
+Train tab, no negative training) gave us `FACE_WEIGHTED_VOTE`, the Telegram
+inline review buttons (`FACE_REVIEW_ENABLED`) and Frigate `person` snapshots
+injected into a burst whose HA trigger fired too early (`FRIGATE_EVENTS_ENABLED`).
+Rhasspy/Double Take's replaceable providers gave us `providers.py`: setting
+`WHISPER_FALLBACK_URL` or `TTS_FALLBACK_URL` serves a turn from the backup and
+logs the downgrade by name, with a circuit breaker so a dead endpoint is not
+retried on every turn. Streaming STT (`CAMERA_STREAMING_STT[_<NAME>]`, the
+LocalAgreement-2 policy of ufal/whisper_streaming) commits only a prefix two
+overlapping windows agree on and skips the full-buffer Whisper call — it is OFF
+by default because it changes WHEN a command is dispatched.
+
 ---
 
 ## Design rules worth remembering
@@ -479,18 +496,22 @@ voice_gateway/
 ├── voice_mcp.py             # MCP :18793: speak/rooms, guards, strict chorus
 ├── face_greeting.py         # LLM phrases cached by (name, time-of-day bucket)
 ├── face_events.py           # arrival watcher: vote, Telegram, pending, one voice
+├── streaming_stt.py         # LocalAgreement-2 stable-prefix STT (opt-in per room)
+├── face_review.py           # Telegram inline review -> pending/_review/<name>/
+├── frigate_events.py        # Frigate person snapshots into an active burst
+├── providers.py             # provider chain + circuit breaker (TTS/Whisper)
 ├── config/                 # devices.json, wake-word ONNX heads
 ├── services/
 │   ├── jev-router/         # cascade L1
 │   └── smolagents-worker/  # cascade L2
 ├── scripts/                # verify_endpoint, camera watchdog, doc gates
-├── tests/                  # 859 tests / 27 files
+├── tests/                  # 890 tests / 32 files
 └── docs/
     └── REFERENCE.md        # full config tables, REST API, known issues, changelog
 ```
 
 - **Configuration, REST API, environment variables, known issues and the full changelog:** [`docs/REFERENCE.md`](docs/REFERENCE.md)
-- **Tests:** 859 tests across 27 files covering engine scoring and wake gates, the camera audio track and its echo guards, the ESP32 protocol, cascade streaming, honesty vetoes, HA entity matching, router resolution, dialogue memory, the streaming speech relay, the TTS engine switching, the Telegram source (allowlist, ack vs final text, turn timeout, voice turns, `/room`), the chorus verdict, the time-of-day greeting cache and the one-voice arrival watcher. Run them inside the container — see [`docs/REFERENCE.md`](docs/REFERENCE.md#tests), the host Python usually lacks `opuslib` / `onnxruntime`. CI (`.github/workflows/tests.yml`) runs the same recipe on every push and PR.
+- **Tests:** 890 tests across 32 files covering engine scoring and wake gates, the camera audio track and its echo guards, the ESP32 protocol, cascade streaming, honesty vetoes, HA entity matching, router resolution, dialogue memory, the streaming speech relay, the TTS engine switching, the Telegram source (allowlist, ack vs final text, turn timeout, voice turns, `/room`), the chorus verdict, the time-of-day greeting cache and the one-voice arrival watcher. Run them inside the container — see [`docs/REFERENCE.md`](docs/REFERENCE.md#tests), the host Python usually lacks `opuslib` / `onnxruntime`. CI (`.github/workflows/tests.yml`) runs the same recipe on every push and PR.
 
 ---
 

@@ -1414,8 +1414,9 @@ class CameraConfig:
     # so a camera and an ESP32 answer a follow-up on the same terms.
     dialogue_question_s: float = 0.0
     dialogue_statement_s: float = 0.0
-    # Streaming STT (LocalAgreement-2). Off by default: it changes WHEN an
-    # utterance is dispatched, which is the most dangerous class of change in
+    # Optional second Whisper endpoint. Empty = sole primary (old behaviour).
+    whisper_fallback_url: str = ""
+    # Streaming STT (LocalAgreement-2). Off by default: it changes WHEN an    # utterance is dispatched, which is the most dangerous class of change in
     # this file. Enable per room only after replaying that room's own utterance
     # dumps through the policy — see streaming_stt.py and AGENTS.md.
     streaming_stt: bool = False
@@ -1506,6 +1507,7 @@ class CameraSession:
         self.chat_id = config.chat_id or self._make_chat_id(config.stream_name)
         self.http_session = config.http_session
         self.whisper_url = config.whisper_url
+        self.whisper_fallback_url = getattr(config, "whisper_fallback_url", "")
         self.whisper_model = config.whisper_model
         self.tts_url = config.tts_url
         self.tts_voice = config.tts_voice
@@ -5476,11 +5478,12 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
         )
         return header + pcm_16k
 
-    async def _fetch_transcription(
+    async def _fetch_transcription_one(
         self,
         wav: bytes,
         temperature: str | None = None,
         rms_raw: float = 0.0,
+        url: str | None = None,
     ) -> str:
         for temp in (temperature, "0.0", "0.5"):
             if not temp:
@@ -5503,7 +5506,7 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
                 )
             try:
                 async with self.http_session.post(
-                    self.whisper_url,
+                    url or self.whisper_url,
                     data=form,
                     # 30 s for a clip that is at most 7 s long. Nothing here waits
                     # on the audio. This is NOT the /play_audio endpoint, whose
@@ -5538,6 +5541,36 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
                     f"[{self.stream_name}] whisper call failed: {e!r}"
                 )
         return ""
+
+    async def _fetch_transcription(
+        self, wav: bytes, temperature: str | None = None, rms_raw: float = 0.0,
+    ) -> str:
+        """Whisper with an optional fallback endpoint and a visible downgrade.
+
+        No fallback URL => the exact old behaviour, byte for byte. With one, a
+        dead or empty primary serves the turn from the backup and the log says
+        WHICH endpoint answered — 'Whisper empty' must never again be an
+        ambiguity between a quiet room and a broken service.
+        """
+        url = getattr(self, "whisper_fallback_url", "") or ""
+        if not url:
+            return await self._fetch_transcription_one(wav, temperature, rms_raw)
+        from providers import Provider, ProviderChain
+
+        async def primary(w, t, r):
+            return await self._fetch_transcription_one(w, t, r, self.whisper_url)
+
+        async def backup(w, t, r):
+            return await self._fetch_transcription_one(w, t, r, url)
+
+        try:
+            res = await ProviderChain("whisper", [
+                Provider("primary", primary), Provider("fallback", backup),
+            ]).call(wav, temperature, rms_raw)
+            return res.value
+        except Exception as exc:                                   # noqa: BLE001
+            logger.warning(f"[{self.stream_name}] whisper chain failed: {exc!r}")
+            return ""
 
     async def _fetch_speaker_id(self, wav: bytes) -> str:
         """Identify the speaker: WAV -> Opus/Ogg -> SpeakerID POST.

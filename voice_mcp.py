@@ -266,7 +266,15 @@ def _dispatch_speak_all(sessions: list, text: str) -> None:
         ok: list[str] = []
         bad: list[tuple[str, str]] = []
         for s, r in zip(sessions, results):
-            if r is not True:                      # an exception, captured
+            # `r is not True` would put EVERY successful room here: `_speak_pcm`
+            # returns `is_question` — a property of the TEXT — and a phrase that
+            # is not a question returns False. The chorus verdict said
+            # "failed: [('livingroom', 'False'), ...]" while all five
+            # `play_audio` lines showed the audio played (17.11.2026, probe #2):
+            # the same is_question trap as the 10.10.2026 return-value verdict,
+            # one level up. Under return_exceptions=True an exception comes back
+            # as an exception INSTANCE, never as a bool — so test for that.
+            if isinstance(r, BaseException):       # an exception, captured
                 bad.append((s.stream_name, repr(r)))
             elif getattr(s, "_last_play_ok", False):
                 ok.append(s.stream_name)

@@ -59,9 +59,15 @@ class _ChorusSession:
     async def _speak_pcm(self, pcm: bytes, reply: str = "", wait=None) -> bool:
         self.pcm_played.append(pcm)
         # The real method records `played` here and returns `is_question` —
-        # the chorus verdict MUST read the flag, not the return value.
+        # a property of the TEXT: False for a phrase that is not a question.
+        # The chorus verdict MUST read the flag, not the return value — and
+        # a stub that returned True here hid the second verdict bug exactly
+        # the way the field showed it (17.11.2026: `r is not True` put every
+        # successful non-question room into the failed list while all five
+        # play_audio lines showed the audio played), so the stub returns the
+        # real shape.
         self._last_play_ok = self.play_ok
-        return True
+        return "?" in (reply or "")
 
 
 def _capture_loguru():
@@ -495,7 +501,31 @@ def test_the_chorus_verdict_names_who_actually_played():
         remove()
 
 
-# --- the server task itself (integration) ------------------------------------
+def test_a_raised_playback_failure_still_names_the_room():
+    """The exception branch: under return_exceptions=True a room whose
+    `_speak_pcm` raises comes back as an exception INSTANCE — `isinstance` is
+    what catches it. The old `r is not True` could not distinguish "raised"
+    from "returned False" (17.11.2026 probe #2: all five successful rooms were
+    reported failed because the real method returns is_question=False)."""
+    sessions = _chorus_sessions()
+
+    async def boom(pcm, reply="", wait=None):
+        raise RuntimeError("camera POST refused")
+
+    sessions[1]._speak_pcm = boom                 # kitchen raises
+    voice_mcp._SESSIONS.extend(sessions)
+    msgs, remove = _capture_loguru()
+    try:
+        asyncio.run(_drive(voice_mcp._speak_tool("Хором", "all",
+                                                 now=_epoch_utc(12))))
+        line = " ".join(msgs)
+        assert "PROACTIVE chorus: spoken in ['livingroom', 'balcony']" in line
+        # repr(r) is a STRING containing single quotes, so the tuple's own
+        # repr wraps it in double quotes.
+        assert ('failed: [(\'kitchen\', "RuntimeError(\'camera POST '
+                'refused\')")]') in line
+    finally:
+        remove()
 
 
 async def _sse_probe(port: int, token: str | None, host: str = "127.0.0.1") -> str:

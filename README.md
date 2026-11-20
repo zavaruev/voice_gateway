@@ -48,7 +48,7 @@ See [`docs/REFERENCE.md`](docs/REFERENCE.md) → *Known Issues & Current Problem
 | L2 turn with a verified side effect | **3.2–4.0 s** |
 | Wake debounce | ~240 ms (2 of 3 chunks); a single chunk ≥ 0.68 fires immediately |
 | Wake window / watchdog | 15 s / 90 s |
-| Test suite | 890 tests, 32 files, ~17,600 lines |
+| Test suite | 891 tests, 32 files, ~17,600 lines |
 
 ---
 
@@ -103,7 +103,7 @@ Full environment table, backend variants, REST API and OTA: [`docs/REFERENCE.md`
 | **`audio_utils.py`** (~220 lines) | `pack_ogg()` (Opus → Ogg for Whisper) and `is_valid_text()` (drops hallucinations and mic echoes of our own TTS) | Shared by both device paths |
 | **`vosk_wake.py`** (~350 lines) | Wake word by **decoding** it (per-room model, free decoder, no grammar) | Decoding has no ceiling where scoring has one — see *Three instruments* above |
 | **`voice_mcp.py`** (~560 lines) | MCP (SSE) server on :18793: `speak(text, room)` / `rooms()` for Hermes, quiet hours, per-room gap, strict `room=all` chorus | Guards live in SERVER CODE, not in the skill prompt; one synthesis and the same bytes for every room |
-| **`face_greeting.py`** (~250 lines) | LLM-written arrival phrases, generated in the background and cached by `(name, time-of-day bucket)`; no «Доброе утро» at 03:00 | A live generation takes 17 s — far too slow for a doorway; the cache makes the choice instant |
+| **`face_greeting.py`** (~260 lines) | LLM-written arrival phrases, generated in the background and cached by `(name, time-of-day bucket)`; no «Доброе утро» at 03:00 | A live generation takes 17 s — far too slow for a doorway; the cache makes the choice instant |
 | **`face_events.py`** (~560 lines) | Watches face-captures events: streaming recognition, 2-frame vote, ambiguity margin, Telegram, `pending/`; speaks through `voice_mcp` | The whole arrival path in one process: one log, one auth model, one voice |
 | **`streaming_stt.py`** (~155 lines) | LocalAgreement-2 stable-prefix STT; only committed text leaves the module | A live generation/transcription cannot happen at the doorway — see *Proactive speech* below |
 | **`face_review.py`** (~134 lines) | Telegram inline review of door photos -> `pending/_review/<name>/` | Frigate's Train tab, but with the bot this house already has; callback names are validated against the stored record |
@@ -506,13 +506,13 @@ voice_gateway/
 │   ├── jev-router/         # cascade L1
 │   └── smolagents-worker/  # cascade L2
 ├── scripts/                # verify_endpoint, camera watchdog, doc gates
-├── tests/                  # 890 tests / 32 files
+├── tests/                  # 891 tests / 32 files
 └── docs/
     └── REFERENCE.md        # full config tables, REST API, known issues, changelog
 ```
 
 - **Configuration, REST API, environment variables, known issues and the full changelog:** [`docs/REFERENCE.md`](docs/REFERENCE.md)
-- **Tests:** 890 tests across 32 files covering engine scoring and wake gates, the camera audio track and its echo guards, the ESP32 protocol, cascade streaming, honesty vetoes, HA entity matching, router resolution, dialogue memory, the streaming speech relay, the TTS engine switching, the Telegram source (allowlist, ack vs final text, turn timeout, voice turns, `/room`), the chorus verdict, the time-of-day greeting cache and the one-voice arrival watcher. Run them inside the container — see [`docs/REFERENCE.md`](docs/REFERENCE.md#tests), the host Python usually lacks `opuslib` / `onnxruntime`. CI (`.github/workflows/tests.yml`) runs the same recipe on every push and PR.
+- **Tests:** 891 tests across 32 files covering engine scoring and wake gates, the camera audio track and its echo guards, the ESP32 protocol, cascade streaming, honesty vetoes, HA entity matching, router resolution, dialogue memory, the streaming speech relay, the TTS engine switching, the Telegram source (allowlist, ack vs final text, turn timeout, voice turns, `/room`), the chorus verdict, the time-of-day greeting cache and the one-voice arrival watcher. Run them inside the container — see [`docs/REFERENCE.md`](docs/REFERENCE.md#tests), the host Python usually lacks `opuslib` / `onnxruntime`. CI (`.github/workflows/tests.yml`) runs the same recipe on every push and PR.
 
 ---
 

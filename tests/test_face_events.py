@@ -86,10 +86,14 @@ def test_face_areas_come_from_the_daemons_meta(tmp_path):
     assert fe.face_areas_from_meta(str(tmp_path), "12-00-00") == {"/a.jpg": 300}
 
 
-def test_marina_alone_is_not_greeted_but_with_company_she_is():
-    assert fe.who_to_greet([_recognized("marina", 0.4)]) == set()
+def test_marina_is_greeted_again_and_explicit_suppression_still_works(monkeypatch):
+    # The user asked to greet Marina again — empty suppression is the default.
+    assert fe.TTS_SUPPRESS_WHEN_ALONE == set()
+    assert fe.who_to_greet([_recognized("marina", 0.4)]) == {"marina"}
     assert fe.who_to_greet([_recognized("marina", 0.4),
                             _recognized("alexander", 0.9)]) == {"marina", "alexander"}
+    monkeypatch.setattr(fe, "TTS_SUPPRESS_WHEN_ALONE", {"marina"})
+    assert fe.who_to_greet([_recognized("marina", 0.4)]) == set()
 
 
 # --- event discovery / dedupe ---------------------------------------------

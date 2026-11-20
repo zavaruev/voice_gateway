@@ -14,6 +14,13 @@ import pytest
 import face_greeting as fg
 
 
+def test_model_is_pinned_and_marina_gets_a_respectful_tone():
+    assert fg.LLM_MODEL == "nvidia/nemotron-3.5-super-vl:free"
+    assert "marina" in fg._RESPECTFUL_NAMES
+    assert "уважительное" in fg._system_prompt("day", "marina")
+    assert "уважительное" not in fg._system_prompt("day", "alexander")
+
+
 # MSK bucket boundaries, checked on both sides of every seam.
 @pytest.mark.parametrize("utc_hour,bucket", [
     (20, "night"),      # 23:00 MSK

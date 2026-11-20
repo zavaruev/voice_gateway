@@ -57,6 +57,11 @@ FALLBACK = {
 }
 FALLBACK_DEFAULT = "Здравствуй, добро пожаловать домой"
 
+LLM_MODEL = os.getenv("FACE_GREETING_MODEL", "nvidia/nemotron-3.5-super-vl:free")
+_RESPECTFUL_NAMES = {
+    n.strip().lower() for n in
+    os.getenv("FACE_GREETING_RESPECT_NAMES", "marina").split(",") if n.strip()
+}
 MAX_CHARS = 60
 CACHE_TTL_S = 48 * 3600          # a phrase older than two days is re-made
 _GEN_TIMEOUT_S = 30.0            # measured Hermes call: 17.2 s
@@ -146,14 +151,22 @@ def choose(name: str, bucket: str, now: float | None = None) -> tuple[str, str]:
     return fallback_for(name), "fallback"
 
 
-def _system_prompt(bucket: str) -> str:
+def _system_prompt(bucket: str, name: str = "") -> str:
+    # The user asked for Marina to be greeted again and to feel respected, not
+    # merely acknowledged. The tone is a prompt detail, so it cannot drift in
+    # the validation rules — phrase_ok() still decides what may be spoken.
+    tone = (
+        " Обращение ОЧЕНЬ уважительное, тёплое и чуть торжественное — так, "
+        "будто хозяин дома рад встрече и хочет это подчеркнуть."
+        if (name or "").strip().lower() in _RESPECTFUL_NAMES else ""
+    )
     return (
         "Ты голосовой ассистент дома. Напиши ОДНУ короткую фразу на русском "
         f"(до {MAX_CHARS} символов), которой можно поприветствовать человека, "
         "только что вошедшего домой. Обращайся по имени. Без вопросов, без "
         "списков, без разметки, без кавычек и без пояснений."
         f" Сейчас {bucket}. Используй приветствие, подходящее именно для этого "
-        "времени суток; ни в коем случае не упоминай другое время суток."
+        "времени суток; ни в коем случае не упоминай другое время суток." + tone
     )
 
 
@@ -170,9 +183,9 @@ async def generate(name: str, bucket: str) -> str:
     _inflight.add(key)
     try:
         payload = {
-            "model": "omniroute/oc/hy3-free",
+            "model": LLM_MODEL,
             "messages": [
-                {"role": "system", "content": _system_prompt(bucket)},
+                {"role": "system", "content": _system_prompt(bucket, name)},
                 {"role": "user", "content": f"Имя: {name or 'друг'}. Сейчас {bucket}."},
             ],
             "stream": False,

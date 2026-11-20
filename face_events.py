@@ -38,7 +38,6 @@ import face_greeting
 import face_review
 import frigate_events
 import voice_mcp
-
 logger = logging.getLogger("face_events")
 
 # --- config (all overridable; defaults are the face-captures production ones)
@@ -64,9 +63,11 @@ COOLDOWN_SECONDS = int(os.getenv("FACE_COOLDOWN", "30"))
 INITIAL_EVENTS_MAX_AGE = int(os.getenv("FACE_INITIAL_EVENTS_MAX_AGE", "120"))
 CONTINUAL_ENROLLMENT_THRESHOLD = float(
     os.getenv("FACE_CONTINUAL_ENROLLMENT_THRESHOLD", "0.6"))
+# Nobody is suppressed by default. Marina used to be muted when alone because
+# her enrolment was being rebuilt; the user asked to greet her again (20.11.2026).
 TTS_SUPPRESS_WHEN_ALONE = {
     n.strip().lower() for n in
-    os.getenv("FACE_TTS_SUPPRESS_WHEN_ALONE", "marina").split(",") if n.strip()
+    os.getenv("FACE_TTS_SUPPRESS_WHEN_ALONE", "").split(",") if n.strip()
 }
 FACE_WEIGHTED_VOTE = os.getenv("FACE_WEIGHTED_VOTE", "").lower() in ("1", "true", "yes")
 CAMERA_IDS = ("camera_entrance1", "camera_entrance2")

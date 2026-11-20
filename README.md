@@ -459,10 +459,11 @@ injected into a burst whose HA trigger fired too early (`FRIGATE_EVENTS_ENABLED`
 Rhasspy/Double Take's replaceable providers gave us `providers.py`: setting
 `WHISPER_FALLBACK_URL` or `TTS_FALLBACK_URL` serves a turn from the backup and
 logs the downgrade by name, with a circuit breaker so a dead endpoint is not
-retried on every turn. Streaming STT (`CAMERA_STREAMING_STT[_<NAME>]`, the
-LocalAgreement-2 policy of ufal/whisper_streaming) commits only a prefix two
-overlapping windows agree on and skips the full-buffer Whisper call — it is OFF
-by default because it changes WHEN a command is dispatched.
+retried on every turn. Streaming STT (`CAMERA_STREAMING_STT[_<NAME>]`, the LocalAgreement-2 policy of
+ufal/whisper_streaming) commits only a prefix two overlapping windows agree on
+and skips the full-buffer Whisper call — enabled in the two rooms without a
+pause endpoint (`balcony`, `entrance1`), where it replaces the 7 s cap with a
+measured ~3.9 s utterance end.
 
 ---
 

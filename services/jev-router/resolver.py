@@ -1161,6 +1161,41 @@ RE_STATUS_Q = re.compile(
     r"|\bкак\s+(?:наш\w*|мой\w*|он|она|оно|сейчас)?\s*[\wа-яё-]+\s*\?",
     re.IGNORECASE,
 )
+# --- Kitchen scale (ESP32, 192.168.22.123) --------------------------------
+# Narrow phrasings for the two step-1 commands. The device noun guard below is
+# what keeps «сколько весит пылесос» out of this route: a weight word alone is
+# not enough when the sentence names something else in the house.
+RE_SCALE_WEIGHT_Q = re.compile(
+    r"\b(?:сколько\s+(?:весит|весят|весов)|какой\s+вес|вес\s+на\s+весах"
+    r"|что\s+показыва(?:ет|ют)\s+весы|сколько\s+грамм\w*)\b",
+    re.IGNORECASE,
+)
+RE_SCALE_TARE = re.compile(
+    r"\b(?:обнули(?:ть)?|тарируй(?:те)?|тарировать|сбросить|сбрось)\b.*\bвес"
+    r"|\bвесы\s+в\s+ноль\b|\bсделай\s+тару\b",
+    re.IGNORECASE,
+)
+
+
+@dataclass
+class ScaleCall:
+    """A deterministic scale command: kind is "weight" or "tare"."""
+
+    kind: str
+
+
+def resolve_scale(text: str) -> ScaleCall | None:
+    """Recognise only the two supported scale commands; no network, no LLM."""
+    t = (text or "").strip()
+    if not t:
+        return None
+    if RE_SCALE_TARE.search(t):
+        return ScaleCall("tare")
+    if RE_SCALE_WEIGHT_Q.search(t) and not _DEVICE_NOUN.search(t):
+        return ScaleCall("weight")
+    return None
+
+
 RE_TIME_Q = re.compile(
     # «сколько времени» is how the question is actually asked — measured
     # 05.10.2026 22:14, the user said «Сколько времени?» and it went to L2 for

@@ -52,6 +52,10 @@ HA_URL = os.getenv("HA_URL", "http://192.168.22.111:8123").rstrip("/")
 # Bearer token for both HA REST and the MCP endpoint (HA 2026.9.3).
 HA_TOKEN = os.getenv("HA_TOKEN", "")
 
+# ESP32 kitchen scale: stateless JSON-RPC endpoint in the firmware (v1.4.2).
+# Tools used in step 1: get_weight (fresh reading) and tare (guarded + verified).
+SCALE_MCP_URL = os.getenv("SCALE_MCP_URL", "http://192.168.22.123/mcp").rstrip("/")
+
 OMNIROUTE_URL = os.getenv("OMNIROUTE_URL", "http://192.168.22.101:20128").rstrip("/")
 # Free OmniRoute combo model used as the general_qa brain and as the expert
 # failover when Hermes is down.

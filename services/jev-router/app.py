@@ -58,6 +58,7 @@ import chat_proxy
 import config
 import history
 import memory
+import scale
 import weather
 from classifier import (
     Classifier,
@@ -92,6 +93,7 @@ from resolver import (
     device_hint_from,
     resolve_action,
     resolve_query,
+    resolve_scale,
     unresolved_hint,
     action_verb_missing,
     normalize_stt_verbs,
@@ -1665,8 +1667,20 @@ async def _handle(req: RouteRequest):
         )
         text = repaired
 
-    decision = await classifier.classify(text)
-    route, confidence, reason = decision.route, decision.confidence, decision.reason
+    # --- L0.5: kitchen scale — deterministic, BEFORE the classifier --------
+    # «обнули весы» is an imperative with no HA device noun. If it reached the
+    # classifier and easy_action, the bare-verb fallback would append «свет»
+    # and turn a scale command into a lamp command. «сколько весит» is a
+    # question a free model would answer from imagination — the scale has no
+    # L2 tool at all. Both are intercepted here, where only the regex decides.
+    scale_call = resolve_scale(text)
+    if scale_call is not None:
+        route = "scale"
+        confidence = 1.0
+        reason = "scale_weight" if scale_call.kind == "weight" else "scale_tare"
+    else:
+        decision = await classifier.classify(text)
+        route, confidence, reason = decision.route, decision.confidence, decision.reason
     logger.info(
         "route=%s conf=%.2f reason=%s stream=%s text=%r",
         route, confidence, reason or "-", req.stream_name, text[:80],
@@ -1929,6 +1943,14 @@ async def _handle(req: RouteRequest):
                     if chunk.get("type") == "sentence" and chunk.get("text"):
                         reply_parts.append(chunk["text"])
                     yield _sse(chunk)
+
+        # --- scale: fresh reading, or a guarded + verified tare -----------
+        elif route == "scale":
+            kind = "weight" if reason == "scale_weight" else "tare"
+            sentence = await scale.handle(kind)
+            logger.info("speaking: %r", sentence)
+            reply_parts.append(sentence)
+            yield _sse({"type": "sentence", "text": sentence})
 
         # --- easy_query: states/history/datetime --------------------------
         elif route == "easy_query":

@@ -1,6 +1,6 @@
 # Voice Gateway
 
-![version](https://img.shields.io/badge/version-v2.80-blue)
+![version](https://img.shields.io/badge/version-v2.81-blue)
 [![tests](https://github.com/zavaruev/voice_gateway/actions/workflows/tests.yml/badge.svg)](https://github.com/zavaruev/voice_gateway/actions/workflows/tests.yml)
 ![python](https://img.shields.io/badge/python-3.12%2B-3776AB?logo=python&logoColor=white)
 ![backend](https://img.shields.io/badge/AI%20backend-Cascade-orange)
@@ -48,7 +48,7 @@ See [`docs/REFERENCE.md`](docs/REFERENCE.md) → *Known Issues & Current Problem
 | L2 turn with a verified side effect | **3.2–4.0 s** |
 | Wake debounce | ~240 ms (2 of 3 chunks); a single chunk ≥ 0.68 fires immediately |
 | Wake window / watchdog | 15 s / 90 s |
-| Test suite | 904 tests, 33 files, ~17,900 lines |
+| Test suite | 905 tests, 33 files, ~17,900 lines |
 
 ---
 
@@ -352,7 +352,7 @@ Everything here exists to avoid listening to garbage.
 
 ---
 
-## The kitchen scale: a device with its own MCP server (v2.80)
+## The kitchen scale: a device with its own MCP server (v2.81)
 
 The ESP32 scale at `192.168.22.123` serves its own stateless JSON-RPC endpoint (`POST /mcp`, firmware v1.4.2) with the tools `get_weight`, `tare` and `set_unit`. Two phrases are answered by L1 with no LLM in the loop:
 
@@ -361,7 +361,7 @@ The ESP32 scale at `192.168.22.123` serves its own stateless JSON-RPC endpoint (
 | «сколько весит?» | `get_weight` | whole grams with noun agreement — «На весах сто граммов.» |
 | «обнули весы» | read → guard → `tare` → read again | «Обнулила.» only when the fresh reading has `zero: true` |
 
-The guard refuses to tare when `abs(grams) > 5`, so an ingredient already on the platform is not silently zeroed. An unreachable scale answers «Весы не отвечают.» instead of escalating to L2 — L2 has no scale tools and would invent a reading. Both phrases are intercepted **before** the classifier: otherwise the bare-verb fallback in `easy_action` appends «свет» to «обнули весы». Measured on the live router: **0.08 s** for a reading, **0.43 s** for a verified tare.
+The guard refuses to tare when `abs(grams) > 5`, so an ingredient already on the platform is not silently zeroed. An unreachable scale answers «Весы не отвечают.» instead of escalating to L2 — L2 has no scale tools and would invent a reading. Both phrases are intercepted **before** the classifier: otherwise the bare-verb fallback in `easy_action` appends «свет» to «обнули весы». Measured on the live router: **0.08 s** for a reading, **0.43 s** for a verified tare. The weight matcher accepts the filler Whisper actually inserts («Сколько это весит?», field case 22.11.2026); that exact transcript, not a textbook phrasing, is what the live probe uses.
 
 `services/jev-router/scale.py` is a plain HTTP client without FastAPI/HA imports, so the worker can reuse it in the next step: recipe-guided cooking with a voice prompt per ingredient and auto-tare at the target weight. `SCALE_MCP_URL` overrides the device address; `set_unit` stays unexposed for now.
 

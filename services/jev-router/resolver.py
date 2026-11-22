@@ -1164,9 +1164,12 @@ RE_STATUS_Q = re.compile(
 # --- Kitchen scale (ESP32, 192.168.22.123) --------------------------------
 # Narrow phrasings for the two step-1 commands. The device noun guard below is
 # what keeps «сколько весит пылесос» out of this route: a weight word alone is
-# not enough when the sentence names something else in the house.
+# not enough when the sentence names something else in the house. The
+# optional «это» between «сколько» and «весит» is from the field: Whisper
+# wrote «Сколько это весит?» on 22.11.2026 and the adjacency-only regex sent
+# the turn to L2, which has no scale tool and never said the weight.
 RE_SCALE_WEIGHT_Q = re.compile(
-    r"\b(?:сколько\s+(?:весит|весят|весов)|какой\s+вес|вес\s+на\s+весах"
+    r"\b(?:сколько\s+(?:это\s+)?(?:весит|весят|весов)|какой\s+вес|вес\s+на\s+весах"
     r"|что\s+показыва(?:ет|ют)\s+весы|сколько\s+грамм\w*)\b",
     re.IGNORECASE,
 )

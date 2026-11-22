@@ -57,6 +57,15 @@ def _weight(grams=0.0, zero=True, stable=True):
 
 # --- phrase recognition ----------------------------------------------------
 
+def test_the_real_stt_phrase_with_eto_is_recognised():
+    # Field case 22.11.2026 18:18:21 UTC, kitchen: Whisper wrote
+    # «Сколько это весит?» — the filler goes BETWEEN the question word and the
+    # verb, so the adjacency-only regex missed it and the turn went to L2,
+    # which has no scale tool and never said the weight.
+    assert resolver.resolve_scale("Сколько это весит?").kind == "weight"
+    assert resolver.resolve_scale("сколько это весит").kind == "weight"
+
+
 def test_scale_phrases_require_weight_words():
     assert resolver.resolve_scale("сколько весит").kind == "weight"
     assert resolver.resolve_scale("Сколько весит?").kind == "weight"

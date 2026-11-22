@@ -1,6 +1,6 @@
 # Voice Gateway
 
-![version](https://img.shields.io/badge/version-v2.79-blue)
+![version](https://img.shields.io/badge/version-v2.80-blue)
 [![tests](https://github.com/zavaruev/voice_gateway/actions/workflows/tests.yml/badge.svg)](https://github.com/zavaruev/voice_gateway/actions/workflows/tests.yml)
 ![python](https://img.shields.io/badge/python-3.12%2B-3776AB?logo=python&logoColor=white)
 ![backend](https://img.shields.io/badge/AI%20backend-Cascade-orange)
@@ -48,7 +48,7 @@ See [`docs/REFERENCE.md`](docs/REFERENCE.md) → *Known Issues & Current Problem
 | L2 turn with a verified side effect | **3.2–4.0 s** |
 | Wake debounce | ~240 ms (2 of 3 chunks); a single chunk ≥ 0.68 fires immediately |
 | Wake window / watchdog | 15 s / 90 s |
-| Test suite | 891 tests, 32 files, ~17,600 lines |
+| Test suite | 904 tests, 33 files, ~17,900 lines |
 
 ---
 
@@ -349,6 +349,21 @@ Everything here exists to avoid listening to garbage.
 - **Whisper only inside a wake window.** Ambient speech from a TV never reaches STT — this is the main defence against false bills and wasted latency.
 - **The player does not wait for the upload before the next sentence.** `/play_audio` answers 3–12× late on a weak link, and the player used to sit inside that call for the whole of it, so the gap between sentences was the gap between uploads. The POST runs as a task, bounded by `_MAX_OUTSTANDING_PLAY_POSTS = 2` — a slow link plus unbounded requests is a pile-up of audio the camera is already failing to play — and `_settle_play_posts()` drains them before anything reads `_last_play_ok`, which is what decides whether a failed sentence adds an apology. The **cues keep the waiting behaviour on purpose**: the attention pip is what this class of bug started with.
 - **Answer** goes to the camera's `/play_audio` endpoint as raw mono s16le with the rate in the `Content-Type` header (`;rate=48000`). The ONVIF/go2rtc backchannel is a **fallback only** and it is pitch-broken — the camera advertises PCMU/8000 and then plays it at 48 kHz, so replies come out ~6× too fast. Set `CAMERA_WEBRTC[_<NAME>]=false` for a room that has `/play_audio`: the session carries no audio this gateway uses, and every `webrtc/offer` makes go2rtc rebuild the producer, which fills the **camera's** send queue and blocks it.
+
+---
+
+## The kitchen scale: a device with its own MCP server (v2.80)
+
+The ESP32 scale at `192.168.22.123` serves its own stateless JSON-RPC endpoint (`POST /mcp`, firmware v1.4.2) with the tools `get_weight`, `tare` and `set_unit`. Two phrases are answered by L1 with no LLM in the loop:
+
+| Say | What happens | Spoken answer |
+|---|---|---|
+| «сколько весит?» | `get_weight` | whole grams with noun agreement — «На весах сто граммов.» |
+| «обнули весы» | read → guard → `tare` → read again | «Обнулила.» only when the fresh reading has `zero: true` |
+
+The guard refuses to tare when `abs(grams) > 5`, so an ingredient already on the platform is not silently zeroed. An unreachable scale answers «Весы не отвечают.» instead of escalating to L2 — L2 has no scale tools and would invent a reading. Both phrases are intercepted **before** the classifier: otherwise the bare-verb fallback in `easy_action` appends «свет» to «обнули весы». Measured on the live router: **0.08 s** for a reading, **0.43 s** for a verified tare.
+
+`services/jev-router/scale.py` is a plain HTTP client without FastAPI/HA imports, so the worker can reuse it in the next step: recipe-guided cooking with a voice prompt per ingredient and auto-tare at the target weight. `SCALE_MCP_URL` overrides the device address; `set_unit` stays unexposed for now.
 
 ---
 

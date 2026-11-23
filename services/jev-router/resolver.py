@@ -1174,8 +1174,11 @@ RE_SCALE_WEIGHT_Q = re.compile(
     re.IGNORECASE,
 )
 RE_SCALE_TARE = re.compile(
+    # «обнулились» / «обнулились ты» are what Whisper actually wrote for
+    # «обнули весы» on 23.11.2026 (09:37 and 09:43, kitchen). They stand alone —
+    # no «вес» word follows, so they need their own alternative here.
     r"\b(?:обнули(?:ть)?|тарируй(?:те)?|тарировать|сбросить|сбрось)\b.*\bвес"
-    r"|\bвесы\s+в\s+ноль\b|\bсделай\s+тару\b",
+    r"|\bвесы\s+в\s+ноль\b|\bсделай\s+тару\b|\bобнулились\b",
     re.IGNORECASE,
 )
 

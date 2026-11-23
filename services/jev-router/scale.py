@@ -4,9 +4,11 @@ The ESP32 scale at 192.168.22.123 serves a stateless JSON-RPC 2.0 endpoint at
 POST /mcp. This module is deliberately free of FastAPI/HA imports so it can be
 unit-tested offline and later reused by the worker for recipe-guided cooking.
 
-Two commands are supported: read the weight, and tare with a guard and a
-read-back. Every failure becomes an honest Russian sentence — nothing here
-ever guesses a reading or claims a tare it did not verify.
+Two commands are supported: read the weight, and tare. The tare tool is the
+firmware's Zero/0 button (weight_task_tare -> scale_filter_tare(hard=true)):
+it stores the CURRENT reading as the new zero, even with a load on the platform.
+Every failure becomes an honest Russian sentence — nothing here ever guesses a
+reading or claims a tare it did not verify.
 """
 
 import json
@@ -22,10 +24,6 @@ logger = logging.getLogger("scale")
 
 _TIMEOUT_S = 3.0
 _RPC_ID = 1
-# A manual «обнули весы» is only for an empty platform; a loaded platform may
-# hold an ingredient whose weight the user still needs. Recipe auto-tare is a
-# separate, future path that will call `tare()` directly.
-_TARE_MAX_GRAMS = 5.0
 
 _HUNDREDS = (
     "", "сто", "двести", "триста", "четыреста",
@@ -92,17 +90,12 @@ async def tare(*, url=None, post=None) -> bool:
 
 
 async def tare_checked(*, url=None, post=None) -> tuple[bool, str]:
-    """Guard -> tare -> verify. Returns (success, reason)."""
+    """Tare (Zero-button semantics) then verify. Returns (success, reason)."""
     before = await get_weight(url=url, post=post)
     if before is None:
         return False, "unreachable"
-    try:
-        loaded = abs(float(before["grams"]))
-    except (KeyError, TypeError, ValueError):
-        return False, "unreachable"
-    if loaded > _TARE_MAX_GRAMS:
-        logger.info("scale tare refused: platform holds %.1f g", loaded)
-        return False, "occupied"
+    logger.info("scale tare: current reading %s g becomes the new zero",
+                before.get("grams"))
     if not await tare(url=url, post=post):
         return False, "failed"
     after = await get_weight(url=url, post=post)
@@ -160,7 +153,6 @@ def sentence_for(kind: str, *, reason: str = "", weight: dict | None = None) -> 
     return {
         "ok": "Обнулила.",
         "unreachable": "Весы не отвечают.",
-        "occupied": "На весах что-то лежит. Сначала убери.",
         "failed": "Не получилось обнулить весы.",
         "unverified": "Не получилось обнулить весы.",
     }.get(reason, "Не получилось обнулить весы.")

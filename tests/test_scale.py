@@ -66,6 +66,15 @@ def test_the_real_stt_phrase_with_eto_is_recognised():
     assert resolver.resolve_scale("сколько это весит").kind == "weight"
 
 
+def test_stt_mangles_of_tare_are_recognised():
+    # Field 23.11.2026 09:37:53 / 09:43:28, kitchen: Whisper wrote
+    # «обнулились» and «обнулились ты» for «обнули весы». Both went to L2
+    # (low_confidence 0.37-0.40), which spoke progress and never touched the
+    # scale while 200+ g sat on the platform.
+    assert resolver.resolve_scale("обнулились").kind == "tare"
+    assert resolver.resolve_scale("обнулились ты").kind == "tare"
+
+
 def test_scale_phrases_require_weight_words():
     assert resolver.resolve_scale("сколько весит").kind == "weight"
     assert resolver.resolve_scale("Сколько весит?").kind == "weight"
@@ -129,13 +138,21 @@ def test_unreachable_scale_speaks_refusal():
     )
 
 
-def test_tare_refuses_while_loaded():
-    stub = _StubPost(_rpc_result(_weight(grams=250, zero=False)))
+def test_tare_zeros_a_loaded_platform_like_the_zero_button():
+    # The firmware's `tare` calls weight_task_tare() -> scale_filter_tare(true),
+    # the exact code behind the Zero/0 button: it stores the CURRENT reading as
+    # the new zero. Refusing a loaded platform contradicted what the user asked
+    # for. Field case 23.11.2026: 218.5 g on the scale, «обнули весы» ignored.
+    stub = _StubPost(
+        _rpc_result(_weight(grams=218.5, zero=False)),
+        _rpc_result("{}"),  # tare tool result
+        _rpc_result(_weight(grams=0, zero=True)),
+    )
     ok, reason = __import__("asyncio").run(scale.tare_checked(post=stub))
-    assert (ok, reason) == (False, "occupied")
-    assert len(stub.calls) == 1  # the tare tool was NOT called
-    sentence = scale.sentence_for("tare", reason=reason)
-    assert "лежит" in sentence.lower()
+    assert (ok, reason) == (True, "ok")
+    assert [c[1]["params"]["name"] for c in stub.calls] == [
+        "get_weight", "tare", "get_weight",
+    ]
 
 
 def test_tare_verifies_zero_after_call():

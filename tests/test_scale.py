@@ -73,6 +73,7 @@ def test_stt_mangles_of_tare_are_recognised():
     # scale while 200+ g sat on the platform.
     assert resolver.resolve_scale("обнулились").kind == "tare"
     assert resolver.resolve_scale("обнулились ты").kind == "tare"
+    assert resolver.resolve_scale("обнулились ли").kind == "tare"  # 10:29:37
 
 
 def test_scale_phrases_require_weight_words():

@@ -1,6 +1,6 @@
 # Voice Gateway
 
-![version](https://img.shields.io/badge/version-v2.82-blue)
+![version](https://img.shields.io/badge/version-v2.83-blue)
 [![tests](https://github.com/zavaruev/voice_gateway/actions/workflows/tests.yml/badge.svg)](https://github.com/zavaruev/voice_gateway/actions/workflows/tests.yml)
 ![python](https://img.shields.io/badge/python-3.12%2B-3776AB?logo=python&logoColor=white)
 ![backend](https://img.shields.io/badge/AI%20backend-Cascade-orange)
@@ -48,7 +48,7 @@ See [`docs/REFERENCE.md`](docs/REFERENCE.md) → *Known Issues & Current Problem
 | L2 turn with a verified side effect | **3.2–4.0 s** |
 | Wake debounce | ~240 ms (2 of 3 chunks); a single chunk ≥ 0.68 fires immediately |
 | Wake window / watchdog | 15 s / 90 s |
-| Test suite | 978 tests, 36 files, ~19,300 lines |
+| Test suite | 980 tests, 36 files, ~19,400 lines |
 
 ---
 
@@ -162,24 +162,27 @@ them** (user 4725 / 9124, television and appliances 13197–32522). The wake wor
 the only discriminator measured to work. `none` requires the wake word again after
 every reply.
 
-### Two address words (v2.82)
+### Two address words (v2.82, enabled in v2.83)
 
 One Vosk decoder, two **exact token allowlists**. The style of confirmation is a property of the word, not of the room:
 
 | Spoken | Confirmation | Brain |
 |---|---|---|
 | «компьютер» | attention pip, no spoken acknowledgement — same as every other camera | the normal `LLM_BACKEND` |
-| «добби» | no pip, one short rotating line after a real pause; a command spoken in the same breath gets no sound | `LLM_BACKEND_DOBBI` when set, otherwise the normal backend |
+| «добби» | no pip, one short rotating line after a real pause; a command spoken in the same breath gets no sound | `LLM_BACKEND_DOBBI` when set, otherwise the normal backend; **voice `aidar` on Silero** |
 
 ```
 WAKE_ALT_WORD[_<NAME>]=dobbi        # only "dobbi" is a known mode; empty = old path
-WAKE_ALT_TOKENS[_<NAME>]=tok1|tok2   # spellings MEASURED on live audio; empty = word disabled
+WAKE_ALT_TOKENS[_<NAME>]=tok1|tok2   # spellings measured on real audio; empty = word disabled
+TTS_VOICE_DOBBI=aidar                # Silero-only speaker for Dobbi turns; empty = normal voice
 LLM_BACKEND_DOBBI=cascade            # optional second brain, empty = shared normal backend
 ```
 
 There is **no second model and no second recogniser** — a grammar-constrained one was measured rejecting the word on live room audio (1 hypothesis in 25 s of speech against 27 from the free decoder), so the same free decoder scores both words. One spoken word fires once: a different word appended inside the same recogniser segment is treated as that word's tail, because every extra `_fire_wake()` clears the command buffer. `vosk diag` now reports `kind=`.
 
-`WAKE_ALT_TOKENS` is deliberately empty in the shipped compose. Vosk's spelling of a name is not something to guess: «компот» and «компания» once woke the house through a prefix match. Record the word through `CAMERA_VOSK_DUMP_<NAME>`, read the decoder's own `hyp=`, and only then list the observed spellings. Filling the tokens is what enables «добби»; leaving them empty keeps v2.81 behaviour byte-for-byte.
+In v2.83 the living room ships `WAKE_ALT_TOKENS_LIVINGROOM=добби` and `TTS_VOICE_DOBBI=aidar`: five Silero voices were synthesised through the **same Vosk model** (16 kHz, 80 ms chunks); `aidar`, `baya` and `kseniya` decoded the word exactly as «добби», while `eugene` → «доме» and `xenia` → «домби». `aidar` was chosen as the contrasting voice, and the override applies only while Silero is the active TTS backend (a Silero speaker sent to Coqui/edge would 400 and cost the whole sentence).
+
+Vosk's spelling of a name is not something to guess: «компот» and «компания» once woke the house through a prefix match. The shipped token is measured on **synthesised** audio, which validates the TTS → Vosk loopback but not a human voice. After a real «добби» in the living room, read `VOSK WAKE … kind=dobbi` and `near=` in `vosk diag`: a non-zero `near=` means the allowlist missed an observed spelling and needs that exact token added, never a prefix.
 
 ### Three instruments that decide whether the wake word is broken
 

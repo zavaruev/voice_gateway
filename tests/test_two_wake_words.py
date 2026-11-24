@@ -348,6 +348,76 @@ async def test_no_dev_backend_keeps_the_old_path(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_dobbi_turn_synthesizes_with_aidar_but_computer_stays_on_baya():
+    """The second address gets its own TTS voice — but only while that turn is
+    open, and only while Silero is the active backend."""
+    import numpy as np
+    import camera_client
+
+    raw = (np.sin(np.linspace(0, 40, 4800)) * 17000).astype(np.int16).tobytes()
+
+    class _Resp:
+        status = 200
+
+        async def read(self):
+            return b"mp3"
+
+    class _Post:
+        async def __aenter__(self):
+            return _Resp()
+
+        async def __aexit__(self, *_a):
+            return False
+
+    class _Http:
+        def __init__(self):
+            self.payloads = []
+
+        def post(self, _url, json=None, **_kw):
+            self.payloads.append(dict(json or {}))
+            return _Post()
+
+    class _Seg:
+        raw_data = raw
+
+        def set_frame_rate(self, _r):
+            return self
+
+        def set_channels(self, _c):
+            return self
+
+        def set_sample_width(self, _w):
+            return self
+
+    s = CameraSession.__new__(CameraSession)
+    s.stream_name = "livingroom"
+    s.tts_url = "http://192.168.22.102:5053/v1/audio/speech"
+    s.tts_voice = "baya"
+    s.tts_api_key = ""
+    s.tts_backend = "silero"
+    s._tts_voice_dobbi = "aidar"
+    s._tts_target_peak = 20000
+    s._wake_kind = "computer"
+    s.http_session = _Http()
+
+    with patch.object(camera_client.AudioSegment, "from_file", return_value=_Seg()):
+        await s._tts_fetch("Включаю.")
+        s._wake_kind = "dobbi"
+        await s._tts_fetch("Включаю.")
+    assert [p["voice"] for p in s.http_session.payloads] == ["baya", "aidar"]
+
+
+def test_dobbi_voice_is_ignored_when_the_backend_is_not_silero():
+    s = CameraSession.__new__(CameraSession)
+    s.tts_url = "http://192.168.22.102:5052/v1/audio/speech"
+    s.tts_voice = "Zofija Kendrick"
+    s.tts_backend = "coqui"
+    s._tts_voice_dobbi = "aidar"
+    s._wake_kind = "dobbi"
+    assert s._tts_voice_for_turn() == "Zofija Kendrick"
+
+
+@pytest.mark.asyncio
 async def test_camera_config_carries_the_alt_wake_env(monkeypatch):
     """The same wiring trap as TTS_VOICE: a new field must be FILLED, not just
     declared on CameraConfig — a config-only test cannot see a missing fill."""
@@ -374,6 +444,7 @@ async def test_camera_config_carries_the_alt_wake_env(monkeypatch):
     monkeypatch.setenv("CAMERA_STREAMS", "livingroom")
     monkeypatch.setenv("WAKE_ALT_WORD_LIVINGROOM", "dobbi")
     monkeypatch.setenv("WAKE_ALT_TOKENS_LIVINGROOM", "добби|доби")
+    monkeypatch.setenv("TTS_VOICE_DOBBI", "aidar")
     monkeypatch.setattr(main_mod, "CameraSession", _FakeSession)
     monkeypatch.setattr(main_mod, "_camera_sessions", [])
     monkeypatch.setattr(main_mod, "VadEngine", lambda **kwargs: None)
@@ -386,4 +457,5 @@ async def test_camera_config_carries_the_alt_wake_env(monkeypatch):
     cfg = created[0].config
     assert cfg.alt_wake_word == "dobbi"
     assert cfg.alt_wake_tokens == "добби|доби"
+    assert cfg.tts_voice_dobbi == "aidar"
     assert CameraConfig(stream_name="x").alt_wake_word == ""

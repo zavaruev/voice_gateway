@@ -101,7 +101,7 @@
     <text x="748" y="486" fill="#8b949e" font-size="12">· wake by DECODING (vosk): 5/5 live,</text>
     <text x="748" y="504" fill="#8b949e" font-size="12">  0 false on 7 min TV</text>
     <text x="748" y="522" fill="#8b949e" font-size="12">· all bands pinned by tests</text>
-    <text x="748" y="540" fill="#8b949e" font-size="12">  (978 / 36 files)</text>
+    <text x="748" y="540" fill="#8b949e" font-size="12">  (980 / 36 files)</text>
   </g>
 
   <text x="30" y="592" fill="#8b949e" font-size="11.5">Fallbacks stay local: a bare wake with no command in 5 s speaks a local «Да?» — the LLM is only polled when a real sentence follows.</text>

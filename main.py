@@ -326,6 +326,9 @@ def apply_tts_backend(name: str, voice: str | None = None) -> str:
         s.tts_url = TTS_URL
         s.tts_voice = TTS_VOICE
         s.tts_stream_url = TTS_STREAM_URL
+        # The Dobbi voice is Silero-only; keep the live backend flag in step so
+        # switching to Coqui/edge cannot send them a 400 with that speaker.
+        s.tts_backend = name
     logger.info(
         f"🔊 TTS backend -> {name} voice={TTS_VOICE!r} url={TTS_URL} "
         f"stream={'on' if TTS_STREAM_URL else 'off'} "
@@ -3965,6 +3968,9 @@ async def start_camera_sessions():
                 # The ESP32 path always read the env; only the camera path
                 # silently reverted to the constant.
                 tts_voice=TTS_VOICE,
+                # «Добби» can have its own Silero speaker. Empty = no override.
+                tts_voice_dobbi=os.getenv("TTS_VOICE_DOBBI", ""),
+                tts_backend=TTS_BACKEND_ACTIVE,
                 # Filled like tts_voice: a missing fill here silently reverts
                 # the camera path to the dataclass default — the exact shape
                 # that put a man's voice in every room on 10.11.2026.

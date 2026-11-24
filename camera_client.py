@@ -1268,6 +1268,11 @@ class CameraConfig:
     whisper_model: str = "koekaverna/faster-whisper-podlodka-turbo"
     tts_url: str = "http://edge_tts:5050/v1/audio/speech"
     tts_voice: str = "ru-RU-SvetlanaNeural"
+    # Voice for turns woken by «добби». Empty = every word uses tts_voice.
+    tts_voice_dobbi: str = ""
+    # Which backend preset is live, so a Silero-only speaker can never be sent
+    # to Coqui/edge (where it would 400 and cost the user a whole sentence).
+    tts_backend: str = ""
     tts_api_key: str = ""
     # Streaming endpoint for LONG sentences (coqui /v1/audio/speech/stream).
     # Empty => every sentence goes through the whole-file path, exactly as
@@ -1574,6 +1579,8 @@ class CameraSession:
     # Class default for hand-built sessions: an AttributeError here would be
     # swallowed by `_call_backend`'s broad except and read as a backend outage.
     dev_backend = None
+    _tts_voice_dobbi = ""
+    tts_backend = ""
     # When the rate heal was first deferred because the user was talking.
     _heal_deferred_since = 0.0
 
@@ -1602,6 +1609,8 @@ class CameraSession:
         self.whisper_model = config.whisper_model
         self.tts_url = config.tts_url
         self.tts_voice = config.tts_voice
+        self._tts_voice_dobbi = config.tts_voice_dobbi
+        self.tts_backend = config.tts_backend
         self.tts_api_key = config.tts_api_key
         self.tts_stream_url = config.tts_stream_url
         self._nanobot_url = config.nanobot_url.rstrip("/")
@@ -6331,6 +6340,24 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
                 return
             await asyncio.sleep(0.2)
 
+    def _tts_voice_for_turn(self) -> str:
+        """The address word may carry its own speaker, but only on Silero.
+
+        «Добби» speaks with `TTS_VOICE_DOBBI` while its turn is open; the next
+        «компьютер» turn goes back to the normal voice. The backend check is
+        load-bearing: aidar/kseniya/... are Silero speakers and a 400 from
+        Coqui or edge would cost the whole sentence (the 10.11 man's-voice
+        incident was the opposite failure, a silent fallback).
+        """
+        if (
+            self._wake_kind == "dobbi"
+            and self._tts_voice_dobbi
+            and (self.tts_backend == "silero"
+                 or ":5053" in self.tts_url or ":5054" in self.tts_url)
+        ):
+            return self._tts_voice_dobbi
+        return self.tts_voice
+
     async def _tts_fetch(self, text: str, speed: float = 1.0) -> bytes | None:
         """Synthesize one sentence to PCM (48kHz mono s16le, the camera
         speaker's native rate — see TTS_PLAY_RATE). Split out of _speak so the
@@ -6365,7 +6392,7 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
         payload = {
             "model": "tts-1",
             "input": text,
-            "voice": self.tts_voice,
+            "voice": self._tts_voice_for_turn(),
             "response_format": "mp3",
         }
         if speed and speed != 1.0:
@@ -6910,7 +6937,7 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
         payload = {
             "model": "tts-1",
             "input": text,
-            "voice": self.tts_voice,
+            "voice": self._tts_voice_for_turn(),
             "response_format": "pcm",
         }
         if speed and float(speed) != 1.0:

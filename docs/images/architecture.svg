@@ -61,7 +61,7 @@
     <text x="346" y="415" fill="#e6edf3" font-size="12.5">    (sentence N+1 synthesises while N plays)</text>
     <text x="346" y="437" fill="#e6edf3" font-size="12.5">pydub → resample → Opus / PCM, 60 ms chunks</text>
     <text x="346" y="459" fill="#e6edf3" font-size="12.5">watchdog 90 s · follow-up window · emotions</text>
-    <text x="346" y="481" fill="#e6edf3" font-size="12.5">978 tests · 3 TTS engines (edge·coqui·silero)</text>
+    <text x="346" y="481" fill="#e6edf3" font-size="12.5">980 tests · 3 TTS engines (edge·coqui·silero)</text>
   </g>
 
   <!-- ============ BRAIN ============ -->

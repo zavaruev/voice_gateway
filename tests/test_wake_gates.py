@@ -254,6 +254,7 @@ class _StubVosk:
     last_partial = ""
     last_text = "компьютер"
     last_trigger_text = "компьютер"
+    last_kind = "computer"   # two wake words: the camera reads this on every fire
     # A stub that mirrors the class has to track the class. `vosk diag` reads these
     # and adding them to the real class without adding them here raised
     # AttributeError inside the live audio path — which is the same reason the real
@@ -719,6 +720,7 @@ class _RecordingVosk:
     last_partial = ""
     last_text = ""
     last_trigger_text = ""
+    last_kind = "computer"
     near_misses = 0
     last_near_miss = ""
 
@@ -939,16 +941,19 @@ def test_repeating_the_same_sentence_fifteen_minutes_later_is_not_an_echo():
     assert s._transcript_is_echo("включи свет") is None
 
 
-def test_a_genuine_echo_within_the_horizon_is_still_caught():
-    """A guard that can only ever say "no" is worth nothing.
-
-    12 s is inside the 15-25 s the old comment described, and well inside the
-    45 s horizon, so the acoustic loop this was written for is still stopped.
+def test_a_user_repeating_a_command_after_nine_seconds_is_not_an_echo():
+    """24.11.2026 11:42 MSK: the relay acts ~185 s after HA accepts the call,
+    so the user repeated «включи свет» 9 s later — and the repeat guard threw
+    it away as its own echo. A duplicate STT of one utterance needs a couple of
+    seconds, not the 45 s backchannel horizon.
     """
-    s = _echo_session(last_at=12.0)
-    assert s._transcript_is_echo("включи свет") == "repeat", (
-        "настоящее эхо должно отсекаться, иначе защита стала безвредной"
-    )
+    s = _echo_session(last_at=9.0)
+    assert s._transcript_is_echo("включи свет") is None
+
+
+def test_a_genuine_duplicate_within_the_debounce_is_still_caught():
+    s = _echo_session(last_at=1.0)
+    assert s._transcript_is_echo("включи свет") == "repeat"
 
 
 def test_the_horizon_default_covers_the_worst_measured_echo_return():
@@ -967,7 +972,7 @@ def test_zero_means_unset_and_not_a_window_that_can_never_fire():
     it would produce a guard that can never refuse anything."""
     cfg = CameraConfig(stream_name="x", echo_repeat_horizon=0.0)
     assert cfg.echo_repeat_horizon == 0.0
-    s = _echo_session(last_at=12.0)
+    s = _echo_session(last_at=1.0)
     s._echo_repeat_horizon = (
         cfg.echo_repeat_horizon if cfg.echo_repeat_horizon > 0
         else _ECHO_REPEAT_HORIZON_S

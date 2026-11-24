@@ -1,6 +1,6 @@
 # Voice Gateway
 
-![version](https://img.shields.io/badge/version-v2.81-blue)
+![version](https://img.shields.io/badge/version-v2.82-blue)
 [![tests](https://github.com/zavaruev/voice_gateway/actions/workflows/tests.yml/badge.svg)](https://github.com/zavaruev/voice_gateway/actions/workflows/tests.yml)
 ![python](https://img.shields.io/badge/python-3.12%2B-3776AB?logo=python&logoColor=white)
 ![backend](https://img.shields.io/badge/AI%20backend-Cascade-orange)
@@ -28,7 +28,7 @@ Home Assistant's own voice stack (Wyoming + ESPHome satellites) is the right ans
 | Who is speaking | — | CAMP++ speaker embeddings, cross-device speaker lock |
 | False-wake protection | per-device threshold | an 8-gate cascade (echo ring, appliance noise, distance, clipping, crest factor, …) with a Whisper confirm-rescue band instead of silence |
 
-The camera subsystem runs **five rooms** — `livingroom`, `kitchen`, `entrance1`, `camera-corridor1` and `balcony`. The wake word there is detected by **decoding** it with a local vosk model (`vosk_wake.py`, 88 MB, CPU-only, one per process shared by all rooms) rather than by scoring it acoustically: a head trained on 27 recordings of the word learned the envelope instead of the word and fired 114–229 times per hour on the television. Measured on the living room: 5/5 live detections, 0 false accepts over 7 minutes of TV. Set `WAKE_VOSK_MODEL_<NAME>` to enable per room; without it a room keeps the acoustic path.
+The camera subsystem runs **five rooms** — `livingroom`, `kitchen`, `entrance1`, `camera-corridor1` and `balcony`. The wake word there is detected by **decoding** it with a local vosk model (`vosk_wake.py`, 88 MB, CPU-only, one per process shared by all rooms) rather than by scoring it acoustically: a head trained on 27 recordings of the word learned the envelope instead of the word and fired 114–229 times per hour on the television. Measured on the living room: 5/5 live detections, 0 false accepts over 7 minutes of TV. Set `WAKE_VOSK_MODEL_<NAME>` to enable per room; without it a room keeps the acoustic path. Since v2.82 the same decoder accepts **two address words** — see *Two address words* below.
 
 Two lessons from bringing the rooms up are worth stating here, because both cost a day each and neither is visible in the code:
 
@@ -48,7 +48,7 @@ See [`docs/REFERENCE.md`](docs/REFERENCE.md) → *Known Issues & Current Problem
 | L2 turn with a verified side effect | **3.2–4.0 s** |
 | Wake debounce | ~240 ms (2 of 3 chunks); a single chunk ≥ 0.68 fires immediately |
 | Wake window / watchdog | 15 s / 90 s |
-| Test suite | 905 tests, 33 files, ~17,900 lines |
+| Test suite | 978 tests, 36 files, ~19,300 lines |
 
 ---
 
@@ -162,13 +162,32 @@ them** (user 4725 / 9124, television and appliances 13197–32522). The wake wor
 the only discriminator measured to work. `none` requires the wake word again after
 every reply.
 
+### Two address words (v2.82)
+
+One Vosk decoder, two **exact token allowlists**. The style of confirmation is a property of the word, not of the room:
+
+| Spoken | Confirmation | Brain |
+|---|---|---|
+| «компьютер» | attention pip, no spoken acknowledgement — same as every other camera | the normal `LLM_BACKEND` |
+| «добби» | no pip, one short rotating line after a real pause; a command spoken in the same breath gets no sound | `LLM_BACKEND_DOBBI` when set, otherwise the normal backend |
+
+```
+WAKE_ALT_WORD[_<NAME>]=dobbi        # only "dobbi" is a known mode; empty = old path
+WAKE_ALT_TOKENS[_<NAME>]=tok1|tok2   # spellings MEASURED on live audio; empty = word disabled
+LLM_BACKEND_DOBBI=cascade            # optional second brain, empty = shared normal backend
+```
+
+There is **no second model and no second recogniser** — a grammar-constrained one was measured rejecting the word on live room audio (1 hypothesis in 25 s of speech against 27 from the free decoder), so the same free decoder scores both words. One spoken word fires once: a different word appended inside the same recogniser segment is treated as that word's tail, because every extra `_fire_wake()` clears the command buffer. `vosk diag` now reports `kind=`.
+
+`WAKE_ALT_TOKENS` is deliberately empty in the shipped compose. Vosk's spelling of a name is not something to guess: «компот» and «компания» once woke the house through a prefix match. Record the word through `CAMERA_VOSK_DUMP_<NAME>`, read the decoder's own `hyp=`, and only then list the observed spellings. Filling the tokens is what enables «добби»; leaving them empty keeps v2.81 behaviour byte-for-byte.
+
 ### Three instruments that decide whether the wake word is broken
 
 They are the reason a mute room can be told apart from a deaf one:
 
 | | Where | Answers |
 |---|---|---|
-| `vosk diag` | every 300 s per room | `chunks` advancing, `triggers`/`decodes`, the decoder's own `hyp=`, and `drop[muted=… echo=…]` |
+| `vosk diag` | every 300 s per room | `chunks` advancing, `triggers`/`decodes`, `kind=` (which address word last fired), the decoder's own `hyp=`, and `drop[muted=… echo=…]` |
 | `CAMERA_WAKE_MIN_PEAK[_<NAME>]` | `0` → 3000 | Refuses a decoded wake word on silence, so a dead mic cannot invent both the word and the command |
 | `CAMERA_VOSK_DUMP_<NAME>` | off; per room | Writes the exact bytes handed to the decoder, so a question about the **live** path can be replayed offline |
 

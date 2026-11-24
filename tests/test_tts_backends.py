@@ -231,7 +231,7 @@ async def test_new_camera_session_follows_active_backend(restore_tts, monkeypatc
     created = []
 
     class _FakeSession:
-        def __init__(self, config=None, backend=None):
+        def __init__(self, config=None, backend=None, dev_backend=None):
             self.config = config
             created.append(self)
 

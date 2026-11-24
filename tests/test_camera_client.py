@@ -994,11 +994,11 @@ async def test_a_late_wake_keeps_the_command_that_is_being_collected():
     s._vad_has_speech = True
     s._speech_starts = 5
 
-    # First wake: clears the slate.
+    # First wake: keeps the audio already spoken (a short buffer survives whole).
     s._awaiting_command = False
     with patch.object(s, "_play_attention"):
         await s._fire_wake("test", score=1.0)
-    assert s._vad_speech_buf == bytearray(), "first wake cleared the buffer"
+    assert s._vad_speech_buf == CMD, "first wake destroyed the pre-wake command"
     assert s._vad_has_speech is False
     assert s._awaiting_command is True
 
@@ -1012,6 +1012,238 @@ async def test_a_late_wake_keeps_the_command_that_is_being_collected():
     assert s._preroll == bytearray(b"preroll audio")
     assert s._vad_has_speech is True
     assert s._awaiting_command is True
+
+
+@pytest.mark.asyncio
+async def test_first_wake_keeps_a_bounded_tail_of_audio_already_spoken():
+    """24.11.2026 12:41 MSK: «компьютер, включи свет» said in one breath. The
+    VAD opened speech 0.5 s BEFORE vosk confirmed the wake word; `_fire_wake`
+    cleared that buffer, so Whisper received only the wake tail as «кан» and
+    the turn went to L2 for ~55 s before the lamp came on.
+
+    Keep a bounded tail (2 s of 16 kHz s16le) of the audio the user has already
+    spoken. Bounded, because a permanently-speech room (corridor) can hold a
+    huge noise buffer and that must not be handed to Whisper.
+    """
+    s = _make_session()
+    old = bytearray(b"\x07" * 96000)  # 3 s at 32000 B/s
+    s._vad_speech_buf = old
+    s._preroll = bytearray(b"preroll audio")
+    s._vad_has_speech = True
+    s._awaiting_command = False
+
+    with patch.object(s, "_play_attention"):
+        await s._fire_wake("vosk")
+
+    assert len(s._vad_speech_buf) == 64000  # 2 s, not 0 and not the whole 3 s
+    assert s._vad_speech_buf == old[-64000:]
+    assert s._preroll == bytearray(), "stale pre-roll would be appended twice"
+    assert s._vad_has_speech is False
+
+
+def _ack_session(delay=0.01):
+    """A session for the spoken 'I'm listening' acknowledgement after a wake."""
+    s = _make_session()
+    s._wake_ack_delay = delay
+    s._wake_ack_phrase = "Слушаю и повинуюсь"
+    s._wake_ack_enabled = True
+    s._wake_ack_min_gap_s = 0.0
+    s._awaiting_command = True
+    s._speech_run = 0
+    s.ack_calls = []
+
+    async def tts(text, speed=1.0):
+        s.ack_calls.append(("tts", text))
+        return b"pcm"
+
+    async def speak(pcm, reply, wait=None):
+        s.ack_calls.append(("speak", reply, wait))
+        return False
+
+    s._tts_fetch = tts
+    s._speak_pcm = speak
+    return s
+
+
+@pytest.mark.asyncio
+async def test_a_quiet_pause_after_the_wake_says_the_acknowledgement_once():
+    """«компьютер» then silence gets a single quiet spoken reply instead of a beep.
+    It must go through the normal playback path so the echo ring and mic mute
+    are registered — otherwise the room hears its own voice as a new wake."""
+    s = _ack_session()
+    s._wake_ack_pool = ["Слушаю и повинуюсь"]
+
+    await s._arm_wake_ack()
+
+    assert s.ack_calls == [
+        ("tts", "Слушаю и повинуюсь"),
+        ("speak", "Слушаю и повинуюсь", True),
+    ], s.ack_calls
+
+
+@pytest.mark.asyncio
+async def test_speaking_after_the_wake_suppresses_the_acknowledgement():
+    """If the command follows the address in one breath, the room must stay
+    silent. `_speech_run` is the level-vs-room-floor counter, not the VAD — in
+    this house the VAD reports speech on television noise alone."""
+    s = _ack_session(delay=0.02)
+    s._speech_run = 3
+
+    await s._arm_wake_ack()
+
+    assert s.ack_calls == [], s.ack_calls
+
+
+@pytest.mark.asyncio
+async def test_a_command_just_finished_still_suppresses_the_ack():
+    """24.11.2026 11:42 MSK: «компьютер включи свет» in one breath still got
+    «К вашим услугам.» 3 s later — `_speech_run` had already decayed to zero
+    after the command ended. Recent speech must count too.
+    """
+    s = _ack_session(delay=0.01)
+    s._speech_run = 0
+    s._last_speech_at = time.time()
+
+    await s._arm_wake_ack()
+
+    assert s.ack_calls == [], s.ack_calls
+
+
+@pytest.mark.asyncio
+async def test_a_command_dispatched_before_the_timer_leaves_no_acknowledgement():
+    """The reply must not talk over the answer when the user was quick."""
+    s = _ack_session(delay=0.02)
+
+    task = s._arm_wake_ack()
+    s._awaiting_command = False
+    await asyncio.gather(task, return_exceptions=True)
+
+    assert s.ack_calls == [], s.ack_calls
+
+
+@pytest.mark.asyncio
+async def test_closing_the_wake_window_leaves_no_acknowledgement():
+    """Generation + flag checks, NOT task.cancel(): cancelling a task that is
+    already in `_speak_pcm` would cut the audio after the mic mute was raised."""
+    s = _ack_session(delay=0.3)
+
+    task = s._arm_wake_ack()
+    await asyncio.sleep(0)
+    s._back_to_wake()
+    await asyncio.gather(task, return_exceptions=True)
+
+    assert s.ack_calls == [], s.ack_calls
+
+
+@pytest.mark.asyncio
+async def test_a_second_wake_replaces_the_first_acknowledgement():
+    """One spoken address = one phrase, even when the decoder fires twice on
+    the tail of the word (measured 21.10 and 22.10: one word, five fires)."""
+    s = _ack_session(delay=0.03)
+
+    first = s._arm_wake_ack()
+    second = s._arm_wake_ack()
+    await asyncio.gather(first, second, return_exceptions=True)
+
+    assert len(s.ack_calls) == 2, s.ack_calls  # one synth + one playback
+
+
+@pytest.mark.asyncio
+async def test_a_wake_arms_the_spoken_acknowledgement():
+    """Wire check: the method must be called from `_fire_wake`. The pilot style
+    now belongs to the ADDRESS WORD, not to a room flag — fire as «добби»."""
+    s = _make_session()
+    with patch.object(s, "_play_attention"), patch.object(s, "_arm_wake_ack") as arm:
+        await s._fire_wake("vosk", kind="dobbi")
+    arm.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_a_room_with_its_beep_still_on_gets_no_spoken_ack():
+    """The pilot is one room. Every other room keeps the beep and must stay
+    silent after the address — otherwise two acknowledgements stack up."""
+    s = _make_session()
+    assert s._wake_ack_enabled is False
+    with patch.object(s, "_play_attention"), patch.object(s, "_arm_wake_ack") as arm:
+        await s._fire_wake("vosk")
+    arm.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_multiple_fires_of_one_word_give_only_one_ack():
+    """Fires of the same spoken word were measured 7-20 s apart. A rotating
+    pool alone would happily say a different line for every tail."""
+    s = _ack_session(delay=0.001)
+    s._wake_ack_min_gap_s = 20.0
+
+    first = s._arm_wake_ack()
+    await first
+    second = s._arm_wake_ack()
+    await second
+
+    assert len([c for c in s.ack_calls if c[0] == "speak"]) == 1, s.ack_calls
+
+
+def test_pause_ack_phrases_do_not_repeat_until_the_pool_is_exhausted():
+    """Every pause after the address gets a DIFFERENT line. A rotating pool is
+    stronger than random.choice, which can repeat the same line twice in a row."""
+    s = _make_session()
+    s._wake_ack_pool = ["а", "б", "в"]
+    s._wake_ack_idx = 0
+
+    got = [s._next_wake_ack_phrase() for _ in range(4)]
+
+    assert set(got[:3]) == {"а", "б", "в"}
+    assert got[3] == got[0]
+
+
+@pytest.mark.asyncio
+async def test_two_pauses_get_two_different_spoken_phrases():
+    """The picker must be used by the live path, not merely exist on the class."""
+    s = _ack_session(delay=0.001)
+
+    await s._wake_ack_after_pause()
+    await s._wake_ack_after_pause()
+
+    spoken = [c[1] for c in s.ack_calls if c[0] == "speak"]
+    assert len(spoken) == 2 and spoken[0] != spoken[1], s.ack_calls
+
+
+def test_the_spoken_ack_is_short_enough_not_to_swallow_the_command():
+    """20:11, living room: the 2.2 s phrase «Жду ваших указаний, капитан.»
+    muted the mic while the user started the command, so the buffer held only
+    room floor. The acknowledgement must be a beat, not a sentence."""
+    from camera_client import _WAKE_ACK_PHRASES
+
+    for phrase in _WAKE_ACK_PHRASES:
+        assert len(phrase) <= 16, phrase
+        assert len(phrase.split()) <= 3, phrase
+        assert "?" not in phrase, phrase
+
+
+def test_the_default_ack_pool_is_big_enough_and_never_says_the_wake_word():
+    """A short pool would repeat noticeably; the wake word in a reply would be
+    decoded as a fresh address and open another window."""
+    from camera_client import _WAKE_ACK_PHRASES
+
+    assert len(_WAKE_ACK_PHRASES) >= 6
+    assert all("компьютер" not in p.lower() for p in _WAKE_ACK_PHRASES)
+
+
+def test_an_explicit_phrase_list_from_env_becomes_the_pool():
+    cfg = CameraConfig(
+        stream_name="x",
+        wake_ack_phrases="раз|два|три",
+    )
+    s = CameraSession(config=cfg)
+    got = [s._next_wake_ack_phrase() for _ in range(3)]
+    assert set(got) == {"раз", "два", "три"}
+
+
+def test_a_single_explicit_phrase_still_works():
+    """Backwards compatibility with CAMERA_WAKE_ACK_PHRASE set by hand."""
+    s = CameraSession(config=CameraConfig(stream_name="x", wake_ack_phrase="Слушаю."))
+    assert s._next_wake_ack_phrase() == "Слушаю."
 
 
 @pytest.mark.asyncio
@@ -1122,6 +1354,11 @@ def _rate_session():
     s._rate_starved = 0
     s.heals = 0
     s._heal_deferred_since = 0.0
+    # Weak-link heal cooldown (20.11.2026). The class defaults exist so a
+    # `__new__` session cannot raise inside the live audio path; setting them
+    # here makes the test's intent explicit.
+    s._degraded_heal_cooldown_s = 300.0
+    s._last_heal_at = 0.0
     s._wake_detected = False
     s._last_wake_fired_at = 0.0
     s._wake_timeout = 60.0
@@ -1133,12 +1370,19 @@ def _rate_session():
     return s
 
 
-def _set_rate(s, ratio, span=40.0):
-    """Pretend a `span`-second window delivered `ratio` x real time."""
+def _set_rate(s, ratio, span=40.0, now=None):
+    """Pretend a `span`-second window delivered `ratio` x real time.
+
+    `now` allows tests to advance the wall clock WITHOUT widening the window
+    (the old helper rewound `_rate_start` to 1.0, so adding to the returned
+    clock silently lowered the measured ratio — a trap already documented in
+    the tests below). The default reproduces the old behaviour exactly.
+    """
+    end = 1.0 + span if now is None else now
     s._rate_bytes = int(span * 16000 * 2 * ratio)
-    s._rate_start = 1.0
-    s._rate_check = 1.0
-    return 1.0 + span
+    s._rate_start = end - span
+    s._rate_check = end - span
+    return end
 
 
 @pytest.mark.asyncio
@@ -1223,26 +1467,60 @@ async def test_a_room_stuck_in_the_degraded_band_reaches_the_escalation():
     """The consequence of the two above: oscillating 1% <-> 70% must arrive at
     the message that names the remedy, because before it never did.
 
-    The SHAPE is the point. It is identical to four consecutive starving windows
-    — heal, heal, escalate, heal — which is what "degraded counts as not
-    recovered" means operationally: the room gets the same three attempts and
-    the same operator message as one that delivers nothing at all. Before this
-    change a room at 70% reset the counter and could stay there silently.
+    The counter still runs down on every bad window — that is what the operator
+    message depends on — but since 20.11.2026 the DEGRADED windows do NOT each
+    re-register the stream: on a weak radio link that churned the go2rtc
+    producer 342 times in a week without making the link faster. Only the
+    STARVED window heals immediately. The escalation is unchanged, so the
+    operator is still told about `/etc/init.d/S95majestic restart`.
     """
     s = _rate_session()
     results = []
-    for ratio in (0.01, 0.70, 0.70, 0.70):
-        # `_set_rate`'s own clock, never `+ i * 20`: see the note in the test
-        # above. A widened window turns these into 0.007 and 0.47, which are
-        # STARVED rather than degraded, and the test would still pass — on the
-        # wrong branch, testing nothing.
-        now = _set_rate(s, ratio)
+    # 20 s apart, like the real watchdog; the window stays 40 s because
+    # `_set_rate` now takes an explicit clock rather than rewinding `_rate_start`.
+    for i, ratio in enumerate((0.01, 0.70, 0.70, 0.70)):
+        now = _set_rate(s, ratio, now=41.0 + 20 * i)
         with patch("camera_client.time.time", return_value=now):
             results.append(await s._account_audio_rate(0))
-    assert results == [True, True, False, True], results
-    assert s.heals == 3
-    # and the 4th window started counting from 1 again — the reset after escalation
+    assert results == [True, False, False, False], results
+    assert s.heals == 1, "only the starved window may re-register the stream"
+    # The 4th window started counting from 1 again — the reset after escalation.
     assert s._rate_starved == 1
+
+
+@pytest.mark.asyncio
+async def test_degraded_heal_resumes_after_the_cooldown():
+    """A cooldown is not a permanent off switch: after 300 s a still-degraded
+    room gets another heal attempt, and the counter still reaches escalation.
+    """
+    s = _rate_session()
+    heals = []
+    for i in range(3):
+        now = _set_rate(s, 0.70, now=41.0 + 301 * i)
+        with patch("camera_client.time.time", return_value=now):
+            heals.append(await s._account_audio_rate(0))
+    assert heals == [True, True, False], heals
+    # The third window reaches the escalation budget and returns False BEFORE
+    # the heal call, so only the first two windows re-register the stream.
+    assert s.heals == 2
+    assert s._rate_starved == 0  # escalation fired and reset the budget
+
+
+@pytest.mark.asyncio
+async def test_starved_stream_still_heals_inside_a_degraded_cooldown():
+    """The counterweight: zero bytes is a different fault. A stream that goes
+    fully dead must be re-registered at once even if a weak-link heal happened
+    seconds ago — the cooldown is for streams that are still delivering audio.
+    """
+    s = _rate_session()
+    now = _set_rate(s, 0.70, now=41.0)
+    with patch("camera_client.time.time", return_value=now):
+        assert await s._account_audio_rate(0) is True
+    # 20 s later the same room delivers nothing at all.
+    now = _set_rate(s, 0.02, now=61.0)
+    with patch("camera_client.time.time", return_value=now):
+        assert await s._account_audio_rate(0) is True
+    assert s.heals == 2
 
 
 @pytest.mark.asyncio
@@ -2569,7 +2847,7 @@ async def test_camera_config_carries_the_streaming_stt_env(monkeypatch):
     created = []
 
     class _FakeSession:
-        def __init__(self, config=None, backend=None):
+        def __init__(self, config=None, backend=None, dev_backend=None):
             self.config = config
             created.append(self)
 
@@ -2678,7 +2956,7 @@ async def test_camera_config_carries_the_env_voice(monkeypatch):
     created = []
 
     class _FakeSession:
-        def __init__(self, config=None, backend=None):
+        def __init__(self, config=None, backend=None, dev_backend=None):
             self.config = config
             created.append(self)
 
@@ -2719,6 +2997,55 @@ async def test_camera_config_carries_the_env_voice(monkeypatch):
         "the dataclass default leaked through — the fill is missing again"
     )
     assert cfg.tts_url == "http://tts.test:5051/v1/audio/speech"
+
+
+@pytest.mark.asyncio
+async def test_camera_config_carries_the_wake_ack_env(monkeypatch):
+    """The pilot is switched by env on ONE room. A test of CameraConfig alone
+    cannot see a missing fill in start_camera_sessions — the same shape that
+    shipped a man's voice for a day (see the tts_voice test above)."""
+    import main as main_mod
+
+    created = []
+
+    class _FakeSession:
+        def __init__(self, config=None, backend=None, dev_backend=None):
+            self.config = config
+            created.append(self)
+
+        async def start(self):
+            return None
+
+    class _StubBackend:
+        pass
+
+    class _FakeClientSession:
+        def __init__(self, timeout=None):
+            pass
+
+    monkeypatch.delenv("DISABLE_CAMERAS", raising=False)
+    monkeypatch.setenv("CAMERA_STREAMS", "livingroom")
+    monkeypatch.setenv("CAMERA_ATTENTION_PIP_LIVINGROOM", "false")
+    monkeypatch.setenv("CAMERA_WAKE_ACK_LIVINGROOM", "true")
+    monkeypatch.setenv("CAMERA_WAKE_ACK_DELAY_LIVINGROOM", "3")
+    monkeypatch.setenv("CAMERA_WAKE_ACK_PHRASE_LIVINGROOM", "Слушаю.")
+    monkeypatch.setenv("CAMERA_WAKE_ACK_PHRASES_LIVINGROOM", "раз|два|три")
+    monkeypatch.setattr(main_mod, "CameraSession", _FakeSession)
+    monkeypatch.setattr(main_mod, "_camera_sessions", [])
+    monkeypatch.setattr(main_mod, "VadEngine", lambda **kwargs: None)
+    monkeypatch.setattr(main_mod, "LLM_BACKEND", "cascade")
+    monkeypatch.setattr(main_mod.backends, "CascadeBackend",
+                        lambda *a, **k: _StubBackend())
+    monkeypatch.setattr(main_mod.aiohttp, "ClientSession", _FakeClientSession)
+
+    await main_mod.start_camera_sessions()
+
+    cfg = created[0].config
+    assert cfg.attention_pip is False
+    assert cfg.wake_ack_enabled is True
+    assert cfg.wake_ack_delay == 3.0
+    assert cfg.wake_ack_phrase == "Слушаю."
+    assert cfg.wake_ack_phrases == "раз|два|три"
 
 
 # --- the utterance must not close on the wake word alone (06.10.2026 13:25) ---
@@ -2819,10 +3146,60 @@ def _wake_then_utterance(end_after_wake: float, dur: float) -> CameraSession:
     return s
 
 
+def test_a_buffer_with_only_the_wake_tail_is_not_a_command():
+    """24.11.2026 07:34: the 7 s buffer was 0.5 s of loud wake-tail followed by
+    6.5 s of room floor (rms 5155 then ~700). Whisper got «чет» and the room
+    spent 39 s in L2 instead of waiting for the command spoken afterwards."""
+    s = _make_session()
+    s._noise.value = 0.010
+    s._noise.mult = 2.5
+    env = [0.06, 0.05, 0.04] + [0.011] * 40
+    assert s._wake_tail_only_envelope(env) is True
+
+
+def test_a_short_buffer_is_not_treated_as_a_wake_tail():
+    """11:56 MSK: «выключи свет» came out as «Ключи свет.» in a 1.84 s buffer.
+    A short utterance keeps its command inside the first frames, so the
+    wake-tail guard must only judge long cap-length buffers (4 s+)."""
+    s = _make_session()
+    s._noise.value = 0.010
+    s._noise.mult = 2.5
+    env = [0.06, 0.05, 0.04] + [0.011] * 8
+    assert s._wake_tail_only_envelope(env) is False
+
+
+def test_speech_later_in_the_buffer_is_a_real_command():
+    s = _make_session()
+    s._noise.value = 0.010
+    s._noise.mult = 2.5
+    env = [0.06, 0.05] + [0.011] * 12 + [0.07] * 5 + [0.011] * 10
+    assert s._wake_tail_only_envelope(env) is False
+
+
+def test_a_device_noun_is_never_mistaken_for_the_wake_word():
+    """12:06 MSK: «выключи свет» came out as just «свет» in a 1.6 s buffer.
+    The time-based wake-only guard swallowed it because it ended 1.42 s after
+    the wake. «свет» is never a spelling of «компьютер» — a device word must
+    keep the turn alive even when the verb was lost.
+    """
+    s = _wake_then_utterance(end_after_wake=1.42, dur=1.6)
+    assert s._is_wake_word_alone("свет") is False
+    assert s._is_wake_word_alone("1000 свят") is True
+
+
 def test_the_wake_words_own_audio_is_recognised_by_time():
     """The measured shape: onset 0.73 s after the wake, 1.12 s long."""
     s = _wake_then_utterance(end_after_wake=1.85, dur=1.12)
     assert s._is_wake_word_alone() is True
+
+
+def test_a_wake_only_buffer_padded_with_silence_is_still_wake_only():
+    """23.11.2026 17:38, livingroom: the pause endpoint closed 1.6 s after the
+    wake, but the wav holds 0.4 s of speech and 1.2 s of room floor. Whisper
+    wrote 'спят' from the wake-word tail, the router escalated to L2 and the
+    room thought for 101 s instead of switching the light. The old 1.5 s
+    duration bound missed this by 0.1 s."""
+    assert _wake_then_utterance(end_after_wake=1.5, dur=1.6)._is_wake_word_alone() is True
 
 
 def test_a_real_command_is_not_mistaken_for_the_wake_word():

@@ -194,6 +194,10 @@ import voice_mcp
 # call and the legacy Nanobot WebSocket. Read at import time only — flipping
 # LLM_BACKEND requires a restart (the global `llm_backend` below is built once).
 LLM_BACKEND = os.getenv("LLM_BACKEND", "nanobot").lower()
+# Optional SECOND brain for the «добби» wake word. Empty = every word uses the
+# normal backend (byte-for-byte old behaviour). Chosen once at import, like the
+# primary backend; the choice is made per TURN from `CameraSession._wake_kind`.
+LLM_BACKEND_DOBBI = os.getenv("LLM_BACKEND_DOBBI", "").lower()
 # Hermes (L3) HTTP API — used when LLM_BACKEND=hermes. Defaults are overridable
 # from .env; never hardcode credentials here (public repo).
 HERMES_API_URL = os.getenv("HERMES_API_URL", "http://192.168.22.102:8000")
@@ -223,21 +227,23 @@ NANOBOT_SESSION_SALT = os.getenv("NANOBOT_SESSION_SALT", "")
 # Speaker-recognition service: POST multipart (file) -> {user_id, confidence}.
 SPEAKER_ID_URL = os.getenv("SPEAKER_ID_URL", "http://192.168.22.102:8001/identify")
 
+def _build_llm_backend(name: str):
+    """One backend factory for the primary brain and the optional «добби» brain.
+    Unknown values fall back to Nanobot, exactly as the old inline code did."""
+    if name == "hermes":
+        logger.info(f"🧠 LLM backend: Hermes @ {HERMES_API_URL}")
+        return backends.HermesBackend(HERMES_API_URL, HERMES_API_KEY)
+    if name == "cascade":
+        logger.info(f"🔀 LLM backend: Cascade @ {ROUTER_URL}")
+        return backends.CascadeBackend(ROUTER_URL, ack_delay=ROUTER_ACK_DELAY)
+    logger.info(f"🤖 LLM backend: Nanobot @ {NANOBOT_WS_URL}")
+    return backends.NanobotBackend(NANOBOT_WS_URL, NANOBOT_TOKEN, NANOBOT_SESSION_SALT)
+
+
 # Global LLM backend (set at import; HermesBackend, CascadeBackend or NanobotBackend)
 # Chosen once at import: every reply path (dispatch + camera sessions) reuses this
 # object, so backend config changes need a container restart.
-llm_backend = None
-if LLM_BACKEND == "hermes":
-    llm_backend = backends.HermesBackend(HERMES_API_URL, HERMES_API_KEY)
-    logger.info(f"🧠 Global LLM backend: Hermes @ {HERMES_API_URL}")
-elif LLM_BACKEND == "cascade":
-    llm_backend = backends.CascadeBackend(ROUTER_URL, ack_delay=ROUTER_ACK_DELAY)
-    logger.info(f"🔀 Global LLM backend: Cascade @ {ROUTER_URL}")
-else:
-    # Unknown values silently fall back to Nanobot — the default keeps old
-    # deployments working when LLM_BACKEND is unset or mistyped.
-    llm_backend = backends.NanobotBackend(NANOBOT_WS_URL, NANOBOT_TOKEN, NANOBOT_SESSION_SALT)
-    logger.info(f"🤖 Global LLM backend: Nanobot @ {NANOBOT_WS_URL}")
+llm_backend = _build_llm_backend(LLM_BACKEND)
 
 # OpenAI-compatible STT endpoint (speaches/whisper): multipart POST of the
 # packed Ogg file -> {"text": ...}. language/model are set in fetch_transcription().
@@ -3624,6 +3630,10 @@ async def start_camera_sessions():
         return
 
     logger.info(f"📷 Starting camera sessions: {streams}")
+    # A second brain only for turns woken by «добби». Built once, shared by all
+    # sessions, and absent (None) when the env is empty — in which case both
+    # words reach the same backend and nothing else about the pipeline changes.
+    dev_backend = _build_llm_backend(LLM_BACKEND_DOBBI) if LLM_BACKEND_DOBBI else None
     http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
     go2rtc_host = os.getenv("GO2RTC_HOST", "192.168.22.102")
     go2rtc_port = int(os.getenv("GO2RTC_PORT", "1984"))
@@ -3722,6 +3732,15 @@ async def start_camera_sessions():
                 wake_vosk_model=os.getenv(
                     f"WAKE_VOSK_MODEL_{name.upper()}"
                 ) or os.getenv("WAKE_VOSK_MODEL", ""),
+                # Second, opt-in address word in the SAME decoder. Tokens are
+                # measured from a live recording; an empty list leaves the old
+                # computer-only path unchanged. Only "dobbi" is a known mode.
+                alt_wake_word=os.getenv(
+                    f"WAKE_ALT_WORD_{name.upper()}"
+                ) or os.getenv("WAKE_ALT_WORD", ""),
+                alt_wake_tokens=os.getenv(
+                    f"WAKE_ALT_TOKENS_{name.upper()}"
+                ) or os.getenv("WAKE_ALT_TOKENS", ""),
                 # High-pass applied ONLY to the audio handed to the wake DECODER,
                 # per room: CAMERA_WAKE_HIGHPASS_<NAME>, 0 => off (the default
                 # everywhere). Not for the other rooms — this exists for a room
@@ -3817,6 +3836,29 @@ async def start_camera_sessions():
                     f"CAMERA_ATTENTION_PIP_{name.upper()}",
                     os.getenv("CAMERA_ATTENTION_PIP", "true"),
                 ).lower() == "true",
+                # Opt-in per room: the pilot swaps the beep for a spoken line
+                # in the livingroom only. Empty/false everywhere else.
+                wake_ack_enabled=os.getenv(
+                    f"CAMERA_WAKE_ACK_{name.upper()}",
+                    os.getenv("CAMERA_WAKE_ACK", "false"),
+                ).lower() == "true",
+                # The beep's replacement: a short spoken acknowledgement after a
+                # real pause. 0 => built-in default (2.0s / phrase below).
+                wake_ack_delay=float(
+                    os.getenv(f"CAMERA_WAKE_ACK_DELAY_{name.upper()}")
+                    or os.getenv("CAMERA_WAKE_ACK_DELAY")
+                    or 0
+                ),
+                wake_ack_phrase=(
+                    os.getenv(f"CAMERA_WAKE_ACK_PHRASE_{name.upper()}")
+                    or os.getenv("CAMERA_WAKE_ACK_PHRASE")
+                    or ""
+                ),
+                wake_ack_phrases=(
+                    os.getenv(f"CAMERA_WAKE_ACK_PHRASES_{name.upper()}")
+                    or os.getenv("CAMERA_WAKE_ACK_PHRASES")
+                    or ""
+                ),
                 # SpeexDSP noise-suppression cutoff, per room. Was hardcoded
                 # `800 if kitchen else 400` in the module, so no room could be
                 # retuned without editing shared code. 0 => 400.
@@ -3936,17 +3978,12 @@ async def start_camera_sessions():
                     onnx_gain=8.0,
                 ),
             )
-            # Pick the LLM backend
-            if LLM_BACKEND == 'hermes':
-                llm_backend = backends.HermesBackend(HERMES_API_URL, HERMES_API_KEY)
-                logger.info('Using Hermes backend at ' + HERMES_API_URL)
-            elif LLM_BACKEND == 'cascade':
-                llm_backend = backends.CascadeBackend(ROUTER_URL, ack_delay=ROUTER_ACK_DELAY)
-                logger.info('Using Cascade router at ' + ROUTER_URL)
-            else:
-                llm_backend = backends.NanobotBackend(NANOBOT_WS_URL, NANOBOT_TOKEN, NANOBOT_SESSION_SALT)
-                logger.info('Using Nanobot backend at ' + NANOBOT_WS_URL)
-            session = CameraSession(config=config, backend=llm_backend)
+            # The primary backend is the SAME object the rest of the gateway
+            # rebinds (apply_tts_backend, the WebSocket dispatch). Rebuilding a
+            # second one per camera gave each session its own ack timers and
+            # state. The optional Dobbi brain is shared across sessions.
+            session = CameraSession(config=config, backend=llm_backend,
+                                    dev_backend=dev_backend)
             _camera_sessions.append(session)
             await session.start()
             logger.info(f"📷 Camera session started: {name}")

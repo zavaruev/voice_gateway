@@ -566,7 +566,7 @@ async def test_camera_config_carries_the_stream_url(monkeypatch):
     created = []
 
     class _FakeSession:
-        def __init__(self, config=None, backend=None):
+        def __init__(self, config=None, backend=None, dev_backend=None):
             self.config = config
             created.append(self)
 

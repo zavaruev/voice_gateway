@@ -2316,11 +2316,10 @@ async def _drive_router(app, text, stream="livingroom"):
 
 
 @pytest.mark.asyncio
-async def test_a_question_with_a_device_noun_still_reaches_l2(monkeypatch):
-    """`_DEVICE_NOUN` contains «фильм» and «кофеварк», and `action_verb_missing`
-    only looks for a device + no action verb — so a genuine question also looks
-    "verbless" and was answered with «Не расслышала действие» instead of being
-    handed to L2. Interrogatives must keep the escalation.
+async def test_a_question_with_a_device_noun_reaches_hermes_not_the_verb_note(monkeypatch):
+    """`_DEVICE_NOUN` contains «фильм» and «кофеварк», so these questions also
+    look "verbless". They must NOT get «Не расслышала действие»; since 26.11
+    an unresolved question goes UP to Hermes before the tool agent.
     """
     import app as jev_router_app
 
@@ -2334,22 +2333,25 @@ async def test_a_question_with_a_device_noun_still_reaches_l2(monkeypatch):
         reached.append(True)
         yield {"type": "sentence", "text": "Ответ верхнего уровня."}
 
+    async def _chat(*a, **k):
+        yield "Ответ Гермеса.", ""
+
     monkeypatch.setattr(jev_router_app.classifier, "classify", _classify)
     monkeypatch.setattr(jev_router_app, "_run_worker", _worker)
+    monkeypatch.setattr(jev_router_app.chat_proxy, "stream_chat", _chat)
 
     for text in ("какой фильм мы смотрели?", "как работает кофеварка?"):
         reached.clear()
         events = await _drive_router(jev_router_app, text)
-        assert reached, f"{text!r} was short-circuited, never reached L2"
+        assert not reached, f"{text!r} was handed to L2"
         sentences = [e.get("text") for e in events if e.get("type") == "sentence"]
-        assert sentences == ["Ответ верхнего уровня."], (text, sentences)
+        assert sentences == ["Ответ Гермеса."], (text, sentences)
 
 
 @pytest.mark.asyncio
-async def test_a_query_route_question_reaches_l2_without_a_question_mark(monkeypatch):
-    """STT does not always keep the trailing «?». A downgraded easy_query
-    (`reason=query_resolver_ambiguous`) is a question route by construction and
-    must not be swallowed by the verb clarification either.
+async def test_a_query_route_question_without_a_question_mark_goes_up(monkeypatch):
+    """STT does not always keep the trailing «?». A leading question word is
+    enough: the unresolved question goes to Hermes, not the verb clarification.
     """
     import app as jev_router_app
 
@@ -2363,13 +2365,17 @@ async def test_a_query_route_question_reaches_l2_without_a_question_mark(monkeyp
         reached.append(True)
         yield {"type": "sentence", "text": "Ответ верхнего уровня."}
 
+    async def _chat(*a, **k):
+        yield "Ответ Гермеса.", ""
+
     monkeypatch.setattr(jev_router_app.classifier, "classify", _classify)
     monkeypatch.setattr(jev_router_app, "_run_worker", _worker)
+    monkeypatch.setattr(jev_router_app.chat_proxy, "stream_chat", _chat)
 
     events = await _drive_router(jev_router_app, "какой фильм мы смотрели")
-    assert reached, "the query route was answered by the verb clarification"
+    assert not reached, "the query route was handed to L2"
     sentences = [e.get("text") for e in events if e.get("type") == "sentence"]
-    assert sentences == ["Ответ верхнего уровня."], sentences
+    assert sentences == ["Ответ Гермеса."], sentences
 
 
 @pytest.mark.asyncio
@@ -4033,21 +4039,35 @@ def test_device_sentences_never_reach_the_chat_brain():
     assert not knowledge_question("")
 
 
-def test_the_knowledge_redirects_are_wired_into_handle():
+@pytest.mark.asyncio
+async def test_the_knowledge_redirect_reaches_hermes_with_its_persona(monkeypatch):
+    """A low-confidence knowledge question must reach Hermes FIRST with the
+    knowledge persona — the 11.11 corridor turn burned 343 s in the worker.
+    """
     import app as jev_router_app
-    import inspect
 
-    src = inspect.getsource(jev_router_app._handle)
-    # Both escalation sites (the easy_query fallback and the classifier's
-    # low_confidence path) must route to expert — a gate that is only read
-    # in one of the two places reproduces the 11.11 corridor turn.
-    assert '"expert", "general_knowledge"' in src
-    assert '"expert", "knowledge_low_confidence"' in src
-    # And the dispatch must PASS the persona flag: a parameter that is added
-    # and not passed shipped once already (the 20.10.2026 stream_name), and
-    # the knowledge persona never reaching the model looks exactly like the
-    # diagnostics persona answering everything.
-    assert "knowledge=knowledge" in src
+    seen = []
+
+    async def _classify(*a, **k):
+        return _route_decision("complex_logic", 0.19, "low_confidence(0.19<0.85)")
+
+    async def _worker(*a, **k):
+        raise AssertionError("a knowledge question must not reach the worker")
+        yield
+
+    async def _chat(text, **kwargs):
+        seen.append(kwargs)
+        yield "Ответ Гермеса.", ""
+
+    monkeypatch.setattr(jev_router_app.classifier, "classify", _classify)
+    monkeypatch.setattr(jev_router_app, "_run_worker", _worker)
+    monkeypatch.setattr(jev_router_app.chat_proxy, "stream_chat", _chat)
+
+    events = await _drive_router(jev_router_app, "что такое корень из трех")
+    sentences = [e.get("text") for e in events if e.get("type") == "sentence"]
+    assert sentences == ["Ответ Гермеса."], events
+    assert seen and seen[0].get("expert") is True, seen
+    assert seen[0].get("knowledge") is True, seen
 
 
 def test_the_low_confidence_redirect_sits_before_the_verb_note():
@@ -4288,3 +4308,123 @@ async def test_the_router_answers_the_weekday_without_l2(monkeypatch):
     events = await _drive_router(jev_router_app, "Какой сегодня день недели?")
     sentences = [e.get("text") for e in events if e.get("type") == "sentence"]
     assert sentences == ["Сегодня пятница."], (events, sentences)
+
+
+# --- 26.11.2026: an unanswered question must reach Hermes, not end in silence ---
+#
+# The standing rule: whatever the lower level cannot answer goes UP, and the
+# upper level must answer it. A downward teaching instruction is desirable but
+# secondary. complex_logic used to be a dead end when the worker spoke nothing.
+
+
+def _route_decision(route, confidence, reason):
+    return type("D", (), {"route": route, "confidence": confidence,
+                          "reason": reason})()
+
+
+@pytest.mark.asyncio
+async def test_a_question_the_worker_cannot_answer_reaches_hermes(monkeypatch):
+    import app as jev_router_app
+
+    seen = []
+
+    async def _classify(*a, **k):
+        return _route_decision("complex_logic", 0.6, "probe")
+
+    async def _worker(*a, **k):
+        return
+        yield  # make it an async generator that speaks nothing
+
+    async def _chat(text, **kwargs):
+        seen.append(kwargs)
+        yield "Ответ Гермеса.", ""
+
+    monkeypatch.setattr(jev_router_app.classifier, "classify", _classify)
+    monkeypatch.setattr(jev_router_app, "_run_worker", _worker)
+    monkeypatch.setattr(jev_router_app.chat_proxy, "stream_chat", _chat)
+
+    events = await _drive_router(jev_router_app, "как работает кофеварка?")
+    sentences = [e.get("text") for e in events if e.get("type") == "sentence"]
+    assert sentences == ["Ответ Гермеса."], events
+    assert seen and seen[0].get("expert") is True, seen
+    assert seen[0].get("knowledge") is True, seen
+
+
+@pytest.mark.asyncio
+async def test_a_silent_action_does_not_summon_hermes(monkeypatch):
+    """The fallback is for QUESTIONS. A silent action must not produce speech."""
+    import app as jev_router_app
+
+    async def _classify(*a, **k):
+        return _route_decision("complex_logic", 0.6, "probe")
+
+    async def _worker(*a, **k):
+        return
+        yield
+
+    async def _chat(*a, **k):
+        raise AssertionError("an action must not fall back to Hermes")
+        yield
+
+    monkeypatch.setattr(jev_router_app.classifier, "classify", _classify)
+    monkeypatch.setattr(jev_router_app, "_run_worker", _worker)
+    monkeypatch.setattr(jev_router_app.chat_proxy, "stream_chat", _chat)
+
+    events = await _drive_router(jev_router_app, "включи кофеварку")
+    assert not [e for e in events if e.get("type") == "sentence"], events
+
+
+@pytest.mark.asyncio
+async def test_a_question_never_reaches_the_worker(monkeypatch):
+    """After the 26.11.2026 rule, a question L1 cannot resolve goes UP before
+    the tool agent. Even a worker that WOULD have answered must not be called.
+    """
+    import app as jev_router_app
+
+    async def _classify(*a, **k):
+        return _route_decision("complex_logic", 0.6, "probe")
+
+    async def _worker(*a, **k):
+        raise AssertionError("a question must not be handed to the tool agent")
+        yield
+
+    async def _chat(*a, **k):
+        yield "Ответ Гермеса.", ""
+
+    monkeypatch.setattr(jev_router_app.classifier, "classify", _classify)
+    monkeypatch.setattr(jev_router_app, "_run_worker", _worker)
+    monkeypatch.setattr(jev_router_app.chat_proxy, "stream_chat", _chat)
+
+    events = await _drive_router(jev_router_app, "как работает кофеварка?")
+    sentences = [e.get("text") for e in events if e.get("type") == "sentence"]
+    assert sentences == ["Ответ Гермеса."], events
+
+
+@pytest.mark.asyncio
+async def test_an_ambiguous_question_goes_up_before_the_worker(monkeypatch):
+    """The standing rule: if L1 cannot commit to a QUESTION, go UP first.
+    Do not spend two minutes in a tool agent that returns nothing.
+    """
+    import app as jev_router_app
+
+    worker_calls = []
+
+    async def _classify(*a, **k):
+        return _route_decision("complex_logic", 0.24, "ambiguous(0.24<0.55)")
+
+    async def _worker(*a, **k):
+        worker_calls.append(True)
+        return
+        yield
+
+    async def _chat(text, **kwargs):
+        yield "Ответ Гермеса.", ""
+
+    monkeypatch.setattr(jev_router_app.classifier, "classify", _classify)
+    monkeypatch.setattr(jev_router_app, "_run_worker", _worker)
+    monkeypatch.setattr(jev_router_app.chat_proxy, "stream_chat", _chat)
+
+    events = await _drive_router(jev_router_app, "как работает кофеварка?")
+    sentences = [e.get("text") for e in events if e.get("type") == "sentence"]
+    assert not worker_calls, events
+    assert sentences == ["Ответ Гермеса."], events

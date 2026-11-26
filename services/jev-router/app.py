@@ -266,6 +266,26 @@ class RouteRequest(BaseModel):
     honorific: str = ""
 
 
+async def _hermes_answer_events(text: str, req):
+    """Last resort for a QUESTION the lower levels could not answer.
+
+    The standing rule (26.11.2026): whatever L1/L2 cannot answer goes UP and
+    gets answered there; a downward teaching rule is desirable but secondary.
+    Only question-shaped turns reach here, so a silent action never produces
+    an unrequested sentence. Hermes-first with the general-knowledge persona.
+    """
+    logger.info("question unanswered by lower levels -> Hermes: %r", text[:80])
+    yield {"type": "route", "route": "expert", "confidence": 1.0,
+           "reason": "l2_no_answer"}
+    async for s, emo in chat_proxy.stream_chat(
+        text, expert=True, knowledge=True, persona=req.persona,
+    ):
+        ev = {"type": "sentence", "text": s}
+        if emo:
+            ev["emotion"] = emo
+        yield ev
+
+
 def _sse(obj: dict) -> str:
     """Serialize one SSE `data:` line.
 
@@ -1854,11 +1874,18 @@ async def _handle(req: RouteRequest):
     # easy_query fallback and L2 spent 161.5 s / 69k tokens on it).
     # `knowledge_question` is a narrow whitelist with home/time guards, so a
     # mangled ACTION text never reaches it (its own device-noun guard).
-    if (route == "complex_logic" and reason.startswith("low_confidence")
-            and knowledge_question(text)):
-        route, reason = "expert", "knowledge_low_confidence"
-        knowledge = True
-        logger.info("knowledge question -> expert (Hermes): %r", text[:80])
+    # A QUESTION the lower level could not commit to goes UP regardless of WHY
+    # L1 failed (low_confidence, low_margin, ambiguous). Hermes answers almost
+    # everything; spending two minutes in a tool agent that returns nothing is
+    # worse than going up immediately. Actions stay on complex_logic: only a
+    # question-shaped utterance is upgraded here.
+    question_to_expert = False
+    if route == "complex_logic" and is_question_shape(text):
+        kind = ("knowledge_low_confidence" if knowledge_question(text)
+                else "unresolved_question")
+        route, reason = "expert", kind
+        question_to_expert = True
+        logger.info("question L1 could not answer -> expert (Hermes): %r", text[:80])
 
     # --- Escalation hooks before emitting the route event ----------------
     # The resolvers are pure and cheap (regex only), so they run HERE as a
@@ -1869,7 +1896,7 @@ async def _handle(req: RouteRequest):
     # both, because a bare utterance made the model guess a device name and a
     # pronoun a whole room (field case 28.09.2026).
     ctx = ""
-    knowledge = False  # expert persona + Hermes-first, set by the knowledge redirects
+    knowledge = question_to_expert  # expert persona + Hermes-first for questions upgraded above
     hist = history.block(req.stream_name or req.session_id)
     # Default-room hint for the resolvers: an explicit /room binding (a
     # source whose stream_name is not a room) beats the stream name. Passed
@@ -1970,8 +1997,16 @@ async def _handle(req: RouteRequest):
             knowledge = True
             logger.info("knowledge question -> expert (Hermes): %r", text[:80])
         elif q is None:
-            logger.info("query resolver ambiguous -> complex_logic: %r", text[:80])
-            route, reason = "complex_logic", "query_resolver_ambiguous"
+            if is_question_shape(text):
+                # The ladder has no owner for this question: go UP now. The
+                # Hermes fallback below is a safety net for turns that still
+                # reach L2, not the primary route for an unanswered question.
+                logger.info("unresolved question -> expert (Hermes): %r", text[:80])
+                route, reason = "expert", "unresolved_question"
+                knowledge = True
+            else:
+                logger.info("query resolver ambiguous -> complex_logic: %r", text[:80])
+                route, reason = "complex_logic", "query_resolver_ambiguous"
     # Every escalation carries the canonical room name: the RU word is NOT an
     # HA area, and an intent fed «гостиная» answers INVALID_AREA (field case
     # 03.10.2026 18:21, where the model then spent a step guessing device
@@ -2261,13 +2296,20 @@ async def _handle(req: RouteRequest):
                             "confidence": round(confidence, 3),
                             "reason": "query_unresolved"})
                 route = "complex_logic"
+                spoken = False
                 async for chunk in _run_worker(
                     text, req.session_id, req.stream_name, context=ctx, hist=hist,
                     lessons_out=pending_lessons,
                 ):
                     if chunk.get("type") == "sentence" and chunk.get("text"):
                         reply_parts.append(chunk["text"])
+                        spoken = True
                     yield _sse(chunk)
+                if is_question_shape(text) and not spoken:
+                    async for ev in _hermes_answer_events(text, req):
+                        if ev.get("type") == "sentence" and ev.get("text"):
+                            reply_parts.append(ev["text"])
+                        yield _sse(ev)
 
         # --- general_qa / expert: chat proxy ------------------------------
         elif route in ("general_qa", "expert"):
@@ -2292,6 +2334,7 @@ async def _handle(req: RouteRequest):
 
         # --- complex_logic: L2 CodeAgent ----------------------------------
         else:
+            spoken = False
             async for chunk in _run_worker(
                 text, req.session_id, req.stream_name, context=ctx, hist=hist,
                 lessons_out=pending_lessons,
@@ -2300,7 +2343,15 @@ async def _handle(req: RouteRequest):
                 # remembered (memory stores what the user actually heard).
                 if chunk.get("type") == "sentence" and chunk.get("text"):
                     reply_parts.append(chunk["text"])
+                    spoken = True
                 yield _sse(chunk)
+            # A question must never end in silence because the tool agent had
+            # nothing to say: escalate upward to Hermes, which can answer it.
+            if is_question_shape(text) and not spoken:
+                async for ev in _hermes_answer_events(text, req):
+                    if ev.get("type") == "sentence" and ev.get("text"):
+                        reply_parts.append(ev["text"])
+                    yield _sse(ev)
 
     except Exception as e:
         # Any handler failure degrades to an error event + done instead of a

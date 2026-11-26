@@ -433,6 +433,14 @@ question gets only that («Сегодня четверг.» — the weekday is a
 of the HA clock payload), and a question asking for more than one of these
 still gets the combined phrase.
 
+The routing rule behind this is simple: whatever the lower levels cannot answer
+goes UP. A question that L1 cannot commit to (low confidence, low margin or an
+ambiguous verdict) goes straight to the Hermes expert path instead of being
+spent in a tool agent that may return nothing. A question-shaped turn that still
+reaches L2 and ends without a spoken sentence falls back to Hermes as a safety
+net. Actions are unaffected. A teaching rule can be sent back down only in the
+narrow word-rewrite form, not as an arbitrary answer.
+
 ---
 
 ## Speech: three TTS engines, switchable at runtime

@@ -4160,3 +4160,74 @@ def test_the_scale_mangle_is_not_a_tare_when_it_is_a_question():
     for text in ("весы обнулились?", "обнулились весы?", "что весы обнулились?"):
         assert resolve_scale(text) is None, f"{text!r} performed a tare"
     assert resolve_scale("Сколько весит?").kind == "weight"
+
+
+# --- 26.11.2026: a time question gets ONLY the clock, a date question ONLY the date ---
+#
+# The user's decision: «Сколько времени?» -> hours and minutes in 24-hour form,
+# nothing else; «Какое сегодня число?» -> day, month and year, nothing else.
+# The combined phrase stays for questions that ask both.
+
+
+def test_time_and_date_questions_get_their_own_answer_mode():
+    time_q = resolve_query("Сколько времени?", "device")
+    assert time_q is not None and time_q.kind == "datetime"
+    assert time_q.mode == "time", time_q
+
+    date_q = resolve_query("Какое сегодня число?", "device")
+    assert date_q is not None and date_q.kind == "datetime"
+    assert date_q.mode == "date", date_q
+
+    both = resolve_query("Какое сегодня число и сколько времени?", "device")
+    assert both is not None and both.mode == "all", both
+
+    for phrase in ("который час", "какое сейчас время"):
+        q = resolve_query(phrase, "device")
+        assert q is not None and q.mode == "time", (phrase, q)
+    for phrase in ("какая дата", "дата сегодня"):
+        q = resolve_query(phrase, "device")
+        assert q is not None and q.mode == "date", (phrase, q)
+
+
+def test_datetime_phrase_in_time_mode_has_no_date_or_weekday():
+    s = _datetime_phrase(_dt_payload(13, 11, 2026, 20, 23), "time")
+    assert s == "Сейчас двадцать часов двадцать три минуты.", s
+    assert not any(w in s for w in ("ноября", "пятница", "2026", "две тысячи"))
+    assert not any(ch.isdigit() for ch in s)
+
+
+def test_datetime_phrase_in_date_mode_has_no_time_or_weekday():
+    s = _datetime_phrase(_dt_payload(13, 11, 2026, 20, 23), "date")
+    assert s == "Тринадцатое ноября две тысячи двадцать шестого года.", s
+    assert not any(w in s for w in ("Сейчас", "двадцать часов", "пятница"))
+    assert not any(ch.isdigit() for ch in s)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text,want,forbidden", [
+    ("Сколько времени?", "Сейчас двадцать часов двадцать три минуты.",
+     ("ноября", "пятница", "две тысячи")),
+    ("Какое сегодня число?", "Тринадцатое ноября две тысячи двадцать шестого года.",
+     ("Сейчас", "двадцать часов", "пятница")),
+])
+async def test_the_router_speaks_only_what_was_asked(monkeypatch, text, want, forbidden):
+    """Wiring test: the app must pass the resolver's mode into _datetime_phrase.
+    A resolver-only test would stay green if the call site dropped the mode.
+    """
+    import app as jev_router_app
+
+    async def _classify(*a, **k):
+        return type("D", (), {"route": "easy_query", "confidence": 0.9,
+                              "reason": ""})()
+
+    async def _call_tool(name, args):
+        assert name == "llm__GetDateTime"
+        return {"ok": True, "result": _dt_payload(13, 11, 2026, 20, 23)}
+
+    monkeypatch.setattr(jev_router_app.classifier, "classify", _classify)
+    monkeypatch.setattr(jev_router_app.ha, "call_tool", _call_tool)
+
+    events = await _drive_router(jev_router_app, text)
+    sentences = [e.get("text") for e in events if e.get("type") == "sentence"]
+    assert sentences == [want], (text, sentences)
+    assert not any(w in sentences[0] for w in forbidden), sentences

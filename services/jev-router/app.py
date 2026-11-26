@@ -2158,7 +2158,7 @@ async def _handle(req: RouteRequest):
                 # and the common unresolved branch escalates to L2.
                 res = await ha.call_tool("llm__GetDateTime", {})
                 if res.get("ok"):
-                    sentence = _datetime_phrase(res.get("result"))
+                    sentence = _datetime_phrase(res.get("result"), q.mode)
             elif q.kind == "weather":
                 # Hybrid chain (25.09.2026): open-meteo builds the forecast
                 # deterministically (instant, cannot invent dates); Hermes L3

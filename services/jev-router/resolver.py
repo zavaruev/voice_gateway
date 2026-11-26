@@ -1340,6 +1340,20 @@ RE_TIME_Q = re.compile(
 )
 RE_WEATHER_Q = re.compile(r"\bпогод\w*|улице\s+(?:жарко|холодно)", re.IGNORECASE)
 
+# 26.11.2026, user's decision: a bare clock question gets ONLY hours/minutes
+# (24-hour form), a bare date question gets ONLY day/month/year. Asking both
+# keeps the combined answer. These are narrower than RE_TIME_Q, which also
+# covers the combined phrasings.
+RE_TIME_ONLY_Q = re.compile(
+    r"\b(?:сколько\s+(?:сейчас\s+)?времени|времени\s+сколько|час\s+сколько"
+    r"|который\s+час|какое\s+(?:сейчас\s+)?время)\b",
+    re.IGNORECASE,
+)
+RE_DATE_ONLY_Q = re.compile(
+    r"\b(?:какое\s+(?:сегодня\s+)?число|какая\s+дата|дата\s+сегодня)\b",
+    re.IGNORECASE,
+)
+
 
 @dataclass
 class ResolvedQuery:
@@ -1358,6 +1372,9 @@ class ResolvedQuery:
     kind: str  # "datetime" | "state" | "weather"
     args: dict = field(default_factory=dict)
     entity_hint: str = ""
+    # datetime only: "time" / "date" / "all" — which part of the HA clock
+    # payload the user actually asked for. "all" is the historical answer.
+    mode: str = "all"
 
 
 def resolve_query(text: str, stream_name: str) -> ResolvedQuery | None:
@@ -1374,9 +1391,14 @@ def resolve_query(text: str, stream_name: str) -> ResolvedQuery | None:
     if not t:
         return None
 
-    # datetime: HA-side clock, no slots to fill.
+    # datetime: HA-side clock, no slots to fill. A bare clock or date question
+    # answers only that part; asking both keeps the full phrase.
     if RE_TIME_Q.search(t):
-        return ResolvedQuery("datetime")
+        want_time = bool(RE_TIME_ONLY_Q.search(t))
+        want_date = bool(RE_DATE_ONLY_Q.search(t))
+        mode = ("all" if want_time and want_date else
+                "time" if want_time else "date" if want_date else "all")
+        return ResolvedQuery("datetime", mode=mode)
 
     # Weather only if no temperature word (see docstring).
     if RE_WEATHER_Q.search(t) and not RE_TEMP.search(t):
@@ -1588,7 +1610,7 @@ def _year_words(year: int) -> str:
     return str(year)
 
 
-def _datetime_phrase(result) -> str | None:
+def _datetime_phrase(result, mode: str = "all") -> str | None:
     """llm__GetDateTime payload -> speakable Russian phrase.
 
     Shape verified live: {"date": "2026-09-24", "time": "17:52:46",
@@ -1597,14 +1619,20 @@ def _datetime_phrase(result) -> str | None:
     Every numeral is spelled out and agrees with its noun:
       «Сегодня пятница, тринадцатое ноября две тысячи двадцать шестого года.
        Сейчас десять часов тридцать минут.»
-    Returns None when nothing speakable could be built; the caller then
-    escalates instead of staying silent (a voice turn must always answer).
+
+    `mode` is the user's question (26.11.2026):
+      "time" -> only hours and minutes, 24-hour form;
+      "date" -> only day, month and year;
+      "all"  -> the historical combined phrase.
+    Returns None when the REQUESTED part is missing, so the caller escalates
+    instead of answering a different question or staying silent.
     """
     if isinstance(result, str):
         return result.strip() or None
     if not isinstance(result, dict):
         return None
-    parts: list[str] = []
+
+    date_part = ""
     date = str(result.get("date", ""))
     # len/date[4] guards distinguish a real "YYYY-MM-DD" from a short or
     # differently formatted value before slicing it apart.
@@ -1613,11 +1641,16 @@ def _datetime_phrase(result) -> str | None:
         if month:
             day = int(date[8:10])
             year = int(date[:4])
-            wd = _WEEKDAYS_RU.get(str(result.get("weekday", "")), "")
-            date_ru = (
-                f"{_ordinal(day, 'n')} {month} {_year_words(year)} года"
-            )
-            parts.append(f"Сегодня {wd}, {date_ru}." if wd else f"Сегодня {date_ru}.")
+            date_ru = f"{_ordinal(day, 'n')} {month} {_year_words(year)} года"
+            if mode == "date":
+                # A bare date question keeps no weekday and no "Сегодня".
+                date_part = date_ru[:1].upper() + date_ru[1:] + "."
+            else:
+                wd = _WEEKDAYS_RU.get(str(result.get("weekday", "")), "")
+                date_part = (f"Сегодня {wd}, {date_ru}." if wd
+                             else f"Сегодня {date_ru}.")
+
+    time_part = ""
     # "17:52:46" -> "17:52": seconds are noise for speech.
     t = str(result.get("time", ""))[:5]
     try:
@@ -1629,10 +1662,15 @@ def _datetime_phrase(result) -> str | None:
         time_ru = f"{_cardinal(h)} {_hour_word(h)}"
         if m:
             time_ru += f" {_cardinal(m, fem=True)} {_minute_word(m)}"
-        parts.append(f"Сейчас {time_ru}.")
+        time_part = f"Сейчас {time_ru}."
     except ValueError:
         # Malformed time: the old digit form, so the turn still answers
         # rather than escalating a working clock.
         if t:
-            parts.append(f"Сейчас {t}.")
-    return " ".join(parts) or None
+            time_part = f"Сейчас {t}."
+
+    if mode == "time":
+        return time_part or None
+    if mode == "date":
+        return date_part or None
+    return " ".join(p for p in (date_part, time_part) if p) or None

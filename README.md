@@ -424,7 +424,12 @@ escalation (`resolver.knowledge_question()`, a narrow whitelist guarded so a
 device sentence never becomes a chat question), and progress heartbeats no longer
 suppress the apology when a turn produced no content. And «сколько времени» is
 answered offline from the resolver with numerals that agree with their nouns
-(«десять часов тридцать минут»), so TTS never receives a digit to mangle.
+(«десять часов тридцать минут»), so TTS never receives a digit to mangle. The
+answer is scoped to what was asked: a clock question gets only the hours and
+minutes in 24-hour form («Сейчас двадцать один час сорок две минуты.»), a date
+question gets only the day, month and year
+(«Двадцать шестое ноября две тысячи двадцать шестого года.»), and a question
+asking for both still gets the combined phrase.
 
 ---
 

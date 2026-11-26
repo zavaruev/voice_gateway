@@ -428,8 +428,10 @@ answered offline from the resolver with numerals that agree with their nouns
 answer is scoped to what was asked: a clock question gets only the hours and
 minutes in 24-hour form («Сейчас двадцать один час сорок две минуты.»), a date
 question gets only the day, month and year
-(«Двадцать шестое ноября две тысячи двадцать шестого года.»), and a question
-asking for both still gets the combined phrase.
+(«Двадцать шестое ноября две тысячи двадцать шестого года.»), a weekday
+question gets only that («Сегодня четверг.» — the weekday is already a field
+of the HA clock payload), and a question asking for more than one of these
+still gets the combined phrase.
 
 ---
 

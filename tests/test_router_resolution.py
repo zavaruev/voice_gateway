@@ -4231,3 +4231,60 @@ async def test_the_router_speaks_only_what_was_asked(monkeypatch, text, want, fo
     sentences = [e.get("text") for e in events if e.get("type") == "sentence"]
     assert sentences == [want], (text, sentences)
     assert not any(w in sentences[0] for w in forbidden), sentences
+
+
+# --- 26.11.2026: the weekday question must be answered by L1, not lost in L2 ---
+#
+# «Какой сегодня день недели?» used to reach complex_logic(query_resolver_ambiguous),
+# the worker produced NO sentence and NO lesson, and the user heard nothing —
+# although the HA clock payload already carries "weekday". Teach the lower level.
+
+
+def test_weekday_question_gets_its_own_answer_mode():
+    for phrase in ("Какой сегодня день недели?", "Какой день недели?",
+                   "Какой сегодня день?"):
+        q = resolve_query(phrase, "device")
+        assert q is not None and q.kind == "datetime", (phrase, q)
+        assert q.mode == "weekday", (phrase, q)
+
+    both = resolve_query("Какой день недели и сколько времени?", "device")
+    assert both is not None and both.mode == "all", both
+
+
+def test_datetime_phrase_in_weekday_mode_has_no_time_or_date():
+    s = _datetime_phrase(_dt_payload(13, 11, 2026, 20, 23), "weekday")
+    assert s == "Сегодня пятница.", s
+    assert not any(w in s for w in ("ноября", "две тысячи", "двадцать часов"))
+    assert not any(ch.isdigit() for ch in s)
+
+
+def test_weekday_mode_without_a_weekday_in_the_payload_escalates():
+    assert _datetime_phrase(_dt_payload(13, 11, 2026, 20, 23, weekday=""),
+                            "weekday") is None
+
+
+@pytest.mark.asyncio
+async def test_the_router_answers_the_weekday_without_l2(monkeypatch):
+    """Wiring: classifier -> easy_query -> resolver mode -> HA clock -> sentence.
+    Stub the worker so a regression into complex_logic fails the test loudly.
+    """
+    import app as jev_router_app
+
+    async def _classify(*a, **k):
+        return type("D", (), {"route": "easy_query", "confidence": 0.9,
+                              "reason": ""})()
+
+    async def _call_tool(name, args):
+        assert name == "llm__GetDateTime"
+        return {"ok": True, "result": _dt_payload(13, 11, 2026, 20, 23)}
+
+    async def _worker(*a, **k):
+        raise AssertionError("the weekday question must not reach L2")
+
+    monkeypatch.setattr(jev_router_app.classifier, "classify", _classify)
+    monkeypatch.setattr(jev_router_app.ha, "call_tool", _call_tool)
+    monkeypatch.setattr(jev_router_app, "_run_worker", _worker)
+
+    events = await _drive_router(jev_router_app, "Какой сегодня день недели?")
+    sentences = [e.get("text") for e in events if e.get("type") == "sentence"]
+    assert sentences == ["Сегодня пятница."], (events, sentences)

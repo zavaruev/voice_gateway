@@ -1335,7 +1335,8 @@ RE_TIME_Q = re.compile(
     # the second one was in the list; the first is the more common phrasing and
     # was simply missing.
     r"\b(который час|какое (?:сейчас )?время|какое (?:сегодня )?число|какая дата"
-    r"|дата сегодня|сколько (?:сейчас )?времени|времени сколько|час сколько)\b",
+    r"|дата сегодня|сколько (?:сейчас )?времени|времени сколько|час сколько"
+    r"|какой (?:сегодня )?день(?: недели)?)\b",
     re.IGNORECASE,
 )
 RE_WEATHER_Q = re.compile(r"\bпогод\w*|улице\s+(?:жарко|холодно)", re.IGNORECASE)
@@ -1351,6 +1352,13 @@ RE_TIME_ONLY_Q = re.compile(
 )
 RE_DATE_ONLY_Q = re.compile(
     r"\b(?:какое\s+(?:сегодня\s+)?число|какая\s+дата|дата\s+сегодня)\b",
+    re.IGNORECASE,
+)
+# 26.11.2026: the weekday is already in the HA clock payload, so this is a
+# lower-level answer, not a knowledge question for Hermes. It used to fall
+# through to complex_logic, where the worker answered nothing at all.
+RE_DAY_OF_WEEK_Q = re.compile(
+    r"\b(?:какой\s+(?:сегодня\s+)?день(?:\s+недели)?|день\s+недели\s+какой)\b",
     re.IGNORECASE,
 )
 
@@ -1396,8 +1404,10 @@ def resolve_query(text: str, stream_name: str) -> ResolvedQuery | None:
     if RE_TIME_Q.search(t):
         want_time = bool(RE_TIME_ONLY_Q.search(t))
         want_date = bool(RE_DATE_ONLY_Q.search(t))
-        mode = ("all" if want_time and want_date else
-                "time" if want_time else "date" if want_date else "all")
+        want_weekday = bool(RE_DAY_OF_WEEK_Q.search(t))
+        chosen = [name for name, want in (("time", want_time), ("date", want_date),
+                                          ("weekday", want_weekday)) if want]
+        mode = chosen[0] if len(chosen) == 1 else "all"
         return ResolvedQuery("datetime", mode=mode)
 
     # Weather only if no temperature word (see docstring).
@@ -1623,6 +1633,7 @@ def _datetime_phrase(result, mode: str = "all") -> str | None:
     `mode` is the user's question (26.11.2026):
       "time" -> only hours and minutes, 24-hour form;
       "date" -> only day, month and year;
+      "weekday" -> only the day of the week (HA already sends it);
       "all"  -> the historical combined phrase.
     Returns None when the REQUESTED part is missing, so the caller escalates
     instead of answering a different question or staying silent.
@@ -1631,6 +1642,11 @@ def _datetime_phrase(result, mode: str = "all") -> str | None:
         return result.strip() or None
     if not isinstance(result, dict):
         return None
+    if mode == "weekday":
+        # The day of week is a field of the SAME HA payload — no tool, no L2,
+        # no Hermes. Missing weekday is not an answer: let the caller escalate.
+        wd = _WEEKDAYS_RU.get(str(result.get("weekday", "")), "")
+        return f"Сегодня {wd}." if wd else None
 
     date_part = ""
     date = str(result.get("date", ""))

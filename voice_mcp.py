@@ -433,6 +433,24 @@ def build_mcp_server():
     return mcp
 
 
+# Long-lived SSE responses that must be given a terminal chunk before uvicorn
+# starts tearing the connection down. Hermes' `RemoteProtocolError: incomplete
+# chunked read` (27.11.2026 05:18/05:30 MSK) lined up with every gateway
+# restart: uvicorn cancelled the response mid-body, so the peer saw a chunked
+# stream that never ended. The wrapper below closes the body itself.
+_SSE_RESPONSES: set = set()
+
+
+async def _close_sse_responses() -> None:
+    """End every live SSE body with an empty terminal chunk on shutdown."""
+    for close in list(_SSE_RESPONSES):
+        try:
+            await close()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"🔌 SSE close failed: {e!r}")
+    _SSE_RESPONSES.clear()
+
+
 class BearerAuth:
     """Pure-ASGI Bearer-token wrapper, fail-closed on an empty token.
 
@@ -474,6 +492,35 @@ class BearerAuth:
                 ],
             })
             await send({"type": "http.response.body", "body": body})
+            return
+        if scope.get("path", "").rstrip("/").endswith("/sse"):
+            # One lock per stream: the generator sends chunks while shutdown
+            # may inject the terminal one from another coroutine.
+            lock = asyncio.Lock()
+            state = {"closed": False}
+
+            async def send_sse(message):
+                async with lock:
+                    if state["closed"] and message["type"] == "http.response.body":
+                        return
+                    await send(message)
+
+            async def close_sse():
+                if state["closed"]:
+                    return
+                state["closed"] = True
+                async with lock:
+                    await send({
+                        "type": "http.response.body", "body": b"",
+                        "more_body": False,
+                    })
+                _SSE_RESPONSES.discard(close_sse)
+
+            _SSE_RESPONSES.add(close_sse)
+            try:
+                await self.app(scope, receive, send_sse)
+            finally:
+                _SSE_RESPONSES.discard(close_sse)
             return
         await self.app(scope, receive, send)
 
@@ -549,6 +596,9 @@ async def run_mcp_server() -> None:
         logger.error(f"🔌 Hermes MCP server failed: {e!r}")
         return
     finally:
+        # Close the chunked SSE bodies BEFORE uvicorn cancels them: otherwise
+        # the peer sees an incomplete message and Hermes logs a protocol error.
+        await _close_sse_responses()
         if server.started:
             try:
                 await server.shutdown()

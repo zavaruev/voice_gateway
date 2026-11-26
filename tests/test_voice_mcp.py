@@ -660,3 +660,70 @@ def test_the_server_task_binds_sse_and_closes_cleanly():
         asyncio.run(drive())
     finally:
         voice_mcp.MCP_TOKEN, voice_mcp.PROACTIVE_MCP_PORT = old
+
+
+# --- 27.11.2026 05:18 / 05:30 MSK: Hermes saw an incomplete chunked SSE body ---
+#
+# Every RemoteProtocolError in Hermes lined up with a gateway restart: uvicorn
+# cancelled the long-lived /sse response mid-body. The server must close the
+# SSE body itself (terminal empty chunk) BEFORE uvicorn starts tearing down.
+
+
+def test_sse_stream_is_terminated_on_gateway_shutdown():
+    import asyncio
+
+    sent = []
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def app(scope, receive, send):
+        await send({
+            "type": "http.response.start", "status": 200,
+            "headers": [(b"content-type", b"text/event-stream")],
+        })
+        await send({"type": "http.response.body", "body": b"data: x\n\n",
+                    "more_body": True})
+        started.set()
+        await release.wait()
+        # Anything the generator emits after shutdown must be dropped, not
+        # sent after the terminal chunk.
+        await send({"type": "http.response.body", "body": b"data: late\n\n",
+                    "more_body": True})
+
+    async def receive():
+        return {"type": "http.disconnect"}
+
+    async def main():
+        scope = {"type": "http", "method": "GET", "path": "/sse",
+                 "headers": [(b"authorization", b"Bearer tok")]}
+        task = asyncio.create_task(
+            voice_mcp.BearerAuth(app, "tok")(scope, receive, _capture(sent))
+        )
+        await asyncio.wait_for(started.wait(), 2)
+        await voice_mcp._close_sse_responses()
+        release.set()
+        await asyncio.wait_for(task, 2)
+
+    asyncio.run(main())
+    bodies = [m for m in sent if m["type"] == "http.response.body"]
+    assert bodies[-1] == {"type": "http.response.body", "body": b"",
+                          "more_body": False}, bodies
+    assert all(b"late" not in m.get("body", b"") for m in bodies), bodies
+    assert voice_mcp._SSE_RESPONSES == set()
+
+
+def _capture(sent):
+    async def send(message):
+        sent.append(message)
+    return send
+
+
+def test_shutdown_closes_sse_before_uvicorn_teardown():
+    """Wiring: a close helper nobody calls changes nothing at restart.
+    Assert the order, not just the presence, so a move after shutdown fails.
+    """
+    import inspect
+
+    src = inspect.getsource(voice_mcp.run_mcp_server)
+    assert "_close_sse_responses()" in src
+    assert src.index("_close_sse_responses()") < src.index("server.shutdown()")

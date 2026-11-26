@@ -4941,3 +4941,45 @@ async def test_speak_pcm_marks_the_clarification_as_a_question():
         wait=True,
     )
     assert is_q is True
+
+
+# --- 27.11.2026 02:00 MSK: two /play_audio POSTs started 60-75 ms apart ----
+#
+# `_play_overlap` was unconditional, so sentence N+1 was uploaded while the
+# camera was still consuming N — the reply sounded as if it cut itself off.
+# A TEXT-DRIVEN gap is what the listener expects: start the next upload when
+# the previous CLIP ends (audio duration), not when its HTTP response arrives.
+
+
+@pytest.mark.asyncio
+async def test_overlap_waits_for_the_previous_clip_to_finish():
+    s = _make_http_session()
+    s.http_session = _FakeHttp(200)
+    s._play_overlap = True
+    s._tts_play_end = time.time() + 1.0
+
+    t0 = time.time()
+    await s._speak_pcm(b"\x03\x04" * 24000, "второе предложение")
+    await s._settle_play_posts()
+    elapsed = time.time() - t0
+
+    assert s.http_session.calls, "no upload happened at all"
+    assert elapsed >= 0.95, (
+        f"the second POST started {elapsed:.2f}s after the call, "
+        "before the previous clip finished"
+    )
+
+
+@pytest.mark.asyncio
+async def test_no_prior_clip_starts_the_upload_immediately():
+    """The scheduled gap must not become a blanket delay on the first sentence."""
+    s = _make_http_session()
+    s.http_session = _FakeHttp(200)
+    s._play_overlap = True
+    s._tts_play_end = 0.0
+
+    t0 = time.time()
+    await s._speak_pcm(b"\x03\x04" * 24000, "первое предложение")
+    await s._settle_play_posts()
+    elapsed = time.time() - t0
+    assert elapsed < 0.4, f"the first upload waited {elapsed:.2f}s for nothing"

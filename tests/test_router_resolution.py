@@ -4428,3 +4428,50 @@ async def test_an_ambiguous_question_goes_up_before_the_worker(monkeypatch):
     sentences = [e.get("text") for e in events if e.get("type") == "sentence"]
     assert not worker_calls, events
     assert sentences == ["Ответ Гермеса."], events
+
+
+# --- 27.11.2026 02:00 MSK: Hermes streamed 5 sentences, then timed out ------
+#
+# `stream_chat` treated a post-content exception as "this target failed" and
+# moved to the next model. The next one returned empty, so the user heard a
+# partial answer and then 55 s of silence. Once a target has SPOKEN, failover
+# must stop: keeping the answer is better than replacing it with nothing.
+
+
+@pytest.mark.asyncio
+async def test_failover_stops_after_the_first_spoken_sentence(monkeypatch):
+    import chat_proxy
+
+    seen = []
+
+    async def _stream(url, model, messages, api_key="", **kwargs):
+        seen.append(model)
+        if model == "hermes-agent":
+            yield "Первое предложение.", ""
+            raise RuntimeError("stream died after real content")
+        yield "Фолбэк.", ""
+
+    monkeypatch.setattr(chat_proxy, "stream_sentences", _stream)
+    out = [s async for s, _ in chat_proxy.stream_chat("тест", expert=True,
+                                                     knowledge=True)]
+    assert out == ["Первое предложение."], out
+    assert seen == ["hermes-agent"], seen
+
+
+@pytest.mark.asyncio
+async def test_failover_still_runs_when_nothing_was_spoken(monkeypatch):
+    import chat_proxy
+
+    seen = []
+
+    async def _stream(url, model, messages, api_key="", **kwargs):
+        seen.append(model)
+        if model == "hermes-agent":
+            raise RuntimeError("no content")
+        yield "Фолбэк.", ""
+
+    monkeypatch.setattr(chat_proxy, "stream_sentences", _stream)
+    out = [s async for s, _ in chat_proxy.stream_chat("тест", expert=True,
+                                                     knowledge=True)]
+    assert out == ["Фолбэк."], out
+    assert seen == ["hermes-agent", chat_proxy.config.OMNIROUTE_COMBO], seen

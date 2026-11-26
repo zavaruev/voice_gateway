@@ -7008,13 +7008,17 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
         # moments, and only two of them were before the upload. `_post_and_close`
         # is a closure over exactly this variable for that reason.
         sent_at = time.time()
+        # When the PREVIOUS clip's sound ends. Two /play_audio POSTs that start
+        # 60-75 ms apart (27.11.2026 02:00 MSK, living room) made the camera
+        # play one body over another and the reply sounded cut off. Waiting for
+        # the HTTP response is not the fix — it is 3 s on a slow link and adds
+        # exactly the gap this overlap was introduced to remove. The audio
+        # clock is the natural boundary: start the next upload when the last
+        # clip is due to finish sounding.
+        prev_end = float(getattr(self, "_tts_play_end", 0.0))
         queued = self._out_track.queue_seconds() if self._out_track else (
             len(pcm) / (TTS_PLAY_RATE * 2)
         )
-        self._arm_playback_timing(sent_at, queued)
-        # Same reason as the two cues, and for the same reason this is a separate
-        # window from the mute above: the endpoint must not hear the reply either.
-        self._arm_tts_inflight(sent_at, queued)
         try:
             # Record the audio we are about to play so the mic feed can later
             # be checked for our own echo (cross-correlation in _is_echo).
@@ -7048,6 +7052,19 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
                 duplication that made the 07.10.2026 timing fix reach only the
                 reply path.
                 """
+                nonlocal sent_at
+                delay = prev_end - time.time()
+                if delay > 0:
+                    # Scheduled gap, NOT a wait for the previous POST's answer.
+                    # Rebase all playback clocks to the moment we actually send.
+                    await asyncio.sleep(delay)
+                    sent_at = time.time()
+                self._arm_playback_timing(sent_at, queued)
+                # Same clock as the mute: the endpoint must not hear the reply
+                # either, and a window anchored to the earlier synthesis moment
+                # would end before the sound does.
+                self._arm_tts_inflight(sent_at, queued)
+
                 if self._play_audio_url:
                     # Preferred path: straight to the speaker at the right rate.
                     played = await self._play_audio_http(pcm)

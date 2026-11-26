@@ -461,6 +461,7 @@ URL/voice/stream globals and updates the **live sessions** in place, so every
 room follows the switch without a restart; an unknown name is refused with the
 valid ones listed. Whatever the backend, three things ride along:
 
+- **Sentence uploads are scheduled at the previous clip's audio end**, not fired the moment the next sentence is synthesised. Two `/play_audio` bodies arriving 60–75 ms apart on a slow link made the camera play one over another; waiting for the HTTP response instead would bring back exactly the gap the overlap was introduced to remove.
 - **ё-restore lives server-side** (`yo_restore.py`), at the single TTS choke
   point shared by cameras, ESP32 and Telegram — no backend can drop it.
 - **`num2ru.py` converts digits to words before synthesis** — silero is silent

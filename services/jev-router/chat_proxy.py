@@ -296,16 +296,29 @@ async def stream_chat(
         "stream_chat expert=%s knowledge=%s primary=%s",
         expert, knowledge, "hermes" if expert else "omniroute",
     )
+    spoken_any = False
     for url, model, api_key in targets:
         try:
             got = False
             async for s, emo in stream_sentences(url, model, messages, api_key=api_key):
                 got = True
+                spoken_any = True
                 yield s, emo
             if got:
                 return
             logger.warning("%s returned empty, trying next target", model)
         except Exception as e:
+            if spoken_any:
+                # 27.11.2026 02:00 MSK: Hermes streamed five sentences and then
+                # hit CHAT_TOTAL_TIMEOUT. Retrying the next model produced an
+                # empty answer, so the user heard a partial reply followed by
+                # 55 s of silence. Once a target has SAID something, keep that
+                # answer: replacing it with nothing is worse than a late stop.
+                logger.warning(
+                    "%s failed (%s) after content was spoken; keeping the answer",
+                    model, e,
+                )
+                return
             logger.warning("%s failed (%s), trying next target", model, e)
 
 

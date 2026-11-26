@@ -843,7 +843,13 @@ def _is_question_reply(reply: str) -> bool:
     if _HAS_QUESTION_RE.search(t):
         return True
     low = t.lower()
-    return "повтори" in low and "пожалуйст" in low
+    if "повтори" in low and "пожалуйст" in low:
+        return True
+    # 27.11.2026 02:22 MSK: the brain asked the user to SPECIFY the question
+    # («…уточни, что именно ты спрашиваешь») without a question mark. The room
+    # stayed deaf afterwards for the same reason as the repeat request did.
+    # «уточню» (I will check) is deliberately not a match — it is a statement.
+    return "уточни" in low or "поясни" in low
 
 # Module level, not a class attribute: `_speak` reads it as a BARE name, and
 # a class-body assignment is invisible to that lookup (bare names in a method

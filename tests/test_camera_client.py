@@ -4983,3 +4983,37 @@ async def test_no_prior_clip_starts_the_upload_immediately():
     await s._settle_play_posts()
     elapsed = time.time() - t0
     assert elapsed < 0.4, f"the first upload waited {elapsed:.2f}s for nothing"
+
+
+# --- 27.11.2026 02:22 MSK: the answer asked the user to clarify, no «?» ----
+#
+# «Если имеешь в виду что-то другое — уточни, что именно ты спрашиваешь.»
+# was treated as a statement, so no follow-up window opened and the user's
+# clarification had nowhere to go. A request to clarify is a question too.
+
+
+def test_a_spoken_clarification_request_counts_as_a_question():
+    assert camera_client._is_question_reply(
+        "Если имеешь в виду что-то другое — уточни, что именно ты спрашиваешь."
+    ) is True
+    assert camera_client._is_question_reply("Уточните, пожалуйста, дату.") is True
+    assert camera_client._is_question_reply("Поясни, о чём речь.") is True
+    # A normal factual answer must still stay a statement.
+    assert camera_client._is_question_reply(
+        "До ближайшего воскресенья осталось три дня."
+    ) is False
+    assert camera_client._is_question_reply("Уточню прогноз на эту дату.") is False
+
+
+@pytest.mark.asyncio
+async def test_speak_pcm_marks_a_clarification_request_as_a_question():
+    """Wiring: the player uses this return value to open the question window."""
+    s = _make_http_session()
+    s.http_session = _FakeHttp(200)
+    assert s._out_track is None
+    is_q = await s._speak_pcm(
+        b"\x03\x04" * 24000,
+        "Если имеешь в виду что-то другое — уточни, что именно ты спрашиваешь.",
+        wait=True,
+    )
+    assert is_q is True

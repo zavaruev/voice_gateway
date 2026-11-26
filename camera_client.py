@@ -829,6 +829,22 @@ class AIVoiceOutputTrack(MediaStreamTrack):
 
 _HAS_QUESTION_RE = re.compile(r"[?？]")
 
+
+def _is_question_reply(reply: str) -> bool:
+    """Does this spoken line expect the user to answer?
+
+    A question mark is the common case, but an explicit request to repeat is a
+    question in disguise: «Не расслышала действие. Повторите команду,
+    пожалуйста.» has no «?», yet the follow-up window MUST open after it.
+    Measured 26.11.2026 20:50 in the living room: the user repeated the command
+    and nothing was transcribed because no window had been opened.
+    """
+    t = (reply or "").strip()
+    if _HAS_QUESTION_RE.search(t):
+        return True
+    low = t.lower()
+    return "повтори" in low and "пожалуйст" in low
+
 # Module level, not a class attribute: `_speak` reads it as a BARE name, and
 # a class-body assignment is invisible to that lookup (bare names in a method
 # go local → global → builtin, never class attrs). Shipped 13.11.2026 as a
@@ -6962,7 +6978,7 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
         if wait is None:
             wait = bool(getattr(self, "_play_overlap", False))
         sr = TTS_PLAY_RATE
-        is_question = bool(_HAS_QUESTION_RE.search((reply or "").strip()))
+        is_question = _is_question_reply(reply)
         self._speaking = True
         # Remember what we said so we can drop the echoed transcript later.
         self._last_tts_reply = reply.lower().strip().strip(".,!? -") if reply else ""
@@ -7277,7 +7293,7 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
         `_tts_fetch`: the edge_tts fallback payload stays byte-identical and
         coqui synthesises bit-identically at 1.0 either way.
         """
-        is_question = bool(_HAS_QUESTION_RE.search((reply or "").strip()))
+        is_question = _is_question_reply(reply)
         payload = {
             "model": "tts-1",
             "input": text,

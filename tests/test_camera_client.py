@@ -4904,3 +4904,40 @@ def test_whisper_spellings_of_domovoy_are_stripped_on_a_dobbi_turn_only():
         assert s._strip_wake_words(text) == want, text
     s._wake_kind = "computer"
     assert s._strip_wake_words("Думовой включи свет") == "Думовой включи свет"
+
+
+# --- 26.11.2026: a spoken clarification must open the listening window -------
+#
+# Living room 20:50 UTC: the user said «компьютер, включи свет», Whisper wrote
+# «включает свет», the router asked «Не расслышала действие. Повторите команду,
+# пожалуйста.» — and the camera logged «no free-form window: the wake word is
+# required again». The user answered again and NOTHING was transcribed: no
+# window, because the clarification has no «?» and `_speak_pcm` equated
+# "question" with "has a question mark".
+
+
+def test_a_spoken_repeat_request_counts_as_a_question():
+    text = "Не расслышала действие. Повторите команду, пожалуйста."
+    assert camera_client._is_question_reply(text) is True
+    assert camera_client._is_question_reply(
+        "Простите, я задумалась. Повторите пожалуйста."
+    ) is True
+    assert camera_client._is_question_reply("Включаю.") is False
+    assert camera_client._is_question_reply("Сколько времени?") is True
+    assert camera_client._is_question_reply("Повторите, пожалуйста, ещё раз.") is True
+
+
+@pytest.mark.asyncio
+async def test_speak_pcm_marks_the_clarification_as_a_question():
+    """Wiring: the value returned by `_speak_pcm` is what the player uses to
+    open the question window. A helper-only test would stay green if the call
+    site kept using the old question-mark regex."""
+    s = _make_http_session()
+    s.http_session = _FakeHttp(200)
+    assert s._out_track is None
+    is_q = await s._speak_pcm(
+        b"\x03\x04" * 24000,
+        "Не расслышала действие. Повторите команду, пожалуйста.",
+        wait=True,
+    )
+    assert is_q is True

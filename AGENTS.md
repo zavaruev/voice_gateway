@@ -2,6 +2,10 @@
 
 WebSocket gateway connecting ESP32 smart speakers **and OpenIPC IP cameras** (corridor / kitchen / livingroom) to an AI pipeline (openWakeWord → Whisper STT → Nanobot LLM → Edge TTS).
 
+## Reporting convention
+
+All event times in replies to the user are **MSK (UTC+3)**, never raw UTC — user instruction 26.11.2026. Container logs print UTC while the host clock is MSK; add three hours, label the result `MSK`, and state the next day when the conversion crosses midnight. Only a verbatim raw log line may stay in UTC, with the MSK equivalent immediately beside it.
+
 ## Entrypoint
 
 `main.py` — FastAPI app on port 18792, run via `python -u main.py` (uvicorn inside `__main__`).

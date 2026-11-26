@@ -184,6 +184,12 @@ LLM_BACKEND_DOBBI=cascade                # optional second brain, empty = shared
 
 The big model (`vosk-model-ru-0.42`, 1.8 GB) was tried and rolled back: it contains the word but costs ~111 % of a core for one room (vs ~30 % total), Vosk has no GPU backend, and removing `rescore/` did not help. «Нафаня» was tried as an alternative and dropped because the small model has no such word at all (`find_word = -1`), so the decoder substituted ordinary words each time.
 
+### Self-learning from L2 repairs
+
+A clean L2 turn that repaired a measured STT near-miss can emit a **lesson** candidate — a narrow rewrite of the user's own words into a phrase L1 already understands (for example «включи кафеварку» → «включи кофеварку»). The answer text is never a source. The router validates the candidate against turns that already succeeded, persists it to Qdrant collection `voice_lessons`, and only then marks it `active`; a repeat of the same phrase quarantines the applied rule. `LEARN_ENABLED=0` disables the whole path.
+
+Verified end to end on 26.11.2026 against the live Qdrant and the v2.84 router: `save` creates a `pending` point, `set_status("active")` plus `refresh()` makes `rewrite()` apply the rule, and `set_status("failed")` plus `refresh()` removes it. A uniquely named probe point was deleted afterwards (collection back to its original 43 points). **Decision still open:** those 43 pre-existing points are all `pending` duplicates of «кафеварку → кофеварку»; activating one is a live behaviour change and has not been done.
+
 ### Three instruments that decide whether the wake word is broken
 
 They are the reason a mute room can be told apart from a deaf one:

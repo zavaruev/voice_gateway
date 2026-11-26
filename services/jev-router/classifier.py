@@ -138,7 +138,10 @@ RE_ACTION_MID = re.compile(
     rf"\b(?:{ACTION_VERBS_ON}|{ACTION_VERBS_OFF})\b", re.IGNORECASE
 )
 RE_QUERY = re.compile(
-    r"^\s*(?:сколько|какая|какой|каковы|который час|какое число|что)\b"
+    # «А сколько времени?» — тот же вопрос, что «Сколько времени?»: Whisper
+    # часто добавляет «а» в начале, и такой вопрос не должен терять
+    # детерминированный ответ только из-за частицы (22.11.2026, гостиная).
+    r"^\s*(?:а\s+)?(?:сколько|какая|какой|каковы|который час|какое число|что)\b"
     r"|\b(?:включ[её]н|горит|работает|открыт|открыта|занят|активен|играет)\s+ли\b",
     re.IGNORECASE,
 )
@@ -397,6 +400,20 @@ class Classifier:
             RE_ACTION.match(text) or RE_ACTION_MID.search(text) or media_like
         )
 
+    def _regex_query(self, text: str) -> bool:
+        """True for a question the regex layer recognises without embeddings.
+
+        The query counterpart of `_regex_action`: used by BOTH cold-embedder
+        and embed-failed fallbacks, so a plain «Сколько времени?» is answered
+        by the resolver instead of burning 10 s in L2 and making the gateway
+        say «Секунду, занимаюсь…» (measured 22.11.2026, livingroom). An
+        unresolvable query still escalates in app._handle — this only gives
+        the deterministic resolver a chance to answer first.
+        """
+        if bool(RE_NO_TOOL.search(text)):
+            return False
+        return bool(RE_QUERY.match(text))
+
     async def classify(self, text: str) -> RouteDecision:
         t = (text or "").strip()
         if not t:
@@ -419,6 +436,9 @@ class Classifier:
             if self._regex_action(t):
                 logger.info("classifier cold, regex action path: %r", t[:60])
                 return RouteDecision("easy_action", 0.92, reason="")
+            if self._regex_query(t):
+                logger.info("classifier cold, regex query path: %r", t[:60])
+                return RouteDecision("easy_query", 0.90, reason="")
             return RouteDecision("complex_logic", 0.0, reason="classifier_unavailable")
 
         try:
@@ -428,6 +448,9 @@ class Classifier:
             if self._regex_action(t):
                 logger.info("embed failed, regex action path: %r", t[:60])
                 return RouteDecision("easy_action", 0.92, reason="")
+            if self._regex_query(t):
+                logger.info("embed failed, regex query path: %r", t[:60])
+                return RouteDecision("easy_query", 0.90, reason="")
             return RouteDecision("complex_logic", 0.0, reason="embed_failed")
 
         cos = self._matrix @ v[0]
@@ -456,7 +479,7 @@ class Classifier:
         media_like = bool(RE_MEDIA_ACTION.search(t))
         no_tool = bool(RE_NO_TOOL.search(t)) and not (
             media_like and not RE_NO_REMINDER.search(t))
-        query_like = bool(RE_QUERY.match(t))
+        query_like = self._regex_query(t)
         fast_path = False  # regex intent beats cosine doubt (see thresholds below)
 
         if action_like and not no_tool:

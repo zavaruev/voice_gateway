@@ -72,6 +72,20 @@ def test_is_valid_text():
     # Test repeated characters
     assert is_valid_text("ааааааааааааааааааа") == False
 
+
+def test_hyphenated_single_letter_syllables_are_not_a_command():
+    """23.11.2026 18:59, living room: Whisper wrote «у-у» from a near-silent
+    buffer (raw rms 667, room floor ~300). It passed is_valid_text, went to L2,
+    which then executed an OLD assistant answer from long-term memory and sent
+    the vacuum to clean the kitchen. A repeated one-letter beep is a hallucination.
+    """
+    assert is_valid_text("у-у") is False
+    assert is_valid_text("а-а") is False
+    assert is_valid_text("м-м-м") is False
+    # A real short word must still survive.
+    assert is_valid_text("нет") is True
+
+
 def test_device_online_status():
     dummy_states = {
         "client1": {"mac": "AA:BB:CC:11:22:33", "status": "online"},

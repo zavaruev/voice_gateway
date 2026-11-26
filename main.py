@@ -158,6 +158,7 @@ import secrets
 import numpy as np
 import onnxruntime as ort
 import opuslib
+import identity_client
 from pydub import AudioSegment
 from loguru import logger
 from dataclasses import dataclass
@@ -171,7 +172,7 @@ from fastapi import (
     File,
     Depends,
 )
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -226,6 +227,28 @@ NANOBOT_TOKEN = os.getenv("NANOBOT_TOKEN", "")
 NANOBOT_SESSION_SALT = os.getenv("NANOBOT_SESSION_SALT", "")
 # Speaker-recognition service: POST multipart (file) -> {user_id, confidence}.
 SPEAKER_ID_URL = os.getenv("SPEAKER_ID_URL", "http://192.168.22.102:8001/identify")
+# Last identity answer for the ESP32/Telegram speaker; identity is the source
+# of truth when it is configured, HONORIFIC_MAP stays the Phase A fallback.
+_last_honorific = ""
+# Mirror of camera_client._honorific_from_identity: identity is the source of
+# truth only when it actually answered for THIS utterance. A failure (incl.
+# 429) clears it so the Phase A local map decides for the new engine uid and a
+# stale address cannot leak into a different speaker's reply.
+_honorific_from_identity = False
+_identity_refresh_task = None
+
+def _current_honorific(uid: str = "") -> str:
+    """ESP32 mirror of camera_client._current_honorific().
+
+    An honorific FROM identity is authoritative — including an empty one (the
+    UI deliberately cleared it). After an identity failure the local Phase A
+    map decides for the NEW engine uid; a stale identity answer must not
+    address a different speaker.
+    """
+    if _honorific_from_identity:
+        return str(_last_honorific or "")
+    return honorific_for_person(uid)
+
 
 def _build_llm_backend(name: str):
     """One backend factory for the primary brain and the optional «добби» brain.
@@ -481,6 +504,26 @@ def _reply_has_question(reply_text: str) -> bool:
     )
 
 SPEAKER_NAME_FILE = "/app/config/speaker_names.json"
+HONORIFIC_FILE = "/app/config/person_honorifics.json"
+# Telegram chat id -> person key, confirmed by the user 25.11.2026. Used only
+# to pick Добби's address: сэр / мэм / none. Phase B replaces this with the
+# unified identity service; until then it is the single source of truth.
+TG_PERSON = {
+    "543867556": "alexander",
+    "1620243752": "marina",
+    "5136076293": "vladislava",
+}
+
+
+def load_honorifics() -> dict:
+    """person key -> honorific (сэр / мэм). Missing file = no address at all,
+    which is the safe direction: Добби drops the address rather than guessing."""
+    try:
+        with open(HONORIFIC_FILE) as f:
+            return json.load(f)
+    except Exception as e:
+        logger.warning(f"Error loading person honorifics: {e}")
+        return {}
 
 
 def load_speaker_names() -> dict:
@@ -502,6 +545,46 @@ def load_speaker_names() -> dict:
 # Snapshot taken once at import; speaker names change rarely, so the file is
 # not re-read per utterance (edit requires a restart).
 SPEAKER_NAME_MAP = load_speaker_names()
+HONORIFIC_MAP = load_honorifics()
+
+
+def honorific_for_person(person: str) -> str:
+    return str(HONORIFIC_MAP.get(str(person or "").lower(), "") or "")
+
+
+def honorific_for_chat(chat: str) -> str:
+    """Address for a Telegram chat. Identity is consulted at CALL time (its
+    profile cache has a 30 s TTL), so an edit in the UI takes effect without
+    recreating the gateway; the Phase A chat map is the fallback."""
+    ident = identity_client.IDENTITY
+    if ident is not None:
+        try:
+            person = ident.chat_map().get(str(chat).strip(), "")
+            if person:
+                # The honorific comes from the profile, NOT from the
+                # import-time Phase A map — otherwise a UI edit never lands.
+                return ident.honorific_for(person)
+        except Exception as exc:
+            logger.warning(f"identity chat map failed: {exc!r}")
+    return honorific_for_person(TG_PERSON.get(str(chat).strip(), ""))
+
+
+async def identity_refresh_loop(interval: float = 15.0):
+    """Keep the identity profile cache warm so UI edits reach every source.
+
+    The client refuses to refetch inside its 30 s TTL, so polling at half that
+    costs one small GET per interval and never blocks a turn. Failures are
+    logged; the last good cache keeps serving.
+    """
+    while True:
+        try:
+            await identity_client.IDENTITY.profiles()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(f"identity profile refresh failed: {exc!r}")
+        await asyncio.sleep(interval)
+
 
 # chat_id -> {chat_id, ts} cache: keeps each satellite's Nanobot conversation
 # context across reconnects and container rebuilds (persists to JSON on disk).
@@ -1388,7 +1471,41 @@ async def fetch_speaker_id(audio: bytes, sess: aiohttp.ClientSession) -> str:
         errors or service downtime — STT must proceed without identity rather
         than fail (speaker names are optional decoration for the transcript).
     """
+    global _last_honorific, _honorific_from_identity
     try:
+        ident = identity_client.IDENTITY
+        if ident is not None:
+            try:
+                person, honorific, conf = await ident.identify(audio)
+                if person and person != "unknown" and conf <= 0.1:
+                    # The engine is guessing. Same floor as the direct
+                    # SpeakerID path below; a rejected match must not leave a
+                    # stale address behind for the next speaker.
+                    logger.info(
+                        f"👤 [Identity] Rejected low confidence: {person} ({conf:.2f})"
+                    )
+                    _last_honorific = ""
+                    _honorific_from_identity = False
+                    return "unknown"
+                _last_honorific = honorific or ""
+                _honorific_from_identity = True
+                if person and person != "unknown":
+                    logger.info(f"✅ [Identity] Recognized: {person} ({conf:.2f})")
+                return person or "unknown"
+            except Exception as e:
+                # A failed identity lookup must not let the previous answer
+                # address this new utterance. The local map decides instead.
+                _last_honorific = ""
+                _honorific_from_identity = False
+                if getattr(e, "status", None) == 429:
+                    # The ENGINE is rate-limiting (10/60s), so a direct call
+                    # hits the same wall — exactly the camera path's rule.
+                    logger.warning(
+                        "⚠️ [Identity] rate-limited (429); not retrying "
+                        "SpeakerID directly"
+                    )
+                    return "unknown"
+                logger.warning(f"⚠️ [Identity] lookup failed, using SpeakerID directly: {e!r}")
         form = aiohttp.FormData()
         form.add_field("file", audio, filename="audio.ogg", content_type="audio/ogg")
         async with sess.post(SPEAKER_ID_URL, data=form, timeout=10) as r:
@@ -1777,6 +1894,13 @@ async def _dispatch_hermes(txt, uid, state, device_ws, _t0, _t_stt):
             session_id=chat_id,
             stream_name=state.get("mac", "device"),
             response_queue=q,
+            # ESP32 has no per-turn wake kind (unlike a camera's _wake_kind),
+            # so it always uses the single primary backend: no Dobbi persona.
+            # The honorific still travels with the turn so the router can
+            # address the speaker when a Dobbi persona is supplied by a source
+            # that has one (camera/Telegram).
+            persona="",
+            honorific=_current_honorific(uid),
         )
     finally:
         # 120 s playback cap: far above any single reply, but bounded so a
@@ -2091,7 +2215,9 @@ async def _synthesize_tts_mp3_url(
         payload = {
             "model": TTS_MODEL,
             "input": text,
-            "voice": TTS_VOICE,
+            # Per-source override (Telegram speaks as Добби). Empty keeps the
+            # global voice, so ESP32 and the default path are byte-identical.
+            "voice": state.get("tts_voice") or TTS_VOICE,
             "response_format": "mp3",
         }
         if speed and speed != 1.0:
@@ -2146,9 +2272,20 @@ async def synthesize_tts_mp3(text: str, state: dict, speed: float = 1.0) -> byte
 
 async def _telegram_tts(text: str, sess: aiohttp.ClientSession | None) -> bytes | None:
     """Adapter for telegram_client: synthesize_tts_mp3() reads its session
-    from state["http_session"], the bot passes a bare one. Same MP3 bytes
-    the device path gets — the bot re-encodes them to ogg/opus itself."""
-    return await synthesize_tts_mp3(text, {"http_session": sess})
+    from state["http_session"], the bot passes a bare one. The whole Telegram
+    source speaks as Добби (user's decision 25.11), so its voice is aidar —
+    the same speaker the camera uses for Dobbi turns, not the global baya.
+    The bot re-encodes the MP3 to ogg/opus itself."""
+    # aidar is a Silero speaker. On edge/coqui it would 400 and cost a whole
+    # sentence, exactly the man's-voice incident of 10.11 in reverse.
+    silero = (
+        TTS_BACKEND_ACTIVE == "silero"
+        or ":5053" in TTS_URL or ":5054" in TTS_URL
+    )
+    dobbi_voice = (os.getenv("TTS_VOICE_DOBBI", "") or "aidar") if silero else ""
+    return await synthesize_tts_mp3(
+        text, {"http_session": sess, "tts_voice": dobbi_voice}
+    )
 
 
 async def stream_tts_pcm(
@@ -2699,6 +2836,40 @@ async def health():
     """Liveness probe for the container/monitoring — unauthenticated by design
     (it exposes nothing beyond process liveness)."""
     return {"status": "ok"}
+
+
+@app.post("/api/identity/capture")
+async def api_identity_capture(req: Request):
+    """Record N seconds from a camera's LIVE mic for voice enrollment.
+
+    Own narrow Bearer token (IDENTITY_CAPTURE_TOKEN), fail closed when empty:
+    this is a write-capable audio tap, never the gateway's admin Basic auth.
+    The session's own _feed_audio supplies the bytes, so no second ffmpeg
+    consumer competes with the camera's single media thread.
+    """
+    token = os.getenv("IDENTITY_CAPTURE_TOKEN", "")
+    header = req.headers.get("authorization", "")
+    if not token or not header.startswith("Bearer ") or not secrets.compare_digest(header[7:], token):
+        raise HTTPException(401, "invalid capture token")
+    try:
+        body = await req.json()
+    except Exception:
+        raise HTTPException(400, "JSON body required")
+    room = str(body.get("room", "")).strip()
+    try:
+        seconds = float(body.get("seconds", 6))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "bad seconds")
+    seconds = max(2.0, min(30.0, seconds))
+    session = next((s for s in _camera_sessions if s.stream_name == room), None)
+    if session is None:
+        raise HTTPException(404, f"no camera session: {room}")
+    try:
+        wav = await session.record_sample(seconds)
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc))
+    logger.info(f"[identity] captured {len(wav)} bytes from {room} ({seconds:g}s)")
+    return Response(content=wav, media_type="audio/wav")
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -3664,10 +3835,16 @@ async def start_camera_sessions():
         hits = sorted(_glob.glob(os.path.join(res_dir, base)))
         if hits:
             wake_model_env = hits[0]
-    wake_word_env = os.getenv("WAKE_WORD", "компьютер")
-
     for name in streams:
         try:
+            # Per-room primary address. 26.11.2026 temporary A/B: the living
+            # room can carry «домовой» as the primary while other rooms keep
+            # the global «компьютер». Empty override => global, so nothing
+            # changes for rooms that do not set it.
+            wake_word_env = (
+                os.getenv(f"WAKE_WORD_{name.upper()}")
+                or os.getenv("WAKE_WORD", "компьютер")
+            )
             # Per-room model: the kitchen mic clips hard at close range
             # (ADC rail 32767) and the library model scores clipped audio
             # 0.001 — only the custom head tolerates it (0.6-0.9 there).
@@ -3880,6 +4057,15 @@ async def start_camera_sessions():
                     or os.getenv("CAMERA_WAKE_MIN_PEAK")
                     or 0
                 ),
+                # Per-room override of the loud-chunk bar. 0 => per-word
+                # default; set 1 for a room on vosk-model-ru-0.42, whose early
+                # «компьютер» partial has only 1-2 loud chunks of 12 (measured
+                # 24.11.2026) and which never decodes clicks as a wake word.
+                wake_loud_bar=int(
+                    os.getenv(f"CAMERA_WAKE_LOUD_BAR_{name.upper()}")
+                    or os.getenv("CAMERA_WAKE_LOUD_BAR")
+                    or 0
+                ),
                 # How long a transcript may still be dismissed as our own voice
                 # coming back. 0 => 45 s. The guard it bounds was written for a
                 # 15-25 s speaker delay and had no timer, so it discarded real
@@ -3970,6 +4156,7 @@ async def start_camera_sessions():
                 tts_voice=TTS_VOICE,
                 # «Добби» can have its own Silero speaker. Empty = no override.
                 tts_voice_dobbi=os.getenv("TTS_VOICE_DOBBI", ""),
+                honorific_map=HONORIFIC_MAP,
                 tts_backend=TTS_BACKEND_ACTIVE,
                 # Filled like tts_voice: a missing fill here silently reverts
                 # the camera path to the dataclass default — the exact shape
@@ -4034,14 +4221,24 @@ async def _warm_face_greetings() -> None:
         return                      # source off (also keeps CI tests offline)
     url = os.getenv("FACE_API_URL", "http://192.168.22.102:8090").rstrip("/")
     try:
-        timeout = aiohttp.ClientTimeout(total=6)
-        async with aiohttp.ClientSession(timeout=timeout) as sess:
-            async with sess.get(f"{url}/health") as resp:
-                if resp.status != 200:
-                    logger.info(f"face greeting warm-up: API HTTP {resp.status}")
-                    return
-                data = await resp.json()
-        names = data.get("known_faces") or []
+        ident = identity_client.IDENTITY
+        if ident is not None:
+            # The identity profile list is the roster; engine users without a
+            # profile are deliberately not greeted. On failure say so and stop.
+            try:
+                names = sorted((await ident.profiles()).keys())
+            except Exception as exc:
+                logger.info(f"face greeting roster via identity failed: {exc!r}")
+                return
+        else:
+            timeout = aiohttp.ClientTimeout(total=6)
+            async with aiohttp.ClientSession(timeout=timeout) as sess:
+                async with sess.get(f"{url}/health") as resp:
+                    if resp.status != 200:
+                        logger.info(f"face greeting warm-up: API HTTP {resp.status}")
+                        return
+                    data = await resp.json()
+            names = data.get("known_faces") or []
         logger.info(f"face greeting warm-up: {names}")
         await face_greeting.warm(names)
     except asyncio.CancelledError:
@@ -4320,12 +4517,19 @@ async def loop_stall_monitor() -> None:
 @app.on_event("startup")
 async def on_startup():
     """Lifespan hook: bring up the go2rtc camera sessions with the app."""
+    # Empty IDENTITY_URL leaves IDENTITY None and every call site on Phase A.
+    identity_client.init_identity()
+    if identity_client.IDENTITY is not None:
+        logger.info(f"identity service enabled: {identity_client.IDENTITY.url}")
     await start_camera_sessions()
     # Hermes MCP: proactive speech on its own port. The session list is the
     # LIVE list object (voice_mcp holds it by reference), and the server
     # only exists when MCP_TOKEN is set — empty means fail-closed.
     voice_mcp.set_sessions(_camera_sessions)
-    global _mcp_task, _face_greeting_warm_task, _face_watcher
+    global _mcp_task, _face_greeting_warm_task, _face_watcher, _identity_refresh_task
+    if identity_client.IDENTITY is not None:
+        _identity_refresh_task = asyncio.create_task(
+            identity_refresh_loop(), name="identity-refresh")
     _mcp_task = asyncio.create_task(voice_mcp.run_mcp_server(), name="voice-mcp")
     # Pre-generate one LLM phrase per known person for the CURRENT part of the
     # day, in the BACKGROUND: a live Hermes call is ~17 s (measured), so the
@@ -4373,6 +4577,7 @@ async def on_startup():
             transcribe=fetch_transcription,
             tts_mp3=_telegram_tts,
             make_session_id=lambda chat: make_chat_id(f"tg:{chat}"),
+            honorific_for_chat=honorific_for_chat,
             go2rtc_host=os.getenv("GO2RTC_HOST", "192.168.22.102"),
             go2rtc_port=int(os.getenv("GO2RTC_PORT", "1984")),
             camera_streams=camera_streams,
@@ -4396,6 +4601,13 @@ async def on_shutdown():
     if _face_watcher is not None:
         await _face_watcher.stop()
         _face_watcher = None
+    if _identity_refresh_task is not None:
+        _identity_refresh_task.cancel()
+        try:
+            await _identity_refresh_task
+        except asyncio.CancelledError:
+            pass
+        _identity_refresh_task = None
     if _face_greeting_warm_task is not None:
         _face_greeting_warm_task.cancel()
         _face_greeting_warm_task = None

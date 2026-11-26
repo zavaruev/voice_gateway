@@ -434,3 +434,112 @@ def test_the_wake_word_leaving_the_hypothesis_re_arms_the_matcher(matcher):
     assert matcher.feed(chunk) is True, (
         "the word left the hypothesis, so this is a new word"
     )
+
+
+# --- a short word is finalised AFTER the loud audio has gone ---------------
+# Measured 25.11.2026 on the living room: «добби включи свет» was decoded in a
+# FINAL segment at t=260.32, 1.92 s after the loud 22 887-peak speech at t=258.4.
+# The trailing 1.9 s window had already gone quiet (peak 1751, loud 0/2), so the
+# gate called a real wake "silence, not a voice". A FINAL segment must be judged
+# on the audio that PRODUCED it, not on the silence at the moment it arrived.
+
+
+def test_final_segment_keeps_the_peak_of_the_whole_segment():
+    from collections import deque
+
+    m = vosk_wake.VoskWakeMatcher.__new__(vosk_wake.VoskWakeMatcher)
+    # 12 quiet chunks at the trigger + a loud chunk 1.9 s earlier.
+    m._peak_win = deque([300] * 11 + [22887], maxlen=50)
+    m.last_from_final = True
+    peak = getattr(m, "wake_evidence_peak", lambda: 0)()
+    loud = getattr(m, "wake_evidence_loud", lambda bar: 0)(3000)
+    assert peak == 22887, f"the segment's loud speech was lost: {peak}"
+    assert loud == 1, f"the loud chunk was not counted: {loud}"
+
+
+def test_partial_segment_does_not_lend_old_peak_evidence():
+    from collections import deque
+
+    m = vosk_wake.VoskWakeMatcher.__new__(vosk_wake.VoskWakeMatcher)
+    m._peak_win = deque([300] * 11 + [22887], maxlen=50)
+    m.last_from_final = False
+    assert getattr(m, "wake_evidence_peak", lambda: 0)() == 0
+    assert getattr(m, "wake_evidence_loud", lambda bar: 0)(3000) == 0
+
+
+def test_old_segment_loud_chunk_does_not_lend_evidence_to_a_new_final():
+    """The 50-chunk peak window spans ~8 s. An unscoped window let a TV burst
+    from the PREVIOUS segment satisfy the click guard for a final that contained
+    no loud audio at all. The window must be filtered to the segment that
+    produced the final — without clearing it on the final (pre-final peaks of
+    that same segment are load-bearing)."""
+    from collections import deque
+
+    m = vosk_wake.VoskWakeMatcher.__new__(vosk_wake.VoskWakeMatcher)
+    m._peak_win = deque([32000] + [300] * 11, maxlen=50)  # old TV burst first
+    m._peak_seg = deque([0] + [1] * 11, maxlen=50)
+    m._final_seg = 1
+    m.last_from_final = True
+    assert m.wake_evidence_peak() == 300
+    assert m.wake_evidence_loud(3000) == 0
+
+
+def test_pre_final_peak_in_the_same_segment_is_kept():
+    """The loud chunk must still count when it belongs to the final's segment,
+    even though it arrived 1.92 s before the word was finalised."""
+    from collections import deque
+
+    m = vosk_wake.VoskWakeMatcher.__new__(vosk_wake.VoskWakeMatcher)
+    m._peak_win = deque([22887] + [300] * 11, maxlen=50)
+    m._peak_seg = deque([1] * 12, maxlen=50)
+    m._final_seg = 1
+    m.last_from_final = True
+    assert m.wake_evidence_peak() == 22887
+    assert m.wake_evidence_loud(3000) == 1
+
+
+def test_feed_tags_each_chunk_with_its_segment():
+    """Wire check: a final closes its segment; the loud chunks BEFORE it must
+    carry that segment's tag, and chunks fed afterwards the next one's."""
+    import numpy as np
+
+    from vosk_wake import VoskWakeMatcher
+
+    m = VoskWakeMatcher.__new__(VoskWakeMatcher)
+    m.model_path = "fake"
+    m.max_secs = 30.0
+    m._model = object()
+    m.triggers = m.decodes = 0
+    m.alt_word = ""
+    m.alt_tokens = frozenset()
+    m.reset()          # begin() would import the real vosk module; stub _rec below
+
+    class _Rec:
+        def __init__(self):
+            self.final = False
+
+        def SetWords(self, v):
+            pass
+
+        def AcceptWaveform(self, pcm):
+            return self.final
+
+        def Result(self):
+            return __import__("json").dumps({"text": ""})
+
+        def PartialResult(self):
+            return __import__("json").dumps({"partial": ""})
+
+    m._rec = _Rec()
+    loud = np.full(2560, 12000, dtype=np.int16).tobytes()
+    quiet = np.zeros(2560, dtype=np.int16).tobytes()
+    m.feed(loud)
+    first = m._final_seg if hasattr(m, "_final_seg") else None
+    assert list(m._peak_seg) == [0]
+    m._rec.final = True
+    m.feed(quiet)                      # final closes segment 0
+    assert m._final_seg == 0
+    assert m.wake_evidence_peak() == 12000
+    m._rec.final = False
+    m.feed(quiet)                      # now belongs to segment 1
+    assert list(m._peak_seg)[-1] == 1

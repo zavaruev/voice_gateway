@@ -91,6 +91,17 @@ def test_scale_phrases_require_weight_words():
     assert resolver.resolve_scale("сколько времени") is None
 
 
+def test_a_percentage_of_the_weight_is_a_scale_command():
+    # Field case 23.11.2026 18:09, kitchen: Whisper wrote
+    # «посчитай два процента от того что на весах». There is no scale tool in
+    # L2, so it spent 92 s searching HA for a weight sensor and gave up.
+    call = resolver.resolve_scale("посчитай два процента от того что на весах")
+    assert call is not None and call.kind == "percent" and call.percent == 2.0
+    assert resolver.resolve_scale("2% от веса").percent == 2.0
+    assert resolver.resolve_scale("десять процентов от того что на весах").percent == 10.0
+    assert resolver.resolve_scale("два процента от заряда пылесоса") is None
+
+
 # --- spoken number + noun agreement ---------------------------------------
 
 def test_weight_sentence_noun_agreement():
@@ -115,6 +126,23 @@ def test_weight_sentence_noun_agreement():
 def test_weight_sentence_refuses_bad_payload():
     assert scale.weight_sentence(None) is None
     assert scale.weight_sentence({"grams": "не число"}) is None
+
+
+def test_percentage_result_has_both_nouns_agreed():
+    sentence = scale.sentence_for(
+        "percent", weight={"grams": 150.0}, percent=2.0
+    )
+    assert sentence == "Два процента от веса — три грамма.", sentence
+    assert scale.sentence_for(
+        "percent", weight={"grams": 500.0}, percent=10.0
+    ) == "Десять процентов от веса — пятьдесят граммов."
+
+
+def test_percent_handle_reads_the_scale_once():
+    stub = _StubPost(_rpc_result(_weight(grams=150.0, zero=False)))
+    answer = __import__("asyncio").run(scale.handle("percent", percent=2.0, post=stub))
+    assert "три грамма" in answer
+    assert [c[1]["params"]["name"] for c in stub.calls] == ["get_weight"]
 
 
 # --- MCP client ------------------------------------------------------------
@@ -221,3 +249,34 @@ def test_scale_phrases_are_intercepted_before_classifier(monkeypatch):
     assert route["confidence"] == 1.0
     assert sentence["type"] == "sentence"
     assert sentence["text"] == "На весах сто граммов."
+
+
+def test_percent_phrase_is_intercepted_before_the_classifier(monkeypatch):
+    app = _router_app()
+
+    def _must_not_run(*args, **kwargs):
+        raise AssertionError("classifier must not run for a percentage question")
+
+    monkeypatch.setattr(app.classifier, "classify", _must_not_run)
+
+    async def _handle_stub(kind, **kwargs):
+        return "Два процента от веса — три грамма."
+
+    monkeypatch.setattr(app.scale, "handle", _handle_stub)
+
+    async def _drive():
+        gen = app._handle(app.RouteRequest(
+            text="посчитай два процента от того что на весах",
+            session_id="probe", stream_name="kitchen",
+        ))
+        first = await gen.__anext__()
+        second = await gen.__anext__()
+        await gen.aclose()
+        return json.loads(first.removeprefix("data: ")), json.loads(
+            second.removeprefix("data: ")
+        )
+
+    route, sentence = __import__("asyncio").run(_drive())
+    assert route["route"] == "scale"
+    assert route["reason"] == "scale_percent"
+    assert sentence["text"] == "Два процента от веса — три грамма."

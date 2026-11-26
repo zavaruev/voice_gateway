@@ -1,6 +1,6 @@
 # Voice Gateway
 
-![version](https://img.shields.io/badge/version-v2.83-blue)
+![version](https://img.shields.io/badge/version-v2.84-blue)
 [![tests](https://github.com/zavaruev/voice_gateway/actions/workflows/tests.yml/badge.svg)](https://github.com/zavaruev/voice_gateway/actions/workflows/tests.yml)
 ![python](https://img.shields.io/badge/python-3.12%2B-3776AB?logo=python&logoColor=white)
 ![backend](https://img.shields.io/badge/AI%20backend-Cascade-orange)
@@ -162,27 +162,27 @@ them** (user 4725 / 9124, television and appliances 13197–32522). The wake wor
 the only discriminator measured to work. `none` requires the wake word again after
 every reply.
 
-### Two address words (v2.82, enabled in v2.83)
+### Two address words: Компьютер and Домовой
 
-One Vosk decoder, two **exact token allowlists**. The style of confirmation is a property of the word, not of the room:
+One Vosk decoder on `small-ru-0.22`, two **exact address allowlists**. Each word owns its confirmation style, voice and chat persona:
 
-| Spoken | Confirmation | Brain |
-|---|---|---|
-| «компьютер» | attention pip, no spoken acknowledgement — same as every other camera | the normal `LLM_BACKEND` |
-| «добби» | no pip, one short rotating line after a real pause; a command spoken in the same breath gets no sound | `LLM_BACKEND_DOBBI` when set, otherwise the normal backend; **voice `aidar` on Silero** |
+| Spoken | Confirmation | Voice | Route |
+|---|---|---|---|
+| «компьютер» | attention pip, no spoken acknowledgement — same as every other camera | `baya` | normal cascade router and prompts |
+| «домовой» | no pip; a short in-character line after a real pause, silence for a command in the same breath | `aidar` (male Silero voice) | same deterministic L1 for actions; a separate Dobbi system prompt for chat/knowledge/diagnostics |
+
+The house-elf from «Гарри Поттера» is the character behind the second word. The code still calls this mode `dobbi` internally (`TTS_VOICE_DOBBI`, `LLM_BACKEND_DOBBI`, `persona="dobbi"`), but the word you say is «домовой». His lines here are his own: «Домовой рад помочь!», «Домовой свободен!», «Домовой ждёт!», «Добби слушает!». The router's chat persona uses the same voice and keeps the emotion-tag / no-markdown contract; **deterministic device commands are never restyled**.
 
 ```
-WAKE_ALT_WORD[_<NAME>]=dobbi        # only "dobbi" is a known mode; empty = old path
-WAKE_ALT_TOKENS[_<NAME>]=tok1|tok2   # spellings measured on real audio; empty = word disabled
-TTS_VOICE_DOBBI=aidar                # Silero-only speaker for Dobbi turns; empty = normal voice
-LLM_BACKEND_DOBBI=cascade            # optional second brain, empty = shared normal backend
+WAKE_ALT_WORD[_<NAME>]=dobbi             # only "dobbi" is a known mode; empty = old path
+WAKE_ALT_TOKENS[_<NAME>]=домовой         # gated forms are handled in vosk_wake.py, not here
+TTS_VOICE_DOBBI=aidar                    # Silero-only speaker; empty = normal voice
+LLM_BACKEND_DOBBI=cascade                # optional second brain, empty = shared normal backend
 ```
 
-There is **no second model and no second recogniser** — a grammar-constrained one was measured rejecting the word on live room audio (1 hypothesis in 25 s of speech against 27 from the free decoder), so the same free decoder scores both words. One spoken word fires once: a different word appended inside the same recogniser segment is treated as that word's tail, because every extra `_fire_wake()` clears the command buffer. `vosk diag` now reports `kind=`.
+**Why the address word is now «домовой» — measured, not guessed:** the earlier address «добби» was a rare proper name whose mis-hearings needed an endless allowlist (`добрый`, `дарби`, `да`, `доме`, `давай без`, `тоби`, `зомби` — each found in the live dump, each a new spelling). The clean-synthesis screen was misleading: on the user's live voice in the living room the small model writes «ты ногой включи свет», «давай включи свет» and «два выключи свет» — never the word itself. Replaying 1049 s of the LIVE streaming dump through the production matcher gives three fires (one per attempt, `kind=dobbi`) and zero television false accepts. The gated forms (`ты ногой`, `давай`, `два`) are accepted only at the **start** of the hypothesis and immediately before a command or question word; bare «давай», «два раза», ordinary speech and television stay refused. Whisper additionally writes «Думовой»/«дымовой» on this speaker — those are stripped only on an alternate-address turn, so an unrelated sentence is never corrupted. Every firing is logged in `VOSK WAKE trig='…'`.
 
-In v2.83 the living room ships `WAKE_ALT_TOKENS_LIVINGROOM=добби` and `TTS_VOICE_DOBBI=aidar`: five Silero voices were synthesised through the **same Vosk model** (16 kHz, 80 ms chunks); `aidar`, `baya` and `kseniya` decoded the word exactly as «добби», while `eugene` → «доме» and `xenia` → «домби». `aidar` was chosen as the contrasting voice, and the override applies only while Silero is the active TTS backend (a Silero speaker sent to Coqui/edge would 400 and cost the whole sentence).
-
-Vosk's spelling of a name is not something to guess: «компот» and «компания» once woke the house through a prefix match. The shipped token is measured on **synthesised** audio, which validates the TTS → Vosk loopback but not a human voice. After a real «добби» in the living room, read `VOSK WAKE … kind=dobbi` and `near=` in `vosk diag`: a non-zero `near=` means the allowlist missed an observed spelling and needs that exact token added, never a prefix.
+The big model (`vosk-model-ru-0.42`, 1.8 GB) was tried and rolled back: it contains the word but costs ~111 % of a core for one room (vs ~30 % total), Vosk has no GPU backend, and removing `rescore/` did not help. «Нафаня» was tried as an alternative and dropped because the small model has no such word at all (`find_word = -1`), so the decoder substituted ordinary words each time.
 
 ### Three instruments that decide whether the wake word is broken
 

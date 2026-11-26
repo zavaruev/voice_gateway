@@ -93,13 +93,15 @@ class ScriptedBackend:
         self.calls: list[dict] = []
 
     async def generate_response(self, text, session_id, stream_name,
-                                response_queue, room=""):
+                                response_queue, room="", persona="", honorific=""):
         self.calls.append(
             {
                 "text": text,
                 "session_id": session_id,
                 "stream_name": stream_name,
                 "room": room,
+                "persona": persona,
+                "honorific": honorific,
             }
         )
         for item in self.items:
@@ -114,7 +116,7 @@ class HangingBackend:
         self.calls = []
 
     async def generate_response(self, text, session_id, stream_name,
-                                response_queue, room=""):
+                                response_queue, room="", persona="", honorific=""):
         self.calls.append({"text": text, "room": room})
         response_queue.put_nowait("Начало ответа.")
         await asyncio.sleep(3600)
@@ -127,7 +129,7 @@ class SilentHangingBackend:
         self.calls = []
 
     async def generate_response(self, text, session_id, stream_name,
-                                response_queue, room=""):
+                                response_queue, room="", persona="", honorific=""):
         self.calls.append({"text": text, "room": room})
         await asyncio.sleep(3600)
 
@@ -525,7 +527,7 @@ def test_state_survives_restart(tmp_path):
 def test_start_command_greets():
     bot, api = _make_bot()
     _run(bot.handle_message(111, _msg(text="/start")))
-    assert any("голосовой ассистент" in t for t in api.texts())
+    assert any("Домовой на связи" in t for t in api.texts())
 
 
 def test_unsupported_content_gets_a_hint():
@@ -542,7 +544,7 @@ def test_dispatch_orders_updates_inside_one_chat():
 
     class Recorder(ScriptedBackend):
         async def generate_response(self, text, session_id, stream_name,
-                                    response_queue, room=""):
+                                    response_queue, room="", persona="", honorific=""):
             processed.append(text)
             await super().generate_response(
                 text, session_id, stream_name, response_queue, room
@@ -643,3 +645,26 @@ def test_send_failure_still_answers_the_llm_turn(tmp_path, monkeypatch):
     # The LLM ran and the text is still returned to the caller...
     assert out == "Ответ."
     assert backend.calls[0]["text"] == "привет"
+
+
+def test_every_telegram_turn_is_dobbi_with_the_chats_honorific(tmp_path):
+    """25.11.2026: the whole Telegram source speaks as Добби. The honorific
+    comes from the confirmed chat->person map in main.py; an unmapped chat
+    sends "" and Добби drops the address instead of guessing one."""
+    backend = ScriptedBackend(["Домовой включил, сэр!"])
+    bot, api = _make_bot(
+        tmp_path=str(tmp_path), allowed=("543867556", "1620243752", "999"),
+        backend=backend,
+        honorific_for_chat=lambda chat: {
+            "543867556": "сэр", "1620243752": "мэм",
+        }.get(str(chat), ""),
+    )
+    _run(bot.handle_message(543867556, _msg(chat_id=543867556, text="включи свет")))
+    assert backend.calls[0]["persona"] == "dobbi"
+    assert backend.calls[0]["honorific"] == "сэр"
+
+    _run(bot.handle_message(1620243752, _msg(chat_id=1620243752, text="включи свет")))
+    assert backend.calls[1]["honorific"] == "мэм"
+
+    _run(bot.handle_message(999, _msg(chat_id=999, text="привет")))
+    assert backend.calls[2]["honorific"] == ""

@@ -129,6 +129,33 @@ def _gram_noun(n: int) -> str:
     return "граммов"
 
 
+def _percent_noun(n: int) -> str:
+    last2, last = n % 100, n % 10
+    if 11 <= last2 <= 14:
+        return "процентов"
+    if last == 1:
+        return "процент"
+    if 2 <= last <= 4:
+        return "процента"
+    return "процентов"
+
+
+def percent_sentence(weight: dict | None, percent: float) -> str | None:
+    """One spoken line: N% of the fresh reading, with both nouns agreed."""
+    if not isinstance(weight, dict):
+        return None
+    try:
+        grams = float(weight["grams"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not math.isfinite(grams):
+        return None
+    pct = int(percent)
+    value = int(grams * percent / 100.0 + (0.5 if grams >= 0 else -0.5))
+    first = f"{_spelled(pct)} {_percent_noun(pct)}"
+    return f"{first[:1].upper() + first[1:]} от веса — {_spelled(abs(value))} {_gram_noun(abs(value))}."
+
+
 def weight_sentence(weight: dict | None) -> str | None:
     """One speakable sentence, whole grams, correct noun agreement."""
     if not isinstance(weight, dict):
@@ -144,12 +171,18 @@ def weight_sentence(weight: dict | None) -> str | None:
     return f"На весах {prefix}{_spelled(abs(n))} {_gram_noun(abs(n))}."
 
 
-def sentence_for(kind: str, *, reason: str = "", weight: dict | None = None) -> str:
+def sentence_for(
+    kind: str, *, reason: str = "", weight: dict | None = None, percent: float = 0.0
+) -> str:
     """The one sentence the caller will speak, for any outcome."""
     if kind == "weight":
         if reason == "unreachable":
             return "Весы не отвечают."
         return weight_sentence(weight) or "Не удалось прочитать вес."
+    if kind == "percent":
+        if reason == "unreachable":
+            return "Весы не отвечают."
+        return percent_sentence(weight, percent) or "Не удалось прочитать вес."
     return {
         "ok": "Обнулила.",
         "unreachable": "Весы не отвечают.",
@@ -158,12 +191,15 @@ def sentence_for(kind: str, *, reason: str = "", weight: dict | None = None) -> 
     }.get(reason, "Не получилось обнулить весы.")
 
 
-async def handle(kind: str, *, url=None, post=None) -> str:
+async def handle(
+    kind: str, *, url=None, post=None, percent: float = 0.0
+) -> str:
     """Entry point used by app._handle — always returns speakable text."""
-    if kind == "weight":
+    if kind in ("weight", "percent"):
         reading = await get_weight(url=url, post=post)
         return sentence_for(
-            "weight", reason="unreachable" if reading is None else "", weight=reading
+            kind, reason="unreachable" if reading is None else "",
+            weight=reading, percent=percent,
         )
     ok, reason = await tare_checked(url=url, post=post)
     return sentence_for("tare", reason="ok" if ok else reason)

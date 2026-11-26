@@ -38,6 +38,7 @@ import base64
 import fractions
 import hashlib
 import io
+import wave
 import json
 import logging
 import os
@@ -54,8 +55,17 @@ from collections import deque
 from dataclasses import dataclass
 from math import gcd
 
+import identity_client
 import vosk_wake
 from vosk_wake import transcript_has_wake
+
+# The wake word itself is always stripped from a transcript via `_wake_tokens`
+# (the exact form «домовой» is supplied by env). Whisper writes two additional
+# spellings for this speaker — «Думовой» and «дымовой» (measured 26.11.2026 on
+# the living room). They are stripped ONLY on an alternate-address turn; on a
+# computer turn they must stay, or an unrelated sentence would be corrupted.
+DOBBI_STRIP_VARIANTS = frozenset({"думовой", "дымовой"})
+WAKE_STRIP_VARIANTS = frozenset()
 
 import aiohttp
 import av
@@ -299,6 +309,17 @@ _WAKE_ACK_PHRASES = (
     "Принято, шеф.",
     "Слушаю, капитан.",
 )
+
+# Добби (домовой эльф из «Гарри Поттера»): его собственные реплики — «Добби
+# слушает!», «Добби свободен!», «Добби рад помочь». Короткие и без вопросительного
+# знака: подтверждение не должно заглушать команду или открывать окно диалога.
+DOBBI_ACK_PHRASES = (
+    "Добби слушает{h}!",
+    "Домовой рад помочь{h}!",
+    "Домовой свободен{h}!",
+    "Домовой ждёт{h}!",
+    "Домовой на связи{h}!",
+)
 # How many chunks of the 1.9 s wake window must be at least as loud as the
 # energy bar. Measured 21.10.2026 in the corridor, on the decoder's own input
 # (12 chunks of 160 ms):
@@ -321,6 +342,22 @@ _WAKE_ACK_PHRASES = (
 # already refuses a dead microphone, and the decoder still has to READ a word
 # before any of this matters.
 _WAKE_MIN_LOUD_CHUNKS = 3
+# «Добби» is TWO syllables against «компьютер»'s four. Measured 24.11.2026 in
+# the living room: a decoded «добби» with loud=2/3 was refused as "silence"
+# while the next one with loud=10/12 fired. A click is still ONE loud chunk, so
+# bar 2 keeps the click guard and fits a short word spoken at a normal level.
+_DOBBI_MIN_LOUD_CHUNKS = 2
+# A 2-word streaming commit is safe ONLY when it contains a command verb.
+# Measured 25.11.2026: with min_words=2 LocalAgreement commits «добби какая»
+# at 2.4 s for a weather question; dispatched as a forced prefix, the bare
+# «какая» escalates to complex_logic for 25 s and asks a clarification. A
+# 3+ word prefix is already long enough to be a question/command on its own,
+# so it keeps the balcony/entrance1 behaviour unchanged.
+_STREAM_COMMAND_VERBS = frozenset({
+    "включи", "выключи", "включить", "выключить", "включите", "выключите",
+    "поставь", "открой", "закрой", "сделай", "переключи", "перезапусти",
+    "погаси", "запусти", "останови", "обнули", "сними",
+})
 # How long the rate heal may be deferred while the user is talking.
 #
 # The heal restarts the audio pipeline, and a restart in the middle of a
@@ -1270,6 +1307,9 @@ class CameraConfig:
     tts_voice: str = "ru-RU-SvetlanaNeural"
     # Voice for turns woken by «добби». Empty = every word uses tts_voice.
     tts_voice_dobbi: str = ""
+    # person key -> honorific (сэр / мэм). Filled from main.py's config so the
+    # camera never imports main (cycle). Unknown speaker -> no address.
+    honorific_map: dict = None
     # Which backend preset is live, so a Silero-only speaker can never be sent
     # to Coqui/edge (where it would 400 and cost the user a whole sentence).
     tts_backend: str = ""
@@ -1465,6 +1505,16 @@ class CameraConfig:
     # then answered a command Whisper invented from the same silence. The user's
     # own commands measure 8000-32767 at the rail. 0 => _WAKE_MIN_PEAK.
     wake_min_peak: int = 0
+    # How many 160 ms chunks of the wake window must reach `wake_min_peak`.
+    # 0 => the per-word default (3 for «компьютер», 2 for «Добби»), both derived
+    # from the SMALL Vosk model. A big model (vosk-model-ru-0.42) commits to a
+    # word much earlier — measured 24.11.2026: its «компьютер» partial appears
+    # when only 1-2 of 12 chunks are loud, so the default bar refuses a word it
+    # heard correctly. That model also produces NO wake word at all on clicks,
+    # bangs, noise or a 1 kHz tone (measured), so the click guard it replaces
+    # is redundant there. Set 1 for a room running the big model; 0 keeps the
+    # proven small-model behaviour everywhere else.
+    wake_loud_bar: int = 0
     # Peak the reply is normalised to before it goes to the camera speaker.
     # 0 => _TTS_TARGET_PEAK_DEFAULT.
     #
@@ -1551,6 +1601,20 @@ class CameraSession:
     # uses `_speech_run` below (the wake itself manufactures an utterance open
     # ~0.7 s after it fires, so the old counter always tripped).
     _speech_starts = 0
+    # Identity answer for the last identified speaker. Class-level default so a
+    # hand-built session (CameraSession.__new__ in the tests) cannot turn a new
+    # attribute into an AttributeError inside the live audio path.
+    _last_honorific = ""
+    # Whether the LAST identification actually got an answer from identity.
+    # A blank honorific FROM identity is authoritative (the UI cleared it);
+    # it must not be replaced by the stale Phase A map. An outage must clear
+    # this flag so the local map decides for the NEW engine uid.
+    _honorific_from_identity = False
+    # One-shot enrollment capture: a bounded tap on the LIVE 16 kHz feed. No
+    # second ffmpeg consumer is started — a camera with one media thread cannot
+    # serve two readers without dropping the gateway's own stream.
+    _capture_buf = None
+    _capture_deadline = 0.0
     # F1: decaying counter of frames whose level is at or above the room's own
     # noise floor (`self._noise.value * self._noise.mult`). It answers "is the
     # user speaking RIGHT NOW?" at the pip decision instant — measured against
@@ -1558,6 +1622,9 @@ class CameraSession:
     # Incremented on an elevated frame, decayed otherwise, so a single noise
     # spike cannot hold it up.
     _speech_run = 0
+    # Class-level default: hand-built sessions (CameraSession.__new__ in tests)
+    # must never raise AttributeError from inside the live audio path.
+    _honorific_map = {}
     # The level (normalised, as fed to _noise) at the last frame — logged with
     # the pip decision so the threshold is verifiable from the log.
     _speech_rms = 0.0
@@ -1574,6 +1641,12 @@ class CameraSession:
     # build a session with __new__; a missing attribute would raise inside the
     # live audio path and read as a playback fault.
     _wake_kind = "computer"
+    # The pool explicitly configured for this room (CAMERA_WAKE_ACK_PHRASE /
+    # ..._PHRASES), kept separately from the rotating copy so `_fire_wake`
+    # cannot overwrite it on the one turn an ack is actually spoken.
+    # Class default: hand-built sessions (CameraSession.__new__) must not
+    # raise AttributeError inside the live audio path.
+    _wake_ack_configured_pool = None
     _wake_tokens = vosk_wake.WAKE_TOKENS
     _alt_wake_tokens = frozenset()
     # Class default for hand-built sessions: an AttributeError here would be
@@ -1610,6 +1683,7 @@ class CameraSession:
         self.tts_url = config.tts_url
         self.tts_voice = config.tts_voice
         self._tts_voice_dobbi = config.tts_voice_dobbi
+        self._honorific_map = dict(getattr(config, "honorific_map", None) or {})
         self.tts_backend = config.tts_backend
         self.tts_api_key = config.tts_api_key
         self.tts_stream_url = config.tts_stream_url
@@ -1738,7 +1812,9 @@ class CameraSession:
         self.webrtc = config.webrtc
         self._attention_pip = config.attention_pip
         self._alt_wake_word = config.alt_wake_word or ""
-        if self._alt_wake_word not in ("", "dobbi"):
+        # "computer" is accepted for the temporary 26.11.2026 A/B where the
+        # living room swaps its primary and alternate address words.
+        if self._alt_wake_word not in ("", "dobbi", "computer"):
             logger.warning(
                 f"[{self.stream_name}] unknown alt wake word "
                 f"{self._alt_wake_word!r} — second word disabled"
@@ -1762,10 +1838,13 @@ class CameraSession:
         # pause gets a different line until the pool is exhausted.
         configured = [p.strip() for p in (config.wake_ack_phrases or "").split("|") if p.strip()]
         if configured:
+            self._wake_ack_configured_pool = list(configured)
             self._wake_ack_pool = configured
         elif config.wake_ack_phrase:
+            self._wake_ack_configured_pool = [config.wake_ack_phrase]
             self._wake_ack_pool = [config.wake_ack_phrase]
         else:
+            self._wake_ack_configured_pool = None
             self._wake_ack_pool = list(_WAKE_ACK_PHRASES)
         if len(self._wake_ack_pool) > 1:
             random.shuffle(self._wake_ack_pool)
@@ -1796,6 +1875,11 @@ class CameraSession:
                 self._vosk_dump_fh = None
         self._wake_min_peak = (
             config.wake_min_peak if config.wake_min_peak > 0 else _WAKE_MIN_PEAK
+        )
+        # 0 means "unset": the per-word bars below stay in force. A positive
+        # value applies to BOTH words in this room (the big model needs 1).
+        self._wake_loud_bar_override = (
+            config.wake_loud_bar if config.wake_loud_bar > 0 else 0
         )
         # 0 means "unset, use the default" like every other tuning value here.
         self._utterance_dump = (config.utterance_dump or "").rstrip("/")
@@ -2467,6 +2551,47 @@ class CameraSession:
         except Exception:
             return 0
 
+    def _wake_loud_bar(self) -> int:
+        """Per-word loud-chunk bar. The matcher already decided WHICH word it
+        heard before this gate runs, so the short address gets its own bar."""
+        override = getattr(self, "_wake_loud_bar_override", 0)
+        if override > 0:
+            return override
+        matcher = getattr(self, "_vosk_wake", None)
+        kind = getattr(matcher, "last_kind", "computer")
+        return _DOBBI_MIN_LOUD_CHUNKS if kind == "dobbi" else _WAKE_MIN_LOUD_CHUNKS
+
+    def _wake_energy_gate(self):
+        """Decide the wake energy gate from the audio that produced the word.
+
+        Returns `(ok, peak, loud)` — the SAME numbers that go into the log, so
+        the instrument cannot disagree with the decision (07.10.2026: the log
+        printed the trigger chunk while the gate judged the window maximum).
+
+        A FINAL recogniser segment is the case that matters for the short
+        address: «добби включи свет» was finalised 1.92 s after the loud 22 887
+        speech, when the trailing 1.9 s window had fallen to 1751 with zero
+        loud chunks, and the gate called a real wake silence. For a FINAL the
+        matcher keeps the peaks of the whole segment (~8 s, bounded), and the
+        sustained-loud-chunk guard still applies to those peaks: a click is
+        ONE loud chunk no matter which window it is measured in.
+        """
+        matcher = getattr(self, "_vosk_wake", None)
+        final_peak, final_loud = 0, 0
+        if matcher is not None and getattr(matcher, "last_from_final", False):
+            final_peak = int(getattr(matcher, "wake_evidence_peak", lambda: 0)())
+            final_loud = int(
+                getattr(matcher, "wake_evidence_loud", lambda bar: 0)(
+                    self._wake_min_peak
+                )
+            )
+        win = getattr(self, "_vosk_peak_win", ())
+        short_peak = int(max(win)) if win else 0
+        peak = max(short_peak, final_peak)
+        loud = max(self._loud_chunks_in_window(), final_loud)
+        bar = self._wake_loud_bar()
+        return (peak >= self._wake_min_peak and loud >= bar, peak, loud)
+
     def _user_is_talking(self, now: float) -> bool:
         """Is the user talking to THIS room right now?
 
@@ -3030,6 +3155,51 @@ class CameraSession:
                 best = corr
         return best >= self._echo_corr_threshold
 
+    def _tap_capture(self, chunk: bytes) -> None:
+        """Copy the newest 16 kHz chunk into an active enrollment capture.
+
+        Called from _feed_audio, i.e. after echo/mute guards and resampling:
+        the bytes are exactly what the wake decoder hears, not a second read of
+        the camera. Bounded so a stuck deadline cannot grow memory forever.
+        """
+        if self._capture_buf is None or time.monotonic() >= self._capture_deadline:
+            return
+        if len(self._capture_buf) + len(chunk) <= 30 * 32000:
+            self._capture_buf.extend(chunk)
+
+    async def record_sample(self, seconds: float) -> bytes:
+        """Record the next N seconds of this room's mic as a mono 16 kHz WAV.
+
+        The tap is armed in-memory and filled by _feed_audio; nothing is sent
+        to the camera and no ffmpeg process is started. Cancelled or empty
+        captures leave no state behind.
+        """
+        if self._capture_buf is not None:
+            # A second capture would replace the first one's buffer and its
+            # finally block would clear both — a corrupt voice sample.
+            raise RuntimeError("capture already active on this room")
+        seconds = max(2.0, min(30.0, float(seconds)))
+        self._capture_buf = bytearray()
+        self._capture_deadline = time.monotonic() + seconds
+        try:
+            while time.monotonic() < self._capture_deadline:
+                await asyncio.sleep(0.05)
+            pcm = bytes(self._capture_buf or b"")
+        finally:
+            self._capture_buf = None
+            self._capture_deadline = 0.0
+        out = io.BytesIO()
+        try:
+            with wave.open(out, "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(16000)
+                w.writeframes(pcm)
+            return out.getvalue()
+        except Exception:
+            logger.exception(f"[{self.stream_name}] enrollment WAV build failed")
+            raise
+
     async def _feed_audio(self, pcm: bytes, rate: int = 16000):
         # Both early returns below DROP the user's audio before anything can
         # recognise it — the wake decoder, the VAD, the utterance buffer, Whisper.
@@ -3053,7 +3223,23 @@ class CameraSession:
             self._drop_track += 1
             return
 
-        if self._wake_detected and time.time() >= self._wake_expires:
+        # The wake window is a TIMER, and STT is not: measured 25.11.2026
+        # 21:26 on the living room, Whisper answered «Добби включи свет.»
+        # in 29.1 s against a 15 s `wake_timeout`. This check runs on every
+        # chunk, so it called `_back_to_wake()` at +15 s while the transcript
+        # was still being produced, and the correctly transcribed command
+        # arrived with `wake_detected=False` and was discarded silently at
+        # `_handle_wake_or_command` — no command, no reply, no light.
+        # `_processing_utterance` spans the Whisper call AND the handling of
+        # its result (`_process_utterance`), so holding the window for that
+        # long is exactly the lifetime an in-flight answer needs. A missed
+        # close can only DELAY `_back_to_wake()` until the next chunk; it
+        # cannot keep a stale window open once STT has finished.
+        if (
+            self._wake_detected
+            and time.time() >= self._wake_expires
+            and not getattr(self, "_processing_utterance", False)
+        ):
             self._back_to_wake()
 
         if rate == 48000:
@@ -3173,6 +3359,7 @@ class CameraSession:
                     self._bg_window.pop(0)
                 now_d = time.time()
 
+            self._tap_capture(chunk)
             asyncio.create_task(self._vad_process(chunk))
 
     def _proximity_level(self) -> float:
@@ -3338,7 +3525,13 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
         if (not text or not self._wake_detected or self._processing_utterance
                 or time.time() < self._tts_playing_until):
             return
-        if len(stt_words(text)) < getattr(self, "_stream_min_words", 3):
+        committed_words = stt_words(text)
+        if len(committed_words) < getattr(self, "_stream_min_words", 3):
+            return
+        if len(committed_words) == 2 and not any(
+            w in _STREAM_COMMAND_VERBS for w in committed_words
+        ):
+            # «добби какая» is not a command — let the full buffer decide.
             return
         if now - self._stream_stable_since < getattr(self, "_stream_stable_s", 0.7):
             return
@@ -3609,7 +3802,9 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
                     # same breath saying the word twice, and that is a
                     # sub-second event, not a minute.
                     now_w = time.time()
-                    if not self._wake_gate_open(now_w):
+                    wake_hyp = getattr(self._vosk_wake, "last_partial", "") or ""
+                    energy_ok, win_peak, loud_n = self._wake_energy_gate()
+                    if not self._wake_gate_open(now_w, text=wake_hyp):
                         # Our own playback still in the air, or the same
                         # breath. Do NOT reset the decoder here: reset() zeroes
                         # _wake_hits, so the next chunk of the same word would
@@ -3626,10 +3821,7 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
                             f"(suppressed={self._vosk_suppressed})"
                         )
                         got_wake = False
-                    elif (
-                        max(self._vosk_peak_win) < self._wake_min_peak
-                        or self._loud_chunks_in_window() < _WAKE_MIN_LOUD_CHUNKS
-                    ):
+                    elif not energy_ok:
                         # A decoder run on near-silence returns its most likely
                         # phrase, and «компьютер» is that phrase. Measured
                         # 06.10.2026 08:55 on the kitchen, whose microphone is
@@ -3683,9 +3875,9 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
                         logger.info(
                             f"[{self.stream_name}] VOSK wake heard but not "
                             f"fired: peak={int(np.abs(s16).max())} "
-                            f"window={max(self._vosk_peak_win)}/{len(self._vosk_peak_win)} "
-                            f"loud={self._loud_chunks_in_window()}"
-                            f"/{_WAKE_MIN_LOUD_CHUNKS} "
+                            f"window={win_peak}/{len(self._vosk_peak_win)} "
+                            f"loud={loud_n}"
+                            f"/{self._wake_loud_bar()} "
                             f"< {self._wake_min_peak} — that is silence, not a "
                             f"voice (suppressed={self._vosk_suppressed})"
                         )
@@ -3736,6 +3928,7 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
                         f"peak_max={self._vosk_last_peak} "
                         f"triggers={self._vosk_wake.triggers} "
                         f"decodes={self._vosk_wake.decodes} "
+                        f"blocked={getattr(self._vosk_wake, 'blocked_same', 0)} "
                         f"hyp='{self._vosk_wake.last_partial}' "
                         f"kind={self._vosk_wake.last_kind}"
                         f"{near_txt} "
@@ -3756,9 +3949,9 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
                         f"trig='{self._vosk_wake.last_trigger_text}' "
                         f"conf='{self._vosk_wake.last_text}' "
                         f"peak={int(np.abs(s16).max())} "
-                        f"window={int(max(self._vosk_peak_win))}"
+                        f"window={int(win_peak)}"
                         f"/{self._wake_min_peak} "
-                        f"loud={self._loud_chunks_in_window()}"
+                        f"loud={loud_n}"
                         f"/{len(self._vosk_peak_win)} "
                         f"triggers={self._vosk_wake.triggers} "
                         f"decodes={self._vosk_wake.decodes} "
@@ -4152,7 +4345,7 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
                                 )
                                 await self._fire_wake(reason="oww")
 
-    def _wake_gate_open(self, now: float) -> bool:
+    def _wake_gate_open(self, now: float, text: str = "") -> bool:
         """May a wake decoded at `now` actually FIRE?
 
         Two things close the gate, and neither of them is `_wake_detected`:
@@ -4169,9 +4362,19 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
         measured 04.10.2026, two «компьютер» 8 s and 11 s after the reply were
         decoded and dropped before the third, 28 s later, got through. A wake
         word exists so that saying it gets attention — always.
+
+        `text` is the decoder's live hypothesis. 25.11.2026 10:20:28 a loud
+        «добби выключи свет» (peak 32457) was refused with `echo_tail=+0.3s`,
+        only 0.3 s before the blind tail expired and 2.6 s after the previous
+        1 s reply ended. Our own speech here is never a command — it is
+        «Добби слушает!» (the ack) or «Включаю.» / «Выключаю.» (the reply). A
+        hypothesis already carrying a command verb is therefore the user, not
+        an echo, and the tail must not swallow it. Bare «добби» inside the tail
+        stays refused: that is exactly what our own ack can look like to Vosk.
         """
         if now < self._wake_suppress_until:
-            return False
+            if not any(w in _STREAM_COMMAND_VERBS for w in stt_words(text)):
+                return False
         if now - self._last_wake_fired_at < _WAKE_REARM_DEBOUNCE_S:
             return False
         return True
@@ -4208,26 +4411,45 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
             logger.info(f"[{self.stream_name}] 🤝 wake ceded to a closer camera")
         return w_ok
 
+    def _current_honorific(self) -> str:
+        """сэр for alexander, мэм for marina/vladislava, "" for anyone else.
+        SpeakerID runs at utterance end; when it has not identified anybody,
+        Добби drops the address rather than guessing one."""
+        # Identity is the source of truth ONLY when it actually answered for
+        # this utterance — including an empty honorific set in the UI. After
+        # an identity failure the local map decides for the NEW engine uid.
+        if getattr(self, "_honorific_from_identity", False):
+            return str(getattr(self, "_last_honorific", "") or "")
+        uid = str(getattr(self, "_last_uid", "") or "").lower()
+        return str((getattr(self, "_honorific_map", None) or {}).get(uid, "") or "")
+
     def _next_wake_ack_phrase(self) -> str:
         phrase = self._wake_ack_pool[self._wake_ack_idx % len(self._wake_ack_pool)]
         self._wake_ack_idx = (self._wake_ack_idx + 1) % len(self._wake_ack_pool)
-        return phrase
+        h = self._current_honorific()
+        return phrase.format(h=f", {h}" if h else "")
 
-    def _arm_wake_ack(self) -> asyncio.Task | None:
+    def _arm_wake_ack(self, delay: float | None = None) -> asyncio.Task | None:
         """Arm ONE spoken acknowledgement for this address.
 
         A generation counter, NOT task.cancel(): cancelling a task that is
         already inside `_speak_pcm(wait=True)` cuts the audio after the mic mute
         and echo guards have been extended, leaving a half-said phrase and a
         deaf room. Superseded tasks simply wake up and see a stale generation.
+
+        `delay` lets the bare-address path answer sooner than the 2 s used when
+        the wake first fires: by then the transcript already proved no command
+        followed, so there is no need to keep waiting.
         """
         self._wake_ack_gen += 1
+        wait = self._wake_ack_delay if delay is None else delay
         self._wake_ack_task = asyncio.create_task(
-            self._wake_ack_after_pause(self._wake_ack_gen)
+            self._wake_ack_after_pause(self._wake_ack_gen, wait)
         )
         return self._wake_ack_task
 
-    async def _wake_ack_after_pause(self, gen: int | None = None) -> None:
+    async def _wake_ack_after_pause(self, gen: int | None = None,
+                                    delay: float | None = None) -> None:
         """Answer the address word ONLY if nobody spoke after it.
 
         `_speech_run` is the level-vs-room-floor counter (see _vad_process), not
@@ -4240,8 +4462,9 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
         """
         if gen is None:
             gen = self._wake_ack_gen
+        wait = self._wake_ack_delay if delay is None else delay
         try:
-            await asyncio.sleep(self._wake_ack_delay)
+            await asyncio.sleep(wait)
             if (
                 gen != self._wake_ack_gen
                 or not self._wake_ack_enabled
@@ -4259,7 +4482,7 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
             self._last_wake_ack_at = time.time()
             logger.info(
                 f"[{self.stream_name}] 🎧 wake ack: '{phrase}' "
-                f"after {self._wake_ack_delay:g}s of silence"
+                f"after {wait:g}s of silence"
             )
         except asyncio.CancelledError:
             return
@@ -4288,6 +4511,18 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
         # sound — no pip and no voice for «добби». The word is the source of
         # truth; keep the runtime flag in step with it.
         self._wake_ack_enabled = use_ack
+        # A turn gets the address's own acknowledgement vocabulary: Добби
+        # speaks with the house-elf's lines, «компьютер» keeps the neutral pool.
+        # An explicit per-room override wins over BOTH address defaults — it
+        # was configured precisely to replace them, and __init__ built it once.
+        configured = getattr(self, "_wake_ack_configured_pool", None)
+        if configured:
+            self._wake_ack_pool = list(configured)
+        else:
+            self._wake_ack_pool = list(
+                DOBBI_ACK_PHRASES if self._wake_kind == "dobbi" else _WAKE_ACK_PHRASES
+            )
+        self._wake_ack_idx = 0
         if self._alt_wake_tokens:
             logger.info(
                 f"[{self.stream_name}] wake kind={self._wake_kind} "
@@ -4708,7 +4943,8 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
         logger.info(f"[{self.stream_name}] ✅ Whisper OK: '{txt[:60]}'")
         return txt
 
-    async def _handle_stt_result(self, txt: str, uid: str | None) -> None:
+    async def _handle_stt_result(self, txt: str, uid: str | None,
+                                 env: list[float] | None = None) -> None:
         # --- Gray-zone STT confirmation ------------------------------------
         # A gate held a decent oww score and opened a confirmation window.
         # The utterance just transcribed decides: live «компьютер» -> full
@@ -4821,7 +5057,42 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
             f"[{self.stream_name}] 🔍 _handle_stt_result -> _handle_wake_or_command: "
             f"wake_detected={self._wake_detected}, txt={txt[:60]!r}"
         )
-        await self._handle_wake_or_command(txt, uid or "camera")
+        await self._handle_wake_or_command(txt, uid or "camera", env=env)
+
+    def _strip_wake_words(self, text: str) -> str:
+        """Remove EVERY configured address word from a transcript.
+
+        The old strip knew only the hard-coded `wake_keyword` («компьютер»), so
+        a repeated address survived intact, went to the router and bought an L2
+        monologue (24.11.2026 12:33). Tokens are matched as WHOLE WORDS: the
+        allowlist contains the short form «комп», and an unanchored replace
+        would turn «компот» into «от». Glued repeats of one token are collapsed
+        first, which preserves the earlier «компьютеркомпьютер» behaviour.
+        Since 26.11.2026 the alternate address is «домовой» (already in
+        `self._wake_tokens`) plus the two Whisper spellings in
+        `DOBBI_STRIP_VARIANTS`, applied only on an alternate-address turn.
+        """
+        if not text:
+            return text
+        extra = (
+            DOBBI_STRIP_VARIANTS
+            if getattr(self, "_wake_kind", "") == "dobbi"
+            else frozenset()
+        )
+        toks = sorted(
+            (t for t in self._wake_tokens | WAKE_STRIP_VARIANTS | extra if t),
+            key=len, reverse=True,
+        )
+        if not toks:
+            return text
+        t = text
+        word_toks = [tok for tok in toks if " " not in tok]
+        for tok in word_toks:
+            t = re.sub(rf"(?:{re.escape(tok)}){{2,}}", tok, t, flags=re.IGNORECASE)
+        if not word_toks:
+            return t.strip(" .,!?-")
+        pattern = r"(?:хей\s+)?\b(?:" + "|".join(re.escape(tok) for tok in word_toks) + r")\b"
+        return re.sub(pattern, " ", t, flags=re.IGNORECASE).strip(" .,!?-")
 
     def _transcript_is_echo(self, norm: str) -> str | None:
         """Which echo guard claims this transcript, if any. "repeat" | "reply" | None.
@@ -5002,7 +5273,11 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
                 f"[{self.stream_name}] ambient utterance ended after "
                 f"{dur:.0f}ms via {reason} — no wake window, discarded"
             )
-        asyncio.create_task(self._process_utterance(buf))
+        # Carry THIS utterance's envelope with the buffer. The field below is
+        # overwritten by every later (ambient) utterance, including while this
+        # one is still in Whisper — the wake-tail guard must judge the buffer
+        # that produced the transcript, not whichever end wrote last.
+        asyncio.create_task(self._process_utterance(buf, env=env))
         # Speaker ID on the FULL utterance buffer (not a single onset chunk),
         # same as the ESP32 path: pack_ogg of the whole phrase, not 160 ms.
         # Works for ambient speech too — identifies who is speaking in the room
@@ -5010,7 +5285,8 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
         if len(buf) >= 3200:  # ≥100 ms of audio
             asyncio.create_task(self._log_speaker_id_full_utterance(buf))
 
-    async def _process_utterance(self, buf: bytes):
+    async def _process_utterance(self, buf: bytes,
+                                 env: list[float] | None = None):
         if self._processing_utterance:
             return
 
@@ -5043,7 +5319,9 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
                 return
 
             self._last_utt_rms_raw = float((stats or {}).get("rms_raw", 0.0))
-            await self._handle_stt_result(txt, self._last_uid or "camera")
+            await self._handle_stt_result(
+                txt, self._last_uid or "camera", env=env
+            )
             if self._wake_only_pending:
                 # Keep the utterance open across the gap between «компьютер» and
                 # the command, so the next pause commits them together and the
@@ -5094,7 +5372,20 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
         except Exception as e:
             logger.error(f"[{self.stream_name}] ⏱ timer speak failed: {e!r}")
 
-    async def _handle_wake_or_command(self, txt: str, uid: str = "camera"):
+    def _signal_wake_only(self) -> None:
+        """A bare address (or a repeated one) must not be met with silence.
+
+        Without this the room just waits, the user repeats the word, and the
+        second fire can destroy the command being collected. The 0.8 s ack is
+        short enough to answer before the user speaks again; `_last_wake_ack_at`
+        keeps a second bare address from stacking two phrases.
+        """
+        self._wake_only_pending = True
+        if self._wake_ack_enabled:
+            self._arm_wake_ack(delay=0.8)
+
+    async def _handle_wake_or_command(self, txt: str, uid: str = "camera",
+                                      env: list[float] | None = None):
         """Handle an utterance that Whisper transcribed AFTER the acoustic
         wake fired. The oww detector is the ONLY wake path now — this method
         never wakes on transcript content, it only extracts and dispatches
@@ -5159,19 +5450,10 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
             f"followup_only={self._followup_only}, txt={txt[:60]!r}"
         )
 
-        # Never forward the wake word itself to nanobot — only the command
-        # that follows it. Tolerate Whisper's glued repeats like
-        # "компьютеркомпьютер" by matching without word boundaries.
-        kw = re.escape(self.wake_keyword.lower())
-        m = re.search(
-            rf"(?:хей\s+)?({kw}|{kw.replace('джарвис','jarvis')})", txt, re.IGNORECASE
-        )
-        if not m:
-            m = re.search(rf"({kw})", txt, re.IGNORECASE)
-        cmd = txt
-        if m:
-            cmd = (txt[: m.start()] + " " + txt[m.end() :]).strip()
-        cmd = cmd.strip(" .,!?-")
+        # Never forward an address word itself — only the command after it.
+        # Both words (and their observed spellings) are stripped; glued repeats
+        # like «компьютеркомпьютер» or «на фаняна фаня» collapse to one first.
+        cmd = self._strip_wake_words(txt)
         if not cmd or not is_valid_text(cmd):
             logger.info(
                 f"[{self.stream_name}] 🎯 Wake-only utterance, awaiting command"
@@ -5187,7 +5469,7 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
             # я не ехать ночью?» — each dispatched as a command and each answered
             # aloud. That is the "strangely reacts to a command" report, and it is
             # caused by closing on the wake word rather than by the wake word.
-            self._wake_only_pending = True
+            self._signal_wake_only()
             return
         if self._is_wake_word_alone(cmd):
             # The transcript carries no «компьютер», so the strip above could not
@@ -5200,9 +5482,9 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
                 f"{self._last_utt_end_ts - self._last_wake_fired_at:.2f}s after the "
                 f"wake) — not a command"
             )
-            self._wake_only_pending = True
+            self._signal_wake_only()
             return
-        if self._awaiting_command and self._wake_tail_only_envelope():
+        if self._awaiting_command and self._wake_tail_only_envelope(env):
             # 24.11.2026 07:34: the wake tail alone filled the first 0.5 s of a
             # 7 s buffer; Whisper wrote «чет» and L2 burned 39 s. The user's
             # actual command arrived ~10 s after the wake. Keep listening.
@@ -5210,7 +5492,7 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
                 f"[{self.stream_name}] 🎯 wake-tail-only buffer — waiting for "
                 f"the command (not dispatching {cmd[:30]!r})"
             )
-            self._wake_only_pending = True
+            self._signal_wake_only()
             return
         logger.info(f"[{self.stream_name}] 🗣 Post-wake command: '{cmd[:60]}'")
         # Timer command: «поставь таймер на 5 минут», etc. Handled locally,
@@ -5327,6 +5609,8 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
                     session_id=self.chat_id,
                     stream_name=self.stream_name,
                     response_queue=q,
+                    persona=self._wake_kind if self._wake_kind == "dobbi" else "",
+                    honorific=self._current_honorific() if self._wake_kind == "dobbi" else "",
                 )
             finally:
                 try:
@@ -5923,6 +6207,49 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
             ogg, _ = await asyncio.wait_for(proc.communicate(wav), timeout=10)
             if not ogg:
                 return "unknown"
+            ident = identity_client.IDENTITY
+            if ident is not None:
+                try:
+                    person, honorific, conf = await ident.identify(ogg)
+                    if person and person != "unknown" and conf <= 0.1:
+                        # Same floor the direct SpeakerID path applies below:
+                        # a 0.05-confidence name is a guess, not a person, and
+                        # must not leave a stale address for the next speaker.
+                        logger.info(
+                            f"[{self.stream_name}] 👤 [Identity] Rejected low "
+                            f"confidence: {person} ({conf:.2f})"
+                        )
+                        self._last_honorific = ""
+                        self._honorific_from_identity = False
+                        return "unknown"
+                    self._last_honorific = honorific or ""
+                    self._honorific_from_identity = True
+                    if person and person != "unknown":
+                        logger.info(
+                            f"[{self.stream_name}] 👤 [Identity] {person} "
+                            f"(honorific={honorific or '—'}, conf={conf:.2f})"
+                        )
+                    return person or "unknown"
+                except Exception as e:
+                    # Never silence the room because the identity service is
+                    # down: log it once and use the direct SpeakerID path. The
+                    # previous identity answer must NOT address this new uid.
+                    self._last_honorific = ""
+                    self._honorific_from_identity = False
+                    if getattr(e, "status", None) == 429:
+                        # The ENGINE is rate-limiting, so a direct call would
+                        # hit the same wall — doubling the load we already have.
+                        logger.warning(
+                            f"[{self.stream_name}] identity rate-limited (429); "
+                            "not retrying SpeakerID directly"
+                        )
+                        return "unknown"
+                    logger.warning(
+                        f"[{self.stream_name}] identity lookup failed, using "
+                        f"SpeakerID directly: {e!r}"
+                    )
+            else:
+                self._honorific_from_identity = False
             form = aiohttp.FormData()
             form.add_field("file", ogg, filename="audio.ogg", content_type="audio/ogg")
             async with self.http_session.post(
@@ -5947,6 +6274,12 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
         Called from _end_utterance with the complete buffer so CAMPPlus has
         enough audio to compare against enrolled speakers.
         """
+        # Only a real command needs an identity: the reply's honorific. Doing
+        # this on every ambient TV utterance called speaker-id ~50x/min across
+        # five rooms, past its 10/60s limit (1491 warnings in one hour, 25.11).
+        if not (getattr(self, "_wake_detected", False)
+                or time.time() < getattr(self, "_wake_expires", 0.0)):
+            return
         try:
             wav = await asyncio.to_thread(self._encode_wav, buf)
             uid = await self._fetch_speaker_id(wav)
@@ -5965,6 +6298,17 @@ high-pass 150Hz -> ['капля яда включи свет в коридоре
 
     def _back_to_wake(self):
         self._wake_detected = False
+        # A recogniser left holding the previous address word can silently
+        # swallow the next one: `hits <= _wake_hits` returns False with no log
+        # line at all. The turn is over now, far beyond the same-breath window,
+        # so give the next word a clean context.
+        matcher = getattr(self, "_vosk_wake", None)
+        if matcher is not None:
+            try:
+                matcher.reset()
+                matcher.begin()
+            except Exception as e:
+                logger.warning(f"[{self.stream_name}] wake decoder re-arm failed: {e!r}")
         # A turn started by «добби» must not lend its dev backend to a later
         # follow-up or fallback turn that had no address word.
         self._wake_kind = "computer"

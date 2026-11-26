@@ -43,10 +43,22 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 import time
+from array import array
+from collections import deque
 
 SR = 16000
+# A recognised address word in a NEW final segment is a NEW attempt, even if
+# the hypothesis still holds the previous one's token. Must match the camera's
+# same-breath debounce so a word's tail cannot fire twice.
+_WAKE_REARM_S = 3.0
+# A late FINAL may re-arm a wake only if FRESH loud audio arrived after the
+# debounce — the same word's tail finalised late carries no new loud chunk.
+# 3000 is the camera's measured wake gate floor (CAMERA_WAKE_MIN_PEAK), so a
+# chunk counted here is one that could itself have produced a wake.
+_WAKE_REARM_PEAK = 3000
 
 # Token forms vosk actually produced for «компьютер» on this room's audio, plus
 # the plausible misspellings. An ALLOWLIST, not a prefix match: "компот" starts
@@ -57,6 +69,44 @@ _log = logging.getLogger("vosk_wake")
 WAKE_TOKENS = frozenset({
     "компьютер", "комп", "компютер", "компъютер", "компьытер",
 })
+
+# The second address is «домовой» (26.11.2026). The previous address «добби»
+# was a rare proper name whose mis-hearings needed an endless allowlist. The
+# clean-synthesis screen for «домовой» was MISLEADING: on the user's live
+# voice in the living room the small model writes «ты ногой включи свет»,
+# «давай включи свет» and «два выключи свет» — never the word itself.
+# Measured over 1049 s of the LIVE streaming dump (gated_probe.py): the three
+# real attempts fire and television does not. The big model reads all three
+# but is ruled out (hardware cannot sustain it), so these forms are accepted
+# ONLY at the START of the hypothesis and IMMEDIATELY before a command verb.
+# «два раза», «давай вперед» etc. stay ordinary speech. These are MATCH tokens
+# only — they must never enter the strip allowlist, where they would corrupt
+# unrelated sentences.
+DOMOVOY_TOKENS = frozenset({"домовой"})
+DOMOVOY_GATED_FORMS = frozenset({"ты ногой", "давай", "два"})
+_DOMOVOY_COMMAND_WORDS = frozenset({
+    "включи", "выключи", "включить", "выключить", "поставь", "открой",
+    "закрой", "сделай", "переключи", "выключите", "включите",
+    "погаси", "запусти", "останови", "обнули", "сними",
+    "какая", "какие", "сколько", "когда", "где", "как", "что",
+    "почему", "зачем", "погода", "времени",
+})
+
+
+def _domovoy_hits(text: str, tokens=frozenset()) -> int:
+    """Count only the LIVE gated forms; exact tokens are counted by the caller."""
+    t = (text or "").lower().replace("ё", "е").strip(" .,!?;:")
+    words = [w.strip(".,!?;:") for w in t.split() if w.strip(".,!?;:")]
+    hits = 0
+    for form in DOMOVOY_GATED_FORMS:
+        n = len(form.split())
+        if words[:n] != form.split():
+            continue
+        rest = words[n:]
+        if rest and rest[0] in _DOMOVOY_COMMAND_WORDS:
+            hits += 1
+        break
+    return hits
 
 _MODEL_LOCK = threading.Lock()
 _MODELS: dict[str, object] = {}
@@ -98,10 +148,14 @@ def wake_near_miss(text: str, tokens=WAKE_TOKENS) -> str:
     spellings are allowed because five were OBSERVED, which means a different
     voice lands outside the list by construction.
 
-    The check is deliberately cheap: a shared 3-character prefix rejects almost
-    every hypothesis in the room, and only survivors are compared. It is a
-    diagnostic, never a match — `transcript_has_wake` stays an exact test,
-    because widening it to a prefix admits «компот» and «компания».
+    The check is deliberately cheap: a shared STEM prefix rejects almost every
+    hypothesis in the room, and only survivors are compared. It was 3 characters
+    until «домовой» arrived (26.11.2026): the «дом» stem makes «доме», «домой»,
+    «домик» and «домашний» look like near misses on television, which floods
+    `near=` and hides a real missed spelling. 5 characters still catches every
+    inflection of both addresses («компъюта», «домовому»). It is a diagnostic,
+    never a match — `transcript_has_wake` stays an exact test, because widening
+    it to a prefix admits «компот» and «компания».
     """
     tokens = tokens or WAKE_TOKENS
     t = (text or "").lower().replace("ё", "е")
@@ -119,7 +173,7 @@ def wake_near_miss(text: str, tokens=WAKE_TOKENS) -> str:
                 # A prefix is a truncation, not a misspelling: «комп» and
                 # «компю» are on the allowlist's own reasoning, not near misses.
                 continue
-            n = min(len(bare), len(cand), 3)
+            n = min(len(bare), len(cand), 5)
             if n and bare[:n] == cand[:n] and abs(len(bare) - len(cand)) <= 3:
                 return bare
     return ""
@@ -141,6 +195,8 @@ def transcript_has_wake(text: str, tokens=WAKE_TOKENS) -> bool:
     words = t.split()
     if not words:
         return False
+    if "домовой" in tokens and _domovoy_hits(t, tokens):
+        return True
     return any(tok.strip(".,!?;:") in tokens for tok in words)
 
 
@@ -153,7 +209,13 @@ def wake_occurrences(text: str, tokens=WAKE_TOKENS) -> int:
     it to two.
     """
     t = (text or "").lower().replace("ё", "е")
-    return sum(1 for tok in t.split() if tok.strip(".,!?;:") in tokens)
+    count = sum(
+        1 for tok in t.split()
+        if tok.strip(".,!?;:") in tokens
+    )
+    if "домовой" in tokens:
+        count += _domovoy_hits(t, tokens)
+    return count
 
 
 def wake_kind_in(text: str, alt_tokens=frozenset(), alt_word: str = "") -> str:
@@ -164,14 +226,17 @@ def wake_kind_in(text: str, alt_tokens=frozenset(), alt_word: str = "") -> str:
     Unknown text returns "" — callers only use this after a wake was confirmed.
     """
     t = (text or "").lower().replace("ё", "е")
-    kind = ""
-    for tok in t.split():
-        bare = tok.strip(".,!?;:")
-        if bare in alt_tokens:
-            kind = alt_word or "dobbi"
-        elif bare in WAKE_TOKENS:
-            kind = "computer"
-    return kind
+    # The address closest to the command wins when one breath holds both.
+    words = [w.strip(".,!?;:") for w in t.split()]
+    alt_at = [i for i, w in enumerate(words) if w in alt_tokens]
+    comp_at = [i for i, w in enumerate(words) if w in WAKE_TOKENS]
+    gated = "домовой" in alt_tokens and _domovoy_hits(t, alt_tokens)
+    if not alt_at and not gated:
+        return "computer" if comp_at else ""
+    alt_pos = max(alt_at) if alt_at else 0
+    if not comp_at or alt_pos > comp_at[-1]:
+        return alt_word or "dobbi"
+    return "computer"
 
 
 class VoskWakeMatcher:
@@ -191,10 +256,24 @@ class VoskWakeMatcher:
     alt_word = ""
     alt_tokens = frozenset()
     last_kind = "computer"
+    # A wake token present in the hypothesis but NOT a new occurrence used to
+    # be the most expensive silence in the path: no fire and no log line at all.
+    # Lifetime counter, reported by `vosk diag`, like `triggers`.
+    blocked_same = 0
+    _last_fire_wall = 0.0
     # One recogniser segment may contain the tail of several words. A DIFFERENT
     # address word appended inside the same segment is not a new wake: firing on
     # it would call _fire_wake twice and destroy the command being collected.
     _segment_fired = False
+    # A short address («добби») is often finalised ~2 s AFTER the loud audio
+    # that produced it: the trailing 1.9 s window is already quiet and the
+    # camera's energy gate called a real wake "silence". Keep the peaks of the
+    # whole recogniser segment (bounded to ~8 s) so the gate can judge the
+    # audio that produced the word instead of the silence at its finalisation.
+    # Class-level defaults so a matcher built with `__new__` (tests) still has
+    # them — a missing attribute here raises inside the live audio path.
+    _peak_win: deque = deque(maxlen=50)
+    last_from_final = False
 
     """Per-stream wake-word matcher built on a FREE (unconstrained) decoder.
 
@@ -232,6 +311,10 @@ class VoskWakeMatcher:
         # lifetime counters, intentionally NOT cleared by reset()
         self.triggers = 0
         self.decodes = 0
+        self._peak_win = deque(maxlen=50)
+        # Parallel segment tags for the peak window: a FINAL must be judged on
+        # the audio of ITS segment, not on a loud burst from up to 8 s earlier.
+        self._peak_seg = deque(maxlen=50)
         self.reset()
 
     def reset(self):
@@ -246,11 +329,23 @@ class VoskWakeMatcher:
         self._fired = False
         self._segment_fired = False
         self._wake_hits = 0
+        # Fresh loud chunks fed AFTER the last fire + debounce. The evidence
+        # that a late FINAL is a NEW word rather than the old word's tail.
+        self._fresh_after_fire = 0
         self._fed = 0
         self._t0 = 0.0
         self.last_text = ""
         self.last_trigger_text = ""
         self.last_partial = ""
+        self._peak_win.clear()
+        # Hand-built sessions (VoskWakeMatcher.__new__ in the tests) have no
+        # instance deques yet — the same trap as other new attributes here.
+        if getattr(self, "_peak_seg", None) is None:
+            self._peak_seg = deque(maxlen=50)
+        self._peak_seg.clear()
+        self._seg = 0
+        self._final_seg = None
+        self.last_from_final = False
 
     def begin(self):
         """(Re)start the recogniser for a fresh window.
@@ -266,6 +361,8 @@ class VoskWakeMatcher:
         self._fired = False
         self._segment_fired = False
         self._wake_hits = 0
+        self._fresh_after_fire = 0
+        self._last_fire_wall = 0.0
         self._fed = 0
         self._t0 = time.time()
         # A lifetime counter like `triggers`, deliberately NOT cleared by reset().
@@ -273,6 +370,48 @@ class VoskWakeMatcher:
         # file: the room ignores a person and every counter reads clean.
         self.near_misses = 0
         self.last_near_miss = ""
+        self._peak_win.clear()
+        # Hand-built sessions (VoskWakeMatcher.__new__ in the tests) have no
+        # instance deques yet — the same trap as other new attributes here.
+        if getattr(self, "_peak_seg", None) is None:
+            self._peak_seg = deque(maxlen=50)
+        self._peak_seg.clear()
+        self._seg = 0
+        self._final_seg = None
+        self.last_from_final = False
+
+    def _segment_peaks(self) -> list:
+        """Peaks belonging to the segment that produced the last FINAL.
+
+        A hand-built test session may set only `_peak_win` (the older shape);
+        with no segment tags, fall back to the whole window rather than dying
+        inside the live audio path.
+        """
+        segs = getattr(self, "_peak_seg", None)
+        final_seg = getattr(self, "_final_seg", None)
+        if not segs or len(segs) != len(self._peak_win) or final_seg is None:
+            return list(self._peak_win)
+        return [p for p, s in zip(self._peak_win, segs) if s == final_seg]
+
+    def wake_evidence_peak(self) -> int:
+        """Peak of the audio that produced a FINAL-segment wake, else 0.
+
+        A PARTIAL hypothesis is still growing, so its trailing window is the
+        only honest evidence. A FINAL segment is a closed utterance: the word
+        may have been spoken seconds before the segment arrived, and that is
+        exactly when the camera's 1.9 s window has gone quiet (measured
+        22.11.2026, «добби включи свет» finalised 1.92 s after a 22 887 peak).
+        """
+        if not self.last_from_final:
+            return 0
+        peaks = self._segment_peaks()
+        return int(max(peaks)) if peaks else 0
+
+    def wake_evidence_loud(self, bar: int) -> int:
+        """How many chunks OF THE FINAL'S SEGMENT reached `bar` — the click guard."""
+        if not self.last_from_final:
+            return 0
+        return sum(1 for p in self._segment_peaks() if p >= bar)
 
     @property
     def active(self) -> bool:
@@ -288,6 +427,19 @@ class VoskWakeMatcher:
             return False
 
         self._fed += len(pcm)
+        # Keep the segment's own energy. The camera gate used to judge a FINAL
+        # wake on its trailing 1.9 s window, which is quiet by the time a short
+        # word is finalised — a real «добби» was refused as "silence".
+        peak = max((abs(v) for v in array("h", pcm)), default=0)
+        self._peak_win.append(peak)
+        self._peak_seg.append(self._seg)
+        # Evidence that a LATE final belongs to a NEW word, not to the tail of
+        # the one that already fired: loud audio that arrived after the
+        # same-breath debounce. A word finalised late has all its loud chunks
+        # BEFORE the fire, so this stays 0 and the final cannot re-arm.
+        if (self._last_fire_wall and peak >= _WAKE_REARM_PEAK
+                and time.time() - self._last_fire_wall > _WAKE_REARM_S):
+            self._fresh_after_fire += 1
         # Bound the context by AUDIO RECEIVED, not by wall clock. With a wall
         # clock bound and a sparse feed the recogniser was thrown away every
         # 3 seconds having consumed almost nothing, so its hypothesis never
@@ -308,19 +460,52 @@ class VoskWakeMatcher:
         # — which is what the live room showed (triggers=0, hyp='') with loud
         # speech present, while every offline probe that fed each chunk once
         # passed.
+        tokens = WAKE_TOKENS | self.alt_tokens
         if self._rec.AcceptWaveform(pcm):
+            self.last_from_final = True
             text = json.loads(self._rec.Result()).get("text", "")
+            # This FINAL closes the current segment. Record its index BEFORE
+            # advancing: the chunk just appended (and the ~2 s of pre-final
+            # audio that produced the word) belong to it, while anything fed
+            # from now on belongs to the next segment and must not lend its
+            # peaks to this final's click guard.
+            self._final_seg = self._seg
+            self._seg += 1
             # A closed recogniser segment is an utterance boundary: after it a
             # different address word is a NEW wake, not the tail of the last one.
             self._segment_fired = False
+            # Measured 24.11.2026 16:10: `blocked=30` — an address word in the
+            # final segment was silently discarded because the OLD hypothesis
+            # still held the same token. Re-arm after the same-breath debounce,
+            # so a later attempt can fire while the word's tail still cannot.
+            if (
+                self._last_fire_wall
+                and time.time() - self._last_fire_wall > _WAKE_REARM_S
+                and transcript_has_wake(text, tokens)
+            ):
+                # The final's own text still holds the word. Zeroing the count
+                # unconditionally made `hits(1) > _wake_hits(0)` fire a SECOND
+                # time for one spoken word; camera._fire_wake() then wiped the
+                # command being collected. Re-arm only on real evidence of a
+                # NEW word: more occurrences than the word that fired, or fresh
+                # loud audio after the debounce (`blocked=30` repeat).
+                if (wake_occurrences(text, tokens) > self._wake_hits
+                        or self._fresh_after_fire):
+                    self._wake_hits = 0
+                    _log.info("vosk: wake re-armed on a new final segment")
+                else:
+                    _log.info(
+                        "vosk: late final of the same word — not a new wake"
+                    )
         else:
+            self.last_from_final = False
             text = json.loads(self._rec.PartialResult()).get("partial", "")
         # kept for the periodic diagnostic in camera_client: when the live room
         # stays silent while every probe passes, the decoder's own hypothesis is
         # the only evidence of what it actually hears
         self.last_partial = text
-        tokens = WAKE_TOKENS | self.alt_tokens
-        if not transcript_has_wake(text, tokens):
+        has_wake = transcript_has_wake(text, tokens)
+        if not has_wake:
             near = wake_near_miss(text, tokens)
             if near:
                 # A near miss means the model still heard the wake word but in
@@ -364,18 +549,23 @@ class VoskWakeMatcher:
         #
         # So the rule is the OCCURRENCE COUNT, and the recogniser is NOT reset
         # after a fire: resetting it is what made the same word fire again.
+        kind = wake_kind_in(text, self.alt_tokens, self.alt_word) or "computer"
         hits = wake_occurrences(text, tokens)
         if hits <= self._wake_hits:
+            self.blocked_same += 1
             return False
-        kind = wake_kind_in(text, self.alt_tokens, self.alt_word) or "computer"
         if kind != self.last_kind and self._segment_fired:
             # The decoder's hypothesis grows: a different word appended to the
             # segment where we just fired is the same breath's tail. Firing again
             # would call _fire_wake twice and clear the command being collected.
             return False
         self._wake_hits = hits
+        # This fire is now the reference; fresh audio before it must not count
+        # as evidence for a later re-arm.
+        self._fresh_after_fire = 0
         self.last_kind = kind
         self._segment_fired = True
+        self._last_fire_wall = time.time()
 
         self.triggers += 1
         self.last_trigger_text = text

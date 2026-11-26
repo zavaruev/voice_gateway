@@ -143,6 +143,12 @@ SINGLE_WORD_HALLUCINATIONS = {
 SHORT_ECHO_PATTERNS = re.compile(
     r"^(а|аа|ааа|и|ии|у|уу|э|о|гм|хм|ага|аха)\s*(?:-\s*)?$"
 )
+# «у-у», «а-а», «м-м-м» are Whisper's output on near-silence. Each fragment is
+# one letter, so the generic <=2-char rule does not catch the whole utterance.
+# Measured 23.11.2026 18:59 in the living room: raw rms 667 against a ~300 room
+# floor, accepted as a command, escalated to L2, and an OLD answer from qdrant
+# was acted on. Refuse the whole class instead of adding one spelling at a time.
+_REPEATED_SYLLABLE_RE = re.compile(r"^[а-яёa-z](?:\s*[-–]\s*[а-яёa-z]){1,5}$")
 
 
 def is_valid_text(txt: str) -> bool:
@@ -190,6 +196,10 @@ def is_valid_text(txt: str) -> bool:
     # Reject TTS echo feedback ("а а", "ага", "аха")
     if SHORT_ECHO_PATTERNS.search(clean):
         return False
+    if _REPEATED_SYLLABLE_RE.fullmatch(clean):
+        parts = re.findall(r"[а-яёa-z]", clean)
+        if len(set(parts)) == 1:
+            return False
 
     # Reject repeated single words (e.g. "а а а а а", "да да да")
     if len(words) >= 3:

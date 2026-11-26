@@ -12,6 +12,18 @@ import backends
 from backends import CascadeBackend
 
 
+def test_dobbi_persona_restyles_only_the_gateway_spoken_lines():
+    """Complex-turn acknowledgement and the apology are gateway-written, so the
+    house-elf's own turns belong there; router replies keep their own persona."""
+    b = CascadeBackend("http://router:8091")
+    assert b._ack_for("") == CascadeBackend.ACK_COMPLEX
+    assert b._sorry_for("") == CascadeBackend.SORRY
+    assert b._ack_for("dobbi", "сэр") == "Домовой слушает, сэр. Секунду."
+    assert b._ack_for("dobbi", "мэм") == "Домовой слушает, мэм. Секунду."
+    assert b._sorry_for("dobbi", "мэм") == "Домовой оплошал, мэм. Повторите, пожалуйста."
+    assert b._sorry_for("dobbi", "") == "Домовой оплошал. Повторите, пожалуйста."
+
+
 def _ev(obj: dict) -> bytes:
     return b"data: " + json.dumps(obj, ensure_ascii=False).encode() + b"\n"
 

@@ -160,7 +160,7 @@ HINT_TEXT_TOO_LONG = (
 HINT_DOWNLOAD_FAILED = "Не удалось скачать голосовое. Отправьте ещё раз."
 
 GREETING = (
-    "Привет! Я — голосовой ассистент дома.\n"
+    "Домовой на связи! Я — Добби, домовой эльф этого дома.\n"
     "Можно прислать голосовое (распознаю и отвечу) или написать текстом.\n"
     "\n"
     "Команды:\n"
@@ -642,6 +642,7 @@ class TelegramBot:
         transcribe,
         tts_mp3,
         make_session_id,
+        honorific_for_chat=None,
         reply_voice: bool = True,
         allow_groups: bool = False,
         max_voice_s: int = 60,
@@ -663,6 +664,7 @@ class TelegramBot:
         self._transcribe = transcribe          # (ogg_bytes, session) -> str
         self._tts_mp3 = tts_mp3                # (text, session) -> mp3 | None
         self._make_session_id = make_session_id  # chat_id -> stable session id
+        self._honorific_for_chat = honorific_for_chat or (lambda _chat: "")
         self.reply_voice = reply_voice
         self.allow_groups = allow_groups
         self.max_voice_s = max_voice_s
@@ -1100,6 +1102,8 @@ class TelegramBot:
                 stream_name=self._stream_name(chat_id),
                 response_queue=queue,
                 room=self.chat_room(chat_id),
+                persona="dobbi",
+                honorific=self._honorific_for_chat(chat_id),
             )
         )
         parts: list[str] = []
@@ -1393,6 +1397,7 @@ def build_telegram_bot(
     transcribe,
     tts_mp3,
     make_session_id,
+    honorific_for_chat=None,
     reply_voice: bool = True,
     allow_groups: bool = False,
     max_voice_s: int = 60,
@@ -1419,6 +1424,7 @@ def build_telegram_bot(
         transcribe=transcribe,
         tts_mp3=tts_mp3,
         make_session_id=make_session_id,
+        honorific_for_chat=honorific_for_chat,
         reply_voice=reply_voice,
         allow_groups=allow_groups,
         max_voice_s=max_voice_s,

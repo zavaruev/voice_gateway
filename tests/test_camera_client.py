@@ -1247,6 +1247,33 @@ def test_a_single_explicit_phrase_still_works():
 
 
 @pytest.mark.asyncio
+async def test_configured_wake_ack_phrases_survive_a_fire():
+    """_fire_wake replaced the pool built in __init__ with the built-in defaults,
+    so CAMERA_WAKE_ACK_PHRASES[...] was silently discarded at the only moment
+    an acknowledgement is ever spoken."""
+    s = CameraSession(config=CameraConfig(
+        stream_name="x", wake_ack_phrases="раз|два|три"))
+    assert set(s._wake_ack_pool) == {"раз", "два", "три"}
+    with patch.object(s, "_play_attention"), patch.object(s, "_arm_wake_ack"), \
+            patch.object(camera_client, "_arbiter_set_owner"):
+        await s._fire_wake("vosk", kind="dobbi")
+    assert set(s._wake_ack_pool) == {"раз", "два", "три"}
+    assert {s._next_wake_ack_phrase() for _ in range(3)} == {"раз", "два", "три"}
+
+
+@pytest.mark.asyncio
+async def test_configured_single_phrase_survives_a_computer_fire():
+    """The old override (wake_ack_phrase) must survive a «компьютер» fire too."""
+    s = CameraSession(config=CameraConfig(
+        stream_name="x", wake_ack_phrase="Мой особый ответ."))
+    assert s._next_wake_ack_phrase() == "Мой особый ответ."
+    with patch.object(s, "_play_attention"), patch.object(s, "_arm_wake_ack"), \
+            patch.object(camera_client, "_arbiter_set_owner"):
+        await s._fire_wake("vosk", kind="computer")
+    assert s._next_wake_ack_phrase() == "Мой особый ответ."
+
+
+@pytest.mark.asyncio
 async def test_old_wake_command_goes_to_nanobot():
     s = _make_session()
     s._wake_detected = True
@@ -1828,6 +1855,28 @@ def test_a_wake_is_muted_only_while_our_own_audio_is_in_the_air():
     assert "echo_tail" in s._wake_gate_reason(1002.9)
 
 
+def test_a_command_word_gets_through_the_echo_tail_but_our_ack_does_not():
+    """25.11.2026 10:20:28: «добби выключи свет» was decoded loud (peak 32457)
+    and refused with `echo_tail=+0.3s` — 0.3 s before the blind tail expired,
+    2.6 s after the previous 1 s reply ended. Our own speech in this system is
+    «Добби слушает!» (an ack) or «Включаю.» (a reply), never a COMMAND verb;
+    a hypothesis carrying one is the user, not an echo."""
+    s = _gate_session()
+    s._wake_suppress_until = 1003.0
+    now = 1002.7
+    # No text (the old callers) and our own ack still blocked.
+    assert s._wake_gate_open(now) is False
+    assert s._wake_gate_open(now, text="добби слушает") is False
+    assert s._wake_gate_open(now, text="Включаю") is False
+    # A real command inside the tail is let through.
+    for heard in ("добби выключи свет", "добрый включи свет",
+                  "компьютер выключи свет", "да выключи свет"):
+        assert s._wake_gate_open(now, text=heard) is True, heard
+    # The same-breath guard still applies regardless of the text.
+    s._last_wake_fired_at = now - 0.2
+    assert s._wake_gate_open(now, text="добби выключи свет") is False
+
+
 def test_the_same_breath_cannot_fire_twice():
     """A second `_fire_wake()` clears `_vad_speech_buf` and destroys the command
     being collected.
@@ -2073,7 +2122,7 @@ async def test_ambient_utterances_do_not_pollute_the_awake_tally():
     s = _cycle_session()
     sent = []
 
-    async def _fake_process(_buf):
+    async def _fake_process(_buf, env=None):
         sent.append(_buf)
 
     s._process_utterance = _fake_process
@@ -2918,6 +2967,51 @@ async def test_streaming_commit_ends_only_on_a_stable_loud_prefix(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_streaming_commit_never_cuts_a_question(monkeypatch):
+    """25.11.2026 replay: LocalAgreement commits «добби какая» at 2.4 s for a
+    weather question. Dispatched as a forced prefix, Whisper's «какая» alone
+    escalates to complex_logic for 25 s and asks a clarification. A 2-word
+    prefix is evidence of a COMMAND only when it contains a command verb."""
+    s = _make_http_session()
+
+    class _FakeST:
+        windows = 5
+        last_latency_s = 0.4
+
+        def __init__(self, committed):
+            self.committed = committed
+
+        async def feed(self, pcm, rms, now):
+            return False
+
+        def reset(self):
+            pass
+
+    for text in ("добби какая", "компьютер сколько"):
+        s._stream_st = _FakeST(text)
+        s._stream_task = None
+        s._stream_min_words = 2
+        s._stream_stable_s = 0.3
+        s._stream_stable_since = time.time() - 2.0
+        s._wake_detected = True
+        s._processing_utterance = False
+        s._tts_playing_until = 0.0
+        ended = []
+        monkeypatch.setattr(s, "_end_utterance", lambda reason: ended.append(reason))
+        await s._stream_maybe_feed(b"\x01\x02" * 100, 4000.0, loud=True)
+        assert ended == [], f"a question must not be cut early: {text!r}"
+        assert s._stream_forced_text == ""
+
+    # A real command with the same 2-word prefix still commits.
+    s._stream_st = _FakeST("добби включи")
+    ended = []
+    monkeypatch.setattr(s, "_end_utterance", lambda reason: ended.append(reason))
+    await s._stream_maybe_feed(b"\x01\x02" * 100, 4000.0, loud=True)
+    assert len(ended) == 1 and "streaming" in ended[0]
+    assert s._stream_forced_text == "добби включи"
+
+
+@pytest.mark.asyncio
 async def test_forced_streaming_prefix_skips_the_full_buffer_whisper_call(monkeypatch):
     """The whole latency win depends on this: a committed prefix must be used
     instead of re-transcribing the full buffer. If the field is added but not
@@ -3174,6 +3268,49 @@ def test_speech_later_in_the_buffer_is_a_real_command():
     s._noise.mult = 2.5
     env = [0.06, 0.05] + [0.011] * 12 + [0.07] * 5 + [0.011] * 10
     assert s._wake_tail_only_envelope(env) is False
+
+
+@pytest.mark.asyncio
+async def test_a_later_ambient_end_cannot_overwrite_the_wake_envelope():
+    """Two utterances: the wake command is inside Whisper when a TV-only
+    ambient buffer ends and writes `_last_utt_env`. The wake-tail guard must
+    judge the buffer that produced THIS transcript, not the mutable field."""
+    s = _make_session()
+    s._noise.value = 0.010
+    s._noise.mult = 2.5
+    s._wake_detected = True
+    s._awaiting_command = True
+    s._followup_only = False
+    s._wake_only_pending = False
+    s._last_wake_fired_at = time.time() - 1.0
+    s._last_utt_peak = 30000
+    s._last_utt_dur = 7.0
+    s._last_utt_end_ts = time.time()
+    # The wake utterance: speech LATE in the buffer = a real command.
+    wake_env = [0.06, 0.05] + [0.011] * 12 + [0.07] * 5 + [0.011] * 10
+    # The ambient utterance ending while Whisper runs: wake-tail shape only.
+    ambient_env = [0.06, 0.05, 0.04] + [0.011] * 40
+    assert s._wake_tail_only_envelope(wake_env) is False
+    assert s._wake_tail_only_envelope(ambient_env) is True
+
+    dispatched = []
+
+    def fake_preprocess(buf):
+        return buf, buf, 7.0, {"rms_raw": 5000}
+
+    async def fake_stt(processed, raw, duration, stats, forced_text=None):
+        # The ambient utterance ends while this one is in flight.
+        s._last_utt_env = ambient_env
+        return "включи свет"
+
+    async def fake_nano(cmd, uid="camera"):
+        dispatched.append(cmd)
+
+    s._preprocess_audio = fake_preprocess
+    s._process_stt = fake_stt
+    s._call_nanobot = fake_nano
+    await s._process_utterance(b"\x00" * 32000, env=wake_env)
+    assert dispatched == ["включи свет"]
 
 
 def test_a_device_noun_is_never_mistaken_for_the_wake_word():
@@ -4643,3 +4780,127 @@ def test_filter_sdp_empty():
 def test_echo_of_reply():
     # Exact match
     assert _echo_of_reply("hello world", "hello world") is True
+
+
+# --- the wake window must outlive an in-flight STT call ---------------------
+# Measured 25.11.2026 21:26 on the living room: «добрый» woke at 21:26:31,
+# Whisper finished «Добби включи свет.» at 21:27:07 (29.1 s) against a
+# 15 s wake window. `_feed_audio` closed the window on its timer while
+# `_process_utterance` was still awaiting Whisper, and the transcript was
+# discarded at `_handle_wake_or_command` with wake_detected=False — no
+# command, no reply, no light. A 48 kHz chunk shorter than one 160 ms block
+# stops `_feed_audio` immediately after the expiry check, so the real method
+# can be exercised without stubbing anything downstream of that check.
+
+
+def _expiry_session(processing: bool):
+    s = CameraSession.__new__(CameraSession)
+    s.stream_name = "cam"
+    s._speaking_until = 0.0
+    s._out_track = None
+    s._wake_detected = True
+    s._wake_expires = time.time() - 1.0
+    s._processing_utterance = processing
+    s._resample_buf = bytearray()
+    # The REAL _back_to_wake() runs; give it the fields it reads so a missing
+    # test-session attribute cannot be mistaken for a playback fault.
+    s._vosk_wake = None
+    s._wake_kind = "dobbi"
+    s._followup_only = False
+    s._followup_is_question = False
+    s._stream_task = None
+    s._stream_st = None
+    s._stream_stable_since = 0.0
+    s._stream_forced_text = ""
+    s._followup_chain = 0
+    s._awaiting_command = True
+    return s
+
+
+@pytest.mark.asyncio
+async def test_the_wake_window_survives_an_inflight_transcription():
+    s = _expiry_session(processing=True)
+    await s._feed_audio(b"\x00" * 100, rate=48000)
+    assert s._wake_detected is True, "the window closed while STT was still running"
+
+
+@pytest.mark.asyncio
+async def test_the_wake_window_still_expires_when_no_transcription_is_inflight():
+    s = _expiry_session(processing=False)
+    await s._feed_audio(b"\x00" * 100, rate=48000)
+    assert s._wake_detected is False, "a stale window must still close"
+
+
+# --- the energy gate must read the audio that produced a FINAL segment ----
+# 25.11.2026 22:23 living room: the decoder finalised «добби включи свет» with
+# window=1751/12 loud=0/2 while the loud 22 887 speech had been 1.92 s earlier.
+# The gate refused a real wake. The matcher now keeps the segment's own peaks;
+# the decision must use them instead of the quiet trailing window.
+
+
+def _energy_gate_session(short_peak, short_loud, final_peak, final_loud):
+    s = CameraSession.__new__(CameraSession)
+    s.stream_name = "livingroom"
+    s._wake_min_peak = 3000
+    # A CLICK is ONE loud chunk, not twelve: all twelve loud would be a
+    # sustained voice and the click guard would rightly pass it.
+    s._vosk_peak_win = [short_peak] * short_loud + [300] * (12 - short_loud)
+    s._wake_loud_bar_override = 2
+    s._vosk_wake = type("M", (), {
+        "last_kind": "dobbi",
+        "last_from_final": True,
+        "wake_evidence_peak": lambda self: final_peak,
+        "wake_evidence_loud": lambda self, bar: final_loud,
+    })()
+    return s
+
+
+def test_a_late_finalised_wake_is_not_refused_as_silence():
+    s = _energy_gate_session(1751, 0, 22887, 6)
+    gate = getattr(s, "_wake_energy_gate", None)
+    assert gate is not None, "the energy gate is not callable from the decision path"
+    ok, peak, loud = gate()
+    assert ok is True, f"a real Dobbi wake was refused: peak={peak} loud={loud}"
+    assert peak == 22887 and loud == 6, (peak, loud)
+
+
+def test_a_click_still_fails_the_sustained_energy_bar():
+    s = _energy_gate_session(32767, 1, 32767, 1)
+    ok, peak, loud = s._wake_energy_gate()
+    assert ok is False, f"a one-chunk click passed the wake gate: peak={peak} loud={loud}"
+
+
+def test_a_partial_hypothesis_keeps_the_short_window_decision():
+    s = _energy_gate_session(1751, 0, 0, 0)
+    s._vosk_wake.last_from_final = False
+    ok, peak, loud = s._wake_energy_gate()
+    assert ok is False, f"quiet partial audio passed the gate: peak={peak} loud={loud}"
+
+
+# --- Домовой address strip (26.11.2026) ------------------------------------
+
+def test_domovoy_is_stripped_but_an_ordinary_word_is_not():
+    s = _make_session()
+    s.wake_keyword = "компьютер"
+    s._wake_tokens = frozenset({"компьютер", "комп", "домовой"})
+    s._wake_kind = "dobbi"
+    assert s._strip_wake_words("Домовой, включи свет") == "включи свет"
+    assert s._strip_wake_words("Домовой Домовой") == ""
+    assert s._strip_wake_words("Добрый включи свет") == "Добрый включи свет"
+
+
+def test_whisper_spellings_of_domovoy_are_stripped_on_a_dobbi_turn_only():
+    """26.11.2026 live: Whisper wrote «Думовой включи свет» and «дымовой
+    выключит свет» for spoken «Домовой …». Those spellings reached the router.
+    They are rare enough to strip, but only on an alternate-address turn —
+    never on a computer turn, where they would corrupt an unrelated sentence."""
+    s = _make_session()
+    s.wake_keyword = "компьютер"
+    s._wake_tokens = frozenset({"компьютер", "комп", "домовой"})
+    s._wake_kind = "dobbi"
+    for text, want in (("Думовой включи свет", "включи свет"),
+                       ("дымовой выключи свет", "выключи свет"),
+                       ("Думовой, Думовой", "")):
+        assert s._strip_wake_words(text) == want, text
+    s._wake_kind = "computer"
+    assert s._strip_wake_words("Думовой включи свет") == "Думовой включи свет"

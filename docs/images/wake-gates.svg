@@ -8,7 +8,7 @@
   <rect x="0" y="0" width="1020" height="620" rx="10" fill="#0d1117"/>
 
   <text x="30" y="38" fill="#e6edf3" font-size="17" font-weight="700">The wake gate cascade — why a robot vacuum or a TV ad does not reach the LLM</text>
-  <text x="30" y="58" fill="#8b949e" font-size="12.5">Every 80 ms chunk must survive all eight. The address word decides the confirmation: «компьютер» → pip, «добби» → spoken ack.</text>
+  <text x="30" y="58" fill="#8b949e" font-size="12.5">Every 80 ms chunk must survive all eight. The address word decides the confirmation: «компьютер» → pip, «домовой» → spoken ack.</text>
 
   <!-- input -->
   <rect x="60" y="72" width="640" height="34" rx="6" fill="#161b22" stroke="#58a6ff"/>
@@ -97,7 +97,7 @@
     <text x="748" y="410" fill="#8b949e" font-size="12">· proximity steal: the room 5×</text>
     <text x="748" y="428" fill="#8b949e" font-size="12">  louder takes over the wake</text>
     <text x="748" y="450" fill="#8b949e" font-size="12">· one decoder, two addresses:</text>
-    <text x="748" y="468" fill="#8b949e" font-size="12">  «компьютер» → pip, «добби» → ack</text>
+    <text x="748" y="468" fill="#8b949e" font-size="12">  «компьютер» → pip, «домовой» → ack</text>
     <text x="748" y="486" fill="#8b949e" font-size="12">· wake by DECODING (vosk): 5/5 live,</text>
     <text x="748" y="504" fill="#8b949e" font-size="12">  0 false on 7 min TV</text>
     <text x="748" y="522" fill="#8b949e" font-size="12">· all bands pinned by tests</text>

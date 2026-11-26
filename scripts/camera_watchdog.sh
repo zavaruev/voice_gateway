@@ -166,6 +166,37 @@ if ! flock -n 9 2>/dev/null; then
   exit 0
 fi
 
+# Dashboard Apply owns a clone-recreate of voice_gateway and the go2rtc stream
+# registry. Starting our own ladder in that window races it for the same stream
+# (last writer wins, and the loser can leave a self-referential producer).
+DASH_LOCK="${DASH_LOCK:-/mnt/media/docker-compose/opencode/dashboard_apply.lock}"
+# The dashboard reclaims a stale lock only when a NEW Apply starts
+# (dashboard/apply.py::RealOps.lock: pid + timestamp, stale when the pid is
+# dead or older than an hour). A bare `-e` test froze this watchdog forever
+# after a killed Apply: every cron pass said "Apply in progress" and left, so
+# dead-stream/audio-starved rooms never healed. Mirror the dashboard's own
+# staleness rule and NEVER write or delete the lock — it is theirs, not ours.
+DASH_LOCK_STALE_S="${DASH_LOCK_STALE_S:-3600}"
+dash_apply_active() {
+  [ -e "$DASH_LOCK" ] || return 1
+  local pid ts ts_int now age
+  read -r pid ts <"$DASH_LOCK" 2>/dev/null || return 1
+  case "$pid" in ''|*[!0-9]*) return 1;; esac
+  ts_int="${ts%%.*}"
+  case "$ts_int" in ''|*[!0-9]*) return 1;; esac
+  [ "$pid" -gt 0 ] 2>/dev/null || return 1
+  now="$(date +%s 2>/dev/null)" || return 1
+  case "$now" in ''|*[!0-9]*) return 1;; esac
+  age=$(( now - ts_int ))
+  [ "$age" -ge "$DASH_LOCK_STALE_S" ] && return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  return 0
+}
+if dash_apply_active; then
+  log "dashboard Apply in progress — leaving the container and streams to it"
+  exit 0
+fi
+
 act() {
   if [ "$DRY_RUN" = "1" ]; then
     log "  [dry-run] would: $*"
@@ -818,6 +849,36 @@ run_self_test() {
     fails=$((fails+1))
   fi
 
+  # --- the dashboard Apply lock -----------------------------------------------
+  # A lock left by a killed Apply (OOM/restart) must not freeze the watchdog:
+  # the dashboard only reclaims it when a NEW Apply starts. Mirror the dashboard
+  # rule — a live pid AND an age under an hour — and never touch the real lock.
+  local dash_lock="$tmp/dashboard_apply.lock"; DASH_LOCK="$dash_lock"
+  FAKE_NOW=20000
+  printf '%s %s\n' "$$" "$FAKE_NOW" >"$dash_lock"
+  if ! dash_apply_active; then
+    echo "  FAIL: a fresh lock with a live pid must be active"; fails=$((fails+1))
+  fi
+  # The dashboard writes `pid time.time()` — the fractional seconds must not
+  # break the arithmetic.
+  printf '%s %s\n' "$$" "$FAKE_NOW.5" >"$dash_lock"
+  if ! dash_apply_active; then
+    echo "  FAIL: a well-formed fresh lock with fractional seconds must be active"
+    fails=$((fails+1))
+  fi
+  printf '%s %s\n' 999999 "$FAKE_NOW" >"$dash_lock"
+  if dash_apply_active; then
+    echo "  FAIL: a lock with a dead pid must be ignored"; fails=$((fails+1))
+  fi
+  printf '%s %s\n' "$$" "$((FAKE_NOW - 4000))" >"$dash_lock"
+  if dash_apply_active; then
+    echo "  FAIL: a lock older than an hour must be ignored"; fails=$((fails+1))
+  fi
+  printf 'garbage\n' >"$dash_lock"
+  if dash_apply_active; then
+    echo "  FAIL: a malformed lock must be ignored"; fails=$((fails+1))
+  fi
+  rm -f "$dash_lock" 2>/dev/null || true
 
   rm -rf "$tmp" 2>/dev/null || true
   if [ "$fails" -eq 0 ]; then

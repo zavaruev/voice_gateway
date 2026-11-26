@@ -64,7 +64,8 @@ class BaseLLMBackend(ABC):
 
     @abstractmethod
     async def generate_response(self, text: str, session_id: str, stream_name: str,
-                                response_queue: asyncio.Queue, room: str = ""):
+                                response_queue: asyncio.Queue, room: str = "", persona: str = "",
+                                honorific: str = ""):
         """
         Generates a response for the given text and pushes sentences into response_queue.
         Should put None into response_queue when finished.
@@ -90,7 +91,8 @@ class NanobotBackend(BaseLLMBackend):
         self.salt = salt
 
     async def generate_response(self, text: str, session_id: str, stream_name: str,
-                                response_queue: asyncio.Queue, room: str = ""):
+                                response_queue: asyncio.Queue, room: str = "", persona: str = "",
+                                honorific: str = ""):
         """Connect, send the utterance as one message event, then stream
         reply sentences into `response_queue`.
 
@@ -325,7 +327,8 @@ class HermesBackend(BaseLLMBackend):
         return re.sub(r"\s+", " ", s).strip()
 
     async def generate_response(self, text: str, session_id: str, stream_name: str,
-                                response_queue: asyncio.Queue, room: str = ""):
+                                response_queue: asyncio.Queue, room: str = "", persona: str = "",
+                                honorific: str = ""):
         """POST the utterance, parse the SSE delta stream, push sentences.
 
         Buffering rules: [thinking] blocks and unclosed tags are held back,
@@ -514,6 +517,31 @@ class CascadeBackend(BaseLLMBackend):
     ACK_COMPLEX = "Секунду, занимаюсь…"
     ACK_THINK = "Секунду, думаю…"
     SORRY = "Простите, что-то пошло не так."
+    # Добби's own turns (домовой эльф из «Гарри Поттера»). He speaks of himself
+    # in the third person and says «домовой» instead of repeating his name —
+    # the wake decoder must not hear its own address in every short reply.
+    # The honorific comes from the speaker: сэр / мэм / "" when unidentified.
+    DOBBI_ACK = "Домовой слушает{h}. Секунду."
+    DOBBI_SORRY = "Домовой оплошал{h}. Повторите, пожалуйста."
+
+    @staticmethod
+    def _h(honorific: str) -> str:
+        return f", {honorific}" if honorific else ""
+
+    def _ack_for(self, persona: str, honorific: str = "") -> str:
+        if persona == "dobbi":
+            return self.DOBBI_ACK.format(h=self._h(honorific))
+        return self.ACK_COMPLEX
+
+    def _think_for(self, persona: str, honorific: str = "") -> str:
+        if persona == "dobbi":
+            return self.DOBBI_ACK.format(h=self._h(honorific))
+        return self.ACK_THINK
+
+    def _sorry_for(self, persona: str, honorific: str = "") -> str:
+        if persona == "dobbi":
+            return self.DOBBI_SORRY.format(h=self._h(honorific))
+        return self.SORRY
 
     def __init__(self, router_url: str, ack_delay: float = 3.0,
                  total_timeout: float = 200.0, sock_read_timeout: float = 60.0):
@@ -526,7 +554,8 @@ class CascadeBackend(BaseLLMBackend):
         self.sock_read_timeout = sock_read_timeout
 
     async def generate_response(self, text: str, session_id: str, stream_name: str,
-                                response_queue: asyncio.Queue, room: str = ""):
+                                response_queue: asyncio.Queue, room: str = "", persona: str = "",
+                                honorific: str = ""):
         """POST /route to jev-router and translate its SSE event stream
         into queue sentences.
 
@@ -584,6 +613,14 @@ class CascadeBackend(BaseLLMBackend):
                 # empty so the router's default behaviour is untouched for
                 # devices and cameras.
                 payload["room"] = room
+            if persona:
+                # Per-address persona. The chat proxy reads it and the router's
+                # route_ep restyles deterministic SENTENCES (never actions).
+                payload["persona"] = persona
+            if honorific:
+                # сэр for alexander, мэм for marina/vladislava. An unidentified
+                # speaker sends "" — Добби drops the address rather than guessing.
+                payload["honorific"] = honorific
             # total=200 s covers a full L2 turn (worker WORKER_TIMEOUT 120 s
             # plus L1 routing and stream overhead); sock_read=60 s treats a
             # dead socket as an error instead of hanging the turn.
@@ -623,10 +660,10 @@ class CascadeBackend(BaseLLMBackend):
                                 if ack_task is not None:
                                     ack_task.cancel()
                                     ack_task = None
-                                put_ack(self.ACK_COMPLEX)
+                                put_ack(self._ack_for(persona, honorific))
                             elif not ack_sent and not spoken and ack_task is None:
                                 ack_task = asyncio.create_task(
-                                    ack_later(self.ACK_THINK)
+                                    ack_later(self._think_for(persona, honorific))
                                 )
                         elif etype == "sentence":
                             if ack_task is not None:
@@ -647,7 +684,7 @@ class CascadeBackend(BaseLLMBackend):
                             # ack alone is not content: after it the watchdog is
                             # already cancelled, so silence here would be final.
                             if not content:
-                                put(self.SORRY)
+                                put(self._sorry_for(persona, honorific))
                         elif etype == "done":
                             logger.info(
                                 f"⏱ [Cascade] done route={ev.get('route')} "
@@ -657,7 +694,7 @@ class CascadeBackend(BaseLLMBackend):
         except Exception as e:
             logger.error(f"Cascade error: {e}")
             if not content:
-                put(self.SORRY)
+                put(self._sorry_for(persona, honorific))
         finally:
             if ack_task is not None:
                 ack_task.cancel()
@@ -666,5 +703,5 @@ class CascadeBackend(BaseLLMBackend):
                 # count): never leave the caller in silence (watchdog would
                 # apologize 90 s later; and after 8 heartbeats the user has
                 # already been promised an answer — the apology must come).
-                response_queue.put_nowait(self.SORRY)
+                response_queue.put_nowait(self._sorry_for(persona, honorific))
             response_queue.put_nowait(None)

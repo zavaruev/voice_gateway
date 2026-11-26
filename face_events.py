@@ -35,6 +35,7 @@ import time
 import aiohttp
 
 import face_greeting
+import identity_client
 import face_review
 import frigate_events
 import voice_mcp
@@ -63,6 +64,11 @@ COOLDOWN_SECONDS = int(os.getenv("FACE_COOLDOWN", "30"))
 INITIAL_EVENTS_MAX_AGE = int(os.getenv("FACE_INITIAL_EVENTS_MAX_AGE", "120"))
 CONTINUAL_ENROLLMENT_THRESHOLD = float(
     os.getenv("FACE_CONTINUAL_ENROLLMENT_THRESHOLD", "0.6"))
+# Keep the identity gallery at the best 24 frames. Off in code; enabled in
+# compose only after the one-time top-up has been verified.
+FACE_BEST_FRAMES_ENABLED = os.getenv("FACE_BEST_FRAMES_ENABLED", "").lower() in ("1", "true", "yes")
+FACE_BEST_FRAME_MIN_GAP_S = int(os.getenv("FACE_BEST_FRAME_MIN_GAP_S", "3600"))
+_LAST_CURATED = {}
 # Nobody is suppressed by default. Marina used to be muted when alone because
 # her enrolment was being rebuilt; the user asked to greet her again (20.11.2026).
 TTS_SUPPRESS_WHEN_ALONE = {
@@ -311,13 +317,21 @@ class FaceGreetingWatcher:
                                threshold: float) -> list:
         try:
             with open(frame_path, "rb") as fh:
-                data = aiohttp.FormData()
-                data.add_field("file", fh, filename=os.path.basename(frame_path),
-                               content_type="image/jpeg")
-                data.add_field("threshold", str(threshold))
-                async with session.post(
-                        f"{FACE_API}/recognize", data=data,
-                        timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                image = fh.read()
+            ident = identity_client.IDENTITY
+            if ident is not None:
+                try:
+                    return await ident.recognize(image, threshold)
+                except Exception as exc:
+                    logger.warning(f"[WARN] identity /recognize failed: {exc!r}; "
+                                   "using the face API directly")
+            data = aiohttp.FormData()
+            data.add_field("file", image, filename=os.path.basename(frame_path),
+                           content_type="image/jpeg")
+            data.add_field("threshold", str(threshold))
+            async with session.post(
+                    f"{FACE_API}/recognize", data=data,
+                    timeout=aiohttp.ClientTimeout(total=30)) as resp:
                     if resp.status != 200:
                         logger.warning(f"[WARN] /recognize HTTP {resp.status} "
                                        f"for {os.path.basename(frame_path)}")
@@ -515,6 +529,12 @@ class FaceGreetingWatcher:
                             logger.info(f"[ENROLLMENT] {name}: "
                                         f"{os.path.basename(frame_path)} "
                                         f"(conf={conf:.3f}) -> pending/")
+        if FACE_BEST_FRAMES_ENABLED:
+            for name in names:
+                hits = [(float(r[1] or 0), r[2]) for r in recognized
+                        if r[0] == name and len(r) > 2]
+                if hits:
+                    await maybe_curate_best(name, hits)
 
     # --- main loop ---------------------------------------------------------
     async def run(self) -> None:
@@ -559,3 +579,64 @@ class FaceGreetingWatcher:
             except Exception as exc:
                 logger.warning(f"[ERROR] Face events loop: {exc}")
             await asyncio.sleep(POLL_INTERVAL)
+
+
+async def post_best_frame(frame_path: str, name: str) -> bool:
+    """Send one recognised frame to identity's curator. Basic creds stay server-side."""
+    ident = os.getenv("IDENTITY_URL", "http://192.168.22.102:18794").rstrip("/")
+    user = os.getenv("IDENTITY_ADMIN_USER", "")
+    password = os.getenv("IDENTITY_ADMIN_PASSWORD", "")
+    if not user or not password:
+        logger.warning("[CURATE] identity admin credentials are not configured")
+        return False
+    with open(frame_path, "rb") as handle:
+        image = handle.read()
+    form = aiohttp.FormData()
+    form.add_field("file", image, filename=os.path.basename(frame_path),
+                   content_type="image/jpeg")
+    try:
+        async with aiohttp.ClientSession() as session:
+            url = f"{ident}/api/profiles/{name}/face/curate"
+            async with session.post(
+                    url, data=form, auth=aiohttp.BasicAuth(user, password),
+                    timeout=aiohttp.ClientTimeout(total=30)) as response:
+                if response.status != 200:
+                    logger.warning(f"[CURATE] HTTP {response.status} for {name}")
+                    return False
+                body = await response.json()
+                # "unchanged" is the curator's HTTP 200 answer when the gallery
+                # is full and the new frame is not >=10% better. It is a handled
+                # no-op, not a failure: the caller must still record the hourly
+                # gap, or every arrival re-POSTs and re-runs recognition.
+                return body.get("status") in ("ok", "duplicate", "unchanged")
+    except Exception as exc:
+        logger.warning(f"[CURATE] {type(exc).__name__}: {exc}")
+        return False
+
+
+async def maybe_curate_best(name: str, matches: list, *, poster=None,
+                            now=None, enabled=None, gap=None) -> bool:
+    """One best frame per arrival, at most once an hour per person."""
+    if (FACE_BEST_FRAMES_ENABLED if enabled is None else enabled) is False:
+        return False
+    usable = [m for m in (matches or []) if len(m) >= 2 and float(m[0] or 0) >= 0.6]
+    if not usable:
+        return False
+    moment = time.time() if now is None else float(now)
+    window = FACE_BEST_FRAME_MIN_GAP_S if gap is None else float(gap)
+    last = _LAST_CURATED.get(name, -1e18)
+    if moment - last < window:
+        return False
+    best = max(usable, key=lambda m: float(m[0]))
+    call = poster or post_best_frame
+    try:
+        done = await call(best[1], name)
+    except Exception as exc:
+        logger.warning(f"[CURATE] failed for {name}: {type(exc).__name__}: {exc}")
+        return False
+    if done:
+        _LAST_CURATED[name] = moment
+    return bool(done)
+
+
+

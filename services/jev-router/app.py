@@ -47,7 +47,9 @@ import logging
 import os
 import re
 import time
+import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime
 
 import aiohttp
 from fastapi import FastAPI
@@ -55,8 +57,10 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 import chat_proxy
+import calc
 import config
 import history
+import lessons
 import memory
 import scale
 import weather
@@ -92,10 +96,12 @@ from resolver import (
     STREAM_DEFAULT_AREA,
     device_hint_from,
     resolve_action,
+    resolve_calc,
     resolve_query,
     resolve_scale,
     unresolved_hint,
     action_verb_missing,
+    is_question_shape,
     normalize_stt_verbs,
     knowledge_question,
     _datetime_phrase,
@@ -108,6 +114,59 @@ logging.basicConfig(
     format="%(asctime)s %(name)s %(levelname)s %(message)s",
 )
 logger = logging.getLogger("router")
+
+# A device word with no recognisable action verb: L2 can only guess the
+# direction, which is the one error this house must not make (04.10, 10.10).
+_VERB_CLARIFY = "Не расслышала действие. Повторите команду, пожалуйста."
+# The second address is a male character with a male Silero voice (aidar), so
+# the same gateway-written clarification must agree in gender. Measured
+# 25.11.2026 10:39: "Не расслышала" spoken by aidar reads as a voice/grammar
+# mismatch. The default assistant sentence above is untouched.
+_VERB_CLARIFY_DOBBI = "Не расслышал действие. Повторите команду, пожалуйста."
+
+
+def dobbi_style(text: str, honorific: str = "") -> str:
+    """Restyle ONLY gateway-written deterministic sentences for Добби.
+
+    25.11.2026. The action/verdict/clarification strings below are produced by
+    this router BEFORE any LLM runs, so changing DOBBI_SYSTEM alone cannot touch
+    them. This is a WHITELIST: an arbitrary LLM sentence (chat, knowledge, L2)
+    is returned byte-for-byte unchanged. `honorific` comes from the identity of
+    the speaker: alexander -> «сэр», marina/vladislava -> «мэм», unknown -> "".
+    An empty honorific drops the address instead of guessing one.
+    """
+    if not text:
+        return text
+    h = f", {honorific}" if honorific else ""
+    exact = {
+        "Включаю.": f"Домовой включил{h}!",
+        "Выключаю.": f"Домовой выключил{h}.",
+        "Включила.": f"Готово{h}. Домовой справился.",
+        "Выключила.": f"Готово{h}. Домовой справился.",
+        "Включила": f"Готово{h}. Домовой справился.",
+        "Выключила": f"Готово{h}. Домовой справился.",
+        _VERB_CLARIFY: f"Домовой не расслышал действие{h}. Повторите, пожалуйста.",
+        _VERB_CLARIFY_DOBBI: f"Домовой не расслышал действие{h}. Повторите, пожалуйста.",
+        "Простите, что-то пошло не так.": f"Домовой расстроился{h}. Повторите, пожалуйста.",
+        "Не получилось: устройство не переключилось.":
+            f"Домовой оплошал{h}. Устройство не переключилось.",
+    }
+    if text in exact:
+        return exact[text]
+
+    # «В гостиной уже включено.» -> «В гостиной уже горит, сэр. Домовой не трогал.»
+    m = re.fullmatch(r"(?:(.+) )?[уУ]же (включено|выключено)\.", text)
+    if m:
+        prefix = f"{m.group(1)} " if m.group(1) else ""
+        word = "горит" if m.group(2) == "включено" else "погашено"
+        lead = "Уже" if not prefix and text.startswith("У") else "уже"
+        return f"{prefix}{lead} {word}{h}. Домовой не трогал."
+
+    if text.startswith("Частично получилось: "):
+        return f"Домовой оплошал{h}. " + text[len("Частично получилось: "):]
+    if text.startswith("Не получилось: "):
+        return f"Домовой оплошал{h}. " + text[len("Не получилось: "):]
+    return text
 
 # Process-wide singletons: one embedder connection (Ollama) and one HA client
 # (whose /api/states + area-map caches are shared by every request). Both are
@@ -143,6 +202,11 @@ async def lifespan(app: FastAPI):
     mem_task = asyncio.ensure_future(memory.ensure_collections())
     mem_ok = await _retry_memory(mem_task)
     logger.info("qdrant collections: %s", "ok" if mem_ok else "FAILED (memory off)")
+    # Learned rewrites live in Qdrant so they survive an image rebuild. A cold
+    # or absent Qdrant is optional: the router still works with its built-ins.
+    await lessons.ensure_collection()
+    count = await lessons.refresh()
+    logger.info("learned rules: %d active", count)
     # Hands a manually disarmed motion automation back when its room empties.
     override_task = asyncio.ensure_future(_restore_light_automations())
     try:
@@ -192,6 +256,14 @@ class RouteRequest(BaseModel):
     session_id: str = ""
     stream_name: str = ""
     room: str = ""
+    # Per-address persona ("dobbi" for the second wake word). The chat proxy
+    # reads it AND `dobbi_style` restyles the deterministic gateway-written
+    # sentences under route_ep. Deterministic ACTIONS are never changed — only
+    # their wording, after the device call has already happened.
+    persona: str = ""
+    # Honorific for Добби: «сэр» for alexander, «мэм» for marina/vladislava,
+    # empty for an unidentified speaker (the address is dropped, never guessed).
+    honorific: str = ""
 
 
 def _sse(obj: dict) -> str:
@@ -802,9 +874,19 @@ async def _execute_action(
             # lamp). An ordinal is excluded too: «свет 1» names a NUMBERED
             # instance, and the action path refuses rather than guessing which
             # room's "1" was meant (02.10.2026, corridor1/corridor2).
+            # The "unique device elsewhere" rule is for PROPER device names
+            # («кофеварка»), not generic class words. «свет» is never unique:
+            # the house has many lamps, and only one may happen to be available
+            # (23.11.2026: the relay was unavailable, so the garland in another
+            # room became "the only light" and was switched instead).
+            generic_hint = bool(
+                re.fullmatch(r"(?:свет|ламп\w*|светильник\w*|подсветк\w*)",
+                             (call.hint or "").lower())
+            )
             if (
                 not targets
                 and call.hint
+                and not generic_hint
                 and call.area_source != "explicit"
                 and not ordinal_digit(call.hint)
             ):
@@ -1250,6 +1332,25 @@ def _on_off_verdict(
 _LATE_VERIFY_S = 185.0
 
 
+def _state_changed_after(last_changed, issued_at: float) -> bool:
+    """Did HA record a state change AFTER this command was issued?
+
+    HA's `/api/states` carries `last_changed` as an ISO-8601 string. A state
+    that changed after our call cannot be used as evidence that OUR call
+    failed: the user may have given a second command in the meantime. An
+    unparseable/absent timestamp is NOT treated as a change — the conservative
+    branch keeps the original "never moved" verdict for a device we truly
+    never saw respond.
+    """
+    if not last_changed:
+        return False
+    try:
+        when = datetime.fromisoformat(str(last_changed).replace("Z", "+00:00"))
+        return when.timestamp() > issued_at
+    except (ValueError, TypeError, OverflowError):
+        return False
+
+
 class _PendingVerify:
     """Carried out of `_execute_action` so the caller can speak the
     acknowledgement first and confirm after the remaining retries.
@@ -1259,11 +1360,18 @@ class _PendingVerify:
     with no audible counterpart and a three-field return is easy to misread.
     """
 
-    __slots__ = ("ids", "before", "want_on", "moved", "unproven_at_settle")
+    __slots__ = (
+        "ids", "before", "want_on", "moved", "unproven_at_settle", "issued_at",
+    )
 
     def __init__(self, ids, before, want_on, moved):
         self.ids, self.before, self.want_on, self.moved = ids, before, want_on, moved
         self.unproven_at_settle: list[str] = []
+        # The +185 s re-read happens long after the user may have issued
+        # ANOTHER command for the same lamp. Remember when THIS one was sent
+        # so the late read can tell "the state changed afterwards" from
+        # "this device never moved" (25.11.2026 21:40/21:41, living room).
+        self.issued_at = time.time()
 
     def verify_later(self) -> None:
         """Re-read the state when the answer actually exists, and LOG it.
@@ -1289,15 +1397,35 @@ class _PendingVerify:
             await asyncio.sleep(_LATE_VERIFY_S)
             fresh = await ha.get_states(force=True) or []
             by_id = {x.get("entity_id"): x for x in fresh}
-            moved, still = [], []
+            moved, still, changed_after = [], [], []
             for eid in self.ids:
-                ent = by_id.get(eid)
-                st = str((ent or {}).get("state", "")).lower()
-                (moved if st == target else still).append(eid)
+                ent = by_id.get(eid) or {}
+                st = str(ent.get("state", "")).lower()
+                if st == target:
+                    moved.append(eid)
+                elif _state_changed_after(ent.get("last_changed"), self.issued_at):
+                    # 25.11.2026 21:40/21:41: the lamp really went `on` at
+                    # 21:40:39.450406, then the user's own OFF command set it
+                    # `off` at 21:41:01.204291. Reading only the final state
+                    # at +185 s called that working lamp "THE DEVICE NEVER
+                    # MOVED". A state changed AFTER our call belongs to a
+                    # later command — no verdict, not a failure.
+                    changed_after.append(eid)
+                else:
+                    still.append(eid)
+            note = ""
+            if still:
+                note = "  ← THE DEVICE NEVER MOVED"
+            elif changed_after and not moved:
+                note = (
+                    "  ← state changed AFTER this command; a later command may "
+                    "own it — no verdict from this read"
+                )
             logger.info(
-                "  verify late (+%.0fs) want=%s moved=%s not=%s unproven_at_2s=%s%s",
-                _LATE_VERIFY_S, target, moved, still, self.unproven_at_settle or [],
-                "" if moved else "  ← THE DEVICE NEVER MOVED",
+                "  verify late (+%.0fs) want=%s moved=%s not=%s changed_after=%s "
+                "unproven_at_2s=%s%s",
+                _LATE_VERIFY_S, target, moved, still, changed_after,
+                self.unproven_at_settle or [], note,
             )
         except Exception as e:
             logger.warning("  verify late failed: %r", e)
@@ -1580,6 +1708,7 @@ async def _run_worker(
     stream_name: str,
     context: str = "",
     hist: str = "",
+    lessons_out: list | None = None,
 ):
     """Forward smolagents-worker (L2) SSE events; yields router-level dicts.
 
@@ -1618,9 +1747,17 @@ async def _run_worker(
                 if data == "[DONE]":
                     break
                 try:
-                    yield json.loads(data)
+                    chunk = json.loads(data)
                 except json.JSONDecodeError:
                     continue
+                if chunk.get("type") == "lesson":
+                    # A lesson is router-internal: never speak it, never send it
+                    # to the gateway. It is committed only after this turn's
+                    # success signals are collected at the end of _handle.
+                    if lessons_out is not None:
+                        lessons_out.append(chunk)
+                    continue
+                yield chunk
 
 
 async def _handle(req: RouteRequest):
@@ -1636,7 +1773,21 @@ async def _handle(req: RouteRequest):
     progress heartbeats) and is written to memory right before `done`.
     """
     t0 = time.monotonic()
-    text = (req.text or "").strip()
+    # Whether this turn ended cleanly is observable here, not in the worker:
+    # a worker can yield a sentence AND a lesson and still time out afterwards.
+    error_emitted = False
+    raw_text = (req.text or "").strip()
+    text, learned_id = lessons.rewrite(raw_text)
+    stream_key = req.stream_name or req.session_id
+    repeated_lesson = lessons.is_repeat(stream_key, raw_text)
+    if repeated_lesson:
+        # The user had to say the same thing again: whatever we taught last
+        # time did not work. Quarantine it instead of teaching it again.
+        asyncio.create_task(
+            lessons.set_status(repeated_lesson, "failed", "the request was repeated")
+        )
+    # A `lesson` event from L2 is held here until this turn's success is known.
+    pending_lessons: list[dict] = []
     # Everything speakable across all branches; feeds the fire-and-forget
     # memory write (route metadata + what was really said).
     reply_parts: list[str] = []
@@ -1674,10 +1825,17 @@ async def _handle(req: RouteRequest):
     # question a free model would answer from imagination — the scale has no
     # L2 tool at all. Both are intercepted here, where only the regex decides.
     scale_call = resolve_scale(text)
-    if scale_call is not None:
-        route = "scale"
+    calc_call = resolve_calc(text) if scale_call is None else None
+    if scale_call is not None or calc_call is not None:
         confidence = 1.0
-        reason = "scale_weight" if scale_call.kind == "weight" else "scale_tare"
+        if scale_call is not None:
+            route = "scale"
+            reason = {
+                "weight": "scale_weight", "tare": "scale_tare",
+                "percent": "scale_percent",
+            }.get(scale_call.kind, "scale_weight")
+        else:
+            route, reason = "calc", "arithmetic"
     else:
         decision = await classifier.classify(text)
         route, confidence, reason = decision.route, decision.confidence, decision.reason
@@ -1835,13 +1993,23 @@ async def _handle(req: RouteRequest):
     # note has to be attached for every escalation, including the classifier's
     # `low_confidence` path, which never calls the resolver at all. **Silence
     # about a missing verb reads as "the direction is yours to choose".**
-    if route == "complex_logic" and action_verb_missing(text):
-        ctx = (ctx + " " if ctx else "") + (
-            "В фразе есть название устройства, но глагол действия не распознан "
-            f"(в исходном виде: {text[:60]!r}). НЕ угадывай направление действия и "
-            "не вызывай ha_action: спроси, что нужно сделать — включить или "
-            "выключить. Если действие нельзя определить, это вопрос, а не команда."
-        )
+    # The guard describes a shape, not an intent: `_DEVICE_NOUN` also holds
+    # «фильм» and «кофеварк», so «какой фильм мы смотрели?» and «как работает
+    # кофеварка?» are flagged too. Stop at the short clarification ONLY for a
+    # command-shaped utterance — a question (or a downgraded easy_query route,
+    # which STT may leave without its «?») still belongs to L2. The +verb_missing
+    # note stays on every escalation so a command that does reach L2 is never
+    # free to guess the direction.
+    verb_missing = route == "complex_logic" and action_verb_missing(text)
+    clarify_verb = (
+        verb_missing
+        and not is_question_shape(text)
+        and "query" not in (reason or "")
+    )
+    if verb_missing:
+        # 12:17 MSK: «компьютер, включи свет» arrived as «и свет» — a device
+        # with no verb. L2 can only guess the direction (or waste two minutes
+        # asking), so answer with one short question and stop the turn here.
         reason = (reason + "+verb_missing").strip("+")
 
     # The (usually single) route event: emitted before any execution so the
@@ -1852,8 +2020,18 @@ async def _handle(req: RouteRequest):
     )
 
     try:
+        # --- verbless device phrase: ask, never guess --------------------
+        if clarify_verb:
+            # Gender/honorific are applied by dobbi_style in route_ep, the one
+            # place all sentences pass through. Keeping the neutral sentence
+            # here avoids a second, drifting copy of the character rules.
+            sentence = _VERB_CLARIFY
+            logger.info("speaking: %r (verb missing, no L2)", sentence)
+            reply_parts.append(sentence)
+            yield _sse({"type": "sentence", "text": sentence})
+
         # --- easy_action: HA MCP intent call ------------------------------
-        if route == "easy_action":
+        elif route == "easy_action":
             # Resolved a second time (pure regex, no I/O): the pre-flight
             # already turned this branch off if the resolver said None.
             call = resolve_action(text, area_hint)
@@ -1938,7 +2116,8 @@ async def _handle(req: RouteRequest):
                     "попробуй иначе, либо прямо сообщи, что не получилось."
                 )
                 async for chunk in _run_worker(
-                    text, req.session_id, req.stream_name, context=ctx, hist=hist
+                    text, req.session_id, req.stream_name, context=ctx, hist=hist,
+                    lessons_out=pending_lessons,
                 ):
                     if chunk.get("type") == "sentence" and chunk.get("text"):
                         reply_parts.append(chunk["text"])
@@ -1946,8 +2125,20 @@ async def _handle(req: RouteRequest):
 
         # --- scale: fresh reading, or a guarded + verified tare -----------
         elif route == "scale":
-            kind = "weight" if reason == "scale_weight" else "tare"
-            sentence = await scale.handle(kind)
+            kind = {
+                "scale_weight": "weight", "scale_tare": "tare",
+                "scale_percent": "percent",
+            }.get(reason, "weight")
+            sentence = await scale.handle(
+                kind, percent=(scale_call.percent if scale_call else 0.0)
+            )
+            logger.info("speaking: %r", sentence)
+            reply_parts.append(sentence)
+            yield _sse({"type": "sentence", "text": sentence})
+
+        # --- calc: pure arithmetic, evaluated before the classifier ---------
+        elif route == "calc":
+            sentence = calc.sentence(calc_call.value)
             logger.info("speaking: %r", sentence)
             reply_parts.append(sentence)
             yield _sse({"type": "sentence", "text": sentence})
@@ -2004,7 +2195,16 @@ async def _handle(req: RouteRequest):
                     domain=q.args.get("domain"),
                     device=q.args.get("device"),
                 )
-                if ent is None and area and q.args.get("domain"):
+                # A named device is not in the speaker's room. The fallback
+                # below ignores the hint and takes the first sensor in the
+                # area, which answered a battery question with the room's
+                # thermometer (23.11.2026). Never apply it to a device read.
+                if (
+                    ent is None
+                    and area
+                    and q.args.get("domain")
+                    and not q.args.get("device")
+                ):
                     # A DOMAIN + ROOM query the names cannot answer: no entity
                     # id carries «Living Room», so find_entity filtered the
                     # player out and «что сейчас играет в гостиной» answered
@@ -2062,7 +2262,8 @@ async def _handle(req: RouteRequest):
                             "reason": "query_unresolved"})
                 route = "complex_logic"
                 async for chunk in _run_worker(
-                    text, req.session_id, req.stream_name, context=ctx, hist=hist
+                    text, req.session_id, req.stream_name, context=ctx, hist=hist,
+                    lessons_out=pending_lessons,
                 ):
                     if chunk.get("type") == "sentence" and chunk.get("text"):
                         reply_parts.append(chunk["text"])
@@ -2080,7 +2281,8 @@ async def _handle(req: RouteRequest):
             # the gateway maps sad/angry -> slower playback (emotion ->
             # speed in backends.py); the tag itself never reaches the text.
             async for s, emo in chat_proxy.stream_chat(
-                text, expert=(route == "expert"), knowledge=knowledge
+                text, expert=(route == "expert"), knowledge=knowledge,
+                persona=req.persona,
             ):
                 reply_parts.append(s)
                 ev = {"type": "sentence", "text": s}
@@ -2091,7 +2293,8 @@ async def _handle(req: RouteRequest):
         # --- complex_logic: L2 CodeAgent ----------------------------------
         else:
             async for chunk in _run_worker(
-                text, req.session_id, req.stream_name, context=ctx, hist=hist
+                text, req.session_id, req.stream_name, context=ctx, hist=hist,
+                lessons_out=pending_lessons,
             ):
                 # Heartbeats are forwarded for UX but only sentences are
                 # remembered (memory stores what the user actually heard).
@@ -2103,6 +2306,7 @@ async def _handle(req: RouteRequest):
         # Any handler failure degrades to an error event + done instead of a
         # hung stream — a voice turn must always terminate.
         logger.exception("route handler failed")
+        error_emitted = True
         yield _sse({"type": "error", "message": str(e)[:300]})
 
     # --- P4: fire-and-forget memory write (before the final yield so a
@@ -2111,12 +2315,53 @@ async def _handle(req: RouteRequest):
     if reply:
         # Short-term ring FIRST (sync, in-process): the next turn of this
         # satellite must see this one even if the Qdrant write below fails.
-        history.push(req.stream_name or req.session_id, text, reply)
+        history.push(stream_key, raw_text, reply)
         asyncio.create_task(
             memory.save_turn(
-                text, reply, route, confidence, req.session_id, req.stream_name
+                raw_text, reply, route, confidence, req.session_id, req.stream_name
             )
         )
+    # --- Self-learning: commit ONLY after an upper-level success -----------
+    # The worker emits a lesson only for a clean run. The router adds what it
+    # can observe (an answer really was produced, the user did not repeat) and
+    # validates the rewrite against turns that were already answered well.
+    if pending_lessons and reply:
+        candidate = dict(pending_lessons[0])
+        candidate.setdefault("lesson_id", str(uuid.uuid4()))
+        check, why = lessons.validate(candidate, await lessons.successful_history())
+        signals = {
+            "error": error_emitted,
+            "veto": bool(candidate.get("veto")),
+            "sentence": True,
+            "done": not error_emitted,
+            "repeated": bool(repeated_lesson),
+            "outcome": candidate.get("outcome") or {},
+        }
+        commit, why_commit = lessons.should_commit(signals)
+        # `set_status` only PATCHes an existing Qdrant point; `save()` is the
+        # sole creator of it (status=pending). Without this call a "committed"
+        # rule lives only in the process cache and disappears on restart —
+        # and a rejected one has no point to patch at all. Never raises.
+        await lessons.save(candidate)
+        if check and commit:
+            candidate["status"] = "active"
+            await lessons.set_status(candidate["lesson_id"], "active", why)
+            active_id = candidate["lesson_id"]
+            logger.info("lesson applied: %r -> %r (%s)",
+                        candidate["from_text"], candidate["to_text"], why)
+        else:
+            await lessons.set_status(
+                candidate["lesson_id"], "rejected", why if not check else why_commit
+            )
+            logger.info("lesson rejected: %s / %s", why, why_commit)
+            active_id = ""
+    else:
+        active_id = ""
+    # Remember the id that was ACTUALLY used on this turn: a turn that merely
+    # applied an existing rule has no `active_id`, but the user repeating the
+    # same words must still quarantine that applied rule. A freshly committed
+    # rule takes precedence over one that was applied.
+    lessons.note_turn(stream_key, raw_text, active_id or learned_id or "")
 
     yield _sse(
         {"type": "done", "route": route,
@@ -2131,8 +2376,34 @@ async def route_ep(req: RouteRequest):
     Returns a StreamingResponse over the `_handle` generator; no auth on
     port 8091 is a deliberate LAN-only decision (see module header).
     """
+    async def _styled(req: RouteRequest):
+        """One choke point for Добби's wording. The device action has already
+        happened by the time these events are emitted — styling is cosmetic.
+
+        `_handle` yields complete SSE LINES (`data: {...}\\n\\n`), not dicts, so
+        the event is parsed and re-serialized with the SAME `_sse` helper —
+        the wire contract must stay byte-identical for every other event.
+        """
+        async for event in _handle(req):
+            if (
+                getattr(req, "persona", "") == "dobbi"
+                and isinstance(event, str)
+                and event.startswith("data: ")
+            ):
+                try:
+                    obj = json.loads(event[6:].strip())
+                except Exception:
+                    yield event
+                    continue
+                if obj.get("type") == "sentence" and obj.get("text"):
+                    obj["text"] = dobbi_style(
+                        obj["text"], getattr(req, "honorific", "")
+                    )
+                    event = _sse(obj)
+            yield event
+
     return StreamingResponse(
-        _handle(req),
+        _styled(req),
         media_type="text/event-stream",
         # no-cache + X-Accel-Buffering=no: any proxy/buffer in between would
         # hold sentences back and turn a streaming answer into a burst.

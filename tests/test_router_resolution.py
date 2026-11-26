@@ -7,8 +7,11 @@ because the host has no fastapi — app.py is never imported here.
 
 import contextlib
 import inspect
+import json
 import os
 import sys
+import time
+from datetime import datetime, timezone
 
 import pytest
 
@@ -24,6 +27,7 @@ from resolver import (  # noqa: E402
     resolve_action,
     resolve_query,
     unresolved_hint,
+    normalize_stt_verbs,
     knowledge_question,
     _datetime_phrase,
 )
@@ -582,6 +586,41 @@ def test_a_cold_classify_answers_at_once_and_warms_in_the_background():
     assert warming, "warm-up was not left running in the background"
 
 
+def test_embed_failure_serves_a_time_question_without_l2():
+    """22.11.2026 17:23 and 17:37, livingroom: a broken embedder routed
+    «А сколько сейчас времени?» / «Сколько времени?» to complex_logic, so
+    the gateway spoke «Секунду, занимаюсь…» and L2 took ~10 s. The resolver
+    answers both instantly; the embedder must not get a veto over that.
+    """
+    import numpy as np
+
+    c = clf.Classifier(embedder=_FlakyEmbedder(fail_times=1))
+    c.warmed = True
+    c._matrix = np.zeros((1, 4), dtype=np.float32)  # embed() fails before it is read
+    for text in ("Сколько времени?", "А сколько сейчас времени?"):
+        d = _run(c.classify(text))
+        assert d.route == "easy_query", (text, d.route, d.reason)
+        assert d.reason == "", (text, d.reason)
+
+
+def test_cold_classifier_serves_a_time_question():
+    """Same guarantee on the cold branch: a time question still gets an
+    immediate deterministic answer while the warm-up runs behind it."""
+    import asyncio
+
+    async def scenario():
+        c = clf.Classifier(embedder=_FlakyEmbedder(fail_times=1))
+        c._matrix = None
+        d = await c.classify("Сколько времени?")
+        if c._warming_task:
+            c._warming_task.cancel()
+        return d
+
+    with _fast_schedule():
+        d = _run(scenario())
+    assert d.route == "easy_query" and d.reason == ""
+
+
 def test_only_one_warmup_runs_at_a_time():
     """Startup and a cold first request must not embed the same 60 utterances
     concurrently against one Ollama."""
@@ -841,6 +880,191 @@ def test_battery_query_carries_device_label_and_missing_sentence():
     # чайника») — the generic «не нашла такого устройства» would deny a
     # device that sits right there in the registry.
     assert "заряде" in q.args["missing"]
+
+
+@pytest.mark.asyncio
+async def test_a_verbless_command_gets_a_short_clarification_not_l2(monkeypatch):
+    """12:17 MSK: Whisper turned «включи свет» into «и свет». The resolver had
+    no verb, so the turn went to L2 for 20-120 s and never acted. Ask for the
+    missing word immediately instead; never guess the direction.
+    """
+    mod = _router_app()
+
+    async def _classify(*a, **k):
+        return type("D", (), {"route": "complex_logic", "confidence": 0.9,
+                              "reason": "low_confidence"})()
+
+    async def _must_not_run(*a, **k):
+        raise AssertionError("L2 must not be called when the verb is missing")
+        yield  # make it an async generator, like the real _run_worker
+
+    monkeypatch.setattr(mod.classifier, "classify", _classify)
+    monkeypatch.setattr(mod, "_run_worker", _must_not_run)
+
+    async def _drive():
+        return [
+            json.loads(c.removeprefix("data: "))
+            async for c in mod._handle(mod.RouteRequest(
+                text="и свет", session_id="probe", stream_name="livingroom"
+            ))
+        ]
+
+    events = await _drive()
+    sentences = [e["text"] for e in events if e.get("type") == "sentence"]
+    assert sentences == ["Не расслышала действие. Повторите команду, пожалуйста."]
+    assert any(e.get("route") == "complex_logic" for e in events)
+
+
+@pytest.mark.asyncio
+async def test_the_dobbi_persona_answers_a_missing_verb_in_the_masculine(monkeypatch):
+    """25.11.2026 10:39: the male-voiced Добби said «Не расслышала действие».
+    The clarification is gateway-written, so the persona is the only place that
+    can make the grammar agree with the voice. The normal assistant keeps its
+    feminine wording; only the second address changes."""
+    mod = _router_app()
+
+    async def _classify(*a, **k):
+        return type("D", (), {"route": "complex_logic", "confidence": 0.9,
+                              "reason": "low_confidence"})()
+
+    async def _must_not_run(*a, **k):
+        raise AssertionError("L2 must not be called when the verb is missing")
+        yield
+
+    monkeypatch.setattr(mod.classifier, "classify", _classify)
+    monkeypatch.setattr(mod, "_run_worker", _must_not_run)
+
+    events = [
+        json.loads(c.removeprefix("data: "))
+        async for c in mod._handle(mod.RouteRequest(
+            text="и свет", session_id="probe", stream_name="livingroom",
+            persona="dobbi",
+        ))
+    ]
+    sentences = [e["text"] for e in events if e.get("type") == "sentence"]
+    # _handle stays neutral; dobbi_style is applied once at route_ep so there
+    # is a single copy of the character rules for every source (camera + TG).
+    assert sentences == ["Не расслышала действие. Повторите команду, пожалуйста."]
+    assert mod.dobbi_style(sentences[0], "сэр") == (
+        "Домовой не расслышал действие, сэр. Повторите, пожалуйста."
+    )
+    assert mod.dobbi_style(sentences[0], "") == (
+        "Домовой не расслышал действие. Повторите, пожалуйста."
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_verbless_phrase_classified_as_easy_action_still_gets_the_clarification(
+    monkeypatch,
+):
+    """12:32:32 MSK: «И свет» was classified easy_action conf 0.93 (not
+    complex_logic), so the clarification guard missed it and the turn reached
+    a relay. The guard must follow the TEXT, not the classifier's confidence.
+    """
+    mod = _router_app()
+
+    async def _classify(*a, **k):
+        return type("D", (), {"route": "easy_action", "confidence": 0.93,
+                              "reason": "-"})()
+
+    monkeypatch.setattr(mod.classifier, "classify", _classify)
+
+    async def _must_not_act(*a, **k):
+        raise AssertionError("a verbless phrase reached an action call")
+        yield
+
+    monkeypatch.setattr(mod, "_execute_action", _must_not_act)
+
+    async def _drive():
+        return [
+            json.loads(c.removeprefix("data: "))
+            async for c in mod._handle(mod.RouteRequest(
+                text="И свет", session_id="probe", stream_name="livingroom"
+            ))
+        ]
+
+    events = await _drive()
+    sentences = [e["text"] for e in events if e.get("type") == "sentence"]
+    assert sentences == ["Не расслышала действие. Повторите команду, пожалуйста."]
+
+
+@pytest.mark.asyncio
+async def test_battery_question_from_the_kitchen_never_reports_a_temperature():
+    """23.11.2026 19:xx: «сколько процентов заряда пылесоса» spoken in the
+    kitchen answered «Пылесос: 24,1 градусов». The satellite's default area
+    (Kitchen) bounded the lookup; find_entity found nothing, and the
+    domain+area fallback then took the FIRST kitchen sensor — the thermometer.
+    A named device is not located in the room the speaker stands in.
+    """
+    mod = _router_app()
+
+    states = list(_BAT_STATES) + [
+        {"entity_id": "sensor.kitchen_thermometer_temperature", "state": "24.14",
+         "attributes": {"friendly_name": "Кухня Термометр",
+                        "unit_of_measurement": "°C", "device_class": "temperature"}},
+    ]
+
+    class _HA(_DeadHA):
+        async def get_entity_areas(self):
+            return {"sensor.kitchen_thermometer_temperature": "Kitchen"}
+
+        async def get_states_by_domain(self):
+            return {"sensor": [e for e in states if e["entity_id"].startswith("sensor.")]}
+
+    mod.ha = _HA(states, {"ok": True})
+
+    async def _drive():
+        gen = mod._handle(mod.RouteRequest(
+            text="сколько процентов заряда пылесоса",
+            session_id="probe", stream_name="kitchen",
+        ))
+        out = []
+        async for chunk in gen:
+            out.append(json.loads(chunk.removeprefix("data: ")))
+        return out
+
+    chunks = await _drive()
+    sentences = [c["text"] for c in chunks if c["type"] == "sentence"]
+    assert sentences, chunks
+    assert "градусов" not in sentences[0], sentences
+    assert "97" in sentences[0], sentences
+
+
+@pytest.mark.asyncio
+async def test_a_generic_light_word_never_grabs_a_garland_in_another_room():
+    """23.11.2026 19:47, living room: «Включи свет» called light.wled
+    (a festoon garland in another room) and left the lamp untouched. The relay
+    was unavailable, so the target finder returned exactly one available
+    «свет» entity elsewhere, and the 'uniquely named device' rule treated the
+    generic word 'light' as if it were a proper device name like 'coffee maker'.
+    """
+    mod = _router_app()
+    states = [
+        {"entity_id": "switch.living_room_light_swith_relay", "state": "unavailable",
+         "attributes": {"friendly_name": "living_room_light_swith Relay"}},
+        {"entity_id": "light.wled", "state": "off",
+         "attributes": {"friendly_name": "festoon2"}},
+    ]
+    areas = {"light.wled": "Bedroom"}
+    ha = _HAWithAreas(states, areas, {"ok": True})
+    mod.ha = ha
+
+    call = resolve_action("Включи свет", "livingroom")
+    result = await mod._execute_action(call, "Включи свет", "livingroom")
+    err = result[1]
+    assert not ha.calls, ha.calls
+    assert err is not None
+
+
+def test_a_split_coffee_maker_noun_is_repaired_before_routing():
+    """21:35, kitchen: Whisper wrote «Выключи кофе варку.» from the real audio.
+    The split noun resolves to None, so the command never reached HA. Repair it
+    inside normalize_stt_verbs, which runs before the classifier."""
+    fixed = normalize_stt_verbs("выключи кофе варку")
+    assert fixed == "выключи кофеварку"
+    call = resolve_action(fixed, "kitchen")
+    assert call is not None and call.tool == "intent__HassTurnOff"
+    assert "кофеварка" in str(call.args)
 
 
 def test_battery_query_finds_the_devices_own_sensor():
@@ -1166,9 +1390,11 @@ def test_cold_classifier_still_routes_a_command_it_can_resolve():
     c = clf.Classifier(embedder=DeadEmbedder())
     d = asyncio.run(c.classify("поставь коди на паузу в гостиной"))
     assert d.route == "easy_action" and d.reason == ""
+    # Deterministic questions need no embeddings either. Before 22.11.2026
+    # this asserted complex_logic, which is exactly why «Сколько времени?»
+    # got «Секунду, занимаюсь» + 10 s of L2 while Ollama was down.
     q = asyncio.run(c.classify("какая сейчас погода"))
-    assert q.route == "complex_logic" and q.reason in (
-        "classifier_unavailable", "embed_failed")
+    assert q.route == "easy_query" and q.reason == ""
 
 
 def test_the_embed_batch_is_chunked_to_fit_the_timeout():
@@ -1767,17 +1993,38 @@ def test_the_measured_stt_spellings_of_the_off_verb_resolve():
     assert normalize_stt_verbs("куча свет") == "выключи свет"
     assert normalize_stt_verbs("КУЧА свет в гостиной") == "выключи свет в гостиной"
     assert normalize_stt_verbs("кучи свет") == "выключи свет"
-    assert normalize_stt_verbs("ключи свет") == "выключи свет"
     assert normalize_stt_verbs("выкл юч свет") == "выключи свет"
 
     for text in ("куча свет", "куча свет в гостиной", "кучи свет",
-                 "ключи свет", "выкл юч свет"):
+                 "выкл юч свет"):
         call = resolve_action(text, "livingroom")
         assert call is not None, f"{text!r} still escalates"
         assert "TurnOff" in call.tool, f"{text!r} -> {call.tool}, expected TurnOff"
         assert call.args.get("area") == "Living Room", (
             f"{text!r} lost the room: {call.args}"
         )
+
+
+def test_the_shared_tail_ключи_is_never_mapped_to_a_direction():
+    """24.11.2026 12:32 MSK: «компьютер, включи свет» reached the router as
+    «ключи свет» and was normalised to «выключи свет» — a REVERSED ACTION on a
+    real relay («уже выключено» three times in a row).
+
+    «ключи» is the tail of BOTH «включи» and «выключи»: 06.10.2026 observed it
+    from an OFF order, but the same spelling now arrives from an ON order. No
+    text rule can separate the two, so it must never resolve to a direction —
+    it stays verbless and gets the short clarification instead.
+    """
+    from resolver import normalize_stt_verbs, resolve_action, action_verb_missing
+
+    for text in ("ключи свет", "Ключи свет", "ключи свет в гостиной"):
+        assert normalize_stt_verbs(text) == text, f"{text!r} was given a direction"
+        assert action_verb_missing(text) is True, f"{text!r} must look verbless"
+        assert resolve_action(text, "livingroom") is None, f"{text!r} reached a relay"
+
+    # The unambiguous fragments still resolve — the fix is not a blanket refusal.
+    assert "TurnOff" in resolve_action("куча свет", "livingroom").tool
+    assert "TurnOn" in resolve_action("включи свет", "livingroom").tool
 
 
 def test_ordinary_words_that_merely_look_like_the_misheard_verb_are_left_alone():
@@ -1837,6 +2084,117 @@ def test_a_first_person_future_off_verb_is_repaired():
     assert call is not None, "the measured turn-1 transcript still escalates"
     assert "TurnOff" in call.tool, f"{measured!r} -> {call.tool}"
     assert call.args.get("area") == "Living Room", call.args
+
+
+def test_a_third_person_future_off_verb_is_repaired():
+    """24.11.2026 12:52 MSK: the capture fix made Whisper hear the whole phrase,
+    but it wrote «Компьютер выключит свет.» — a 3rd-person future, one letter
+    from the 1st-person form measured 16.11. It fell through to the deterministic
+    clarification, so the lamp stayed off. Same mechanism, same repair.
+    """
+    from resolver import normalize_stt_verbs, resolve_action
+
+    measured = "Компьютер выключит свет."
+    assert normalize_stt_verbs(measured) == "Компьютер выключи свет."
+    call = resolve_action(measured, "livingroom")
+    assert call is not None, "the measured turn still escalates"
+    assert "TurnOff" in call.tool, f"{measured!r} -> {call.tool}"
+    assert call.args.get("area") == "Living Room", call.args
+
+    # A statement about a THIRD person with no device still must not act.
+    assert normalize_stt_verbs("он выключит") == "он выключит"
+
+
+def test_a_past_tense_on_verb_is_repaired():
+    """25.11.2026 10:39 UTC, living room. «Добби, включи свет» reached Whisper
+    as 'Добби включил свет' — a past-tense verb, which RE_ON does not match.
+    The router logged `complex_logic conf=0.84 verb_missing` and said
+    «Не расслышала действие», leaving the lamp off. The OFF mirror
+    «выключил» was not observed but is the same grammar slip one verb over.
+    A question keeps its verb, as with the participle table."""
+    from resolver import normalize_stt_verbs, resolve_action
+
+    measured = "Добби включил свет"
+    assert normalize_stt_verbs(measured) == "Добби включи свет"
+    call = resolve_action(measured, "livingroom")
+    assert call is not None, "the measured past-tense turn still escalates"
+    assert "TurnOn" in call.tool, f"{measured!r} -> {call.tool}"
+    assert call.args.get("area") == "Living Room", call.args
+
+    assert normalize_stt_verbs("выключил свет") == "выключи свет"
+    # A statement is still a statement when the user asks about it.
+    assert normalize_stt_verbs("кто включил свет?") == "кто включил свет?"
+    assert normalize_stt_verbs("он включил") == "он включил"
+
+
+def test_dobbi_style_uses_the_speakers_honorific_and_leaves_llm_text_alone():
+    """25.11.2026: сэр only for Александр, мэм for Марина/Влада, no address
+    when the speaker is unknown. «Домовой» (not the name) keeps the third
+    person without making the wake decoder hear its own address in every
+    short reply. Arbitrary LLM sentences must pass through byte-for-byte."""
+    from app import dobbi_style
+
+    cases = {
+        "Включаю.": "Домовой включил{h}!",
+        "Выключаю.": "Домовой выключил{h}.",
+        "Включила.": "Готово{h}. Домовой справился.",
+        "Уже включено.": "Уже горит{h}. Домовой не трогал.",
+        "В гостиной уже выключено.": "В гостиной уже погашено{h}. Домовой не трогал.",
+        "Не получилось: устройство не переключилось.":
+            "Домовой оплошал{h}. Устройство не переключилось.",
+        "Простите, что-то пошло не так.":
+            "Домовой расстроился{h}. Повторите, пожалуйста.",
+    }
+    for src, expected in cases.items():
+        assert dobbi_style(src, "сэр") == expected.format(h=", сэр"), src
+        assert dobbi_style(src, "мэм") == expected.format(h=", мэм"), src
+        assert dobbi_style(src, "") == expected.format(h=""), src
+
+    long_llm = "Домовой посчитал, что в гостиной сейчас двадцать три градуса."
+    assert dobbi_style(long_llm, "сэр") == long_llm
+
+
+@pytest.mark.asyncio
+async def test_dobbi_persona_selects_the_character_system_prompt(monkeypatch):
+    """The second address gets its own chat persona without touching the
+    deterministic action path (which never reads `persona`)."""
+    import chat_proxy
+
+    seen = {}
+
+    async def _fake_stream(url, model, messages, api_key=""):
+        seen["messages"] = messages
+        yield "Добби слушает! Всё сделаю, хозяин.", "neutral"
+
+    monkeypatch.setattr(chat_proxy, "stream_sentences", _fake_stream)
+    out = [s async for s, _ in chat_proxy.stream_chat(
+        "что такое корень", persona="dobbi"
+    )]
+    assert out and seen["messages"][0]["content"] == chat_proxy.DOBBI_SYSTEM
+
+    # Default stays the old assistant persona.
+    [s async for s, _ in chat_proxy.stream_chat("что такое корень")]
+    assert seen["messages"][0]["content"] == chat_proxy.CHAT_SYSTEM
+
+
+def test_route_request_accepts_the_persona_field():
+    import app as router_app
+    req = router_app.RouteRequest(text="включи свет", persona="dobbi")
+    assert req.persona == "dobbi"
+
+
+def test_a_polite_imperative_off_verb_is_repaired():
+    """24.11.2026 14:57 UTC living room: «выключи свет» was heard as
+    «Тоби выключите свет.» — RE_OFF's word-boundary match misses the polite
+    ending, the turn went to `verb_missing` and the lamp was not switched.
+    """
+    from resolver import normalize_stt_verbs, resolve_action
+
+    measured = "Тоби выключите свет."
+    assert normalize_stt_verbs(measured) == "Тоби выключи свет."
+    call = resolve_action(measured, "livingroom")
+    assert call is not None and "TurnOff" in call.tool, call and call.tool
+    assert normalize_stt_verbs("выключите") == "выключите", "no device noun"
 
 
 def test_the_parallel_future_on_verb_is_repaired_too():
@@ -1932,18 +2290,113 @@ def test_the_stt_repair_happens_before_the_classifier_decides():
     )
 
 
-def test_the_escalation_note_tells_l2_not_to_guess_the_direction():
-    """The note is the whole fix for the unmeasured cases, so its wording is
-    load-bearing: it has to forbid the action, not merely mention the ambiguity."""
+def test_the_verbless_guard_is_wired_and_never_guesses():
+    """24.11.2026: a device noun with no verb used to reach L2 with a note
+    forbidding it to guess the direction. The note was prompt text and the
+    model ignored it; the turn now stops at a deterministic clarification.
+    """
     import app as jev_router_app
     import inspect
 
     src = inspect.getsource(jev_router_app._handle)
     assert "action_verb_missing" in src, "the guard is not wired into _handle"
-    assert "НЕ угадывай направление" in src
-    assert "спроси" in src
+    assert "_VERB_CLARIFY" in src, "the clarification is not emitted by _handle"
     # It must gate on route == complex_logic, or it would fire on resolved actions.
     assert 'route == "complex_logic"' in src
+    assert "угадывай" not in src, "the old prompt-only note is still the mechanism"
+
+
+async def _drive_router(app, text, stream="livingroom"):
+    return [
+        json.loads(c.removeprefix("data: "))
+        async for c in app._handle(app.RouteRequest(
+            text=text, session_id="probe", stream_name=stream
+        ))
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_question_with_a_device_noun_still_reaches_l2(monkeypatch):
+    """`_DEVICE_NOUN` contains «фильм» and «кофеварк», and `action_verb_missing`
+    only looks for a device + no action verb — so a genuine question also looks
+    "verbless" and was answered with «Не расслышала действие» instead of being
+    handed to L2. Interrogatives must keep the escalation.
+    """
+    import app as jev_router_app
+
+    reached = []
+
+    async def _classify(*a, **k):
+        return type("D", (), {"route": "complex_logic", "confidence": 0.5,
+                              "reason": "probe"})()
+
+    async def _worker(*a, **k):
+        reached.append(True)
+        yield {"type": "sentence", "text": "Ответ верхнего уровня."}
+
+    monkeypatch.setattr(jev_router_app.classifier, "classify", _classify)
+    monkeypatch.setattr(jev_router_app, "_run_worker", _worker)
+
+    for text in ("какой фильм мы смотрели?", "как работает кофеварка?"):
+        reached.clear()
+        events = await _drive_router(jev_router_app, text)
+        assert reached, f"{text!r} was short-circuited, never reached L2"
+        sentences = [e.get("text") for e in events if e.get("type") == "sentence"]
+        assert sentences == ["Ответ верхнего уровня."], (text, sentences)
+
+
+@pytest.mark.asyncio
+async def test_a_query_route_question_reaches_l2_without_a_question_mark(monkeypatch):
+    """STT does not always keep the trailing «?». A downgraded easy_query
+    (`reason=query_resolver_ambiguous`) is a question route by construction and
+    must not be swallowed by the verb clarification either.
+    """
+    import app as jev_router_app
+
+    reached = []
+
+    async def _classify(*a, **k):
+        return type("D", (), {"route": "complex_logic", "confidence": 0.5,
+                              "reason": "query_resolver_ambiguous"})()
+
+    async def _worker(*a, **k):
+        reached.append(True)
+        yield {"type": "sentence", "text": "Ответ верхнего уровня."}
+
+    monkeypatch.setattr(jev_router_app.classifier, "classify", _classify)
+    monkeypatch.setattr(jev_router_app, "_run_worker", _worker)
+
+    events = await _drive_router(jev_router_app, "какой фильм мы смотрели")
+    assert reached, "the query route was answered by the verb clarification"
+    sentences = [e.get("text") for e in events if e.get("type") == "sentence"]
+    assert sentences == ["Ответ верхнего уровня."], sentences
+
+
+@pytest.mark.asyncio
+async def test_a_verbless_command_still_short_circuits(monkeypatch):
+    """Guard on the measured case: «компьютер, включи свет» arrived as «и свет».
+    It has a device and no verb, no question shape — it must still get the one
+    short clarification instead of burning L2 seconds and guessing a direction.
+    """
+    import app as jev_router_app
+
+    reached = []
+
+    async def _classify(*a, **k):
+        return type("D", (), {"route": "complex_logic", "confidence": 0.5,
+                              "reason": "probe"})()
+
+    async def _worker(*a, **k):
+        reached.append(True)
+        yield {"type": "sentence", "text": "L2 должен был быть пропущен"}
+
+    monkeypatch.setattr(jev_router_app.classifier, "classify", _classify)
+    monkeypatch.setattr(jev_router_app, "_run_worker", _worker)
+
+    events = await _drive_router(jev_router_app, "и свет")
+    assert not reached, "a verbless command reached L2"
+    sentences = [e.get("text") for e in events if e.get("type") == "sentence"]
+    assert sentences == [jev_router_app._VERB_CLARIFY], sentences
 
 
 # --- «ok» is not a device that moved, on the FAST path either (06.10.2026) ----
@@ -3632,3 +4085,78 @@ def test_the_knowledge_persona_is_not_the_diagnostics_one():
     assert "диагностике" not in src[know_at:], (
         "KNOWLEDGE_SYSTEM must not reuse the diagnostics framing"
     )
+
+
+# --- a later command must not be read back as this command's failure -------
+# Measured 25.11.2026 21:40/21:41 on the living room: HassTurnOn at 21:40:39.33
+# moved the relay (`on` at 21:40:39.450406 in HA's recorder), then the user's
+# «выключит свет» turned it `off` at 21:41:01.204291. The +185 s late verify
+# saw `off` and logged "THE DEVICE NEVER MOVED" — a verdict about a state that
+# a LATER command had changed, not about the ON call it was judging.
+
+
+def _late_verify_pending(monkeypatch, jev_router_app, state, changed_after_s):
+    eid = "switch.living_room_light_swith_relay"
+    # Hand-built fixture from the measured field case: ON at 21:40:39.450406,
+    # OFF at 21:41:01.204291 — 22 s apart, i.e. the state was changed by a
+    # later command relative to the moment this verify was created. A plain
+    # negative number is the control: nothing changed after our call.
+    last_changed = datetime.fromtimestamp(
+        time.time() + changed_after_s, tz=timezone.utc,
+    ).isoformat()
+
+    class _HA:
+        async def get_states(self, force=False):
+            return [{"entity_id": eid, "state": state,
+                     "last_changed": last_changed}]
+
+    monkeypatch.setattr(jev_router_app, "ha", _HA())
+    monkeypatch.setattr(jev_router_app, "_LATE_VERIFY_S", 0.01)
+    logs = []
+    monkeypatch.setattr(
+        jev_router_app.logger, "info",
+        lambda msg, *a: logs.append(msg % a if a else msg),
+    )
+    p = jev_router_app._PendingVerify([eid], {}, True, [])
+    return p, logs
+
+
+@pytest.mark.asyncio
+async def test_late_verify_does_not_condemn_a_device_a_later_command_changed(monkeypatch):
+    import app as jev_router_app
+
+    p, logs = _late_verify_pending(monkeypatch, jev_router_app, "off", 22.0)
+    await p._late_verify()
+
+    assert not any("THE DEVICE NEVER MOVED" in line for line in logs), logs
+    assert any("later command" in line for line in logs), logs
+
+
+@pytest.mark.asyncio
+async def test_late_verify_still_condemns_a_device_that_never_changed(monkeypatch):
+    import app as jev_router_app
+
+    p, logs = _late_verify_pending(monkeypatch, jev_router_app, "off", -600.0)
+    await p._late_verify()
+
+    assert any("THE DEVICE NEVER MOVED" in line for line in logs), logs
+
+
+def test_the_scale_mangle_is_not_a_tare_when_it_is_a_question():
+    """23.11.2026: «обнулились» is an observed STT form of «обнули весы» and
+    must keep working as a command. But «весы обнулились?» is a question about
+    the scale's state, and `resolve_scale` checked tare before any question
+    handling — so the router performed a real tare (Zero button) on it.
+    """
+    from resolver import resolve_scale
+
+    # Command side: the three observed mangles and the explicit imperative all
+    # still tare a loaded platform (the Zero button zeroes what is on it).
+    for text in ("обнулились", "обнулились ты", "обнулились ли", "обнули весы"):
+        call = resolve_scale(text)
+        assert call is not None and call.kind == "tare", (text, call)
+
+    # Question side: no side effect, and a weight question is still answered.
+    for text in ("весы обнулились?", "обнулились весы?", "что весы обнулились?"):
+        assert resolve_scale(text) is None, f"{text!r} performed a tare"
+    assert resolve_scale("Сколько весит?").kind == "weight"

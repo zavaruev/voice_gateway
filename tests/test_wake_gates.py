@@ -471,8 +471,12 @@ def test_the_wake_log_reports_the_peak_the_gate_actually_judged():
         body.append(ln.strip())
     wake_line = "\n".join(body)
 
-    assert "max(self._vosk_peak_win)" in wake_line, (
-        f"the VOSK WAKE log does not report the window peak: {wake_line!r}"
+    # The peak the gate judges is now computed ONCE by `_wake_energy_gate()`
+    # (which also considers a FINAL segment's own audio) and logged as
+    # `win_peak`, so the line cannot disagree with the decision. This test is
+    # still source-level only because reaching the branch needs a live decoder.
+    assert "win_peak" in wake_line, (
+        f"the VOSK WAKE log does not report the peak the gate judged: {wake_line!r}"
     )
     assert "min_peak=" not in wake_line, (
         f"the threshold is now logged as window=<max>/<threshold>, and the old "

@@ -42,6 +42,7 @@ import re
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 
+import calc
 import config
 from ha_client import ordinal_digit
 
@@ -189,7 +190,7 @@ RE_OFF = re.compile(
 #
 #     'куча свет'              -> L2, conf 0.75 -> «Включила свет»     (asked to turn OFF)
 #     'куча свет в гостиной'   -> L2, conf 0.72 -> «Включила свет в гостиной»
-#     'ключи свет'             -> L2, conf 0.74
+#     'ключи свет'             -> L2, conf 0.74   [RETRACTED 24.11, see below]
 #     'выкл юч свет'           -> L2, conf 0.86, resolver_ambiguous
 #
 # Below the classifier's 0.85 the turn is escalated, and **an LLM handed «куча
@@ -203,14 +204,22 @@ RE_OFF = re.compile(
 # log holds 'включи', 'Включи', 'включи свет' — so there is no ON entry, and
 # adding one would be inventing a rule from no measurement.
 #
-# The gate is a device noun, because «куча» and «ключи» are ordinary Russian
-# words. With no device in the sentence these are ignored, so «куча чая» cannot
-# reach a switch. See normalize_stt_verbs().
+# RETRACTED 24.11.2026: «ключи» used to be listed here, observed 06.10.2026
+# from an OFF order. It is the shared tail of BOTH «включи» and «выключи»: on
+# 24.11 at 12:32 MSK three fast ON orders arrived as «ключи свет» and were
+# turned into «выключи свет», so the room said «уже выключено» to an order to
+# switch the light ON — a reversed action on a real relay, and the poisoned
+# transcript was then borrowed as the next turn's device hint. One spelling with
+# two possible meanings cannot carry a direction. It is now left ALONE (it is
+# also an ordinary noun, «ключи от машины»), so the verbless clarification asks
+# instead of guessing. The other three fragments are unambiguous and stay.
+#
+# The gate is a device noun, because «куча» is an ordinary Russian word. With
+# no device in the sentence these are ignored, so «куча чая» cannot reach a
+# switch. See normalize_stt_verbs().
 _STT_OFF_VARIANTS: tuple[tuple[re.Pattern[str], str], ...] = (
     # 'куча свет', 'куча свет в гостиной'
     (re.compile(r"\bкуч[аеуыи]\b", re.IGNORECASE), "выключи"),
-    # 'ключи свет'
-    (re.compile(r"\bключи\b", re.IGNORECASE), "выключи"),
     # 'выкл юч свет' — Whisper split the word
     (re.compile(r"\bвыкл\s*юч\b", re.IGNORECASE), "выключи"),
     # 'выкл свет' — the truncated stem, which RE_OFF's \b...\b misses
@@ -230,16 +239,35 @@ _STT_OFF_VARIANTS: tuple[tuple[re.Pattern[str], str], ...] = (
 # was NOT observed in the log and is here for the reason the ON participle
 # above is: a one-sided repair looks finished and is not.
 #
+# 24.11.2026 12:52 MSK: Whisper wrote the 3rd-person future «выключит» for an
+# imperative «выключи свет» (the capture fix now delivers the whole phrase, so
+# this mis-inflection became visible). It is one letter from the measured 1st
+# person and produced the deterministic clarification instead of acting.
+# «включит» is its unmeasured mirror, added with the same reasoning as above.
+#
 # No question-mark gate, unlike the participle table: «свет выключен» can be
 # read as a statement about the world, «выключу свет» cannot — a future with a
-# device noun is an order.
+# device noun is an order. A bare «он выключит» carries no device noun and so
+# never reaches this table.
 #
 # OFF substitution first, matching _STT_OFF_VARIANTS; the two words do not
 # collide («выключу» has «ы» where «включу» needs «в»), so order is a
 # convention rather than a load-bearing choice.
 _STT_FUTURE_VARIANTS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\bвыключу\b", re.IGNORECASE), "выключи"),
+    (re.compile(r"\bвыключит\b", re.IGNORECASE), "выключи"),
     (re.compile(r"\bвключу\b", re.IGNORECASE), "включи"),
+    (re.compile(r"\bвключит\b", re.IGNORECASE), "включи"),
+)
+
+# Measured 24.11.2026 14:57 UTC, living room: an imperative «выключи свет»
+# arrived as «Тоби выключите свет.». «выключите» is the polite/plural form of
+# the SAME imperative, but RE_OFF's \b...\b misses the ending, so the turn
+# became `verb_missing` and the lamp was not switched. The ON mirror is
+# unmeasured and is here for the same reason as the ON future above.
+_STT_POLITE_VARIANTS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"\bвыключите\b", re.IGNORECASE), "выключи"),
+    (re.compile(r"\bвключите\b", re.IGNORECASE), "включи"),
 )
 
 
@@ -264,6 +292,23 @@ _STT_FUTURE_VARIANTS: tuple[tuple[re.Pattern[str], str], ...] = (
 _STT_PARTICIPLE_VARIANTS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\bвыключен\b", re.IGNORECASE), "выключи"),
     (re.compile(r"\bвключен\b", re.IGNORECASE), "включи"),
+)
+# Measured 25.11.2026 10:39 UTC, living room: «Добби, включи свет» arrived as
+# 'Добби включил свет' — a past-tense VERB (not a participle), so RE_ON found
+# nothing and the router answered «Не расслышала действие» with the lamp off.
+# Same mechanism as the future table above, one tense over. The OFF mirror is
+# unmeasured and labelled as such; the device-noun and no-question gates are
+# the same ones that keep «он включил» an ordinary statement.
+_STT_PAST_VARIANTS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"\bвключил\b", re.IGNORECASE), "включи"),   # measured
+    (re.compile(r"\bвыключил\b", re.IGNORECASE), "выключи"),  # mirror, unmeasured
+)
+# One observed STT split of a DEVICE noun: 21.11.2026, Whisper wrote
+# «Выключи кофе варку.» from a clean recording. The split word resolves to
+# None, so the command died before HA. Gated on an action verb below, so a
+# sentence about coffee brewing is not turned into a device command.
+_STT_NOUN_VARIANTS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"\bкофе\s+варк", re.IGNORECASE), "кофеварк"),
 )
 
 # «цвет» is an ordinary Russian word, so it is admitted as a device ONLY where
@@ -295,14 +340,21 @@ def normalize_stt_verbs(text: str) -> str:
     if not t:
         return t
     t = _RE_COLOUR_AS_LIGHT.sub(_colour_to_light, t, count=1)
+    if RE_ON.search(t) or RE_OFF.search(t):
+        for pattern, canonical in _STT_NOUN_VARIANTS:
+            t = pattern.sub(canonical, t, count=1)
     if not _DEVICE_NOUN.search(t):
         return t
     if "?" not in t:
         for pattern, canonical in _STT_PARTICIPLE_VARIANTS:
             t = pattern.sub(canonical, t, count=1)
+        for pattern, canonical in _STT_PAST_VARIANTS:
+            t = pattern.sub(canonical, t, count=1)
     for pattern, canonical in _STT_OFF_VARIANTS:
         t = pattern.sub(canonical, t, count=1)
     for pattern, canonical in _STT_FUTURE_VARIANTS:
+        t = pattern.sub(canonical, t, count=1)
+    for pattern, canonical in _STT_POLITE_VARIANTS:
         t = pattern.sub(canonical, t, count=1)
     if t.strip() != (text or "").strip():
         logger.info("STT off-verb normalised: %r -> %r", text[:80], t[:80])
@@ -332,6 +384,27 @@ def action_verb_missing(text: str) -> bool:
     if RE_TIMERS.search(t):
         return False
     return True
+
+
+# A question is still a question even when Whisper drops the trailing «?», and
+# even when the only "device" in it is a film title or a coffee maker — both are
+# in _DEVICE_NOUN, which is why «какой фильм мы смотрели?» looked "verbless" and
+# was answered with a clarification instead of being escalated. Bare «да» and
+# «ли» are deliberately NOT here: those are ordinary words in this house's
+# recorded commands, and «обнулились ли» is a measured tare command.
+_RE_QUESTION_START = re.compile(
+    r"^\s*(?:а\s+)?(?:что|чего|какой|какая|какое|какие|как|кто|сколько|где|куда|"
+    r"откуда|почему|зачем|когда|чей|чья|чьё|чьи)\b",
+    re.IGNORECASE,
+)
+
+
+def is_question_shape(text: str) -> bool:
+    """Interrogative by punctuation or by its opening question word."""
+    t = (text or "").strip()
+    if not t:
+        return False
+    return "?" in t or bool(_RE_QUESTION_START.search(t))
 
 
 RE_BRIGHTER = re.compile(r"\b(ярче|яркость|светлее|прибавь свет)\b", re.IGNORECASE)
@@ -1174,32 +1247,85 @@ RE_SCALE_WEIGHT_Q = re.compile(
     re.IGNORECASE,
 )
 RE_SCALE_TARE = re.compile(
-    # «обнулились» / «обнулились ты» are what Whisper actually wrote for
-    # «обнули весы» on 23.11.2026 (09:37 and 09:43, kitchen). They stand alone —
-    # no «вес» word follows, so they need their own alternative here.
     r"\b(?:обнули(?:ть)?|тарируй(?:те)?|тарировать|сбросить|сбрось)\b.*\bвес"
-    r"|\bвесы\s+в\s+ноль\b|\bсделай\s+тару\b|\bобнулились\b",
+    r"|\bвесы\s+в\s+ноль\b|\bсделай\s+тару\b",
+    re.IGNORECASE,
+)
+# «обнулились» / «обнулились ты» / «обнулились ли» are what Whisper actually
+# wrote for «обнули весы» on 23.11.2026 (09:37, 09:43, 10:29 — kitchen). They
+# stand alone — no «вес» word follows — and are a PAST/reflexive form, i.e. the
+# same shape as a state question. Kept separate from the imperative forms so
+# the question gate can refuse «весы обнулились?» without losing the commands.
+RE_SCALE_TARE_MANGLE = re.compile(r"\bобнулились\b", re.IGNORECASE)
+
+
+# A percentage of what is on the scale (23.11.2026 18:09, kitchen: "посчитай
+# два процента от того что на весах"). The weight word must be in the phrase:
+# "два процента от заряда пылесоса" is a different device and stays with L2.
+_RU_SCALE_NUMBERS = {
+    "ноль": 0, "один": 1, "два": 2, "три": 3, "четыре": 4, "пять": 5,
+    "шесть": 6, "семь": 7, "восемь": 8, "девять": 9, "десять": 10,
+    "одиннадцать": 11, "двенадцать": 12, "тринадцать": 13,
+    "четырнадцать": 14, "пятнадцать": 15, "шестнадцать": 16,
+    "семнадцать": 17, "восемнадцать": 18, "девятнадцать": 19,
+    "двадцать": 20, "тридцать": 30, "сорок": 40, "пятьдесят": 50,
+    "шестьдесят": 60, "семьдесят": 70, "восемьдесят": 80,
+    "девяносто": 90, "сто": 100,
+}
+_RE_SCALE_NUMBER = "|".join(sorted(_RU_SCALE_NUMBERS, key=len, reverse=True))
+RE_SCALE_PERCENT = re.compile(
+    rf"\b(\d{{1,3}}|{_RE_SCALE_NUMBER})\s*(?:%|процент\w*)\s*"
+    r"(?:от\s+)?(?:того\s+)?(?:что\s+)?(?:на\s+)?(?:весах|веса|весов|вес)\b",
     re.IGNORECASE,
 )
 
 
 @dataclass
 class ScaleCall:
-    """A deterministic scale command: kind is "weight" or "tare"."""
+    """A deterministic scale command: kind is "weight", "tare" or "percent"."""
 
     kind: str
+    percent: float = 0.0
 
 
 def resolve_scale(text: str) -> ScaleCall | None:
-    """Recognise only the two supported scale commands; no network, no LLM."""
+    """Recognise only the supported scale commands; no network, no LLM."""
     t = (text or "").strip()
     if not t:
         return None
     if RE_SCALE_TARE.search(t):
         return ScaleCall("tare")
+    # The past-tense mangle is a command only when nobody is asking about the
+    # scale. «весы обнулились?» is a question about its state, not an order to
+    # press Zero; the imperative forms above keep their old behaviour.
+    if not is_question_shape(t) and RE_SCALE_TARE_MANGLE.search(t):
+        return ScaleCall("tare")
+    m = RE_SCALE_PERCENT.search(t)
+    if m:
+        token = m.group(1).lower()
+        pct = float(token) if token.isdigit() else _RU_SCALE_NUMBERS.get(token)
+        if pct is not None and 0 <= pct <= 100:
+            return ScaleCall("percent", pct)
     if RE_SCALE_WEIGHT_Q.search(t) and not _DEVICE_NOUN.search(t):
         return ScaleCall("weight")
     return None
+
+
+@dataclass
+class CalcCall:
+    """A deterministic arithmetic question, already evaluated in L1."""
+
+    value: float
+
+
+def resolve_calc(text: str) -> CalcCall | None:
+    """Only a parseable expression. Everything else keeps its old route.
+
+    Called AFTER `resolve_scale`, so a percentage of the scale reading stays
+    on the scale route; before the classifier, so no LLM ever sees the maths.
+    """
+    value = calc.evaluate(text)
+    return CalcCall(value) if value is not None else None
 
 
 RE_TIME_Q = re.compile(
@@ -1257,7 +1383,8 @@ def resolve_query(text: str, stream_name: str) -> ResolvedQuery | None:
         return ResolvedQuery("weather")
 
     # The area *source* is irrelevant for queries (nothing is toggled).
-    area, _src = _find_area(t, stream_name)
+    area, area_src = _find_area(t, stream_name)
+    device_room_named = area_src != "default"
     thing_domain, thing_name, _low, thing_stem = _find_thing(t)
 
     # Sensor reads: domain=sensor (+ room when known); the RU stem travels
@@ -1274,7 +1401,11 @@ def resolve_query(text: str, stream_name: str) -> ResolvedQuery | None:
         return ResolvedQuery("state", args, entity_hint="влажн")
     if RE_BATT.search(t):
         args = {"domain": ["sensor"]}
-        if area:
+        # A DEVICE is named: the satellite's default room is where the SPEAKER
+        # stands, not where the device stands. Keeping it made the kitchen
+        # answer «Пылесос: 24,1 градусов» from the room thermometer (23.11).
+        # An explicitly named room stays a hard constraint.
+        if area and (device_room_named or not thing_stem and not thing_name):
             args["area"] = area
         # «сколько заряда у робота» (29.09.2026): the METRIC alone matches
         # every battery in the house and find_entity returns the first one

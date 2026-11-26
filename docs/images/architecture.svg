@@ -28,7 +28,7 @@
     <rect x="30" y="220" width="235" height="104" rx="7" fill="#161b22" stroke="#30363d"/>
     <text x="46" y="246" fill="#e6edf3" font-size="13.5" font-weight="700">OpenIPC cameras</text>
     <text x="46" y="267" fill="#8b949e" font-size="12">raw L16 16 kHz over RTSP</text>
-    <text x="46" y="285" fill="#8b949e" font-size="12">vosk: «компьютер» / «добби» · /play_audio out</text>
+    <text x="46" y="285" fill="#8b949e" font-size="12">vosk: «компьютер» / «домовой» · /play_audio out</text>
     <text x="46" y="303" fill="#8b949e" font-size="12">5 rooms · arbitration · echo guards</text>
 
     <rect x="30" y="348" width="235" height="76" rx="7" fill="#161b22" stroke="#30363d"/>

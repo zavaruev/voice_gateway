@@ -45,6 +45,7 @@ from difflib import SequenceMatcher
 import calc
 import config
 from ha_client import ordinal_digit
+from query_norm import normalise_download_verb
 
 logger = logging.getLogger("router.resolver")
 
@@ -405,6 +406,75 @@ def is_question_shape(text: str) -> bool:
     if not t:
         return False
     return "?" in t or bool(_RE_QUESTION_START.search(t))
+
+
+# A download request is an ACTION with a verb and an object, not a garbled
+# question. Measured 27.11.2026 13:10 MSK: «скачай восьмой сезон Симпсонов»
+# had no smart-home device noun, so `is_unrecognised_utterance` called it
+# suspect STT and the room heard an apology while Hermes was downloading.
+# The verb list is the observed imperative plus its ordinary infinitives;
+# the object list keeps «скачай» alone out of this narrow route.
+_RE_DOWNLOAD_VERB = re.compile(
+    r"\b(скачай|скачать|скачивать|скачайте|загрузи|загрузить|загружать|"
+    r"загрузите|качай|качать)\b",
+    re.IGNORECASE,
+)
+_RE_DOWNLOAD_OBJECT = re.compile(
+    r"\b(сезон\w*|сериал\w*|сери[яию]|фильм\w*|эпизод\w*|песн\w*|"
+    r"альбом\w*|книг\w*|торрент\w*|кино)\b",
+    re.IGNORECASE,
+)
+
+
+def is_download_request(text: str) -> bool:
+    """True for «скачай <content>»-shaped requests handed up to Hermes.
+
+    Guarded by BOTH a verb and a content word: a bare verb (or a question
+    about downloading) is not this action and keeps its existing path.
+    """
+    t = normalise_download_verb(normalize_stt_verbs(text or "")).strip()
+    if not t or is_question_shape(t):
+        return False
+    verb = _RE_DOWNLOAD_VERB.search(t)
+    if not verb or not _RE_DOWNLOAD_OBJECT.search(t):
+        return False
+    # A negative immediately before the verb is an order NOT to download.
+    # This is deliberately narrow: «не забудь скачать …» is still a request.
+    before = t[:verb.start()].split()
+    if before and before[-1].lower() in {"не", "нет"}:
+        return False
+    return True
+
+
+def is_unrecognised_utterance(text: str) -> bool:
+    """True when a fluent transcript carries NO intent we could act on.
+
+    Measured 27.11.2026 10:15 MSK: Whisper wrote «так звали Пушкина» for
+    «как звали Пушкина?» — real speech at rms 2813 / peak 26608, so every
+    acoustic gate passed — and the classifier answered
+    `complex_logic conf=0.0 reason=ambiguous`. No question mark, no leading
+    question word, no device and no verb: the tool agent spent 120 s and said
+    nothing. That is a SHAPE, not a word to repair: a question whose marker
+    survived, a device phrase and any action verb all keep their old path.
+
+    This predicate is deliberately text-only and cheap; the router combines it
+    with the classifier verdict before upgrading the turn.
+    """
+    t = normalize_stt_verbs(text or "").strip()
+    if not t or is_question_shape(t) or knowledge_question(t):
+        return False
+    if is_download_request(t):
+        return False
+    if _DEVICE_NOUN.search(t):
+        return False
+    for pat in (RE_ON, RE_OFF, RE_BRIGHTER, RE_DIMMER,
+                RE_VACUUM_DOCK, RE_VACUUM_CLEAN, RE_TIMERS):
+        if pat.search(t):
+            return False
+    for pat, _, _ in RE_MEDIA:
+        if pat.search(t):
+            return False
+    return True
 
 
 RE_BRIGHTER = re.compile(r"\b(ярче|яркость|светлее|прибавь свет)\b", re.IGNORECASE)
@@ -1174,7 +1244,8 @@ def unresolved_hint(text: str) -> str:
 RE_KNOWLEDGE = re.compile(
     r"\b(?:что|кто)\s+так[ао][йе]\b"          # «что такое корень из трех»
     r"|\bсколько\s+(?:будет|составит)\b"       # «сколько будет корень из трех»
-    r"|\b(?:корень|квадрат|степен|синус|косинус|тангенс|логарифм)\w*\b",
+    r"|\b(?:корень|квадрат|куб|степен|синус|косинус|тангенс|логарифм"
+    r"|процент|умнож|подели|раздели|плюс|минус)\w*\b",
     re.IGNORECASE,
 )
 RE_HOME_QUESTION = re.compile(

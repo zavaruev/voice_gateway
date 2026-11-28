@@ -516,12 +516,19 @@ class CascadeBackend(BaseLLMBackend):
 
     ACK_COMPLEX = "Секунду, занимаюсь…"
     ACK_THINK = "Секунду, думаю…"
+    # 27.11.2026: a question sent up to Hermes must be acknowledged at once.
+    # The generic ACK_COMPLEX does not say the question was HEARD, and the
+    # suspect route used to say nothing at all for the 13-17 s Hermes thinks.
+    # put_ack() writes straight to the queue, so this never sets `content`
+    # and cannot disarm the apology if the brain then fails.
+    ACK_HEARD = "Вопрос услышан. Секунду, думаю."
     SORRY = "Простите, что-то пошло не так."
     # Добби's own turns (домовой эльф из «Гарри Поттера»). He speaks of himself
     # in the third person and says «домовой» instead of repeating his name —
     # the wake decoder must not hear its own address in every short reply.
     # The honorific comes from the speaker: сэр / мэм / "" when unidentified.
     DOBBI_ACK = "Домовой слушает{h}. Секунду."
+    DOBBI_ACK_HEARD = "Домовой услышал{h}. Секунду думаю."
     DOBBI_SORRY = "Домовой оплошал{h}. Повторите, пожалуйста."
 
     @staticmethod
@@ -532,6 +539,12 @@ class CascadeBackend(BaseLLMBackend):
         if persona == "dobbi":
             return self.DOBBI_ACK.format(h=self._h(honorific))
         return self.ACK_COMPLEX
+
+    def _ack_for_question(self, persona: str, honorific: str = "") -> str:
+        """Immediate acknowledgement for a question going up to Hermes."""
+        if persona == "dobbi":
+            return self.DOBBI_ACK_HEARD.format(h=self._h(honorific))
+        return self.ACK_HEARD
 
     def _think_for(self, persona: str, honorific: str = "") -> str:
         if persona == "dobbi":
@@ -544,7 +557,7 @@ class CascadeBackend(BaseLLMBackend):
         return self.SORRY
 
     def __init__(self, router_url: str, ack_delay: float = 3.0,
-                 total_timeout: float = 200.0, sock_read_timeout: float = 60.0):
+                 total_timeout: float = 300.0, sock_read_timeout: float = 60.0):
         """`ack_delay` = seconds before the "thinking" ack fires on easy
         routes; `total_timeout`/`sock_read_timeout` bound the SSE stream
         (an L2 turn may legitimately run ~2 min, hence the headroom)."""
@@ -621,9 +634,11 @@ class CascadeBackend(BaseLLMBackend):
                 # сэр for alexander, мэм for marina/vladislava. An unidentified
                 # speaker sends "" — Добби drops the address rather than guessing.
                 payload["honorific"] = honorific
-            # total=200 s covers a full L2 turn (worker WORKER_TIMEOUT 120 s
-            # plus L1 routing and stream overhead); sock_read=60 s treats a
-            # dead socket as an error instead of hanging the turn.
+            # total=300 s covers a full L2 turn (worker WORKER_TIMEOUT 120 s
+            # plus L1 routing) AND the direct torrent search: the field case
+            # on 27.11 took ~205 s, so the old 200 s cap cut the turn just
+            # before the torrent was added. sock_read=60 s still treats a
+            # dead socket as an error; silent keepalives reset that timer.
             timeout = aiohttp.ClientTimeout(
                 total=self.total_timeout,
                 sock_connect=5,
@@ -660,7 +675,22 @@ class CascadeBackend(BaseLLMBackend):
                                 if ack_task is not None:
                                     ack_task.cancel()
                                     ack_task = None
-                                put_ack(self._ack_for(persona, honorific))
+                                if ev.get("reason") == "download_request":
+                                    # 27.11.2026: a parseable download request
+                                    # answers with ONE factual sentence from
+                                    # the router. A generic «услышан, думаю»
+                                    # ack would be a second, misleading phrase.
+                                    continue
+                                # 27.11.2026: EVERY Hermes-bound question is
+                                # acknowledged IMMEDIATELY — including
+                                # stt_suspect, whose correction cue comes only
+                                # AFTER the answer. Without this the room sits
+                                # silent for the 13-17 s the brain thinks.
+                                put_ack(
+                                    self._ack_for_question(persona, honorific)
+                                    if route == "expert"
+                                    else self._ack_for(persona, honorific)
+                                )
                             elif not ack_sent and not spoken and ack_task is None:
                                 ack_task = asyncio.create_task(
                                     ack_later(self._think_for(persona, honorific))

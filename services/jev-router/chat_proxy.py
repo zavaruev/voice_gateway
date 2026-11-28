@@ -268,7 +268,8 @@ KNOWLEDGE_SYSTEM = (
 
 
 async def stream_chat(
-    text: str, expert: bool = False, knowledge: bool = False, persona: str = ""
+    text: str, expert: bool = False, knowledge: bool = False, persona: str = "",
+    stt_suspect: bool = False,
 ):
     """general_qa: OmniRoute combo → Hermes failover (fast chat brain).
     expert: Hermes L3 FIRST, OmniRoute failover — the expert route is the
@@ -285,6 +286,17 @@ async def stream_chat(
         system = KNOWLEDGE_SYSTEM
     else:
         system = EXPERT_SYSTEM if expert else CHAT_SYSTEM
+    if stt_suspect:
+        # 27.11.2026: the router saw a fluent utterance with no intent, which
+        # means Whisper may have distorted real speech. The user is told this
+        # separately; the brain must answer by MEANING rather than treating a
+        # mistranscribed word as a new question. It asks to clarify only when
+        # the meaning really is unclear — never a canned refusal.
+        system += (
+            "\nВНИМАНИЕ: фраза пришла из голосового ввода и могла быть "
+            "распознана неточно. Отвечай по смыслу; если смысл действительно "
+            "неясен — коротко проси уточнить."
+        )
     messages = [
         {"role": "system", "content": system},
         {"role": "user", "content": text},

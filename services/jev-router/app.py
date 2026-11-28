@@ -59,6 +59,7 @@ from pydantic import BaseModel
 import chat_proxy
 import calc
 import config
+import download
 import history
 import lessons
 import memory
@@ -102,9 +103,17 @@ from resolver import (
     unresolved_hint,
     action_verb_missing,
     is_question_shape,
+    is_unrecognised_utterance,
+    is_download_request,
     normalize_stt_verbs,
     knowledge_question,
     _datetime_phrase,
+)
+from onoff_verify import (  # noqa: E402 — shared with the worker; held identical
+    POWER_ON_W as _POWER_ON_W,
+    POWER_SENSOR_SUFFIX as _POWER_SENSOR_SUFFIX,
+    physics_agrees as _physics_agrees,
+    power_sensor_for as _power_sensor_for,
 )
 
 # stdout logging: uvicorn does not configure root logging by default, and the
@@ -123,6 +132,30 @@ _VERB_CLARIFY = "Не расслышала действие. Повторите 
 # 25.11.2026 10:39: "Не расслышала" spoken by aidar reads as a voice/grammar
 # mismatch. The default assistant sentence above is untouched.
 _VERB_CLARIFY_DOBBI = "Не расслышал действие. Повторите команду, пожалуйста."
+
+# 27.11.2026 10:15 MSK: a mangled question («так звали Пушкина» from «как
+# звали Пушкина?») passed every acoustic gate, scored complex_logic/0.00, and
+# burned 120 s in L2 because it had neither a question marker nor a device.
+# This is spoken AFTER Hermes' answer, on purpose: the phrase below is what
+# opens the camera's follow-up window («повторите, пожалуйста» is already a
+# question in `_is_question_reply`), and it must open at the END of the turn.
+_STT_SUSPECT_ACK = (
+    "Похоже, я неверно расслышала. Если это не то — повторите, пожалуйста, "
+    "правильную фразу."
+)
+
+# 28.11.2026 12:29-12:32 MSK: a browser search for «Симпсоны 3» took 2 min 24 s
+# and the room heard nothing until the torrent was added. This acknowledgement
+# is emitted BEFORE the tool call; the factual confirmation still waits for
+# the add, so no completion is ever announced for a torrent not yet in the queue.
+_DOWNLOAD_ACK = "Пытаюсь скачать."
+
+# The gateway reads /route with sock_read=60 s. Hermes may run tools for
+# minutes (a Rutracker download took 13:10->13:14 MSK on 27.11.2026), so an
+# expert turn emits a SILENT keepalive before that deadline. 15 s gives four
+# chances inside the gateway's window; a keepalive carries no text and is
+# never spoken or remembered — it only keeps the socket honest.
+EXPERT_KEEPALIVE_S = 15.0
 
 
 def dobbi_style(text: str, honorific: str = "") -> str:
@@ -147,6 +180,8 @@ def dobbi_style(text: str, honorific: str = "") -> str:
         "Выключила": f"Готово{h}. Домовой справился.",
         _VERB_CLARIFY: f"Домовой не расслышал действие{h}. Повторите, пожалуйста.",
         _VERB_CLARIFY_DOBBI: f"Домовой не расслышал действие{h}. Повторите, пожалуйста.",
+        _STT_SUSPECT_ACK: f"Домовой неверно расслышал{h}. Повторите, пожалуйста, правильную фразу.",
+        _DOWNLOAD_ACK: f"Домовой пытается скачать{h}.",
         "Простите, что-то пошло не так.": f"Домовой расстроился{h}. Повторите, пожалуйста.",
         "Не получилось: устройство не переключилось.":
             f"Домовой оплошал{h}. Устройство не переключилось.",
@@ -1544,52 +1579,9 @@ _FIRST_READ_S = 0.8
 #
 # So: where a power sensor exists, the PHYSICS decides. Where none exists, the
 # state read is all there is, and it is logged as unproven rather than believed.
-_POWER_SENSOR_SUFFIX = "_power"
-# Below this the appliance is drawing nothing measurable. 1074 W on vs 0 W off,
-# so the midpoint is not a judgement call — but it is a number, and it is named.
-_POWER_ON_W = 5.0
-
-
-def _power_sensor_for(entity_id: str, states: list[dict]) -> str | None:
-    """The power sensor paired with this switch, or None.
-
-    Matched by name (`switch.coffemaker` -> `sensor.coffemaker_power`) and only
-    when it really is a power sensor. There is no device_id on a `/api/states`
-    row, so name pairing is the instrument available; it is deliberately
-    conservative — a wrong pairing would mean believing a number about the wrong
-    appliance, which is worse than admitting there is none.
-    """
-    if not entity_id.startswith("switch."):
-        return None
-    base = entity_id.split(".", 1)[1]
-    want = "sensor." + base + _POWER_SENSOR_SUFFIX
-    for ent in states or []:
-        if ent.get("entity_id") != want:
-            continue
-        attrs = ent.get("attributes") or {}
-        if attrs.get("device_class") != "power":
-            return None       # same name, not a power reading: do not trust it
-        return want
-    return None
-
-
-def _physics_agrees(ent: dict | None, target: str) -> bool | None:
-    """Does the power sensor support the target state? None = no opinion.
-
-    None is returned whenever the number cannot be read, and the caller must
-    treat that as UNPROVEN rather than as success — the whole point of the
-    exercise. An `unavailable`/`unknown` sensor is the absence of evidence.
-    """
-    if not ent:
-        return None
-    raw = str(ent.get("state", "")).strip().lower()
-    if raw in ("unknown", "unavailable", "none", ""):
-        return None
-    try:
-        watts = float(raw)
-    except ValueError:
-        return None
-    return watts >= _POWER_ON_W if target == "on" else watts < _POWER_ON_W
+# These four names used to be defined here. They now come from the shared
+# onoff_verify module above, which is byte-identical in the worker's image; the
+# old private names are kept as aliases so call sites and tests keep working.
 
 
 async def confirm_on_off_one_read(
@@ -1780,6 +1772,47 @@ async def _run_worker(
                 yield chunk
 
 
+async def _chat_events_with_keepalive(text: str, **kwargs):
+    """Forward chat_proxy.stream_chat, emitting a silent keepalive if the next
+    sentence is slower than EXPERT_KEEPALIVE_S.
+
+    Waiting on `anext()` with a timeout would CANCEL the chat generator and
+    lose its answer, so the consumer runs in a task and feeds a queue. A timed
+    out `queue.get()` is safe: it cancels only the wait, not the producer.
+    Hermes' tool loop may take minutes; a byte on the SSE wire every 15 s is
+    what keeps the gateway from declaring a dead socket after 60 s (27.11
+    13:11 MSK: the room apologized while a download was still starting).
+    """
+    queue: asyncio.Queue = asyncio.Queue()
+    done = object()
+
+    async def produce():
+        try:
+            async for s, emo in chat_proxy.stream_chat(text, **kwargs):
+                await queue.put({"type": "sentence", "text": s, "emotion": emo})
+        except Exception as e:
+            await queue.put(e)
+        finally:
+            await queue.put(done)
+
+    task = asyncio.create_task(produce())
+    try:
+        while True:
+            try:
+                ev = await asyncio.wait_for(queue.get(), timeout=EXPERT_KEEPALIVE_S)
+            except asyncio.TimeoutError:
+                yield {"type": "keepalive"}
+                continue
+            if ev is done:
+                return
+            if isinstance(ev, Exception):
+                raise ev
+            yield ev
+    finally:
+        if not task.done():
+            task.cancel()
+
+
 async def _handle(req: RouteRequest):
     """Async generator of router SSE events for one request.
 
@@ -1880,7 +1913,7 @@ async def _handle(req: RouteRequest):
     # worse than going up immediately. Actions stay on complex_logic: only a
     # question-shaped utterance is upgraded here.
     question_to_expert = False
-    if route == "complex_logic" and is_question_shape(text):
+    if route == "complex_logic" and (is_question_shape(text) or knowledge_question(text)):
         kind = ("knowledge_low_confidence" if knowledge_question(text)
                 else "unresolved_question")
         route, reason = "expert", kind
@@ -2046,6 +2079,39 @@ async def _handle(req: RouteRequest):
         # with no verb. L2 can only guess the direction (or waste two minutes
         # asking), so answer with one short question and stop the turn here.
         reason = (reason + "+verb_missing").strip("+")
+
+    # A fluent transcript with NO intent at all is not an L2 job. Measured
+    # 27.11.2026 10:15 MSK: «так звали Пушкина» (Whisper for «как звали
+    # Пушкина?») passed every acoustic gate, had no «?», no leading question
+    # word, no device and no verb — so the v2.87 question upgrade skipped it,
+    # the tool agent spent 120 s, and the room heard only an apology. Go UP
+    # instead, and tell the user the phrase may have been misheard. The cue is
+    # deterministic and spoken AFTER Hermes' answer (see the expert branch).
+    # A download command is a REAL action with a verb and a content object —
+    # not a misheard fragment. 27.11.2026 13:10 MSK: «скачай восьмой сезон
+    # Симпсонов» had no smart-home device noun, so it was called stt_suspect
+    # and Hermes was told the words might be wrong. Go up to Hermes as a task
+    # instead, with no "may be misheard" note and no spoken apology cue.
+    direct_download = None
+    if route == "complex_logic" and is_download_request(text):
+        route, reason = "expert", "download_request"
+        knowledge = True
+        direct_download = download.parse_request(text)
+        logger.info(
+            "download request -> direct client: %r parsed=%s",
+            text[:80], direct_download,
+        )
+
+    stt_suspect = (
+        route == "complex_logic"
+        and not clarify_verb
+        and is_unrecognised_utterance(text)
+    )
+    if stt_suspect:
+        route, reason = "expert", "stt_suspect"
+        question_to_expert = True
+        knowledge = True
+        logger.info("STT suspect -> Hermes (no L2): %r", text[:80])
 
     # The (usually single) route event: emitted before any execution so the
     # caller can log/telemetry the verdict immediately.
@@ -2322,15 +2388,76 @@ async def _handle(req: RouteRequest):
             # The emotion tag travels as a STRUCTURED FIELD on the event —
             # the gateway maps sad/angry -> slower playback (emotion ->
             # speed in backends.py); the tag itself never reaches the text.
-            async for s, emo in chat_proxy.stream_chat(
-                text, expert=(route == "expert"), knowledge=knowledge,
-                persona=req.persona,
-            ):
-                reply_parts.append(s)
-                ev = {"type": "sentence", "text": s}
-                if emo:
-                    ev["emotion"] = emo
-                yield _sse(ev)
+            # A parseable download request goes straight to the service that
+            # adds the torrent. The factual sentence still waits for the add
+            # (27.11.2026 decision); an immediate «Пытаюсь скачать.» only says
+            # the request was heard, never that anything was downloaded.
+            direct_ok = False
+            if direct_download is not None:
+                ack = _DOWNLOAD_ACK
+                reply_parts.append(ack)
+                yield _sse({"type": "sentence", "text": ack})
+                # The browser call takes 1-4 min. Wait on a SHIELDED task so
+                # a timeout cancels only the wait, not the add, and emit a
+                # silent keepalive each interval — the gateway's sock_read
+                # is 60 s and must not speak an apology mid-download.
+                task = asyncio.create_task(
+                    download.search_and_download(direct_download)
+                )
+                while not task.done():
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(task), timeout=EXPERT_KEEPALIVE_S
+                        )
+                    except asyncio.TimeoutError:
+                        yield _sse({"type": "keepalive"})
+                        continue
+                try:
+                    added = task.result()
+                except Exception as e:
+                    logger.warning("direct download crashed: %s", e)
+                    added = download.UNKNOWN
+                if added is download.UNKNOWN:
+                    # The add may already have happened — never send this
+                    # text to Hermes again, or the torrent is added twice.
+                    sentence = "Не удалось подтвердить добавление в закачки."
+                    reply_parts.append(sentence)
+                    yield _sse({"type": "sentence", "text": sentence})
+                    direct_ok = True
+                elif added is not None:
+                    sentence = download.confirmation_sentence(direct_download)
+                    reply_parts.append(sentence)
+                    yield _sse({"type": "sentence", "text": sentence})
+                    direct_ok = True
+                else:
+                    # A definite refusal is a fact, not a task for Hermes. The
+                    # tool-agent path guessed a title from earlier turns and
+                    # narrated every step — one sentence is enough here.
+                    sentence = "Не нашла подходящего релиза."
+                    reply_parts.append(sentence)
+                    yield _sse({"type": "sentence", "text": sentence})
+                    direct_ok = True
+            if not direct_ok:
+                async for ev in _chat_events_with_keepalive(
+                    text, expert=(route == "expert"), knowledge=knowledge,
+                    persona=req.persona, stt_suspect=stt_suspect,
+                ):
+                    if ev.get("type") == "keepalive":
+                        yield _sse(ev)
+                        continue
+                    s, emo = ev.get("text", ""), ev.get("emotion") or ""
+                    reply_parts.append(s)
+                    sentence_ev = {"type": "sentence", "text": s}
+                    if emo:
+                        sentence_ev["emotion"] = emo
+                    yield _sse(sentence_ev)
+                if stt_suspect:
+                    # LAST sentence: the camera opens its follow-up window after
+                    # the sentence that asks the user to repeat, so the correction
+                    # lands after the whole answer has finished sounding.
+                    logger.info("speaking: %r (STT suspect)", _STT_SUSPECT_ACK[:60])
+                    reply_parts.append(_STT_SUSPECT_ACK)
+                    yield _sse({"type": "sentence", "text": _STT_SUSPECT_ACK})
 
         # --- complex_logic: L2 CodeAgent ----------------------------------
         else:

@@ -17,3 +17,4 @@ openwakeword
 slowapi
 limits  # direct `import limits` in main.py; slowapi dep but kept explicit
 mcp>=1.2,<2  # 2.x renamed FastMCP -> MCPServer; voice_mcp.py uses the v1 API
+pymorphy3==2.0.6  # services/jev-router/query_norm.py, imported by the test suite

@@ -70,6 +70,7 @@ import config
 from honesty import failure_note, reset_tool_call, same_block_check, vet_answer, vet_weather
 from tools import (
     TOOLS,
+    _ACK_BOX,
     get_action_events,
     get_read_events,
     get_weather_events,
@@ -412,6 +413,12 @@ async def _handle(req: InvokeRequest):
     # so no lock is needed (and a lock here would defeat the point — the
     # thread can be stuck inside agent.run() for up to WORKER_TIMEOUT).
     box: dict = {}
+    # A verified on/off intent writes its short confirmation here from the
+    # worker THREAD; to_thread() copies this context, so the two never mix
+    # between parallel /invoke requests.
+    ack_box: list[str] = []
+    ack_token = _ACK_BOX.set(ack_box)
+    ack_sent = False
 
     def worker() -> None:
         # Everything, vetoes included, must land in `box`: an unhandled
@@ -431,6 +438,11 @@ async def _handle(req: InvokeRequest):
         while "answer" not in box and "error" not in box:
             await asyncio.sleep(1.0)
             now = time.monotonic()
+            if ack_box and not ack_sent:
+                # Verified action: speak at once, before the model's own answer
+                # AND before a timeout/error can erase it (the action happened).
+                ack_sent = True
+                yield _sse({"type": "sentence", "text": ack_box.pop(0)})
             if now - t0 > config.WORKER_TIMEOUT:
                 # The worker thread cannot be interrupted here; its result
                 # is simply discarded (the "error" branch below is checked
@@ -445,9 +457,17 @@ async def _handle(req: InvokeRequest):
                 hb_idx += 1
 
         if "error" in box:
+            if ack_box and not ack_sent:
+                # The tool verified the action before the model failed.
+                ack_sent = True
+                yield _sse({"type": "sentence", "text": ack_box.pop(0)})
             logger.error("invoke error: %s", box["error"])
             yield _sse({"type": "error", "message": box["error"]})
         else:
+            if ack_box and not ack_sent:
+                # The agent finished inside one poll tick — still say it.
+                ack_sent = True
+                yield _sse({"type": "sentence", "text": ack_box.pop(0)})
             sentences = split_sentences(box.get("answer", ""))
             for s in sentences:
                 yield _sse({"type": "sentence", "text": s})
@@ -456,6 +476,7 @@ async def _handle(req: InvokeRequest):
     finally:
         # No yield here: on client disconnect GeneratorExit arrives at the
         # await point and a yield in finally would be a RuntimeError.
+        _ACK_BOX.reset(ack_token)
         if not agent_task.done():
             agent_task.cancel()
 

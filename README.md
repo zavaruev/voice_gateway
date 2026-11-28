@@ -1,6 +1,6 @@
 # Voice Gateway
 
-![version](https://img.shields.io/badge/version-v2.84-blue)
+![version](https://img.shields.io/badge/version-v2.92-blue)
 [![tests](https://github.com/zavaruev/voice_gateway/actions/workflows/tests.yml/badge.svg)](https://github.com/zavaruev/voice_gateway/actions/workflows/tests.yml)
 ![python](https://img.shields.io/badge/python-3.12%2B-3776AB?logo=python&logoColor=white)
 ![backend](https://img.shields.io/badge/AI%20backend-Cascade-orange)
@@ -48,7 +48,26 @@ See [`docs/REFERENCE.md`](docs/REFERENCE.md) → *Known Issues & Current Problem
 | L2 turn with a verified side effect | **3.2–4.0 s** |
 | Wake debounce | ~240 ms (2 of 3 chunks); a single chunk ≥ 0.68 fires immediately |
 | Wake window / watchdog | 15 s / 90 s |
-| Test suite | 980 tests, 36 files, ~19,400 lines |
+| Test suite | 1163 passed, 4 skipped, 1 known pre-existing failure; 47 files |
+
+---
+
+## Download requests (v2.92)
+
+A spoken request to download a series or film takes a deterministic path instead of a tool agent: `services/jev-router/download.py` parses the command, calls the `search_and_download` tool of the torrent-updater MCP server, and speaks at two moments only.
+
+1. **Immediately**, before the browser call: `Пытаюсь скачать.` (for Добби, `Домовой пытается скачать, сэр.` / `…мэм.`). The acknowledgement says the request was heard, never that a torrent was added.
+2. **After the add**: `Скачивается третий сезон Симпсонов.` A definite refusal says `Не нашла подходящего релиза.`; a timeout that may have added the torrent says `Не удалось подтвердить добавление в закачки.` Neither outcome is retried through Hermes, because the add may already have happened.
+
+This matters because a RuTracker search with a Cloudflare challenge took **2 min 24 s** on 28.11.2026 (12:29:47 → 12:32:11 MSK); without the first sentence the room was silent for the whole search. The factual confirmation is still emitted only after the add — the early sentence is an acknowledgement, not a completion claim.
+
+**Text normalisation** is general, not a list of titles (`services/jev-router/query_norm.py`, `pymorphy3==2.0.6` in both the router and gateway requirements):
+
+- A declined object is sent in the form RuTracker indexes: `Симпсонов → Симпсоны` (plural nominative for plural inflected words), `серию → серия`, `Черного зеркала → Чёрное зеркало` (an adjective before a noun agrees with it).
+- A conjugated download verb is brought to the infinitive: `скачает`, `загрузил`, `скачивает` all reach the download route, so the form Whisper happened to write does not change the route.
+- Guards keep this narrow: past tense (`скачал серию…`) is a report, not an order; a preceding `не`/`нет` refuses; a capitalised proper name whose stem would change (`Влада → Влад`) is sent unchanged; an unknown token is passed through.
+
+The browser search itself must have the **current** scripts in the image: a container running an old `rutracker_scraper.py` failed with `RutrackerScraper has no attribute attach` before reaching the tracker, and the router reported it as “nothing found”. Build from the repository; do not copy single scripts into a live container.
 
 ---
 

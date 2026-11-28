@@ -250,3 +250,20 @@ def test_both_levels_wait_the_same_time_before_calling_a_call_a_failure():
     # Volume gets the long window, transport the short one, in BOTH copies.
     assert sum(router.confirm_delays("volume_up")) > \
         sum(router.confirm_delays("media_pause"))
+
+
+def test_onoff_verify_module_is_identical_in_both_services():
+    """L1 and L2 must use the same instrument, not two drifting copies.
+
+    Field case 27.11.2026 16:09 MSK: L2 declared a working coffee maker off
+    while L1 would have proved it by the power sensor. The file is duplicated
+    because the services are two separate images; this test is the only thing
+    that keeps them one rule.
+    """
+    a = os.path.join(_ROOT, "services", "jev-router", "onoff_verify.py")
+    b = os.path.join(_ROOT, "services", "smolagents-worker", "onoff_verify.py")
+    with open(a, encoding="utf-8") as fh:
+        left = fh.read()
+    with open(b, encoding="utf-8") as fh:
+        right = fh.read()
+    assert left == right, "the two on/off verification copies drifted apart"

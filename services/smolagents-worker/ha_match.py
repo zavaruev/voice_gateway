@@ -28,6 +28,12 @@ from __future__ import annotations
 
 import json
 import re
+import time as _time
+
+from onoff_verify import (  # noqa: E402 — same file as the router's copy
+    physics_agrees,
+    power_sensor_for,
+)
 
 # Transport/parse error prefixes returned by mcp_call/ha_action/ha_read.
 # Byte-level contract with tools._record_action and honesty._truth — do not
@@ -1035,38 +1041,84 @@ def claimed_entity_ids(text: str) -> list[str]:
     ]
 
 
+def _judge_onoff(rows, entity_ids, target, reached, unproven):
+    """One read. A power sensor decides where one exists; state is the fallback.
+
+    `unproven` is NOT failure: the appliance may take minutes to act, and a
+    sensor that has not moved yet is absence of evidence, not evidence of absence.
+    """
+    by_id = {
+        str(s.get("entity_id")): str(s.get("state", "")).lower()
+        for s in rows if isinstance(s, dict)
+    }
+    if not rows:
+        # HA did not answer. That is absence of evidence, not a device verdict.
+        for eid in entity_ids:
+            if eid not in reached and eid not in unproven:
+                unproven.append(eid)
+        return
+    for eid in entity_ids:
+        if eid in reached:
+            continue
+        sensor = power_sensor_for(eid, rows)
+        if sensor:
+            ent = next((s for s in rows if s.get("entity_id") == sensor), None)
+            if physics_agrees(ent, target) is True:
+                reached.append(eid)
+                if eid in unproven:
+                    unproven.remove(eid)
+            elif eid not in unproven:
+                unproven.append(eid)
+            continue
+        if by_id.get(eid) == target:
+            reached.append(eid)
+            if eid in unproven:
+                unproven.remove(eid)
+
+
+def _read_onoff(entity_ids, target, fetch_states, delays):
+    reached: list[str] = []
+    unproven: list[str] = []
+    prev = 0.0
+    sensor_for: dict[str, str | None] = {}
+    for delay in delays:
+        _time.sleep(delay - prev)
+        prev = delay
+        rows = fetch_states() or []
+        for eid in entity_ids:
+            # recompute while unknown: a first pass with no rows must not
+            # permanently disable the power-sensor instrument.
+            if rows and sensor_for.get(eid) is None:
+                sensor_for[eid] = power_sensor_for(eid, rows)
+        _judge_onoff(rows, entity_ids, target, reached, unproven)
+        if len(reached) == len(entity_ids):
+            break
+    # Measured 27.11.2026: the coffee maker's power sensor moved at +2.93 s,
+    # after all three base reads. One extra read proves it instead of guessing;
+    # only entities WITH a sensor need it, and there is no further retry.
+    pending = [eid for eid in unproven if sensor_for.get(eid)]
+    if pending:
+        _time.sleep(1.0)
+        rows = fetch_states() or []
+        _judge_onoff(rows, pending, target, reached, unproven)
+    return reached, unproven
+
+
 def confirm_on_off_reached(entity_ids: list[str], target: str,
                            fetch_states) -> list[str]:
     """Which of these entities actually reached `target`, read back LATE.
 
-    `fetch_states` is a zero-argument callable returning the raw HA state list; it
-    is passed in rather than imported so this module stays pure stdlib and the
-    suite can drive the whole thing without a network — `tools.py` cannot be
-    imported at all in the gateway's test image because it needs `smolagents`.
-
-    The delay is not a fudge. Home Assistant updates a `switch` entity
-    optimistically on `turn_on`/`turn_off`, so an immediate read returns the value
-    HA itself just wrote. Measured 10.10.2026 on `switch.coffemaker`: state `off`
-    at t=+0.26 s while `sensor.coffemaker_power` still read 1072 W, and 0 W by
-    t=+0.77 s. L1 uses the same schedule for the same reason, and the two must stay
-    identical or they will disagree about the same turn.
+    Kept for callers that only need the proved list. The delay is not a fudge:
+    HA writes the state optimistically before the device acts, so a sub-second
+    read returns our own request echoed. L1 uses the same schedule.
     """
-    import time as _time
-
     delays = (1.0, 1.5, 2.5)
-    reached: list[str] = []
-    prev = 0.0
-    for delay in delays:
-        _time.sleep(delay - prev)
-        prev = delay
-        live = {
-            str(s.get("entity_id")): str(s.get("state", "")).lower()
-            for s in (fetch_states() or [])
-            if isinstance(s, dict)
-        }
-        for eid in entity_ids:
-            if eid not in reached and live.get(eid) == target:
-                reached.append(eid)
-        if reached:
-            break
-    return reached
+    return _read_onoff(entity_ids, target, fetch_states, delays)[0]
+
+
+def confirm_on_off_verdict(
+    entity_ids: list[str], target: str, fetch_states,
+) -> tuple[list[str], list[str]]:
+    """(proved, unproven) — the second list must never be called a failure."""
+    delays = (1.0, 1.5, 2.5)
+    return _read_onoff(entity_ids, target, fetch_states, delays)

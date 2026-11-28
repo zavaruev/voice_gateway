@@ -61,6 +61,18 @@ OMNIROUTE_URL = os.getenv("OMNIROUTE_URL", "http://192.168.22.101:20128").rstrip
 # failover when Hermes is down.
 OMNIROUTE_COMBO = os.getenv("OMNIROUTE_COMBO", "gemma4_31b_free")
 
+# torrent-updater: the service that actually adds a torrent. Its documented
+# agent interface is MCP (streamable HTTP), wrapping the same search-and-
+# download API; a voice request calls the tool so the confirmation can be
+# spoken when the torrent is added, not minutes later.
+# No credentials — the endpoint is on the trusted host LAN.
+TORRENT_UPDATER_MCP_URL = os.getenv(
+    "TORRENT_UPDATER_MCP_URL", "http://192.168.22.102:8020/mcp"
+).rstrip("/")
+# Browser search + add takes 1-3 min; keep headroom above the measured
+# 205 s field case without holding a turn forever.
+DOWNLOAD_TIMEOUT_S = _f("DOWNLOAD_TIMEOUT_S", "240")
+
 HERMES_URL = os.getenv("HERMES_URL", "http://192.168.22.102:8642").rstrip("/")
 # L3 expert + weather fallback; empty key means "trust the LAN endpoint".
 HERMES_API_KEY = os.getenv("HERMES_API_KEY", "")

@@ -2144,6 +2144,7 @@ def test_dobbi_style_uses_the_speakers_honorific_and_leaves_llm_text_alone():
             "Домовой оплошал{h}. Устройство не переключилось.",
         "Простите, что-то пошло не так.":
             "Домовой расстроился{h}. Повторите, пожалуйста.",
+        "Пытаюсь скачать.": "Домовой пытается скачать{h}.",
     }
     for src, expected in cases.items():
         assert dobbi_style(src, "сэр") == expected.format(h=", сэр"), src
@@ -4475,3 +4476,18 @@ async def test_failover_still_runs_when_nothing_was_spoken(monkeypatch):
                                                      knowledge=True)]
     assert out == ["Фолбэк."], out
     assert seen == ["hermes-agent", chat_proxy.config.OMNIROUTE_COMBO], seen
+
+
+def test_math_without_a_question_marker_is_knowledge():
+    """Field texts 27.11: both were spoken without «?» and without a lead word."""
+    assert knowledge_question("шесть в квадрате")
+    assert knowledge_question("два процента четырех тысяч")
+    assert knowledge_question("умножь три на четыре")
+    assert knowledge_question("подели сто на пять")
+
+
+def test_home_math_stays_on_the_home_ladder():
+    """Broadening the math vocabulary must not steal device questions."""
+    assert not knowledge_question("включи свет на 50 процентов")
+    assert not knowledge_question("сколько процентов заряда пылесоса")
+    assert not knowledge_question("нагрей воду до ста градусов")

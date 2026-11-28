@@ -13,6 +13,7 @@ _ROUTER = os.path.abspath(
 sys.path.insert(0, _ROUTER)
 
 import calc  # noqa: E402
+import classifier  # noqa: E402
 import resolver  # noqa: E402
 
 
@@ -142,3 +143,64 @@ def test_the_scale_percentage_still_wins_over_calculator(monkeypatch):
     route = __import__("asyncio").run(_drive())
     assert route["route"] == "scale"
     assert route["reason"] == "scale_percent"
+
+
+def test_percent_in_genitive_without_ot():
+    """Field text 27.11 16:54 MSK: «два процента четырех тысяч»."""
+    assert calc.evaluate("два процента четырех тысяч") == 80.0
+    assert calc.evaluate("2 процента 4000") == 80.0
+
+
+def test_bare_percent_is_not_a_multiplication():
+    assert calc.evaluate("двадцать процентов") == 0.2
+
+
+def test_spoken_square_and_cube():
+    """Field text 27.11 17:48 MSK: «шесть в квадрате»."""
+    assert calc.evaluate("шесть в квадрате") == 36.0
+    assert calc.evaluate("два в кубе") == 8.0
+
+
+def test_field_math_texts_are_answered_by_calc(monkeypatch):
+    app = _router_app()
+
+    def _must_not_run(*args, **kwargs):
+        raise AssertionError("a solvable expression must not reach the classifier")
+
+    monkeypatch.setattr(app.classifier, "classify", _must_not_run)
+
+    async def _drive(text):
+        gen = app._handle(app.RouteRequest(
+            text=text, session_id="probe", stream_name="camera-corridor1"
+        ))
+        first = await gen.__anext__()
+        await gen.aclose()
+        return json.loads(first.removeprefix("data: "))
+
+    for text in ("шесть в квадрате", "два процента четырех тысяч"):
+        route = __import__("asyncio").run(_drive(text))
+        assert route["route"] == "calc", (text, route)
+
+
+def test_unparsed_math_goes_to_expert_not_l2(monkeypatch):
+    app = _router_app()
+
+    async def _low(*args, **kwargs):
+        return classifier.RouteDecision(
+            route="complex_logic", confidence=0.18,
+            reason="low_confidence(0.18<0.85)",
+        )
+
+    monkeypatch.setattr(app.classifier, "classify", _low)
+
+    async def _drive(text):
+        gen = app._handle(app.RouteRequest(
+            text=text, session_id="probe", stream_name="camera-corridor1"
+        ))
+        first = await gen.__anext__()
+        await gen.aclose()
+        return json.loads(first.removeprefix("data: "))
+
+    route = __import__("asyncio").run(_drive("синус тридцати"))
+    assert route["route"] == "expert", route
+    assert route["reason"] == "knowledge_low_confidence", route

@@ -2,3 +2,4 @@ fastapi
 uvicorn
 aiohttp
 numpy
+pymorphy3==2.0.6  # normalises declined RuTracker titles in query_norm.py

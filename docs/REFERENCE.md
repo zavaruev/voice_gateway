@@ -334,6 +334,12 @@ CI (`.github/workflows/tests.yml`) runs this exact recipe inside the built image
 
 ## Changelog
 
+- **2.92 (28.11.2026)** — Download requests now acknowledge being heard immediately and survive Russian declensions and verb forms.
+  - `download.py` parses a narrow download request and calls the torrent-updater MCP tool `search_and_download`; the router emits `Пытаюсь скачать.` **before** the browser call and the factual `Скачивается …` only after the torrent is added. Refusals and timeouts still speak once and are never retried through Hermes (a timed-out add may already have happened).
+  - Field case: at 12:29:47 MSK a corrected «Скачай третий сезон Симпсонов» started a search that needed a Cloudflare CDP solve and three tracker pages; the torrent was added at 12:32:10 and the room heard the confirmation at 12:32:11. The two-minute silent gap is what the early acknowledgement removes.
+  - `query_norm.py` uses `pymorphy3` 2.0.6 to lemmatise the outbound search query (plural nominative for plural inflected nouns, adjective–noun agreement) and to bring download verbs to the infinitive. Guards exclude past tense, negation and stem-changing proper names. Running images without the matching `RutrackerScraper.attach` / `download_url_and_add_to_transmission` failed before searching; rebuild from repository source instead of copying scripts into a live container.
+  - TDD: 29 download tests plus the router-guard tests; full suite 1163 passed, 4 skipped, one documented pre-existing failure. Router rebuilt and health-gated; live probe confirmed the acknowledgement reaches the SSE stream while the tool is still blocked. See `docs/superpowers/specs/2026-11-28-download-request-normalisation-design.md`.
+
 - **2.48** — The corridor light stayed off for 40 seconds, and the room said «Не получилось» about a command that worked. Two independent defects, both measured.
   - **A manual «выключи свет» was undone by the motion sensor within the minute.** The relay history, one hour, no intervention:
 

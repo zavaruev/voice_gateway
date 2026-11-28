@@ -50,6 +50,7 @@ CONTRACT
 
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import threading
@@ -64,12 +65,14 @@ from smolagents import tool
 import config
 import kodi
 from concurrent.futures import ThreadPoolExecutor
+from onoff_verify import UNPROVEN_ONOFF_TEXT, ack_for_onoff
 from ha_match import (
     MEDIA_DOMAIN,
     claimed_a_usable_entity,
     claimed_entity_ids,
     confirm_delays,
     confirm_on_off_reached,
+    confirm_on_off_verdict,
     has_data,
     media_fingerprint,
     match_states,
@@ -283,6 +286,30 @@ _RAW_LOCK = threading.Lock()
 _RAW_STATES: list | None = None
 _RAW_AREAS: dict | None = None
 _RAW_AT = 0.0
+
+# A verified action's short confirmation travels back to the SSE loop without
+# going through the LLM. asyncio.to_thread() copies the caller's context, so the
+# _handle coroutine sets a fresh list per request and this tool appends to it.
+_ACK_BOX: contextvars.ContextVar[list | None] = contextvars.ContextVar(
+    "onoff_ack_box", default=None
+)
+
+
+def _fresh_states() -> list | None:
+    """Post-call read-back: ALWAYS live /api/states, never the 10 s registry cache.
+
+    A snapshot taken before turn_on cannot prove the turn_on worked; using one
+    is exactly the 27.11.2026 false refusal.
+    """
+    try:
+        states = _http_json(
+            f"{config.HA_URL}/api/states",
+            headers={"Authorization": f"Bearer {config.HA_TOKEN}"},
+        )
+    except Exception as e:  # noqa: BLE001 — verification must not raise
+        logger.warning("fresh HA states fetch failed: %s", e)
+        return None
+    return states if isinstance(states, list) else None
 
 
 def _http_text(url: str, payload: dict | None = None, timeout: float = config.TOOL_TIMEOUT) -> str:
@@ -530,11 +557,30 @@ def _verify_on_off_result(tool_name: str, result: str) -> str:
     # will disagree about the same turn, which is what happened here.
     claimed = claimed_entity_ids(result)
     target = "on" if tool_name.endswith("TurnOn") else "off"
-    if claimed and not confirm_on_off_reached(claimed, target, _raw_states):
+    if claimed:
+        # NEVER the cached _raw_states(): it was read before the call, so it
+        # cannot see the change we are trying to verify (27.11.2026).
+        reached, unproven = confirm_on_off_verdict(
+            claimed, target, _fresh_states
+        )
+        if len(reached) == len(claimed):
+            # Fast, deterministic feedback; the model's own answer follows.
+            box = _ACK_BOX.get()
+            if box is not None:
+                box.append(ack_for_onoff(target))
+            return result
+        if reached or unproven:
+            # A partial fan-out or a device that acts minutes later is NOT a
+            # failed device. No blanket ack: only what was proved may be said.
+            logger.warning(
+                "on/off read-back partial: reached=%s unproven=%s",
+                ", ".join(sorted(reached)), ", ".join(sorted(unproven)),
+            )
+            return UNPROVEN_ONOFF_TEXT
         res = (
             "Тул вернул ошибку: Home Assistant принял вызов "
             f"{tool_name} и ответил «успех», но перечитывание состояния "
-            f"через 1-2.5 с показало, что ни одно из устройств "
+            f"показало, что ни одно из устройств "
             f"({', '.join(sorted(claimed))}) не пришло в состояние "
             f"'{target}'. Устройство НЕ переключено. Не говори, что "
             f"включила или выключила: назови настоящую причину."

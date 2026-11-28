@@ -64,6 +64,10 @@ _OPS = (
     (re.compile(r"\bквадратный\s+корень\s+из\b", re.I), "sqrt"),
     (re.compile(r"\bкорень\s+из\b", re.I), "sqrt"),
     (re.compile(r"\bв\s+степени\b", re.I), "**"),
+    # Postfix powers: «шесть в квадрате» -> «6**2». Placed here so the
+    # number-word pass below sees the operator and leaves only digits.
+    (re.compile(r"\bв\s+квадрат(?:е)?\b", re.I), "**2"),
+    (re.compile(r"\bв\s+куб(?:е)?\b", re.I), "**3"),
     (re.compile(r"\bумнож(?:ить|ь|ьте|им)\b(?:\s+на)?", re.I), "*"),
     (re.compile(r"\bраздели(?:ть|ь|те)?\b(?:\s+на)?", re.I), "/"),
     (re.compile(r"\bподели(?:ть|ь|те)?\b(?:\s+на)?", re.I), "/"),
@@ -96,7 +100,7 @@ def _words_to_number(phrase: str) -> str:
 def _looks_like_math(text: str) -> bool:
     return bool(re.search(
         r"[+\-*/^()%]|\b(?:плюс|минус|умнож\w*|раздели\w*|подели\w*"
-        r"|процент\w*|корень\w*|степен\w*|сложи\w*|вычти\w*"
+        r"|процент\w*|корень\w*|степен\w*|квадрат\w*|куб\w*|сложи\w*|вычти\w*"
         r"|посчитай|вычисли|сколько будет)\b",
         text or "", re.IGNORECASE,
     ))
@@ -132,6 +136,9 @@ def evaluate(text: str) -> float | None:
     expr = re.sub(r"(?<=\d)\s+и\s+(?=\d)", "+", expr)
     expr = re.sub(r"\bпроцент\w*\b", "%", expr)
     expr = re.sub(r"(\d+(?:[.,]\d+)?)\s*%\s*от\s*", r"(\1/100)*", expr)
+    # «два процента четырёх тысяч»: the preposition «от» is optional in
+    # spoken Russian, so a number immediately after % is the multiplicand.
+    expr = re.sub(r"(\d+(?:[.,]\d+)?)\s*%\s*(?=\d|\()", r"(\1/100)*", expr)
     expr = re.sub(r"(\d+(?:[.,]\d+)?)\s*%", r"(\1/100)", expr)
     expr = expr.replace(",", ".")
     if re.search(r"[а-яё]", expr):

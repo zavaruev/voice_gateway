@@ -116,6 +116,76 @@ def test_complex_route_immediate_ack():
     assert out[2] == "Проверил: всё работает."
 
 
+def test_suspect_route_speaks_the_router_cue_instead_of_the_generic_ack():
+    """27.11.2026: the deterministic "I may have misheard" sentence is the
+    acknowledgement. A second «Секунду, занимаюсь…» would bury it and waste
+    three seconds before the user learns there was a problem."""
+    cue = (
+        "Похоже, я неверно расслышала. Если это не то — повторите, пожалуйста, "
+        "правильную фразу."
+    )
+    events = [
+        {"type": "route", "route": "expert", "confidence": 0.0,
+         "reason": "stt_suspect"},
+        {"type": "sentence", "text": "Полностью его звали Александр Сергеевич Пушкин."},
+        {"type": "sentence", "text": cue},
+        {"type": "done", "route": "expert", "elapsed": 5.0},
+    ]
+    out = _drain(asyncio.run(_run(events)))
+    assert CascadeBackend.ACK_COMPLEX not in out, out
+    assert out[-1] == cue, out
+
+
+def test_other_expert_routes_get_the_same_heard_ack():
+    events = [
+        {"type": "route", "route": "expert", "confidence": 0.0,
+         "reason": "unresolved_question"},
+        {"type": "sentence", "text": "Ответ Гермеса."},
+        {"type": "done", "route": "expert", "elapsed": 5.0},
+    ]
+    out = _drain(asyncio.run(_run(events)))
+    assert out[0] == CascadeBackend.ACK_HEARD, out
+
+
+def test_expert_route_immediately_acks_that_the_question_was_heard():
+    """27.11.2026: a Hermes-bound question must never sit in silence. The ack
+    is explicit about the question having been heard, and it comes from the
+    route event — not from a timer that may fire after the answer."""
+    for reason in ("stt_suspect", "unresolved_question", "low_confidence"):
+        events = [
+            {"type": "route", "route": "expert", "confidence": 0.0,
+             "reason": reason},
+            {"type": "sentence", "text": "Ответ Гермеса."},
+            {"type": "done", "route": "expert", "elapsed": 5.0},
+        ]
+        out = _drain(asyncio.run(_run(events)))
+        assert out[0] == "Вопрос услышан. Секунду, думаю.", (reason, out)
+        assert out[1] == "Ответ Гермеса.", (reason, out)
+        assert CascadeBackend.ACK_COMPLEX not in out, (reason, out)
+
+
+def test_dobbi_heard_ack_is_masculine_and_uses_the_honorific():
+    b = CascadeBackend("http://x")
+    assert b._ack_for_question("", "") == "Вопрос услышан. Секунду, думаю."
+    assert b._ack_for_question("dobbi", "сэр") == (
+        "Домовой услышал, сэр. Секунду думаю."
+    )
+    assert b._ack_for_question("dobbi", "") == "Домовой услышал. Секунду думаю."
+
+
+def test_the_heard_ack_is_not_treated_as_an_answer_when_hermes_fails():
+    """An ack must not disarm the apology: only a real answer sentence may."""
+    events = [
+        {"type": "route", "route": "expert", "confidence": 0.0,
+         "reason": "stt_suspect"},
+        {"type": "error", "message": "hermes down"},
+        {"type": "done", "route": "expert", "elapsed": 5.0},
+    ]
+    out = _drain(asyncio.run(_run(events)))
+    assert out[0] == "Вопрос услышан. Секунду, думаю.", out
+    assert CascadeBackend.SORRY in out, out
+
+
 def test_easy_route_fast_no_ack():
     events = [
         {"type": "route", "route": "easy_query", "confidence": 1.0},
@@ -159,7 +229,7 @@ def test_strips_emotion_tags():
         {"type": "done", "route": "expert", "elapsed": 2.0},
     ]
     out = _drain(asyncio.run(_run(events)))
-    assert out == [CascadeBackend.ACK_COMPLEX, "Привет! Как дела?"]
+    assert out == [CascadeBackend.ACK_HEARD, "Привет! Как дела?"]
 
 
 def test_escalation_second_route_event_acks_immediately():
@@ -272,3 +342,32 @@ def test_real_content_still_suppresses_the_apology():
     out = _drain(asyncio.run(_run(events)))
     assert out == [CascadeBackend.ACK_COMPLEX, "Анализирую запрос…",
                    "Готово: свет выключен."]
+
+
+def test_a_keepalive_event_is_silent_and_does_not_count_as_an_answer():
+    """27.11.2026: the router keeps a long Hermes tool turn's SSE socket alive
+    with a textless `keepalive` event. It must never be spoken, and it must
+    not disarm the apology if Hermes then dies — only content does that."""
+    events = [
+        {"type": "route", "route": "expert", "confidence": 0.01,
+         "reason": "download_request"},
+        {"type": "keepalive"},
+        {"type": "keepalive"},
+        {"type": "error", "message": "hermes died"},
+        {"type": "done", "route": "expert", "elapsed": 70.0},
+    ]
+    out = _drain(asyncio.run(_run(events)))
+    assert out == [CascadeBackend.SORRY], out
+
+
+def test_a_download_request_is_not_acknowledged_before_its_fact():
+    """A parseable download request has its own factual sentence. The generic
+    «question heard, thinking» ack would add a second, misleading phrase."""
+    events = [
+        {"type": "route", "route": "expert", "confidence": 0.92,
+         "reason": "download_request"},
+        {"type": "sentence", "text": "Скачивается восьмой сезон Симпсонов."},
+        {"type": "done", "route": "expert", "elapsed": 0.4},
+    ]
+    out = _drain(asyncio.run(_run(events)))
+    assert out == ["Скачивается восьмой сезон Симпсонов."], out
